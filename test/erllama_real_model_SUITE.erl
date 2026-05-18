@@ -53,10 +53,17 @@
     verify_does_not_mutate_caller_visible_state/1,
     verify_accepted_count_le_k/1,
     chunked_prefill_matches_unchunked/1,
-    continue_multi_turn_cache_delta/1
+    continue_multi_turn_cache_delta/1,
+    tokenize_large_input/1,
+    apply_chat_template_large_input/1,
+    tokenize_over_text_cap/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
+%% Mirror of the C-side ERLLAMA_MAX_TOKENS define. Kept in sync with
+%% `c_src/erllama_nif.c`; if you change one, change the other.
+-define(ERLLAMA_MAX_TOKENS, (16 * 1024 * 1024)).
+-define(ERLLAMA_MAX_TOKEN_TEXT, (64 * 1024 * 1024)).
 -define(SHORT_PROMPT, <<"The quick brown fox">>).
 -define(LONG_PROMPT, <<
     "Once upon a time in a quiet village there lived a clever old woman "
@@ -89,7 +96,10 @@ all() ->
         verify_does_not_mutate_caller_visible_state,
         verify_accepted_count_le_k,
         chunked_prefill_matches_unchunked,
-        continue_multi_turn_cache_delta
+        continue_multi_turn_cache_delta,
+        tokenize_large_input,
+        apply_chat_template_large_input,
+        tokenize_over_text_cap
     ].
 
 init_per_suite(Config) ->
@@ -633,6 +643,87 @@ continue_multi_turn_cache_delta(Config) ->
     ?assert(maps:get(created, Delta3) >= length(Suffix3)),
     ok = erllama:end_session(Model, SessionId),
     ok.
+
+%% =============================================================================
+%% Large-input tokenize / apply_chat_template safety
+%% =============================================================================
+
+%% Regression coverage for the production segfault report against
+%% Claude-Code-shaped requests (30-50 MiB rendered chat template).
+%% The engine must accept inputs up to ERLLAMA_MAX_TOKEN_TEXT without
+%% crashing and produce token outputs at or below ERLLAMA_MAX_TOKENS.
+
+tokenize_large_input(Config) ->
+    Model = ?config(model, Config),
+    Sizes = [1 * 1024 * 1024, 8 * 1024 * 1024, 60 * 1024 * 1024],
+    lists:foreach(
+        fun(Sz) ->
+            Prompt = big_text(Sz),
+            {ok, Tokens} = erllama:tokenize(Model, Prompt),
+            ?assert(is_list(Tokens)),
+            ?assert(length(Tokens) > 0),
+            ?assert(length(Tokens) =< ?ERLLAMA_MAX_TOKENS),
+            ct:log(
+                "tokenize ~p MiB -> ~p tokens",
+                [Sz div (1024 * 1024), length(Tokens)]
+            )
+        end,
+        Sizes
+    ),
+    ok.
+
+apply_chat_template_large_input(Config) ->
+    Model = ?config(model, Config),
+    %% Skip cleanly if the model has no chat template — every size
+    %% would otherwise just return the same `{error, no_template}`.
+    Probe = #{messages => [#{role => <<"user">>, content => <<"hi">>}]},
+    case erllama:apply_chat_template(Model, Probe) of
+        {error, no_template} ->
+            {skip, "model has no chat template in GGUF metadata"};
+        {ok, _} ->
+            Sizes = [1 * 1024 * 1024, 5 * 1024 * 1024, 50 * 1024 * 1024],
+            lists:foreach(
+                fun(Sz) ->
+                    Content = big_text(Sz),
+                    Request = #{messages => [#{role => <<"user">>, content => Content}]},
+                    {ok, Tokens} = erllama:apply_chat_template(Model, Request),
+                    ?assert(is_list(Tokens)),
+                    ?assert(length(Tokens) > 0),
+                    ?assert(length(Tokens) =< ?ERLLAMA_MAX_TOKENS),
+                    ct:log(
+                        "apply_chat_template ~p MiB -> ~p tokens",
+                        [Sz div (1024 * 1024), length(Tokens)]
+                    )
+                end,
+                Sizes
+            ),
+            ok
+    end.
+
+tokenize_over_text_cap(Config) ->
+    %% Just above ERLLAMA_MAX_TOKEN_TEXT must produce a clean
+    %% {error, too_large} rather than a BEAM crash. Synthetic input
+    %% is exactly cap+1 bytes so we exercise the boundary check.
+    Model = ?config(model, Config),
+    Over = big_text(?ERLLAMA_MAX_TOKEN_TEXT + 1),
+    ?assertEqual({error, too_large}, erllama:tokenize(Model, Over)),
+    Request = #{messages => [#{role => <<"user">>, content => Over}]},
+    case erllama:apply_chat_template(Model, Request) of
+        {error, too_large} ->
+            ok;
+        %% Older models without a template short-circuit before tokenize.
+        {error, no_template} ->
+            {skip, "model has no chat template in GGUF metadata"}
+    end.
+
+%% Build a deterministic ASCII payload of exactly Sz bytes. The
+%% repeated sentence keeps per-token entropy low enough that even a
+%% large input completes quickly under TinyLlama.
+big_text(Sz) ->
+    Seed = <<"The quick brown fox jumps over the lazy dog. ">>,
+    Reps = (Sz div byte_size(Seed)) + 1,
+    Big = binary:copy(Seed, Reps),
+    binary:part(Big, 0, Sz).
 
 %% =============================================================================
 %% Helpers
