@@ -1,18 +1,110 @@
 # erllama bench
 
-Two scenarios, runnable against any GGUF llama.cpp can load:
+Two harnesses live here:
 
-1. **`cold_vs_warm`** — single agent, prompt lengths 512 / 1024 / 2048
-   tokens. Measures total `complete/3` time on the cold path then the
-   warm path; reports the speedup ratio.
-2. **`multi_agent`** — pre-warm one shared system-prompt prefix (~1024
-   tokens), then run 4 concurrent agents that each append a distinct
-   per-agent task and complete a 1-token response. Reports min /
-   p50 / p99 / max / mean latency across the agents and dumps the
-   cache counters (`hits_*`, `misses`, `longest_prefix_*`,
-   `load_total_ns`).
+- **Local "cold vs warm" markdown** (`bench/run.sh`) — quick eyeball
+  comparison printed to stdout. Two scenarios: `cold_vs_warm` across
+  prompt lengths and `multi_agent` for shared-prefix concurrency.
+- **Cross-machine JSON collect** (`bench/collect.sh` and
+  `bench/bootstrap.sh`) — one JSON artifact per `{machine, model}`
+  pair, designed to be shipped off-box and aggregated. Use this when
+  comparing GPUs / models across hosts.
 
-## Run
+## Cross-machine collect mode
+
+```bash
+# already cloned + built:
+bench/collect.sh /path/to/model.gguf
+
+# one-shot (clone, build, run):
+curl -fsSL https://raw.githubusercontent.com/erllama/erllama/main/bench/bootstrap.sh \
+  | bash -s -- /path/to/model.gguf
+```
+
+Output lands in `bench/results/` with a deterministic name:
+
+```
+<gpu-slug>__<model-basename>__erllama-<vsn>__<utc-ts>.json
+```
+
+The script auto-detects the host (kernel, arch, CPU brand, RAM) and
+GPU (probes `nvidia-smi`, then `rocm-smi`, then `system_profiler` on
+macOS, else falls back to CPU). One file per run; collect the files
+back from each machine for off-line summarisation.
+
+Tunables (env vars on `collect.sh` or `bootstrap.sh`):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `N_GPU_LAYERS` | `999` | Layers offloaded to GPU (high = all of them) |
+| `N_CTX` | `4096` | `llama_context` size |
+| `N_BATCH` | `4096` | `llama_decode` batch size |
+| `N_SEQ_MAX` | `1` | Concurrent sequence slots |
+| `BENCH_SHORT_TOKENS` | `50` | Short-prompt target length |
+| `BENCH_LONG_TOKENS` | `500` | Long-prompt target length |
+| `BENCH_RESPONSE_TOKENS` | `32` | Tokens to generate per workload |
+| `SKIP_SHA256=1` | unset | Skip GGUF sha256 (faster, less model identity info) |
+| `ERLLAMA_REF` | `main` | (bootstrap only) git ref to check out |
+| `ERLLAMA_DIR` | `~/.erllama-bench/erllama` | (bootstrap only) clone target |
+
+The collect harness runs four workloads:
+
+1. `cold_short` — fresh cache, ~50-token prompt, 32 tokens generated.
+2. `cold_long` — fresh cache, ~500-token prompt, 32 tokens generated.
+3. `warm_long` — same prompt as `cold_long`, hits the row that
+   `cold_long` just wrote.
+4. `continue_3turn` — pinned session, turn 1 via `infer/4`, turns 2/3
+   via `continue/3`. Captures per-turn Stats including the new
+   `cache_hit_kind => continuation`.
+
+The cache is cleared with `erllama_cache_meta_srv:gc/0` between
+unrelated workloads so cross-prompt prefix overlap doesn't accidentally
+warm a "cold" number. The `cold_long` → `warm_long` pair deliberately
+shares state.
+
+A run takes roughly 5-10 seconds on Metal/CUDA with TinyLlama, longer
+on CPU or with larger models. Local results are gitignored.
+
+### Caveats
+
+- Timings are millisecond-granularity. Workloads under ~5ms of real
+  work (notably `cold_short` against TinyLlama on Metal/CUDA) hit
+  timer noise; on real-size models (Llama-3-8B and up) the same
+  workload produces stable numbers.
+- A warmup pass is run before measurement to amortise Metal/CUDA
+  kernel-compilation cost on the first big-batch prefill. The
+  warmup result is discarded.
+
+### Summarising collected results
+
+The JSON shape is flat enough for `jq` one-liners. Headline cache
+speedup per file:
+
+```bash
+jq -r '
+  .gpu.name as $gpu
+  | .model.basename as $model
+  | (.workloads[] | select(.name=="cold_long").prefill_ms) as $cold
+  | (.workloads[] | select(.name=="warm_long").prefill_ms) as $warm
+  | "\($gpu)\t\($model)\tcold=\($cold)ms\twarm=\($warm)ms\tspeedup=\(($cold/$warm)|tostring[0:4])x"
+' bench/results/*.json
+```
+
+Continuation reuse per file:
+
+```bash
+jq -r '
+  .gpu.name as $gpu
+  | (.workloads[] | select(.name=="continue_3turn").turns) as $t
+  | "\($gpu)\tturn2 read=\($t[1].cache_delta_read)/created=\($t[1].cache_delta_created)\tturn3 read=\($t[2].cache_delta_read)/created=\($t[2].cache_delta_created)"
+' bench/results/*.json
+```
+
+For richer aggregation (a Markdown table across many runs), ship the
+result files back to one place and feed them through whatever
+post-processor fits — the schema is stable per `schema_version`.
+
+## Local cold-vs-warm markdown mode
 
 ```bash
 bench/run.sh              # all configured models
