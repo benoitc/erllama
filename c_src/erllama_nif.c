@@ -182,20 +182,22 @@ extern int32_t erllama_safe_n_embd(const struct llama_model *m);
 extern int erllama_safe_set_embeddings(struct llama_context *c, bool value);
 
 #ifndef ERLLAMA_MAX_TOKENS
-/* Cap on accepted token-list inputs and tokenize output. The largest
- * practical context window today is ~10M; 1M tokens leaves plenty of
- * headroom while bounding worst-case allocations to ~4 MB and keeping
- * one bad request from tying up dirty schedulers indefinitely. */
-#define ERLLAMA_MAX_TOKENS (1024 * 1024)
+/* Cap on tokenize output, on the retry-needed-size returned from
+ * `llama_tokenize`, and on caller-supplied token-list inputs handed
+ * to prefill/decode NIFs. Sized to cover the worst-case rendered
+ * chat-template body the downstream HTTP server accepts (64 MiB at
+ * roughly 4 bytes/token) with comfortable headroom. Override at
+ * build time via -DERLLAMA_MAX_TOKENS=N. */
+#define ERLLAMA_MAX_TOKENS (16 * 1024 * 1024)
 #endif
 
 #ifndef ERLLAMA_MAX_TOKEN_TEXT
-/* Largest text accepted by tokenize/3 (bytes). 4 MiB covers ~1 M
- * tokens at ~4 bytes each, well above any realistic chat prompt
- * while keeping a single bad request from chewing dirty-scheduler
- * time. Override at build time via -DERLLAMA_MAX_TOKEN_TEXT=N for
- * batch-tokenization workflows. */
-#define ERLLAMA_MAX_TOKEN_TEXT (4 * 1024 * 1024)
+/* Cap on text bytes accepted by tokenize/3 and on the rendered
+ * chat-template buffer in apply_chat_template/2. 64 MiB matches the
+ * downstream erllama_server's max_request_body_bytes so any input
+ * the server passes through is bounded by this cap. Override at
+ * build time via -DERLLAMA_MAX_TOKEN_TEXT=N for batch workflows. */
+#define ERLLAMA_MAX_TOKEN_TEXT (64 * 1024 * 1024)
 #endif
 
 /* =========================================================================
@@ -1200,9 +1202,15 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     }
 
     int32_t text_len = (int32_t) text.size;
+    /* `n_max = text_len + 8` is a sound upper bound: tokens-per-byte
+     * for any tokenizer is `<= 1 + small constant`, the +8 covering
+     * BOS/EOS specials. Clamping it down to ERLLAMA_MAX_TOKENS would
+     * force an unnecessary retry on inputs over ~1 byte/token average
+     * and cap production workloads below the input text cap. The
+     * input text cap (ERLLAMA_MAX_TOKEN_TEXT, enforced above) is
+     * what bounds the allocation. */
     int32_t n_max = text_len + 8;
     if (n_max < 16) n_max = 16;
-    if (n_max > ERLLAMA_MAX_TOKENS) n_max = ERLLAMA_MAX_TOKENS;
 
     llama_token *tokens = (llama_token *) enif_alloc(sizeof(llama_token) * (size_t) n_max);
     if (!tokens) {
@@ -1242,6 +1250,16 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     if (n < 0) {
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
+    }
+    /* Enforce the output cap post-success: removing the n_max clamp
+     * before the first call means the tokenizer can fully populate a
+     * buffer larger than ERLLAMA_MAX_TOKENS (e.g. byte-fallback
+     * tokenizers at ~1 byte/token on a 60 MiB input). Convert that
+     * into a clean too_large error rather than returning an
+     * over-cap list to Erlang. */
+    if (n > ERLLAMA_MAX_TOKENS) {
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_too_large);
     }
 
     ERL_NIF_TERM list = enif_make_list(env, 0);
@@ -2347,9 +2365,16 @@ static ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
     }
     int32_t written = erllama_safe_chat_apply_template(
         tmpl, msgs, (size_t) n_msgs, true, buf, buf_size);
-    if (written < 0 && written != INT32_MIN) {
-        int32_t needed = -written;
-        if (needed > (int32_t) ERLLAMA_MAX_TOKEN_TEXT) {
+    /* Vendored `llama_chat_apply_template` returns the formatted-chat
+     * size as a positive value even when `buf` was too small to hold
+     * it — strncpy silently truncates and the function does not
+     * indicate truncation via a negative return. Detect truncation by
+     * comparing `written` against `buf_size` and retry with a grown
+     * buffer. (A negative return means an unknown template, which we
+     * bail on below; INT32_MIN is the C++-exception sentinel from
+     * `erllama_safe_chat_apply_template`.) */
+    if (written > 0 && written > buf_size) {
+        if (written > (int32_t) ERLLAMA_MAX_TOKEN_TEXT) {
             pthread_mutex_unlock(&m->mu);
             free_chat_msgs(msgs, n_msgs);
             enif_free(msgs);
@@ -2357,7 +2382,7 @@ static ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
             return enif_make_tuple2(env, atom_error, atom_too_large);
         }
         enif_free(buf);
-        buf_size = needed + 16;
+        buf_size = written + 16;
         buf = enif_alloc((size_t) buf_size);
         if (!buf) {
             pthread_mutex_unlock(&m->mu);
@@ -2367,6 +2392,16 @@ static ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
         }
         written = erllama_safe_chat_apply_template(
             tmpl, msgs, (size_t) n_msgs, true, buf, buf_size);
+        /* Defensive: a stable template render must produce the same
+         * size on the second call. If it suddenly claims more, bail
+         * rather than feed a still-truncated buffer to tokenize. */
+        if (written > buf_size) {
+            pthread_mutex_unlock(&m->mu);
+            free_chat_msgs(msgs, n_msgs);
+            enif_free(msgs);
+            enif_free(buf);
+            return enif_make_tuple2(env, atom_error, atom_template_failed);
+        }
     }
     if (written < 0) {
         pthread_mutex_unlock(&m->mu);
@@ -2390,9 +2425,10 @@ static ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
 
+    /* See the matching comment in `nif_tokenize`: written + 8 is a
+     * sound upper bound and clamping down forces unnecessary retries. */
     int32_t n_max = written + 8;
     if (n_max < 16) n_max = 16;
-    if (n_max > ERLLAMA_MAX_TOKENS) n_max = ERLLAMA_MAX_TOKENS;
     llama_token *tokens = enif_alloc(sizeof(llama_token) * (size_t) n_max);
     if (!tokens) {
         pthread_mutex_unlock(&m->mu);
@@ -2436,6 +2472,11 @@ static ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
     if (n < 0) {
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
+    }
+    /* See the matching post-success check in `nif_tokenize`. */
+    if (n > ERLLAMA_MAX_TOKENS) {
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_too_large);
     }
 
     ERL_NIF_TERM list = enif_make_list(env, 0);
