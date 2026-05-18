@@ -96,9 +96,13 @@ backend that targets a different runtime.
 ### Stateful streaming with bit-exact KV resume
 
 Today's warm restore re-prefills the last KV cell to regenerate
-logits, which can shift a near-tied sample. A turn-boundary save
-that persists the sampler+RNG state alongside the KV cells would
-make multi-turn replies bit-identical to the unbroken stream.
+logits, which can shift a near-tied sample. `erllama:continue/3`
+(0.6.0) extends a pinned sticky session with a caller-asserted
+token tail and avoids the warm-restore primer cost entirely for
+multi-turn workloads, but it's still not bit-exact: the sampler
+and RNG state are rebuilt per request. A turn-boundary save that
+persists the sampler+RNG state alongside the KV cells would make
+multi-turn replies bit-identical to the unbroken stream.
 
 ### Persistent sampler chain state across turns
 
@@ -142,3 +146,25 @@ measurable I/O amplification.
 A model loaded on node A served from node B. The cache subsystem is
 node-local; cross-node cache sharing (via the disk tier on a shared
 filesystem, or a small announce protocol) is a 0.3+ topic.
+
+### Incremental chat-template render
+
+`erllama:continue/3` (0.6.0) lets callers pass only the new turn's
+tokens, but they still have to render the full conversation through
+`apply_chat_template/2` and slice off the prior tokens — wasteful
+when the history is large. A companion `apply_chat_template_delta/3`
+that takes the prior token count plus the new messages and emits
+just the tail bytes would let HTTP layers skip the full Jinja pass
+on every turn. The primitive is well-defined; the work is mostly
+plumbing through the existing chat-template detector.
+
+### Streaming tokenize for very large prompts
+
+`erllama:tokenize/2` and `apply_chat_template/2` allocate the full
+output buffer up front (worst case ~256 MB at the new 64 MiB text
+cap). A streaming variant that yields tokens in chunks would let
+the prefill scheduler start work before tokenization completes and
+cap peak NIF allocations to a fixed chunk size. The C++ tokenize
+already builds an internal vector incrementally, so the path is
+exposing it through a cursor-based NIF rather than the one-shot
+copy.
