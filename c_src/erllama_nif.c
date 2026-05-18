@@ -1251,6 +1251,16 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
     }
+    /* Enforce the output cap post-success: removing the n_max clamp
+     * before the first call means the tokenizer can fully populate a
+     * buffer larger than ERLLAMA_MAX_TOKENS (e.g. byte-fallback
+     * tokenizers at ~1 byte/token on a 60 MiB input). Convert that
+     * into a clean too_large error rather than returning an
+     * over-cap list to Erlang. */
+    if (n > ERLLAMA_MAX_TOKENS) {
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_too_large);
+    }
 
     ERL_NIF_TERM list = enif_make_list(env, 0);
     for (int32_t i = n - 1; i >= 0; i--) {
@@ -2462,6 +2472,11 @@ static ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
     if (n < 0) {
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
+    }
+    /* See the matching post-success check in `nif_tokenize`. */
+    if (n > ERLLAMA_MAX_TOKENS) {
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_too_large);
     }
 
     ERL_NIF_TERM list = enif_make_list(env, 0);
