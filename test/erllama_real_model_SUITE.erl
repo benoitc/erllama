@@ -657,17 +657,7 @@ tokenize_large_input(Config) ->
     Model = ?config(model, Config),
     Sizes = [1 * 1024 * 1024, 8 * 1024 * 1024, 60 * 1024 * 1024],
     lists:foreach(
-        fun(Sz) ->
-            Prompt = big_text(Sz),
-            {ok, Tokens} = erllama:tokenize(Model, Prompt),
-            ?assert(is_list(Tokens)),
-            ?assert(length(Tokens) > 0),
-            ?assert(length(Tokens) =< ?ERLLAMA_MAX_TOKENS),
-            ct:log(
-                "tokenize ~p MiB -> ~p tokens",
-                [Sz div (1024 * 1024), length(Tokens)]
-            )
-        end,
+        fun(Sz) -> assert_tokenize_safe(Model, Sz) end,
         Sizes
     ),
     ok.
@@ -683,21 +673,56 @@ apply_chat_template_large_input(Config) ->
         {ok, _} ->
             Sizes = [1 * 1024 * 1024, 5 * 1024 * 1024, 50 * 1024 * 1024],
             lists:foreach(
-                fun(Sz) ->
-                    Content = big_text(Sz),
-                    Request = #{messages => [#{role => <<"user">>, content => Content}]},
-                    {ok, Tokens} = erllama:apply_chat_template(Model, Request),
-                    ?assert(is_list(Tokens)),
-                    ?assert(length(Tokens) > 0),
-                    ?assert(length(Tokens) =< ?ERLLAMA_MAX_TOKENS),
-                    ct:log(
-                        "apply_chat_template ~p MiB -> ~p tokens",
-                        [Sz div (1024 * 1024), length(Tokens)]
-                    )
-                end,
+                fun(Sz) -> assert_apply_chat_template_safe(Model, Sz) end,
                 Sizes
             ),
             ok
+    end.
+
+%% Engine contract: for inputs within ERLLAMA_MAX_TOKEN_TEXT, the
+%% engine returns either {ok, Tokens} with length(Tokens) bounded by
+%% ERLLAMA_MAX_TOKENS, or a clean {error, too_large} when the
+%% tokenizer would produce more tokens than the cap. Both are
+%% valid; what is NOT valid is a BEAM crash, a hang, or garbage
+%% tokens from reading past a truncated buffer. Byte-fallback
+%% tokenizers (e.g. stories260K's tiny vocab) routinely produce
+%% 1-token-per-byte output and hit the cap at lower input sizes
+%% than mainstream BPE models would.
+assert_tokenize_safe(Model, Sz) ->
+    Prompt = big_text(Sz),
+    case erllama:tokenize(Model, Prompt) of
+        {ok, Tokens} ->
+            ?assert(is_list(Tokens)),
+            ?assert(length(Tokens) > 0),
+            ?assert(length(Tokens) =< ?ERLLAMA_MAX_TOKENS),
+            ct:log(
+                "tokenize ~p MiB -> ~p tokens",
+                [Sz div (1024 * 1024), length(Tokens)]
+            );
+        {error, too_large} ->
+            ct:log(
+                "tokenize ~p MiB -> too_large (within contract)",
+                [Sz div (1024 * 1024)]
+            )
+    end.
+
+assert_apply_chat_template_safe(Model, Sz) ->
+    Content = big_text(Sz),
+    Request = #{messages => [#{role => <<"user">>, content => Content}]},
+    case erllama:apply_chat_template(Model, Request) of
+        {ok, Tokens} ->
+            ?assert(is_list(Tokens)),
+            ?assert(length(Tokens) > 0),
+            ?assert(length(Tokens) =< ?ERLLAMA_MAX_TOKENS),
+            ct:log(
+                "apply_chat_template ~p MiB -> ~p tokens",
+                [Sz div (1024 * 1024), length(Tokens)]
+            );
+        {error, too_large} ->
+            ct:log(
+                "apply_chat_template ~p MiB -> too_large (within contract)",
+                [Sz div (1024 * 1024)]
+            )
     end.
 
 tokenize_over_text_cap(Config) ->
