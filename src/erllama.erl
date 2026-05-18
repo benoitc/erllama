@@ -48,6 +48,7 @@ an explicit `model_id` in the config map.
     prefill_only/2,
     prefill_only/3,
     infer/4,
+    continue/3,
     cancel/1,
     end_session/2,
     status/1,
@@ -152,7 +153,7 @@ carrying:
 - `committed_tokens` — `length(context_tokens)`
 - `finish_key` — cache key for the full context, or `undefined` if
   the finish save was suppressed
-- `cache_hit_kind` — `exact | partial | cold`
+- `cache_hit_kind` — `exact | partial | cold | sticky | continuation`
 - `finish_reason` — `stop | length | cancelled`
 - `cache_delta` — `#{read := N, created := N}`. `read` is the warm
   prefix length restored from cache at admission; `created` is the
@@ -265,6 +266,63 @@ on the same `session_id` are out of scope: the second one returns
     {ok, reference()} | {error, term()}.
 infer(Model, Tokens, Params, CallerPid) ->
     erllama_model:infer(Model, Tokens, Params, CallerPid).
+
+-doc """
+Streaming inference that extends a pinned sticky session by
+prefilling `SuffixTokens` directly onto the session's already-live
+KV cells, skipping both the chat-template prefix-equality check and
+any cache lookup.
+
+Use this when the chat template renders a different leading byte
+sequence depending on history length (typical for production chat
+templates that wrap the first user message differently in a
+1-message vs N-message history). In that situation `infer/4` with
+`session_id` would re-tokenise the full prompt, fail the
+`is_strict_prefix_or_equal` check, evict the sticky seq, and admit
+cold. `continue/3` lets the caller assert "here is the new
+tokenised tail" and the engine appends it on top of the resident
+KV without re-tokenising the prior turns.
+
+`Opts` must carry:
+
+- `session_id => Term` — identifies a previously pinned session.
+- `caller_pid => pid()` — where streaming events are sent.
+
+All other `infer_params()` keys are honoured
+(`response_tokens`, `temperature`, `top_p`, `grammar`,
+`thinking`, `thinking_budget_tokens`, `stop_sequences`, ...).
+`parent_key` is ignored on this path because no cache lookup runs.
+
+Contract: the caller asserts that `SuffixTokens` is the exact
+tokenised tail to append on top of the session's stored prefix. The
+engine performs no prefix equality check. A wrong tail produces
+garbage generation but does not corrupt engine state.
+
+Errors:
+
+- `{error, no_session}` — `session_id` is unknown (no prior turn
+  pinned this session, or it was released).
+- `{error, sticky_busy}` — the session's seq is currently in flight
+  with an earlier request.
+
+Streaming wire shape is identical to `infer/4`. On success
+`Stats.cache_hit_kind` is `continuation`,
+`Stats.cache_delta.read` equals the length of the session's stored
+tokens before this call, and `Stats.cache_delta.created` equals
+`length(SuffixTokens) + completion_tokens`.
+
+See the "Chat-template continuation" example in the guides for the
+recommended pattern (render the full prompt, slice off the first
+`prior_token_count` tokens, pass the tail).
+""".
+-spec continue(
+    model(),
+    [erllama_nif:token_id()],
+    map()
+) ->
+    {ok, reference()} | {error, no_session | sticky_busy | term()}.
+continue(Model, SuffixTokens, Opts) ->
+    erllama_model:continue(Model, SuffixTokens, Opts).
 
 -doc """
 Cancel an in-flight streaming inference. Idempotent and

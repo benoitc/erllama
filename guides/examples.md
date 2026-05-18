@@ -502,7 +502,86 @@ Constraints:
   end (or you can pre-`end_session` LRU ones from your own
   scheduler).
 
-## 14. Multi-tenant concurrent decoding (`n_seq_max`)
+## 14. Chat-template continuation (`continue/3`)
+
+`infer/4` with `session_id` reuses the live KV cells across turns,
+but only when the new prompt's tokens are a strict prefix extension
+of what was stored on the prior turn. Production chat templates
+typically render different role markers when the same first user
+message is wrapped in a 1-message vs an N-message history, so the
+retokenised prefix on turn N does not equal the stored tokens from
+turn N-1 - the sticky path evicts the seq and admits cold every
+single turn.
+
+`continue/3` lets the caller assert "here is the new tokenised
+tail" and the engine appends it directly on top of the resident KV,
+with no prefix equality check and no cache lookup. The caller
+takes the contract: if the asserted tail is wrong the generation is
+garbage tokens, but engine state stays consistent.
+
+```erlang
+SessionId = ConvId,
+
+%% Turn 1: render the full conversation as today, infer/4 pins the
+%% session on finish.
+{ok, Turn1Tokens} = erllama:apply_chat_template(ModelId, #{
+    messages => [#{role => <<"user">>, content => Q1}]
+}),
+{ok, Ref1} = erllama:infer(ModelId, Turn1Tokens,
+                           #{session_id => SessionId,
+                             response_tokens => 64},
+                           self()),
+{Reply1, Stats1} = drain(Ref1),
+
+%% After turn 1, the session holds prompt + reply on its pinned seq.
+PriorTokenCount = maps:get(prompt_tokens, Stats1)
+                + maps:get(completion_tokens, Stats1),
+
+%% Turn 2: re-render the full conversation, then slice off the
+%% tokens the engine already has and pass only the new tail to
+%% continue/3. No need for the slice to match what the model
+%% actually decoded — continue/3 trusts the caller.
+{ok, Turn2Tokens} = erllama:apply_chat_template(ModelId, #{
+    messages => [
+        #{role => <<"user">>, content => Q1},
+        #{role => <<"assistant">>, content => Reply1},
+        #{role => <<"user">>, content => Q2}
+    ]
+}),
+Suffix = lists:nthtail(PriorTokenCount, Turn2Tokens),
+{ok, Ref2} = erllama:continue(ModelId, Suffix,
+                              #{session_id => SessionId,
+                                caller_pid => self(),
+                                response_tokens => 64}),
+{Reply2, Stats2} = drain(Ref2).
+%% Stats2.cache_hit_kind = continuation
+%% Stats2.cache_delta.read = PriorTokenCount
+%% Stats2.cache_delta.created = length(Suffix) + completion_tokens
+
+ok = erllama:end_session(ModelId, SessionId).
+```
+
+During caller development it is worth running the slicing path in
+debug mode and asserting `StoredTokens ++ Suffix == Turn2Tokens` -
+when the chat template renders identically across turns the slice
+will be a true tail, and the assertion validates the caller's
+math. In production, drop the assertion: the whole point of
+`continue/3` is that the slice need not match.
+
+Errors:
+
+- `{error, no_session}` - the session id is not known to the model.
+  Falls back to the cold/warm path: rebuild the conversation and
+  call `infer/4` instead.
+- `{error, sticky_busy}` - an earlier request on the same session
+  is still in flight. Serialise calls per session id (typical HTTP
+  per-user pipelines do this naturally).
+
+`parent_key` is ignored on the `continue/3` path because no cache
+lookup runs. The caller-asserted tail is the entire admission
+contract.
+
+## 15. Multi-tenant concurrent decoding (`n_seq_max`)
 
 Default is single-tenant. Opt in with `context_opts.n_seq_max > 1`
 and up to N requests prefill and decode concurrently through one
@@ -535,7 +614,7 @@ Long prompts are sliced by `prefill_chunk_size` (default
 monopolise the batch. See [caching](caching.md) for warm-prefix
 behaviour across concurrent workers.
 
-## 15. Lock-free observability for routers
+## 16. Lock-free observability for routers
 
 A cluster router that bin-packs requests onto the least-loaded node
 should not serialise behind the work it is probing. These accessors
@@ -561,7 +640,7 @@ the model has not admitted any request yet. All four are O(1) ETS
 reads and safe to call from a hot path or via `erpc` from another
 node.
 
-## 16. Per-request cache delta (`cache_creation_input_tokens` / `cache_read_input_tokens`)
+## 17. Per-request cache delta (`cache_creation_input_tokens` / `cache_read_input_tokens`)
 
 Every result and `Stats` map carries `cache_delta => #{read := N,
 created := N}`. `read` counts tokens served from the warm prefix
@@ -590,7 +669,7 @@ Streaming consumers read the same map from the final
 `{erllama_done, Ref, Stats}` message; `prefill_only/2` exposes it
 on its result map too.
 
-## 17. Inspecting cache state
+## 18. Inspecting cache state
 
 ```erlang
 %% Hit/miss/save counters and per-path latency totals.
@@ -612,7 +691,7 @@ erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 erllama_cache:gc().
 ```
 
-## 18. Memory-pressure-driven eviction (in `sys.config`)
+## 19. Memory-pressure-driven eviction (in `sys.config`)
 
 ```erlang
 {erllama, [
@@ -631,7 +710,7 @@ Sources shipped: `noop`, `system`, `nvidia_smi`, `{module, M}`. Roll
 your own with `-behaviour(erllama_pressure)` and pass
 `{module, M}` as the source.
 
-## 19. Cache-only tests (no model required)
+## 20. Cache-only tests (no model required)
 
 The cache subsystem is independently usable. eunit tests that
 exercise save/load round-trips never touch llama.cpp:
@@ -674,7 +753,7 @@ round_trip_test() ->
 The lazy `llama_backend_init` means cache-only tests never trigger
 `ggml_backend_load_all` — no Metal/CUDA discovery cost.
 
-## 20. End-to-end against a real GGUF
+## 21. End-to-end against a real GGUF
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
@@ -686,7 +765,7 @@ parent-key resume, longest-prefix walk, eviction, and a multi-model
 concurrent run. Without the env var it skips so default
 `rebar3 ct` stays green.
 
-## 21. Microbench: cold vs. warm
+## 22. Microbench: cold vs. warm
 
 ```bash
 bench/run.sh tiny    # TinyLlama 1.1B Q4_K_M

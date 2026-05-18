@@ -135,6 +135,7 @@ concurrently through one decode call per tick.
     prefill_only/2,
     prefill_only/3,
     infer/4,
+    continue/3,
     cancel/1,
     end_session/2,
     status/1,
@@ -195,12 +196,13 @@ concurrently through one decode call per tick.
     vram_estimate_b := non_neg_integer()
 }.
 
--type cache_hit_kind() :: exact | partial | cold | sticky.
+-type cache_hit_kind() :: exact | partial | cold | sticky | continuation.
 
 -type pending_request() ::
     {complete, gen_statem:from(), binary(), map()}
     | {prefill_only, gen_statem:from(), [non_neg_integer()], map()}
-    | {infer, gen_statem:from(), [non_neg_integer()], map(), pid()}.
+    | {infer, gen_statem:from(), [non_neg_integer()], map(), pid()}
+    | {continue, gen_statem:from(), [non_neg_integer()], map()}.
 -type finish_reason() :: stop | length | cancelled.
 -type stats() :: #{
     prompt_tokens := non_neg_integer(),
@@ -624,6 +626,63 @@ infer(Model, Tokens, Params, CallerPid) when
     gen_statem:call(via(Model), {infer, Tokens, Params, CallerPid}, infinity).
 
 -doc """
+Streaming inference that extends a pinned sticky session by prefilling
+`SuffixTokens` directly onto the session's already-resident KV cells,
+without re-rendering or re-tokenising the prior turns and without the
+prompt prefix-equality check `infer/4` performs.
+
+`Opts` must carry `session_id` (identifying a previously pinned
+session) and `caller_pid` (where streaming events are sent). All other
+`infer_params()` keys are honoured (`response_tokens`, `temperature`,
+`top_p`, `grammar`, `thinking`, `thinking_budget_tokens`,
+`stop_sequences`, ...). `parent_key` is ignored on this path because
+no cache lookup runs.
+
+Contract: the caller asserts that `SuffixTokens` is the exact
+tokenised tail to append on top of the session's stored prefix. The
+engine performs no prefix equality check. If the suffix is wrong the
+generation will be garbage tokens, but engine state stays consistent.
+
+Use this primitive when the chat template renders different role
+markers depending on history length, so the retokenised prefix on
+turn N would not equal the stored tokens from turn N-1 and the
+sticky path in `infer/4` would fall through to a cold admission.
+
+Errors:
+
+- `{error, no_session}` — `session_id` is unknown (no prior turn
+  pinned this session, or it was released).
+- `{error, sticky_busy}` — the session's seq is currently in flight
+  with an earlier request.
+
+Streaming wire shape and `Stats` are identical to `infer/4`. On
+success `Stats.cache_hit_kind` is `continuation`,
+`Stats.cache_delta.read` equals the length of the session's stored
+tokens before the call, and `Stats.cache_delta.created` equals
+`length(SuffixTokens) + completion_tokens`.
+
+See the "Sticky sessions" example in the guides for the recommended
+caller pattern (slice the rendered prompt at the prior turn's
+`committed_tokens` count and pass the tail).
+""".
+-spec continue(model(), [non_neg_integer()], map()) ->
+    {ok, reference()} | {error, no_session | sticky_busy | term()}.
+continue(Model, SuffixTokens, Opts) when is_list(SuffixTokens), is_map(Opts) ->
+    case maps:find(session_id, Opts) of
+        error ->
+            {error, no_session};
+        {ok, _} ->
+            case maps:find(caller_pid, Opts) of
+                error ->
+                    {error, {missing_opt, caller_pid}};
+                {ok, Pid} when is_pid(Pid) ->
+                    gen_statem:call(via(Model), {continue, SuffixTokens, Opts}, infinity);
+                {ok, _} ->
+                    {error, {missing_opt, caller_pid}}
+            end
+    end.
+
+-doc """
 Cancel an in-flight streaming inference. Idempotent and fire-and-
 forget: returns `ok` even if the ref is unknown (already finished or
 never existed). The cancellation is observed at the next
@@ -941,6 +1000,8 @@ idle({call, From}, {prefill_only, PromptTokens, Opts}, Data) ->
     admit({prefill_only, From, PromptTokens, Opts}, Data);
 idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
     admit({infer, From, Tokens, Params, CallerPid}, Data);
+idle({call, From}, {continue, Suffix, Opts}, Data) ->
+    admit_continue({continue, From, Suffix, Opts}, Data);
 idle({call, From}, status, Data) ->
     {keep_state, Data, [{reply, From, idle}]};
 idle({call, From}, {end_session, SessionId}, Data) ->
@@ -968,6 +1029,8 @@ running({call, From}, {prefill_only, PromptTokens, Opts}, Data) ->
     admit({prefill_only, From, PromptTokens, Opts}, Data);
 running({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
     admit({infer, From, Tokens, Params, CallerPid}, Data);
+running({call, From}, {continue, Suffix, Opts}, Data) ->
+    admit_continue({continue, From, Suffix, Opts}, Data);
 running({call, From}, status, Data) ->
     %% Phase reported is the dominant phase across in-flight reqs:
     %% if any seq is still prefilling, report `prefilling`; else
@@ -1014,9 +1077,36 @@ admit(Item, Data) ->
             {keep_state, Data, [{reply, From, {error, sticky_busy}}]}
     end.
 
+%% `continue/3` items take the `admit_continue/2` path, not `admit/2`,
+%% so this helper never sees them. The clauses cover only the
+%% `pending_request()` shapes that flow through `admit/2`.
 caller_from_of({complete, From, _, _}) -> From;
 caller_from_of({prefill_only, From, _, _}) -> From;
 caller_from_of({infer, From, _, _, _}) -> From.
+
+%% Admit a caller-asserted continuation on a pinned sticky session.
+%% Unlike `admit/2` this path performs no prompt prefix-equality
+%% check: the caller has rendered the new tail and trusts the
+%% engine to extend the live KV with it. We only verify that the
+%% session id is known and that the pinned seq is not currently
+%% in flight.
+admit_continue(Item = {continue, From, _Suffix, Opts}, Data) ->
+    case maps:find(session_id, Opts) of
+        error ->
+            {keep_state, Data, [{reply, From, {error, no_session}}]};
+        {ok, SessionId} ->
+            case maps:find(SessionId, Data#data.session_seq) of
+                error ->
+                    {keep_state, Data, [{reply, From, {error, no_session}}]};
+                {ok, {SeqId, StoredTokens}} ->
+                    case maps:is_key(SeqId, Data#data.req_table) of
+                        true ->
+                            {keep_state, Data, [{reply, From, {error, sticky_busy}}]};
+                        false ->
+                            start_admission(Item, SeqId, {continue, StoredTokens}, Data)
+                    end
+            end
+    end.
 
 admit_normal(Item, Data = #data{idle_seq_ids = []}) ->
     %% No seq_ids available — queue. The caller stays blocked on
@@ -1044,6 +1134,7 @@ start_admission(Item, SeqId, Mode, Data) ->
             Data1 =
                 case Mode of
                     {sticky, _} -> Data;
+                    {continue, _} -> Data;
                     normal -> Data#data{idle_seq_ids = [SeqId | Data#data.idle_seq_ids]}
                 end,
             {keep_state, Data1, [{reply, From, {error, Reason}}]}
@@ -1136,6 +1227,8 @@ is_strict_prefix_or_equal([], _Prompt) -> true;
 is_strict_prefix_or_equal([T | StRest], [T | PrRest]) -> is_strict_prefix_or_equal(StRest, PrRest);
 is_strict_prefix_or_equal(_, _) -> false.
 
+%% Same note as `caller_from_of/1` above: `continue/3` items are
+%% handled in `admit_continue/2` and never reach these helpers.
 session_id_of({complete, _From, _Prompt, Opts}) ->
     maps:get(session_id, Opts, undefined);
 session_id_of({prefill_only, _From, _PromptTokens, Opts}) ->
@@ -1250,6 +1343,48 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
             {ok, snapshot_admission(Data1, Req1), [{reply, From, {ok, Ref}}]};
         {error, Reason} ->
             {error, Reason, From}
+    end;
+start_request({continue, From, Suffix, Opts}, SeqId, {continue, StoredTokens} = Mode, Data) ->
+    case sampler_for(Opts, Data) of
+        {ok, SamplerRef, SamplerCfg, Data0} ->
+            Ref = make_ref(),
+            ok = erllama_inflight:register(Ref, self()),
+            CallerPid = maps:get(caller_pid, Opts),
+            %% `prompt_tokens` is reported as `Stats.prompt_tokens` at
+            %% finish. Use the logical input (stored prefix + new tail)
+            %% so HTTP-layer input-token reporting matches `infer/4`
+            %% semantics. Prefill itself drives off `prefill_cursor`
+            %% (set in `setup_admission_path/5`), not `prompt_tokens`.
+            FullPrompt = StoredTokens ++ Suffix,
+            {Stops, StopPat, StopMax} = stop_sequences_from(Opts),
+            GreedyRef = greedy_sampler_for(Data0),
+            Req = #req{
+                seq_id = SeqId,
+                mode = streaming,
+                caller_pid = CallerPid,
+                request_ref = Ref,
+                prompt_tokens = FullPrompt,
+                response_target = maps:get(response_tokens, Opts, 64),
+                generated = [],
+                last_save_at = 0,
+                context_tokens = [],
+                request_fp = Data0#data.effective_fp,
+                sampler_ref = SamplerRef,
+                last_sampler_cfg = SamplerCfg,
+                prefill_started_at = erlang:monotonic_time(millisecond),
+                stop_sequences = Stops,
+                stop_pattern = StopPat,
+                stop_max_len = StopMax,
+                thinking = thinking_from(Opts),
+                thinking_budget = thinking_budget_from(Opts),
+                session_id = maps:get(session_id, Opts),
+                tool_call_greedy_sampler_ref = GreedyRef
+            },
+            Req1 = setup_admission_path(Req, Mode, Suffix, Opts, Data0),
+            Data1 = put_req(Data0, Req1),
+            {ok, snapshot_admission(Data1, Req1), [{reply, From, {ok, Ref}}]};
+        {error, Reason} ->
+            {error, Reason, From}
     end.
 
 %% Dispatch on admission mode: the normal path runs the cache lookup
@@ -1269,6 +1404,22 @@ setup_admission_path(Req, {sticky, StoredTokens}, Prompt, _OptsOrParams, _Data) 
             end,
         context_tokens = StoredTokens,
         cache_hit_kind = sticky,
+        cache_hit_prefix_len = length(StoredTokens)
+    };
+setup_admission_path(Req, {continue, StoredTokens}, Suffix, _Opts, _Data) ->
+    %% Caller-asserted continuation: the third positional arg is the
+    %% suffix directly (no `lists:nthtail` slice). Mirrors the sticky
+    %% clause above but stamps `cache_hit_kind = continuation` so the
+    %% wire shape distinguishes engine-detected prefix reuse from
+    %% caller-asserted tail continuation.
+    Req#req{
+        prefill_cursor =
+            case Suffix of
+                [] -> undefined;
+                _ -> Suffix
+            end,
+        context_tokens = StoredTokens,
+        cache_hit_kind = continuation,
         cache_hit_prefix_len = length(StoredTokens)
     }.
 

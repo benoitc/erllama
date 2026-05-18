@@ -625,6 +625,148 @@ end_session_unknown_is_noop_test() ->
         ?assertEqual(ok, erllama:end_session(<<"test_model">>, make_ref()))
     end).
 
+%% =============================================================================
+%% continue/3 — caller-asserted continuation on a pinned sticky session
+%% =============================================================================
+
+continue_extends_session_without_prefix_check_test() ->
+    %% Turn 1 pins a session. Turn 2 calls continue/3 with a Suffix
+    %% that has NO byte-for-byte relationship with what the chat
+    %% template would have rendered — exactly the case where the
+    %% sticky path in infer/4 would have evicted the seq. continue/3
+    %% must accept the tail anyway, prefill it on the live KV, and
+    %% report cache_hit_kind = continuation with the correct delta.
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, #{generated := Gen1}} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        %% Caller-asserted tail: deliberately not derivable from any
+        %% re-rendering of the prior prompt + reply.
+        Suffix = [12345, 67890, 11111],
+        {ok, Ref} = erllama:continue(
+            <<"test_model">>,
+            Suffix,
+            #{
+                session_id => SessionId,
+                caller_pid => self(),
+                response_tokens => 2
+            }
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(continuation, maps:get(cache_hit_kind, Stats)),
+        Delta = maps:get(cache_delta, Stats),
+        ?assertEqual(length(Turn1Tokens), maps:get(read, Delta)),
+        ?assert(maps:get(created, Delta) >= length(Suffix)),
+        %% prompt_tokens reflects the logical input (stored prefix +
+        %% new tail), matching infer/4 semantics for HTTP-layer
+        %% input-token reporting.
+        ?assertEqual(
+            length(Turn1Tokens) + length(Suffix),
+            maps:get(prompt_tokens, Stats)
+        ),
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
+    end).
+
+continue_returns_no_session_for_unknown_session_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ?assertEqual(
+            {error, no_session},
+            erllama:continue(
+                <<"test_model">>,
+                [1, 2, 3],
+                #{session_id => make_ref(), caller_pid => self()}
+            )
+        )
+    end).
+
+continue_returns_no_session_when_session_id_missing_test() ->
+    %% Opts must carry session_id explicitly. An Opts map without it
+    %% is a malformed call; reject with no_session before reaching
+    %% the gen_statem so a stray caller can't bounce off the model.
+    with_model(#{}, fun(_Cfg) ->
+        ?assertEqual(
+            {error, no_session},
+            erllama:continue(
+                <<"test_model">>,
+                [1, 2, 3],
+                #{caller_pid => self()}
+            )
+        )
+    end).
+
+continue_returns_sticky_busy_when_seq_in_flight_test() ->
+    %% Establish the session with a finished turn so session_seq is
+    %% populated, then launch a long-running streaming infer that
+    %% extends the stored prefix (so the sticky path keeps the
+    %% session alive and the seq lands in req_table). The third
+    %% call — continue/3 on the same session — must reject with
+    %% sticky_busy without enqueueing.
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, #{generated := Gen1}} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        NewSuffix = prompt_tokens(<<"continue please">>),
+        Turn2Tokens = Turn1Tokens ++ NewSuffix,
+        {ok, Ref1} = erllama_model:infer(
+            <<"test_model">>,
+            Turn2Tokens,
+            #{response_tokens => 10000, session_id => SessionId},
+            self()
+        ),
+        receive
+            {erllama_token, Ref1, _} -> ok;
+            {erllama_token_id, Ref1, _} -> ok
+        after 2000 -> erlang:error(no_first_token)
+        end,
+        ?assertEqual(
+            {error, sticky_busy},
+            erllama:continue(
+                <<"test_model">>,
+                [99],
+                #{session_id => SessionId, caller_pid => self()}
+            )
+        ),
+        ok = erllama_model:cancel(Ref1),
+        receive
+            {erllama_done, Ref1, _} -> ok
+        after 5000 -> erlang:error(timeout_drain)
+        end,
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
+    end).
+
+continue_with_empty_suffix_generates_from_current_kv_test() ->
+    %% Edge case: empty Suffix means prefill_cursor=undefined and
+    %% generation runs immediately from the existing KV. The path
+    %% must not blow up on `lists:nthtail` style assumptions.
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, _} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        {ok, Ref} = erllama:continue(
+            <<"test_model">>,
+            [],
+            #{
+                session_id => SessionId,
+                caller_pid => self(),
+                response_tokens => 1
+            }
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(continuation, maps:get(cache_hit_kind, Stats)),
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
+    end).
+
 %% Drain streaming until the done message and return its Stats map.
 drain_done(Ref, TimeoutMs) ->
     receive

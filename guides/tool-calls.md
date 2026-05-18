@@ -96,6 +96,9 @@ erllama provides adjacent primitives that help compose the full flow:
   before generation.
 - `session_id` on `infer/4` and `complete/3` can pin a live sequence
   across turns.
+- `erllama:continue/3` extends a pinned sequence with a
+  caller-asserted token tail, for chat templates that render
+  differently across turns.
 - `erllama:end_session/2` releases a pinned sequence explicitly.
 
 See [Examples](examples.md#11-tool-call-streaming-tool_call_markers) for

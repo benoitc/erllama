@@ -6,6 +6,20 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `erllama:continue/3` for caller-asserted chat-template continuation
+  on a sticky session. Skips the prompt prefix-equality check in
+  `resolve_sticky_continuation` so chat templates whose rendered
+  prefix shifts between turns can still reuse the live KV cells.
+  Caller passes the tokenised tail directly; the engine prefills
+  only that tail on top of the pinned seq's stored KV. Returns
+  `{error, no_session}` for unknown session ids and
+  `{error, sticky_busy}` for in-flight seqs. New
+  `cache_hit_kind => continuation` reports the path in `Stats`.
+  Companion guide section in `guides/examples.md` and lifecycle
+  notes in `internals/request-lifecycle.md`.
+
 ## [0.5.1] - 2026-05-17
 
 Documentation-only patch on top of 0.5.0.

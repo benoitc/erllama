@@ -25,6 +25,14 @@ the caller supplied a `session_id`, the model tries to reuse that session's
 pinned sequence instead. If the session is already active in another
 request, admission returns `{error, sticky_busy}`.
 
+`continue/3` is a separate admission path used by callers that have a
+pinned session and want to extend its live KV with a caller-asserted token
+tail. It short-circuits the cache resolution stage entirely: no `parent_key`
+lookup, no longest-prefix walk, no prompt prefix-equality check. The only
+admission checks are that the `session_id` is known (otherwise
+`{error, no_session}`) and that the pinned seq is not in flight
+(otherwise `{error, sticky_busy}`).
+
 At admission, the model also prepares request-local state: token cursor,
 sampling options, optional grammar, optional thinking/tool-call markers, and
 the reply destination for streaming calls.
@@ -40,6 +48,7 @@ The result is reported as `cache_hit_kind`:
 | `partial` | A shorter exact prefix matched and the suffix must be prefed. |
 | `cold` | No usable prefix was found. |
 | `sticky` | A pinned session sequence already contains the prefix live. |
+| `continuation` | Caller asserted the tail on a pinned session via `continue/3`; no prefix check, no cache lookup. |
 
 The lookup order is:
 
@@ -53,7 +62,7 @@ uses the longest row that actually exists.
 
 ## Restore or prefill
 
-After cache resolution, the request takes one of three paths:
+After cache resolution, the request takes one of four paths:
 
 - **Warm restore.** `kv_unpack` restores the saved KV bytes into the
   sequence. The model then prefills the last token again as a logits primer
@@ -61,6 +70,10 @@ After cache resolution, the request takes one of three paths:
 - **Cold prefill.** The sequence is cleared and the full prompt is prefed.
 - **Sticky continuation.** The live sequence already holds the prefix, so
   the model truncates or extends in place and only prefills the new suffix.
+- **Caller-asserted continuation.** `continue/3` enters with the session's
+  stored tokens already resident on the pinned seq. The supplied suffix is
+  queued for prefill without any prefix equality check; correctness is the
+  caller's contract.
 
 Long prompts are sliced by `prefill_chunk_size`, defaulting to
 `max(64, n_batch div 4)`, so one large prefill cannot monopolize every

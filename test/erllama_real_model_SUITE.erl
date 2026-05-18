@@ -52,7 +52,8 @@
     grammar_plus_sampler/1,
     verify_does_not_mutate_caller_visible_state/1,
     verify_accepted_count_le_k/1,
-    chunked_prefill_matches_unchunked/1
+    chunked_prefill_matches_unchunked/1,
+    continue_multi_turn_cache_delta/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -87,7 +88,8 @@ all() ->
         grammar_plus_sampler,
         verify_does_not_mutate_caller_visible_state,
         verify_accepted_count_le_k,
-        chunked_prefill_matches_unchunked
+        chunked_prefill_matches_unchunked,
+        continue_multi_turn_cache_delta
     ].
 
 init_per_suite(Config) ->
@@ -563,6 +565,73 @@ verify_accepted_count_le_k(Config) ->
             {[7, 7, 7], 3}
         ]
     ],
+    ok.
+
+%% =============================================================================
+%% continue/3 — caller-asserted continuation against a real GGUF
+%% =============================================================================
+
+continue_multi_turn_cache_delta(Config) ->
+    %% Three-turn profile against a real model. Turn 1 admits cold
+    %% under a session_id. Turns 2 and 3 use continue/3 to extend
+    %% the live KV with caller-asserted suffix tokens; both must
+    %% report cache_hit_kind = continuation, cache_delta.read equal
+    %% to the prior turn's stored token count, and cache_delta.created
+    %% covering the new suffix + generated tokens.
+    Model = ?config(model, Config),
+    SessionId = make_ref(),
+    {ok, Prompt1} = erllama:tokenize(Model, ?LONG_PROMPT),
+    Resp = 4,
+    %% Turn 1: infer/4 establishes the session.
+    {ok, Ref1} = erllama_model:infer(
+        Model,
+        Prompt1,
+        #{response_tokens => Resp, session_id => SessionId},
+        self()
+    ),
+    {_Bins1, Stats1} = drain(Ref1, 60000),
+    Stored1 = maps:get(prompt_tokens, Stats1) + maps:get(completion_tokens, Stats1),
+    ct:log("turn1 stats=~p", [Stats1]),
+    %% Turn 2: continue/3 with a tokenised suffix.
+    {ok, Suffix2} = erllama:tokenize(Model, <<" Tell me more.">>),
+    {ok, Ref2} = erllama:continue(
+        Model,
+        Suffix2,
+        #{
+            session_id => SessionId,
+            caller_pid => self(),
+            response_tokens => Resp
+        }
+    ),
+    {_Bins2, Stats2} = drain(Ref2, 60000),
+    ct:log("turn2 stats=~p", [Stats2]),
+    ?assertEqual(continuation, maps:get(cache_hit_kind, Stats2)),
+    Delta2 = maps:get(cache_delta, Stats2),
+    ?assertEqual(Stored1, maps:get(read, Delta2)),
+    ?assert(maps:get(created, Delta2) >= length(Suffix2)),
+    ?assertEqual(
+        Stored1 + length(Suffix2),
+        maps:get(prompt_tokens, Stats2)
+    ),
+    Stored2 = Stored1 + length(Suffix2) + maps:get(completion_tokens, Stats2),
+    %% Turn 3: another continue/3 — cumulative growth.
+    {ok, Suffix3} = erllama:tokenize(Model, <<" And then?">>),
+    {ok, Ref3} = erllama:continue(
+        Model,
+        Suffix3,
+        #{
+            session_id => SessionId,
+            caller_pid => self(),
+            response_tokens => Resp
+        }
+    ),
+    {_Bins3, Stats3} = drain(Ref3, 60000),
+    ct:log("turn3 stats=~p", [Stats3]),
+    ?assertEqual(continuation, maps:get(cache_hit_kind, Stats3)),
+    Delta3 = maps:get(cache_delta, Stats3),
+    ?assertEqual(Stored2, maps:get(read, Delta3)),
+    ?assert(maps:get(created, Delta3) >= length(Suffix3)),
+    ok = erllama:end_session(Model, SessionId),
     ok.
 
 %% =============================================================================
