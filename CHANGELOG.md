@@ -6,6 +6,24 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-05-18
+
+### Fixed
+
+- BEAM segfault in `erllama:apply_chat_template/2` on rendered
+  chat-template output above the initial 4 KiB render buffer. The
+  vendored `llama_chat_apply_template` returns the full formatted
+  size as a positive value even when the caller's buffer was too
+  small (`strncpy` silently truncates). The NIF retry path only
+  fired on negative return, so the positive size was fed as
+  `text_len` to `llama_tokenize` and the subsequent `std::string`
+  construction walked past the truncated buffer into unmapped pages.
+  Retry now triggers on `written > buf_size`. Caps bumped to match
+  the downstream's 64 MiB body limit: `ERLLAMA_MAX_TOKEN_TEXT`
+  4 MiB → 64 MiB, `ERLLAMA_MAX_TOKENS` 1 M → 16 M. The token output
+  cap is enforced on the tokenize success path so byte-fallback
+  tokenizers don't return over-cap lists.
+
 ## [0.6.0] - 2026-05-18
 
 ### Added
