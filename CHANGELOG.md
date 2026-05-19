@@ -6,6 +6,30 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-20
+
+### Added
+
+- `erllama:reset_session/2` recovery primitive. Forcibly drops a
+  sticky session's live KV cells and any in-flight `#req{}` on its
+  seq, then returns the seq slot to the idle pool. Uses a 5 s
+  `gen_statem:call` timeout so it stays reachable when the engine's
+  `infinity`-timeout hot path is wedged. Returns
+  `{ok, recovered | not_found} | {error, timeout}`. Streaming
+  callers on the reset seq receive `{erllama_error, Ref, engine_reset}`.
+- `n_seq_max` and `available_seqs` keys in `erllama:model_info/1`.
+  `available_seqs` is the live idle-list length; sticky-pinned seqs
+  count as unavailable. Lets callers detect saturation up front
+  instead of inferring it from `sticky_busy` errors.
+
+### Changed
+
+- `nif_step` now returns `{error, {decode_failed, Rc}}` (was bare
+  `{error, decode_failed}`). The `Rc` integer surfaces the
+  `llama_decode` return code (1, -1, 2, ...) so operators can tell
+  OOM from KV-cache corruption from sample rejection. The exception
+  path (`{error, exception}`) is unchanged.
+
 ## [0.6.2] - 2026-05-19
 
 ### Changed
