@@ -138,6 +138,7 @@ concurrently through one decode call per tick.
     continue/3,
     cancel/1,
     end_session/2,
+    reset_session/2,
     status/1,
     evict/1,
     shutdown/1,
@@ -704,6 +705,20 @@ cancel(Ref) when is_reference(Ref) ->
 end_session(Model, SessionId) ->
     gen_statem:call(via(Model), {end_session, SessionId}, infinity).
 
+%% Recovery primitive. Uses a 5 s timeout so it stays reachable when
+%% the engine's hot path is wedged. Force-fails any in-flight req on
+%% the session's seq, drops the sticky mapping, returns the seq to
+%% the idle pool. `noproc` exits propagate; `timeout` is converted
+%% to `{error, timeout}` so the caller has a clean fall-through.
+-spec reset_session(model(), term()) ->
+    {ok, recovered | not_found} | {error, timeout}.
+reset_session(Model, SessionId) ->
+    try gen_statem:call(via(Model), {reset_session, SessionId}, 5000) of
+        Reply -> Reply
+    catch
+        exit:{timeout, _} -> {error, timeout}
+    end.
+
 -spec status(model()) -> idle | prefilling | generating.
 status(Model) ->
     gen_statem:call(via(Model), status).
@@ -1223,6 +1238,45 @@ drop_session(SessionId, Data) ->
             end
     end.
 
+%% Recovery counterpart of drop_session/2. Force-fails any in-flight
+%% req on the session's seq, frees the seq's KV cells, and returns
+%% the seq to the idle pool. Returns {Data', recovered | not_found}.
+reset_session_seq(SessionId, Data) ->
+    case maps:find(SessionId, Data#data.session_seq) of
+        error ->
+            {Data, not_found};
+        {ok, {SeqId, _StoredTokens}} ->
+            Data1 = fail_inflight_for_seq(SeqId, Data, engine_reset),
+            _ = release_seq(SeqId, Data1),
+            NewData = Data1#data{
+                session_seq = maps:remove(SessionId, Data1#data.session_seq),
+                idle_seq_ids = [SeqId | Data1#data.idle_seq_ids]
+            },
+            {NewData, recovered}
+    end.
+
+fail_inflight_for_seq(SeqId, Data, Err) ->
+    case maps:find(SeqId, Data#data.req_table) of
+        error ->
+            Data;
+        {ok, Req} ->
+            notify_caller_error(Req, Err),
+            _ = release_sampler(Req, Data),
+            remove_req(Data, SeqId)
+    end.
+
+notify_caller_error(
+    #req{mode = streaming, request_ref = Ref, caller_pid = Pid}, Err
+) when is_pid(Pid), is_reference(Ref) ->
+    erllama_inflight:unregister(Ref),
+    Pid ! {erllama_error, Ref, Err},
+    ok;
+notify_caller_error(#req{caller = From}, Err) when From =/= undefined ->
+    _ = gen_statem:reply(From, {error, Err}),
+    ok;
+notify_caller_error(_Req, _Err) ->
+    ok.
+
 is_strict_prefix_or_equal([], _Prompt) -> true;
 is_strict_prefix_or_equal([T | StRest], [T | PrRest]) -> is_strict_prefix_or_equal(StRest, PrRest);
 is_strict_prefix_or_equal(_, _) -> false.
@@ -1594,6 +1648,9 @@ handle_common(_State, {call, From}, shutdown, Data) ->
     {keep_state, fire_save_for_reason(shutdown, Data), [{reply, From, ok}]};
 handle_common(State, {call, From}, model_info, Data) ->
     reply(From, build_model_info(State, Data), Data);
+handle_common(_State, {call, From}, {reset_session, SessionId}, Data) ->
+    {NewData, Outcome} = reset_session_seq(SessionId, Data),
+    reply(From, {ok, Outcome}, NewData);
 handle_common(_State, {call, From}, {tokenize, Text}, Data) ->
     reply(From, wrap_ok(backend_call(Data, tokenize, [Text])), Data);
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->

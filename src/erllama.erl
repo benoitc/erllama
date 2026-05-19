@@ -51,6 +51,7 @@ an explicit `model_id` in the config map.
     continue/3,
     cancel/1,
     end_session/2,
+    reset_session/2,
     status/1,
     evict/1,
     shutdown/1,
@@ -344,6 +345,31 @@ longer worth keeping resident.
 -spec end_session(model(), term()) -> ok.
 end_session(Model, SessionId) ->
     erllama_model:end_session(Model, SessionId).
+
+-doc """
+Forcibly drop a session's live KV cells and any in-flight request
+row tagged to its seq, then return the seq to the idle pool.
+
+Unlike `end_session/2`, this primitive uses a short timeout and is
+reachable when the engine's hot path is wedged (a `gen_statem:call`
+with `infinity` would never return). It also force-fails any
+in-flight `#req{}` on the session's seq, signalling the caller with
+`{erllama_error, Ref, engine_reset}` for streaming callers or
+`{error, engine_reset}` to sync callers.
+
+Returns:
+- `{ok, recovered}` — session existed, seq was reclaimed.
+- `{ok, not_found}` — no such sticky session (TTL evict, never
+  registered). The caller can fall through to a plain `infer/4`.
+- `{error, timeout}` — the gen_statem mailbox itself is unreachable
+  within 5 s. Restart the model.
+
+For graceful conversation teardown prefer `end_session/2`.
+""".
+-spec reset_session(model(), term()) ->
+    {ok, recovered | not_found} | {error, timeout}.
+reset_session(Model, SessionId) ->
+    erllama_model:reset_session(Model, SessionId).
 
 -doc """
 Current model state. `idle` means no request is in flight;

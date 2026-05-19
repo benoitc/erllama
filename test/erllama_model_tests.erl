@@ -625,6 +625,97 @@ end_session_unknown_is_noop_test() ->
         ?assertEqual(ok, erllama:end_session(<<"test_model">>, make_ref()))
     end).
 
+reset_session_unknown_returns_not_found_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ?assertEqual(
+            {ok, not_found},
+            erllama:reset_session(<<"test_model">>, make_ref())
+        )
+    end).
+
+reset_session_idle_session_returns_recovered_test() ->
+    %% Pin a session with a completed turn so session_seq holds the
+    %% mapping but req_table is empty. reset_session must reclaim
+    %% the seq cleanly and the next session lookup must miss.
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, _} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 2, session_id => SessionId}
+        ),
+        ?assertEqual(
+            {ok, recovered},
+            erllama:reset_session(<<"test_model">>, SessionId)
+        ),
+        %% Second call: session has been dropped, so not_found.
+        ?assertEqual(
+            {ok, not_found},
+            erllama:reset_session(<<"test_model">>, SessionId)
+        )
+    end).
+
+reset_session_in_flight_signals_caller_and_recovers_test() ->
+    %% Mirror the wedge: a streaming infer is in req_table when the
+    %% recovery call arrives. The caller must be signalled with
+    %% {erllama_error, Ref, engine_reset}, the seq must return to
+    %% idle, and a fresh infer on the same session_id must admit.
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, #{generated := Gen1}} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        NewSuffix = prompt_tokens(<<"continue please">>),
+        Turn2Tokens = Turn1Tokens ++ NewSuffix,
+        {ok, Ref1} = erllama_model:infer(
+            <<"test_model">>,
+            Turn2Tokens,
+            #{response_tokens => 10000, session_id => SessionId},
+            self()
+        ),
+        %% Wait for the first token so we know the seq is in req_table.
+        receive
+            {erllama_token, Ref1, _} -> ok;
+            {erllama_token_id, Ref1, _} -> ok
+        after 2000 -> erlang:error(no_first_token)
+        end,
+        ?assertEqual(
+            {ok, recovered},
+            erllama:reset_session(<<"test_model">>, SessionId)
+        ),
+        receive
+            {erllama_error, Ref1, engine_reset} -> ok
+        after 2000 -> erlang:error(no_engine_reset)
+        end,
+        %% Drain any tokens emitted between the reset call and the
+        %% reset taking effect; they're harmless.
+        drain_stream_messages(Ref1),
+        %% Seq returned to idle pool: a fresh infer on the same
+        %% session_id admits without sticky_busy and without queueing.
+        {ok, Ref2} = erllama_model:infer(
+            <<"test_model">>,
+            Turn2Tokens,
+            #{response_tokens => 2, session_id => SessionId},
+            self()
+        ),
+        _Stats = drain_done(Ref2, 5000),
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
+    end).
+
+drain_stream_messages(Ref) ->
+    receive
+        {erllama_token, Ref, _} -> drain_stream_messages(Ref);
+        {erllama_token_id, Ref, _} -> drain_stream_messages(Ref);
+        {erllama_thinking_end, Ref, _} -> drain_stream_messages(Ref);
+        {erllama_tool_call_end, Ref, _} -> drain_stream_messages(Ref);
+        {erllama_done, Ref, _} -> drain_stream_messages(Ref);
+        {erllama_error, Ref, _} -> drain_stream_messages(Ref)
+    after 50 -> ok
+    end.
+
 %% =============================================================================
 %% continue/3 — caller-asserted continuation on a pinned sticky session
 %% =============================================================================
