@@ -118,7 +118,9 @@ model_info_returns_map_test() ->
         ?assertEqual(f16, maps:get(quant_type, Info)),
         ?assertEqual(16, maps:get(quant_bits, Info)),
         ?assertEqual(disk, maps:get(tier, Info)),
-        ?assertEqual(32, byte_size(maps:get(fingerprint, Info)))
+        ?assertEqual(32, byte_size(maps:get(fingerprint, Info))),
+        ?assertEqual(1, maps:get(n_seq_max, Info)),
+        ?assertEqual(1, maps:get(available_seqs, Info))
     end).
 
 model_info_via_pid_test() ->
@@ -624,6 +626,39 @@ end_session_unknown_is_noop_test() ->
     with_model(#{}, fun(_Cfg) ->
         ?assertEqual(ok, erllama:end_session(<<"test_model">>, make_ref()))
     end).
+
+%% available_seqs reflects the live free-list head. With n_seq_max=1
+%% (the default in with_model/2), a single in-flight infer drives it
+%% to 0 and a cancel restores it to 1.
+model_info_available_seqs_decrements_with_inflight_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, fun(_Cfg) ->
+            Info0 = erllama_model:model_info(<<"test_model">>),
+            ?assertEqual(1, maps:get(available_seqs, Info0)),
+            {ok, Ref} = erllama_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 10000},
+                self()
+            ),
+            %% Wait for first token so we know the seq has been taken
+            %% off the idle list and is in req_table.
+            receive
+                {erllama_token, Ref, _} -> ok;
+                {erllama_token_id, Ref, _} -> ok
+            after 2000 -> erlang:error(no_first_token)
+            end,
+            Info1 = erllama_model:model_info(<<"test_model">>),
+            ?assertEqual(0, maps:get(available_seqs, Info1)),
+            ok = erllama_model:cancel(Ref),
+            receive
+                {erllama_done, Ref, _} -> ok
+            after 5000 -> erlang:error(timeout_drain)
+            end,
+            Info2 = erllama_model:model_info(<<"test_model">>),
+            ?assertEqual(1, maps:get(available_seqs, Info2))
+        end)
+    end}.
 
 reset_session_unknown_returns_not_found_test() ->
     with_model(#{}, fun(_Cfg) ->

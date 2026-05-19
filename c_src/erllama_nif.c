@@ -1676,8 +1676,10 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         pthread_mutex_unlock(&c->mu);
         free_step_ops(ops, n_ops);
         ERL_NIF_TERM why =
-            (dr == ERLLAMA_DECODE_EXC_SENTINEL) ? atom_exception
-                                                : atom_decode_failed;
+            (dr == ERLLAMA_DECODE_EXC_SENTINEL)
+                ? atom_exception
+                : enif_make_tuple2(env, atom_decode_failed,
+                                   enif_make_int(env, dr));
         return enif_make_tuple2(env, atom_error, why);
     }
 
