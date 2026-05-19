@@ -6,6 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-05-19
+
+### Changed
+
+- Vendored llama.cpp bumped from `b9119` to `b9222`. No erllama
+  source changes required; the C ABI surfaces we depend on (model
+  load/free, context, sampler chain, `llama_n_batch`,
+  `llama_state_seq_*`) are unchanged.
+
 ## [0.6.1] - 2026-05-18
 
 ### Fixed
