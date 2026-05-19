@@ -194,7 +194,14 @@ concurrently through one decode call per tick.
     %% the gpu offload is configured. 0 if no GPU layers are
     %% offloaded or if the backend cannot report the underlying
     %% sizes (stub backend, etc.).
-    vram_estimate_b := non_neg_integer()
+    vram_estimate_b := non_neg_integer(),
+    %% Total seq capacity of the live context (`context_opts.n_seq_max`).
+    n_seq_max := pos_integer(),
+    %% Number of seq slots currently free for a new admission. A
+    %% sticky session with no in-flight req still holds its slot
+    %% off the free list, so this counts only seqs the engine could
+    %% admit a brand-new request onto right now.
+    available_seqs := non_neg_integer()
 }.
 
 -type cache_hit_kind() :: exact | partial | cold | sticky | continuation.
@@ -1879,7 +1886,9 @@ build_model_info(State, Data) ->
         tier => Data#data.tier,
         fingerprint => Data#data.fingerprint,
         loaded_at_monotonic => Data#data.loaded_at_monotonic,
-        vram_estimate_b => Data#data.vram_estimate_b
+        vram_estimate_b => Data#data.vram_estimate_b,
+        n_seq_max => Data#data.n_seq_max,
+        available_seqs => length(Data#data.idle_seq_ids)
     }.
 
 %% =============================================================================
