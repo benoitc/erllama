@@ -143,6 +143,11 @@ Recognised keys in `Opts`:
   Generation halts on the first occurrence (by list order) of any
   element in the accumulated detokenised output; the matched string
   is trimmed from `reply` and reported as `stop_sequence`.
+- `on_full` (`block | error`, default `block`) — admission behaviour
+  when no seq_id is free. `block` queues the request until a slot
+  frees; `error` fails fast with `{error, seq_capacity}`. Pair with
+  `available_seqs` / `n_seq_max` from `model_info/1` to size capacity
+  and avoid an unbounded wait when all seqs are pinned.
 
 Returns `{ok, Result}` where `Result` is a `completion_result()` map
 carrying:
@@ -243,6 +248,11 @@ Anthropic-style cache accounting: `read` tokens came from the warm
 prefix at admission, `created` tokens were added to the cache by
 this request.
 
+`Stats` also carries `generated => [token_id()]`, the exact
+generated token ids for this turn in order, so a caller can feed a
+byte-exact suffix to `continue/3` without re-tokenising detokenised
+text.
+
 When `Params` carries `thinking_budget_tokens => N` and the
 thinking phase emits `N` or more `{thinking_delta, _}` payloads,
 the scheduler synthesises the `{erllama_thinking_end, _, _}` close
@@ -257,6 +267,12 @@ as its prompt continues the stored tokens. Concurrent requests
 on the same `session_id` are out of scope: the second one returns
 `{error, sticky_busy}`. Release the session explicitly with
 `end_session/2` when the conversation ends.
+
+When `Params` carries `on_full => error`, an admission that finds no
+free seq_id returns `{error, seq_capacity}` immediately instead of
+queueing. The default `block` preserves the queue-and-wait
+behaviour. Use `available_seqs` / `n_seq_max` from `model_info/1` to
+decide capacity up front.
 """.
 -spec infer(
     model(),

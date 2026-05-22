@@ -1911,7 +1911,9 @@ static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
     if (rc != 0) {
-        return enif_make_tuple2(env, atom_error, enif_make_int(env, rc));
+        return enif_make_tuple2(
+            env, atom_error,
+            enif_make_tuple2(env, atom_decode_failed, enif_make_int(env, rc)));
     }
     ERL_NIF_TERM tag = eog ? enif_make_atom(env, "eog") : atom_ok;
     return enif_make_tuple2(env, tag, enif_make_int(env, tok));
