@@ -293,9 +293,14 @@ concurrently through one decode call per tick.
 }.
 
 %% Optional fields the caller may set on `infer/4`. The same fields
-%% are honoured by `complete/3` Opts. The sampler chain is rebuilt
-%% per-request: grammar -> repetition_penalty -> top_k -> top_p ->
-%% min_p -> (temperature > 0 ? temp -> dist(seed) : greedy).
+%% are honoured by `complete/3` Opts and `continue/3`. The sampler
+%% chain is rebuilt per-request: grammar -> repetition_penalty ->
+%% top_k -> top_p -> min_p -> (temperature > 0 ? temp -> dist(seed) :
+%% greedy). A binary `grammar` is authoritative for the whole turn:
+%% it governs tool-call syntax tokens too, disabling the
+%% greedy-on-syntax swap for that request, so `tool_choice` /
+%% `response_format` constraints hold across the turn (including on
+%% `continue/3` rounds).
 %% `stop_sequences` is a list of binaries; generation halts on the
 %% first occurrence (by list order) of any element in the
 %% accumulated detokenized output. The match is trimmed from the
@@ -1431,7 +1436,7 @@ start_request({complete, From, Prompt, Opts}, SeqId, Mode, Data) ->
         {ok, SamplerRef, SamplerCfg, Data0} ->
             PromptTokens = backend_call(Data0, tokenize, [Prompt]),
             {Stops, StopPat, StopMax} = stop_sequences_from(Opts),
-            GreedyRef = greedy_sampler_for(Data0),
+            GreedyRef = greedy_sampler_for(Data0, SamplerCfg),
             Req = #req{
                 seq_id = SeqId,
                 mode = standard,
@@ -1487,7 +1492,7 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
             Ref = make_ref(),
             ok = erllama_inflight:register(Ref, self()),
             {Stops, StopPat, StopMax} = stop_sequences_from(Params),
-            GreedyRef = greedy_sampler_for(Data0),
+            GreedyRef = greedy_sampler_for(Data0, SamplerCfg),
             Req = #req{
                 seq_id = SeqId,
                 mode = streaming,
@@ -1529,7 +1534,7 @@ start_request({continue, From, Suffix, Opts}, SeqId, {continue, StoredTokens} = 
             %% (set in `setup_admission_path/5`), not `prompt_tokens`.
             FullPrompt = StoredTokens ++ Suffix,
             {Stops, StopPat, StopMax} = stop_sequences_from(Opts),
-            GreedyRef = greedy_sampler_for(Data0),
+            GreedyRef = greedy_sampler_for(Data0, SamplerCfg),
             Req = #req{
                 seq_id = SeqId,
                 mode = streaming,
@@ -2875,13 +2880,26 @@ active_sampler_ref(#req{active_sampler = tool_call_syntax} = R) ->
 active_sampler_ref(R) ->
     R#req.sampler_ref.
 
+%% Pick the per-request greedy syntax sampler. A caller-supplied
+%% binary `grammar` is authoritative: it constrains tool-call syntax
+%% tokens too, so we skip the grammar-less greedy sampler and let the
+%% request's grammar chain govern every token (the `active_sampler_ref/1`
+%% fallback routes syntax through `sampler_ref` when this is
+%% `undefined`). Without a grammar, build the greedy chain as usual.
+greedy_sampler_for(Data, Cfg) when is_map(Cfg) ->
+    case maps:get(grammar, Cfg, undefined) of
+        Grammar when is_binary(Grammar) -> undefined;
+        _ -> greedy_sampler_build(Data)
+    end.
+
 %% Build a second sampler chain configured for greedy decoding
-%% (temperature = 0). Used when the model is loaded with
-%% `tool_call_markers`: tool-call syntax tokens go through this
-%% sampler so they're byte-deterministic from a fixed prefix.
-%% Returns `undefined` when the backend doesn't expose
-%% `sampler_new/2` or when no tool-call markers are configured.
-greedy_sampler_for(#data{backend = Mod, backend_state = S}) ->
+%% (temperature = 0). The greedy chain is built whenever the backend
+%% exposes `sampler_new/2` (it is NOT gated on `tool_call_markers`);
+%% it is only consulted during a tool-call syntax span, so on a
+%% non-tool-call model it is built but never used. Tool-call syntax
+%% tokens route through it so they're byte-deterministic from a fixed
+%% prefix. Returns `undefined` when the backend has no `sampler_new/2`.
+greedy_sampler_build(#data{backend = Mod, backend_state = S}) ->
     case erlang:function_exported(Mod, sampler_new, 2) of
         false ->
             undefined;

@@ -439,6 +439,48 @@ tool_call_end_carries_full_concatenated_bytes_test() ->
         ?assertEqual(iolist_to_binary(Deltas), Full)
     end).
 
+%% A binary grammar disables the greedy-on-syntax swap for the
+%% request: the grammar-less greedy chain (#{temperature => 0.0}) is
+%% not built, so the request's grammar sampler governs tool-call
+%% syntax tokens too.
+grammar_request_disables_greedy_on_syntax_test() ->
+    with_model(#{tool_call_capable => true}, fun(Id) ->
+        erllama_model_stub:reset_sampler_new_cfgs(),
+        try
+            {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+            GBNF = <<"root ::= \"x\"">>,
+            {ok, Ref} = erllama:infer(
+                Id, Tokens, #{response_tokens => 3, grammar => GBNF}, self()
+            ),
+            Events = collect_all(Ref, 5000),
+            ?assertEqual(done, element(1, lists:last(Events))),
+            Cfgs = erllama_model_stub:sampler_new_cfgs(),
+            ?assert(lists:member(#{grammar => GBNF}, Cfgs)),
+            ?assertNot(lists:member(#{temperature => 0.0}, Cfgs))
+        after
+            erllama_model_stub:reset_sampler_new_cfgs()
+        end
+    end).
+
+%% Control: without a grammar the greedy-on-syntax sampler is still
+%% built, so the swap keeps working by default.
+no_grammar_keeps_greedy_on_syntax_test() ->
+    with_model(#{tool_call_capable => true}, fun(Id) ->
+        erllama_model_stub:reset_sampler_new_cfgs(),
+        try
+            {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+            {ok, Ref} = erllama:infer(
+                Id, Tokens, #{response_tokens => 3}, self()
+            ),
+            _ = collect_all(Ref, 5000),
+            Cfgs = erllama_model_stub:sampler_new_cfgs(),
+            ?assert(lists:member(#{}, Cfgs)),
+            ?assert(lists:member(#{temperature => 0.0}, Cfgs))
+        after
+            erllama_model_stub:reset_sampler_new_cfgs()
+        end
+    end).
+
 non_tool_call_stub_emits_no_tool_messages_test() ->
     %% Default stub: no tool_call_capable. No tool_call messages
     %% should arrive even if downstream code expects to handle them.
