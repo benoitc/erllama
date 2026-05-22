@@ -26,7 +26,11 @@ agentic tool-continue loops).
   `decode_timeout`/`decode_aborted` the engine recovers in place:
   fails in-flight and queued callers, recreates the context via the
   new backend `reset_context/1` (model stays loaded), resets seq and
-  session state, and returns to idle.
+  session state, and returns to idle. Recovery drops only the live
+  in-context KV cells and sticky-session pins; the persistent tiered
+  cache (RAM/disk rows) is untouched, so the next admission still
+  warm-restores from cache where a saved row matches rather than
+  starting fully cold.
 - `on_full => block | error` admission option on `complete/3`,
   `prefill_only/3`, `infer/4` (default `block`). `error` fails fast
   with `{error, seq_capacity}` instead of queueing when no seq is

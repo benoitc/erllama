@@ -378,6 +378,9 @@ context's abort callback), so a stalled or wedged decode is bounded
 rather than blocking forever. An interrupt that actually fires
 recreates the context in place (the model stays loaded), so under
 `n_seq_max > 1` co-batched siblings on other seqs are reset too.
+Only the live in-context KV and sticky-session pins are dropped; the
+persistent tiered cache survives, so warm restore from cache still
+applies on the next admission.
 """.
 -spec cancel(reference()) -> ok.
 cancel(Ref) ->
@@ -411,6 +414,10 @@ Returns:
   registered). The caller can fall through to a plain `infer/4`.
 - `{error, timeout}` — the gen_statem mailbox itself is unreachable
   within 5 s. Restart the model.
+
+Only the session's live KV cells and seq pin are dropped; the
+persistent tiered cache is untouched, so a later request can still
+warm-restore from cache rather than starting fully cold.
 
 For graceful conversation teardown prefer `end_session/2`.
 """.

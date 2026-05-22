@@ -151,8 +151,12 @@ Per-step wall-clock budget for a single `llama_decode`. Default
 context's ggml abort callback and returns `{error, decode_timeout}`,
 so a wedged decode can never block the model process indefinitely.
 The engine recovers in place (recreates the context, model stays
-loaded) rather than cold-reloading. The same callback honours
-`erllama:cancel/1`, which interrupts an in-flight decode and surfaces
+loaded) rather than cold-reloading. Recovery drops only the live
+in-context KV cells and sticky-session pins - the tiered cache
+(RAM/disk rows) persists, so a subsequent request still reuses
+cached prefixes through the normal warm-restore lookup rather than
+starting fully cold. The same callback honours `erllama:cancel/1`,
+which interrupts an in-flight decode and surfaces
 `{error, decode_aborted}`. A legitimate step is sub-second on a
 loaded model, so the default only trips on a genuine wedge; lower it
 if you want a tighter bound.
