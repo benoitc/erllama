@@ -672,6 +672,19 @@ Errors:
   pinned this session, or it was released).
 - `{error, sticky_busy}` — the session's seq is currently in flight
   with an earlier request.
+- `{error, {transcript_mismatch, Detail}}` — `Opts` carried
+  `expect_committed` and it did not equal the session's stored
+  committed tokens (see below). The seq stays pinned; nothing is
+  prefilled.
+
+`Opts` may carry `expect_committed => [token_id()]`: the caller's
+view of the tokens the session has already committed. When present it
+must equal the session's stored context exactly (reconstruct it from
+the prior turn's `Stats.generated`), otherwise the call fails with
+`{error, {transcript_mismatch, #{stored_len, expected_len, diverge_at}}}`
+instead of prefilling a bad splice. `diverge_at` is the first index
+where the lists differ (or the shorter length when one is a prefix).
+Omit it to keep the historical "trust the tail" behaviour.
 
 Streaming wire shape and `Stats` are identical to `infer/4`. On
 success `Stats.cache_hit_kind` is `continuation`,
@@ -684,7 +697,8 @@ caller pattern (slice the rendered prompt at the prior turn's
 `committed_tokens` count and pass the tail).
 """.
 -spec continue(model(), [non_neg_integer()], map()) ->
-    {ok, reference()} | {error, no_session | sticky_busy | term()}.
+    {ok, reference()}
+    | {error, no_session | sticky_busy | {transcript_mismatch, map()} | term()}.
 continue(Model, SuffixTokens, Opts) when is_list(SuffixTokens), is_map(Opts) ->
     case maps:find(session_id, Opts) of
         error ->
@@ -1158,14 +1172,59 @@ admit_continue(Item = {continue, From, _Suffix, Opts}, Data) ->
                 error ->
                     {keep_state, Data, [{reply, From, {error, no_session}}]};
                 {ok, {SeqId, StoredTokens}} ->
-                    case maps:is_key(SeqId, Data#data.req_table) of
-                        true ->
-                            {keep_state, Data, [{reply, From, {error, sticky_busy}}]};
-                        false ->
-                            start_admission(Item, SeqId, {continue, StoredTokens}, Data)
-                    end
+                    admit_continue_pinned(Item, SeqId, StoredTokens, Data)
             end
     end.
+
+%% Continue on a resolved pinned seq: reject if it is in flight, else
+%% verify the optional caller-supplied committed transcript before
+%% prefilling the new tail.
+admit_continue_pinned(
+    {continue, From, _Suffix, Opts} = Item, SeqId, StoredTokens, Data
+) ->
+    case maps:is_key(SeqId, Data#data.req_table) of
+        true ->
+            {keep_state, Data, [{reply, From, {error, sticky_busy}}]};
+        false ->
+            case verify_committed(Opts, StoredTokens) of
+                ok ->
+                    start_admission(Item, SeqId, {continue, StoredTokens}, Data);
+                {mismatch, Detail} ->
+                    %% Caller's view of the committed transcript diverged
+                    %% from what the session holds. Fail fast without
+                    %% prefilling; the seq stays pinned so the caller can
+                    %% re-sync and retry.
+                    {keep_state, Data, [
+                        {reply, From, {error, {transcript_mismatch, Detail}}}
+                    ]}
+            end
+    end.
+
+%% Optional guard on continue/3: when the caller supplies its view of
+%% the session's committed transcript (`expect_committed`), it must
+%% equal the stored context exactly before we append the new suffix.
+%% Absent -> trust the tail (the historical continue/3 contract).
+verify_committed(Opts, Stored) ->
+    case maps:find(expect_committed, Opts) of
+        error ->
+            ok;
+        {ok, Expected} when is_list(Expected) ->
+            case Expected =:= Stored of
+                true ->
+                    ok;
+                false ->
+                    {mismatch, #{
+                        stored_len => length(Stored),
+                        expected_len => length(Expected),
+                        diverge_at => first_divergence(Expected, Stored, 0)
+                    }}
+            end
+    end.
+
+%% First index at which the two token lists differ, or the length of
+%% the shorter list when one is a prefix of the other.
+first_divergence([H | T1], [H | T2], N) -> first_divergence(T1, T2, N + 1);
+first_divergence(_, _, N) -> N.
 
 admit_normal(Item, Data = #data{idle_seq_ids = []}) ->
     %% No seq_ids available. Default `block` queues the request and
