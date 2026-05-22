@@ -1006,6 +1006,90 @@ continue_extends_session_without_prefix_check_test() ->
         ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
     end).
 
+%% expect_committed matching the session's stored tokens admits as
+%% usual.
+continue_with_matching_committed_admits_test() ->
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, #{generated := Gen1}} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        {ok, Ref} = erllama:continue(
+            <<"test_model">>,
+            [12345, 67890],
+            #{
+                session_id => SessionId,
+                caller_pid => self(),
+                response_tokens => 2,
+                expect_committed => Turn1Tokens
+            }
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(continuation, maps:get(cache_hit_kind, Stats)),
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
+    end).
+
+%% A divergent expect_committed fails fast without prefilling and
+%% leaves the session pinned so a follow-up continue still admits.
+continue_with_wrong_committed_rejects_test() ->
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, #{generated := Gen1}} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        Wrong = Turn1Tokens ++ [999999],
+        Result = erllama:continue(
+            <<"test_model">>,
+            [12345],
+            #{
+                session_id => SessionId,
+                caller_pid => self(),
+                response_tokens => 2,
+                expect_committed => Wrong
+            }
+        ),
+        ?assertMatch({error, {transcript_mismatch, _}}, Result),
+        {error, {transcript_mismatch, Detail}} = Result,
+        ?assertEqual(length(Turn1Tokens), maps:get(stored_len, Detail)),
+        ?assertEqual(length(Wrong), maps:get(expected_len, Detail)),
+        ?assertEqual(length(Turn1Tokens), maps:get(diverge_at, Detail)),
+        %% Seq not consumed: a follow-up continue without the guard
+        %% still admits and completes.
+        {ok, Ref} = erllama:continue(
+            <<"test_model">>,
+            [12345],
+            #{session_id => SessionId, caller_pid => self(), response_tokens => 2}
+        ),
+        _ = drain_done(Ref, 5000),
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
+    end).
+
+%% Without expect_committed the historical "trust the tail" path is
+%% unchanged.
+continue_without_committed_unchanged_test() ->
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, _} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        {ok, Ref} = erllama:continue(
+            <<"test_model">>,
+            [12345, 67890],
+            #{session_id => SessionId, caller_pid => self(), response_tokens => 2}
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(continuation, maps:get(cache_hit_kind, Stats)),
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
+    end).
+
 continue_returns_no_session_for_unknown_session_test() ->
     with_model(#{}, fun(_Cfg) ->
         ?assertEqual(

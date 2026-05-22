@@ -326,12 +326,24 @@ tokenised tail to append on top of the session's stored prefix. The
 engine performs no prefix equality check. A wrong tail produces
 garbage generation but does not corrupt engine state.
 
+To catch a divergent caller mental-model rather than generate
+garbage, pass `Opts` key `expect_committed => [token_id()]` — the
+tokens the caller believes the session has already committed
+(reconstruct them from the prior turn's `Stats.generated`). It must
+equal the session's stored context exactly; on divergence the call
+returns `{error, {transcript_mismatch, #{stored_len, expected_len,
+diverge_at}}}` and prefills nothing, leaving the seq pinned so the
+caller can re-sync and retry. Omit it for the historical
+"trust the tail" behaviour.
+
 Errors:
 
 - `{error, no_session}` — `session_id` is unknown (no prior turn
   pinned this session, or it was released).
 - `{error, sticky_busy}` — the session's seq is currently in flight
   with an earlier request.
+- `{error, {transcript_mismatch, Detail}}` — `expect_committed` did
+  not match the session's stored committed tokens.
 
 Streaming wire shape is identical to `infer/4`. On success
 `Stats.cache_hit_kind` is `continuation`,
@@ -348,7 +360,8 @@ recommended pattern (render the full prompt, slice off the first
     [erllama_nif:token_id()],
     map()
 ) ->
-    {ok, reference()} | {error, no_session | sticky_busy | term()}.
+    {ok, reference()}
+    | {error, no_session | sticky_busy | {transcript_mismatch, map()} | term()}.
 continue(Model, SuffixTokens, Opts) ->
     erllama_model:continue(Model, SuffixTokens, Opts).
 
