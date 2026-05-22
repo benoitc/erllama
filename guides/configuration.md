@@ -93,12 +93,13 @@ Passed to `erllama:load_model/1,2`:
   model_path        => "/path/to/x.gguf",
   model_opts        => #{n_gpu_layers => 99},
   context_opts      => #{
-    n_ctx      => 4096,
-    n_batch    => 512,
-    n_seq_max  => 1,           %% > 1 enables the multi-tenant scheduler
-    flash_attn => auto,        %% boolean() | auto
-    type_k     => f16,         %% KV element type for keys
-    type_v     => f16          %% KV element type for values
+    n_ctx           => 4096,
+    n_batch         => 512,
+    n_seq_max       => 1,        %% > 1 enables the multi-tenant scheduler
+    flash_attn      => auto,     %% boolean() | auto
+    type_k          => f16,      %% KV element type for keys
+    type_v          => f16,      %% KV element type for values
+    decode_budget_ms => 30000    %% per-step decode budget; 0 disables
   },
   fingerprint       => <<32 bytes>>,
   fingerprint_mode  => safe,
@@ -136,6 +137,25 @@ Maximum concurrent sequences. Belongs under `context_opts`, not the
 `policy` map - it is a context shape, not a save-policy gate.
 Default `1` (single-tenant). Set higher to opt into multi-tenant
 co-batched scheduling.
+
+When `n_seq_max` is too low for the concurrent-session count, an
+admission with no free seq blocks by default. Pass
+`on_full => error` on `complete/3` / `infer/4` to fail fast with
+`{error, seq_capacity}` instead, and size capacity up front with
+`available_seqs` / `n_seq_max` from `model_info/1`.
+
+### `decode_budget_ms`
+
+Per-step wall-clock budget for a single `llama_decode`. Default
+`30000`; `0` disables. A decode that exceeds it is aborted via the
+context's ggml abort callback and returns `{error, decode_timeout}`,
+so a wedged decode can never block the model process indefinitely.
+The engine recovers in place (recreates the context, model stays
+loaded) rather than cold-reloading. The same callback honours
+`erllama:cancel/1`, which interrupts an in-flight decode and surfaces
+`{error, decode_aborted}`. A legitimate step is sub-second on a
+loaded model, so the default only trips on a genuine wedge; lower it
+if you want a tighter bound.
 
 See [loading a model](loading.md) for the per-field walkthrough.
 
