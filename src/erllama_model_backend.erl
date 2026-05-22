@@ -175,6 +175,19 @@ inference, etc.) can plug in via this same surface.
         NewState :: state()}
     | {error, term()}.
 
+%% Recreate the inference context in place after a wedged/aborted
+%% decode, keeping the model loaded. Drops all live KV state; the
+%% caller resets its per-seq bookkeeping and the next admission is
+%% cold. Returns the backend state holding the fresh context.
+-callback reset_context(state()) -> {ok, state()} | {error, term()}.
+
+%% Opaque handle the engine can hand to `erllama_nif:request_abort/1`
+%% to interrupt an in-flight decode from outside the owning process.
+%% `undefined` when the backend has no interruptible context (e.g.
+%% the stub), in which case the engine relies on the per-step budget
+%% alone.
+-callback abort_handle(state()) -> {ok, term()} | undefined.
+
 -optional_callbacks([
     kv_pack/3,
     kv_unpack/3,
@@ -195,7 +208,9 @@ inference, etc.) can plug in via this same surface.
     apply_adapters/2,
     extra_metadata/1,
     verify/4,
-    thinking_signature/3
+    thinking_signature/3,
+    reset_context/1,
+    abort_handle/1
 ]).
 
 -type sampler_opts() :: #{

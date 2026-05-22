@@ -863,6 +863,104 @@ admit_default_blocks_and_queues_test_() ->
     end}.
 
 %% =============================================================================
+%% #1: bounded/interruptible decode + in-place recovery
+%% =============================================================================
+
+%% A wedged/aborted decode (forced via the stub) recovers the context
+%% in place: the in-flight caller is failed, the gen_statem stays
+%% alive (no supervisor restart), and a fresh infer admits and runs.
+decode_timeout_recovers_in_place_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, fun(_Cfg) ->
+            Pid = erllama_registry:whereis_name(<<"test_model">>),
+            ok = erllama_model_stub:wedge_next_step(decode_timeout),
+            {ok, Ref1} = erllama_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 4},
+                self()
+            ),
+            receive
+                {erllama_error, Ref1, _Reason} -> ok
+            after 5000 -> erlang:error(no_error_on_wedge)
+            end,
+            %% Same gen_statem pid: recovered in place, not restarted.
+            ?assertEqual(Pid, erllama_registry:whereis_name(<<"test_model">>)),
+            ?assertEqual(idle, erllama_model:status(<<"test_model">>)),
+            %% Fresh infer works (wedge already consumed by the stub).
+            {ok, Ref2} = erllama_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 2},
+                self()
+            ),
+            _ = drain_done(Ref2, 5000),
+            ?assertEqual(idle, erllama_model:status(<<"test_model">>))
+        end)
+    end}.
+
+%% Recovery clears sticky sessions: after a wedge the seq pool is fully
+%% available again and the old session is gone.
+recover_in_place_clears_sessions_test_() ->
+    {timeout, 30, fun() ->
+        SessionId = make_ref(),
+        with_model(#{}, fun(_Cfg) ->
+            {ok, _} = erllama_model:complete(
+                <<"test_model">>,
+                long_prompt(),
+                #{response_tokens => 2, session_id => SessionId}
+            ),
+            Info0 = erllama_model:model_info(<<"test_model">>),
+            ?assertEqual(0, maps:get(available_seqs, Info0)),
+            ok = erllama_model_stub:wedge_next_step(decode_aborted),
+            {ok, Ref} = erllama_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()) ++ prompt_tokens(<<"more">>),
+                #{response_tokens => 2, session_id => SessionId},
+                self()
+            ),
+            receive
+                {erllama_error, Ref, _} -> ok
+            after 5000 -> erlang:error(no_error_on_wedge)
+            end,
+            Info1 = erllama_model:model_info(<<"test_model">>),
+            ?assertEqual(
+                maps:get(n_seq_max, Info1), maps:get(available_seqs, Info1)
+            ),
+            ?assertEqual(
+                {ok, not_found},
+                erllama:reset_session(<<"test_model">>, SessionId)
+            )
+        end)
+    end}.
+
+%% cancel/1 on an in-flight request lands within a bounded time and the
+%% caller receives a terminal message.
+cancel_bounded_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, fun(_Cfg) ->
+            {ok, Ref} = erllama_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 10000},
+                self()
+            ),
+            receive
+                {erllama_token, Ref, _} -> ok;
+                {erllama_token_id, Ref, _} -> ok
+            after 2000 -> erlang:error(no_first_token)
+            end,
+            ok = erllama_model:cancel(Ref),
+            receive
+                {erllama_done, Ref, _} -> ok;
+                {erllama_error, Ref, _} -> ok
+            after 5000 -> erlang:error(cancel_did_not_land)
+            end,
+            drain_stream_messages(Ref)
+        end)
+    end}.
+
+%% =============================================================================
 %% continue/3 — caller-asserted continuation on a pinned sticky session
 %% =============================================================================
 

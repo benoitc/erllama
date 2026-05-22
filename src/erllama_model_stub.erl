@@ -37,11 +37,17 @@
     unload_adapter/2,
     apply_adapters/2,
     thinking_signature/3,
+    reset_context/1,
+    abort_handle/1,
     %% Test helpers: read back what the most recent configure_sampler
     %% / clear_sampler / apply_adapters call saw.
     last_sampler_cfg/1,
     cleared/1,
-    applied_adapters/1
+    applied_adapters/1,
+    %% Test helper: force the next step/2 to return {error, Reason},
+    %% simulating a wedged/aborted decode so recovery can be tested
+    %% without a real backend.
+    wedge_next_step/1
 ]).
 
 %% Stub state.
@@ -137,8 +143,15 @@ seq_rm(_S, SeqId) ->
 %% the same sampler keeps producing the same token (matching the
 %% prior single-seq stub semantics for cache-integration tests).
 step(S, Ops) ->
-    Results = [stub_step_op(Op, S) || Op <- Ops],
-    {ok, Results}.
+    case persistent_term:get({?MODULE, wedge}, undefined) of
+        undefined ->
+            Results = [stub_step_op(Op, S) || Op <- Ops],
+            {ok, Results};
+        Reason ->
+            %% Test knob: simulate a wedged/aborted decode once.
+            persistent_term:erase({?MODULE, wedge}),
+            {error, Reason}
+    end.
 
 stub_step_op({SeqId, {prefill, _Tokens}}, _S) ->
     {SeqId, prefilled};
@@ -242,6 +255,19 @@ decode_token(SeqId, Sampler) ->
 %% the observed thinking text via HMAC.
 thinking_signature(_S, SeqId, _Bytes) ->
     crypto:hash(sha256, <<"stub-thinking-sig-", (integer_to_binary(SeqId))/binary>>).
+
+%% No real context to recreate; recovery just returns the same state.
+reset_context(S) ->
+    {ok, S}.
+
+%% No interruptible context; the engine relies on the per-step budget.
+abort_handle(_S) ->
+    undefined.
+
+%% Test knob: arm the next step/2 to return {error, Reason} once.
+wedge_next_step(Reason) ->
+    persistent_term:put({?MODULE, wedge}, Reason),
+    ok.
 
 %% Sampler refs are opaque references. Free drops the per-sampler
 %% per-sampler stub phase (a no-op when neither thinking_capable nor

@@ -331,6 +331,21 @@ int erllama_safe_free(struct llama_context *c) noexcept {
     }
 }
 
+// Install a ggml abort callback on the context. ggml invokes it
+// periodically during compute (possibly from worker threads); if it
+// returns true the in-flight llama_decode aborts and returns non-zero.
+// Used to bound and interrupt a wedged decode.
+void erllama_safe_set_abort_callback(struct llama_context *c,
+                                     bool (*cb)(void *),
+                                     void *data) noexcept {
+    try {
+        llama_set_abort_callback(c, cb, data);
+    } catch (...) {
+        // Best-effort: a context without the callback simply has no
+        // per-step budget; decode still works.
+    }
+}
+
 const struct llama_model *
 erllama_safe_get_model(const struct llama_context *c) noexcept {
     try {
