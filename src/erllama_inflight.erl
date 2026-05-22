@@ -28,13 +28,17 @@ model dies unexpectedly.
     queue_depth/1,
     obs_put/2,
     obs_get/1,
-    obs_delete/1
+    obs_delete/1,
+    set_abort_handle/2,
+    get_abort_handle/1,
+    delete_abort_handle/1
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(TABLE, ?MODULE).
 -define(OBS_TABLE, erllama_model_obs).
+-define(ABORT_TABLE, erllama_model_abort).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
 %% =============================================================================
@@ -166,6 +170,39 @@ obs_delete(ModelId) when is_binary(ModelId) ->
         _ -> ets:delete(?OBS_TABLE, ModelId)
     end.
 
+%% Abort-handle registry: maps a model gen_statem pid to an opaque
+%% handle (the backend's context ref) that `erllama:cancel/1` can pass
+%% to `erllama_nif:request_abort/1` to interrupt an in-flight decode
+%% without going through the (possibly blocked) gen_statem. The model
+%% republishes on every context recreate. Tolerant of a missing table
+%% (same as obs_*); a missing handle just means cancel falls back to
+%% the per-step budget.
+-spec set_abort_handle(pid(), term()) -> true.
+set_abort_handle(Pid, Handle) when is_pid(Pid) ->
+    case ets:whereis(?ABORT_TABLE) of
+        undefined -> true;
+        _ -> ets:insert(?ABORT_TABLE, {Pid, Handle})
+    end.
+
+-spec get_abort_handle(pid()) -> {ok, term()} | undefined.
+get_abort_handle(Pid) when is_pid(Pid) ->
+    case ets:whereis(?ABORT_TABLE) of
+        undefined ->
+            undefined;
+        _ ->
+            case ets:lookup(?ABORT_TABLE, Pid) of
+                [{_, Handle}] -> {ok, Handle};
+                [] -> undefined
+            end
+    end.
+
+-spec delete_abort_handle(pid()) -> true.
+delete_abort_handle(Pid) when is_pid(Pid) ->
+    case ets:whereis(?ABORT_TABLE) of
+        undefined -> true;
+        _ -> ets:delete(?ABORT_TABLE, Pid)
+    end.
+
 %% =============================================================================
 %% gen_server
 %% =============================================================================
@@ -186,6 +223,8 @@ init([]) ->
     %% the inflight table above; the model gen_statem is the sole
     %% writer for its own row.
     _ = ets:new(?OBS_TABLE, Opts),
+    %% Per-model decode-abort handle (model pid -> context ref).
+    _ = ets:new(?ABORT_TABLE, Opts),
     %% Park a fresh counter ref in persistent_term so any process
     %% (including remote nodes via erpc, used by erllama_cluster)
     %% can read queue_depth/0 without crossing this gen_server.
@@ -220,6 +259,7 @@ handle_info({'DOWN', _MonRef, process, Pid, _Reason}, S = #{monitors := M}) ->
         [] -> ok;
         _ -> counter_add(-length(Refs))
     end,
+    _ = delete_abort_handle(Pid),
     {noreply, S#{monitors := maps:remove(Pid, M)}};
 handle_info(_, S) ->
     {noreply, S}.

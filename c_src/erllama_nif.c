@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -117,6 +118,8 @@ extern int erllama_safe_model_free(struct llama_model *m);
 extern struct llama_context *erllama_safe_init_from_model(
     struct llama_model *m, struct llama_context_params params);
 extern int erllama_safe_free(struct llama_context *c);
+extern void erllama_safe_set_abort_callback(
+    struct llama_context *c, bool (*cb)(void *), void *data);
 extern const struct llama_model *erllama_safe_get_model(
     const struct llama_context *c);
 extern const struct llama_vocab *erllama_safe_model_get_vocab(
@@ -235,6 +238,8 @@ static ERL_NIF_TERM atom_free_b;
 static ERL_NIF_TERM atom_used_b;
 static ERL_NIF_TERM atom_eos;
 static ERL_NIF_TERM atom_decode_failed;
+static ERL_NIF_TERM atom_decode_timeout;
+static ERL_NIF_TERM atom_decode_aborted;
 
 /* Forward decl: build_default_greedy_chain is defined in the sampler
  * section but used as a lazy fallback in nif_decode_one. */
@@ -306,6 +311,14 @@ typedef struct {
     struct llama_context *ctx;     /* NULL after successful release */
     erllama_model_t *model_res;    /* keep_resource'd by new_context */
     int decode_ready;              /* set after llama_decode; cleared after kv ops */
+    /* Decode interrupt/budget. The abort callback (installed on the
+     * llama_context at new_context time) reads these from ggml worker
+     * threads; the NIF decode thread arms them before each
+     * llama_decode. request_abort sets abort_flag WITHOUT taking mu
+     * (a wedged decode holds mu), so these must be atomic. */
+    uint64_t decode_budget_ns;          /* per-step budget; 0 = disabled */
+    _Atomic uint_least64_t decode_deadline_ns; /* 0 = no live deadline */
+    _Atomic int abort_flag;             /* 1 = abort the in-flight decode */
     /* Sampler chain cached on the first nif_decode_one call. The
      * chain is greedy-only and lives for the resource's lifetime;
      * a future sampler-config NIF would free + rebuild this under
@@ -542,6 +555,8 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_used_b = enif_make_atom(env, "used_b");
     atom_eos = enif_make_atom(env, "eos");
     atom_decode_failed = enif_make_atom(env, "decode_failed");
+    atom_decode_timeout = enif_make_atom(env, "decode_timeout");
+    atom_decode_aborted = enif_make_atom(env, "decode_aborted");
 
     MODEL_RT = enif_open_resource_type(
         env, NULL, "erllama_model", model_dtor, ERL_NIF_RT_CREATE, NULL);
@@ -1020,6 +1035,72 @@ static ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
  * Context
  * ========================================================================= */
 
+/* Abort callback installed on every llama_context. ggml calls it
+ * periodically during compute, possibly from worker threads, so it
+ * reads only atomics and never locks. Returns true to abort the
+ * in-flight llama_decode. */
+static bool erllama_decode_abort_cb(void *data) {
+    erllama_context_t *c = (erllama_context_t *) data;
+    if (atomic_load_explicit(&c->abort_flag, memory_order_relaxed)) {
+        return true;
+    }
+    uint_least64_t dl =
+        atomic_load_explicit(&c->decode_deadline_ns, memory_order_relaxed);
+    if (dl == 0) {
+        return false;
+    }
+    return (uint_least64_t) enif_monotonic_time(ERL_NIF_NSEC) >= dl;
+}
+
+/* Arm the interrupt before a llama_decode: clear any stale abort and
+ * set the per-step deadline from the configured budget. Called by the
+ * NIF decode thread while holding c->mu. */
+static void arm_decode(erllama_context_t *c) {
+    atomic_store_explicit(&c->abort_flag, 0, memory_order_relaxed);
+    if (c->decode_budget_ns == 0) {
+        atomic_store_explicit(&c->decode_deadline_ns, 0, memory_order_relaxed);
+    } else {
+        uint_least64_t now = (uint_least64_t) enif_monotonic_time(ERL_NIF_NSEC);
+        atomic_store_explicit(&c->decode_deadline_ns,
+                              now + c->decode_budget_ns, memory_order_relaxed);
+    }
+}
+
+/* Classify a non-zero, non-exception llama_decode return after a
+ * decode armed by arm_decode/1: an interrupt we requested maps to a
+ * structured timeout/aborted reason; anything else is decode_failed. */
+static ERL_NIF_TERM classify_decode_error(ErlNifEnv *env, erllama_context_t *c,
+                                          int rc) {
+    if (atomic_load_explicit(&c->abort_flag, memory_order_relaxed)) {
+        return atom_decode_aborted;
+    }
+    uint_least64_t dl =
+        atomic_load_explicit(&c->decode_deadline_ns, memory_order_relaxed);
+    if (dl != 0 &&
+        (uint_least64_t) enif_monotonic_time(ERL_NIF_NSEC) >= dl) {
+        return atom_decode_timeout;
+    }
+    return enif_make_tuple2(env, atom_decode_failed, enif_make_int(env, rc));
+}
+
+/* Set the abort flag on a context from outside the decode thread.
+ * Deliberately does NOT take c->mu: a wedged decode holds the mutex,
+ * and the whole point is to interrupt it. Registered as a regular
+ * (non-dirty) NIF: it is a single atomic store. */
+static ERL_NIF_TERM nif_request_abort(ErlNifEnv *env, int argc,
+                                      const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    if (!c->ctx) {
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    atomic_store_explicit(&c->abort_flag, 1, memory_order_relaxed);
+    return atom_ok;
+}
+
 static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
     erllama_model_t *m;
@@ -1032,7 +1113,16 @@ static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 
     struct llama_context_params params = llama_context_default_params();
 
+    /* Per-step decode budget. The abort callback trips a wedged
+     * llama_decode after this many ms so the call always returns.
+     * Default 30 s (a legit step is sub-second on a loaded model);
+     * 0 disables the deadline. */
+    uint64_t decode_budget_ns = (uint64_t) 30000 * 1000000ULL;
+
     unsigned int u;
+    if (get_map_uint(env, argv[1], "decode_budget_ms", &u)) {
+        decode_budget_ns = (uint64_t) u * 1000000ULL;
+    }
     if (get_map_uint(env, argv[1], "n_ctx", &u)) params.n_ctx = (uint32_t) u;
     if (get_map_uint(env, argv[1], "n_batch", &u)) params.n_batch = (uint32_t) u;
     if (get_map_uint(env, argv[1], "n_ubatch", &u)) params.n_ubatch = (uint32_t) u;
@@ -1118,6 +1208,12 @@ static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     res->mu_inited = 1;
     res->ctx = ctx;
     res->model_res = m;
+    res->decode_budget_ns = decode_budget_ns;
+    /* Install the per-step interrupt. data = res stays valid for the
+     * context's lifetime (the context is freed before the resource in
+     * ctx_dtor / free_context) and the callback only runs during a
+     * llama_decode on this very context. */
+    erllama_safe_set_abort_callback(ctx, erllama_decode_abort_cb, res);
     m->active_contexts++;
     enif_keep_resource(m);
     pthread_mutex_unlock(&m->mu);
@@ -1668,18 +1764,18 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         }
     }
 
+    arm_decode(c);
     int dr = erllama_safe_decode(c->ctx, batch);
     if (dr != 0) {
         erllama_safe_batch_free(batch);
         enif_free(last_logits_idx_new);
         c->decode_ready = 0;
-        pthread_mutex_unlock(&c->mu);
-        free_step_ops(ops, n_ops);
         ERL_NIF_TERM why =
             (dr == ERLLAMA_DECODE_EXC_SENTINEL)
                 ? atom_exception
-                : enif_make_tuple2(env, atom_decode_failed,
-                                   enif_make_int(env, dr));
+                : classify_decode_error(env, c, dr);
+        pthread_mutex_unlock(&c->mu);
+        free_step_ops(ops, n_ops);
         return enif_make_tuple2(env, atom_error, why);
     }
 
@@ -1903,17 +1999,18 @@ static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 
     llama_token tok_buf = tok;
     struct llama_batch batch = erllama_safe_batch_get_one(&tok_buf, 1);
+    arm_decode(c);
     int rc = erllama_safe_decode(c->ctx, batch);
     if (rc == 0) c->decode_ready = 1;
     else c->decode_ready = 0;
-    pthread_mutex_unlock(&c->mu);
-    if (rc == ERLLAMA_DECODE_EXC_SENTINEL) {
-        return enif_make_tuple2(env, atom_error, atom_exception);
-    }
+    ERL_NIF_TERM why = atom_ok;
     if (rc != 0) {
-        return enif_make_tuple2(
-            env, atom_error,
-            enif_make_tuple2(env, atom_decode_failed, enif_make_int(env, rc)));
+        why = (rc == ERLLAMA_DECODE_EXC_SENTINEL) ? atom_exception
+                                                  : classify_decode_error(env, c, rc);
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (rc != 0) {
+        return enif_make_tuple2(env, atom_error, why);
     }
     ERL_NIF_TERM tag = eog ? enif_make_atom(env, "eog") : atom_ok;
     return enif_make_tuple2(env, tag, enif_make_int(env, tok));
@@ -2580,6 +2677,7 @@ static ERL_NIF_TERM nif_embed(ErlNifEnv *env, int argc,
     }
 
     struct llama_batch batch = erllama_safe_batch_get_one(tokens, n);
+    arm_decode(c);
     int dr = erllama_safe_decode(c->ctx, batch);
     if (dr == ERLLAMA_DECODE_EXC_SENTINEL) {
         pthread_mutex_unlock(&c->mu);
@@ -2587,9 +2685,10 @@ static ERL_NIF_TERM nif_embed(ErlNifEnv *env, int argc,
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
     if (dr != 0) {
+        ERL_NIF_TERM why = classify_decode_error(env, c, dr);
         pthread_mutex_unlock(&c->mu);
         enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, enif_make_int(env, dr));
+        return enif_make_tuple2(env, atom_error, why);
     }
     /* The `decode_ready` flag implies "logits are ready for sampling";
      * after an embeddings decode the logits buffer is repurposed and a
@@ -3335,6 +3434,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_free_model",   1, nif_free_model,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_new_context",  2, nif_new_context,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_free_context", 1, nif_free_context, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_request_abort", 1, nif_request_abort, 0},
     {"nif_tokenize",     3, nif_tokenize,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_prefill",      2, nif_prefill,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_decode_one",   1, nif_decode_one,   ERL_NIF_DIRTY_JOB_CPU_BOUND},

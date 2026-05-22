@@ -30,6 +30,7 @@
     free_model/1,
     new_context/2,
     free_context/1,
+    request_abort/1,
     tokenize/3,
     detokenize/2,
     prefill/2,
@@ -130,6 +131,12 @@ Recognised keys in `Opts` (all optional; defaults come from
 - `type_k, type_v :: f16 | f32 | bf16 | q4_0 | q5_0 | q5_1 | q8_0`
   — KV cache element type for keys and values. Maps to
   `GGML_TYPE_*`.
+- `decode_budget_ms :: non_neg_integer()` — per-step wall-clock
+  budget (default 30000; 0 disables). A `decode`/`step`/`embed` call
+  that exceeds it is aborted via the context's ggml abort callback
+  and returns `{error, decode_timeout}` instead of blocking
+  indefinitely. The same callback honours `request_abort/1`, which
+  returns `{error, decode_aborted}`.
 
 A bad atom for any of `flash_attn`, `type_k`, or `type_v` raises
 `badarg`.
@@ -139,6 +146,16 @@ new_context(Model, Opts) when is_map(Opts) -> nif_new_context(Model, Opts).
 
 -spec free_context(context_ref()) -> ok.
 free_context(Ctx) -> nif_free_context(Ctx).
+
+%% Request that the in-flight decode on this context abort. Sets an
+%% atomic flag the per-context abort callback checks during compute;
+%% the running `llama_decode` returns early and the owning NIF maps it
+%% to `{error, decode_aborted}`. Runs on a regular scheduler and never
+%% locks the context mutex, so it stays callable while a decode is
+%% wedged holding that mutex. No-op effect if no decode is running
+%% (the flag is cleared before the next decode).
+-spec request_abort(context_ref()) -> ok | {error, atom()}.
+request_abort(Ctx) -> nif_request_abort(Ctx).
 
 -spec tokenize(model_ref(), iodata(), map()) -> [token_id()] | {error, atom()}.
 tokenize(Model, Text, Opts) when is_map(Opts) -> nif_tokenize(Model, Text, Opts).
@@ -182,13 +199,21 @@ Errors:
 - `{error, exception}` — `llama_decode` or `llama_sampler_sample`
   threw across the C ABI; the context's `decode_ready` flag is
   cleared and the gen_statem owning it is expected to stop.
+- `{error, decode_timeout}` — the decode exceeded the context's
+  `decode_budget_ms` and was aborted. The engine recovers the
+  context in place rather than stopping.
+- `{error, decode_aborted}` — an external `request_abort/1` fired
+  during the decode (e.g. a `cancel/1` mid-decode). Same in-place
+  recovery as `decode_timeout`.
+- `{error, {decode_failed, Rc}}` — `llama_decode` returned a
+  non-zero code `Rc` for a non-timeout, non-abort reason.
 """.
 -spec step(
     context_ref(),
     [{non_neg_integer(), {prefill, [token_id()]} | {decode, sampler_ref()}}]
 ) ->
     {ok, [{non_neg_integer(), prefilled | {token, token_id(), 0 | 1}}]}
-    | {error, atom()}.
+    | {error, atom() | {decode_failed, integer()}}.
 step(Ctx, Ops) when is_list(Ops) -> nif_step(Ctx, Ops).
 
 -spec kv_pack(context_ref(), [token_id()], non_neg_integer()) ->
@@ -358,6 +383,7 @@ nif_load_model(_Path, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_free_model(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_new_context(_Model, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_free_context(_Ctx) -> erlang:nif_error(nif_not_loaded).
+nif_request_abort(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_tokenize(_Model, _Text, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_detokenize(_Model, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_prefill(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).

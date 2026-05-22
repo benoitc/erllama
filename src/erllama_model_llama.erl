@@ -50,12 +50,18 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     apply_adapters/2,
     extra_metadata/1,
     verify/4,
-    thinking_signature/3
+    thinking_signature/3,
+    reset_context/1,
+    abort_handle/1
 ]).
 
 -record(s, {
     model :: erllama_nif:model_ref(),
     ctx :: erllama_nif:context_ref(),
+    %% Context options passed to erllama_nif:new_context/2. Retained
+    %% so reset_context/1 can rebuild the context in place after a
+    %% wedged/aborted decode without reloading the model.
+    context_opts = #{} :: map(),
     %% Captured once at init for vram_estimate_b derivation. The
     %% values are immutable once the model is loaded; the gen_statem
     %% reads them via extra_metadata/1 at its own init time and
@@ -115,6 +121,7 @@ build_state(Model, Ctx, Config, MOpts) ->
     #s{
         model = Model,
         ctx = Ctx,
+        context_opts = maps:get(context_opts, Config, #{}),
         model_size_bytes = safe_uint(erllama_nif:model_size(Model)),
         total_layers = safe_uint(erllama_nif:model_n_layer(Model)),
         n_gpu_layers = maps:get(n_gpu_layers, MOpts, 0),
@@ -169,6 +176,20 @@ terminate(#s{ctx = Ctx, model = Model}) ->
     erllama_nif:free_context(Ctx),
     erllama_nif:free_model(Model),
     ok.
+
+%% Recreate the context in place after a wedged/aborted decode. The
+%% model stays loaded; all live KV is dropped. On a new_context
+%% failure the old context is already gone, so we surface the error
+%% and let the gen_statem stop (supervisor reload as a last resort).
+reset_context(#s{ctx = OldCtx, model = Model, context_opts = COpts} = S) ->
+    _ = erllama_nif:free_context(OldCtx),
+    case erllama_nif:new_context(Model, COpts) of
+        {ok, NewCtx} -> {ok, S#s{ctx = NewCtx}};
+        {error, _} = E -> E
+    end.
+
+abort_handle(#s{ctx = Ctx}) ->
+    {ok, Ctx}.
 
 tokenize(#s{model = M}, Text) ->
     erllama_nif:tokenize(M, Text, #{add_special => true, parse_special => false}).

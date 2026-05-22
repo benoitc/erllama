@@ -707,6 +707,21 @@ completes.
 cancel(Ref) when is_reference(Ref) ->
     case erllama_inflight:lookup(Ref) of
         {ok, ModelPid} ->
+            %% Best-effort: interrupt an in-flight decode promptly
+            %% rather than waiting out the per-step budget. Only takes
+            %% effect if a decode is actually running and the backend
+            %% has an interruptible context; otherwise the cast below
+            %% is honoured at the next tick (the existing path).
+            case erllama_inflight:get_abort_handle(ModelPid) of
+                {ok, Ctx} ->
+                    try
+                        erllama_nif:request_abort(Ctx)
+                    catch
+                        _:_ -> ok
+                    end;
+                undefined ->
+                    ok
+            end,
             gen_statem:cast(ModelPid, {cancel, Ref}),
             ok;
         {error, not_found} ->
@@ -915,6 +930,7 @@ init([ModelId, Config]) ->
         {ok, BState} ->
             Data = build_init_data(ModelId, Config, Backend, BState),
             ok = obs_install_initial(Data),
+            ok = publish_abort_handle(Data),
             {ok, idle, Data};
         {error, Reason} ->
             {stop, Reason}
@@ -991,6 +1007,7 @@ resolve_policy(Config, NBatch) ->
 
 terminate(_Reason, _State, #data{model_id = ModelId, backend = B, backend_state = S}) ->
     _ = erllama_inflight:obs_delete(ModelId),
+    _ = erllama_inflight:delete_abort_handle(self()),
     B:terminate(S),
     ok;
 terminate(_Reason, _State, _Data) ->
@@ -1242,6 +1259,77 @@ backend_seq_clear_for(SeqId, #data{backend = Mod, backend_state = S}) ->
         true -> Mod:seq_rm(S, SeqId);
         false -> ok
     end.
+
+%% Publish (or clear) the backend's decode-abort handle so cancel/1
+%% can interrupt an in-flight decode without the gen_statem. Backends
+%% without an interruptible context return `undefined`.
+publish_abort_handle(#data{backend = Mod, backend_state = S}) ->
+    Handle =
+        case erlang:function_exported(Mod, abort_handle, 1) of
+            true -> Mod:abort_handle(S);
+            false -> undefined
+        end,
+    case Handle of
+        {ok, H} ->
+            _ = erllama_inflight:set_abort_handle(self(), H),
+            ok;
+        undefined ->
+            _ = erllama_inflight:delete_abort_handle(self()),
+            ok
+    end.
+
+%% Recover a wedged/aborted context in place: notify every in-flight
+%% caller, recreate the backend context (model stays loaded), reset
+%% all per-seq bookkeeping, drop sticky sessions, fail queued admits,
+%% and return to idle. Falls back to the supervisor-restart stop if
+%% the backend can't recreate (or has no reset_context callback).
+recover_in_place(Data, Err) ->
+    fail_all_requests(Data, Err),
+    fail_pending_admits(Data, Err),
+    Mod = Data#data.backend,
+    case erlang:function_exported(Mod, reset_context, 1) of
+        true ->
+            case Mod:reset_context(Data#data.backend_state) of
+                {ok, NewBState} ->
+                    NewData = reset_after_recovery(Data, NewBState),
+                    ok = publish_abort_handle(NewData),
+                    ok = obs_refresh(idle, NewData),
+                    {next_state, idle, NewData};
+                {error, ResetErr} ->
+                    {stop, {recover_failed, ResetErr}, Data}
+            end;
+        false ->
+            {stop, {step_failed, Err}, Data}
+    end.
+
+reset_after_recovery(Data, NewBState) ->
+    Data#data{
+        backend_state = NewBState,
+        req_table = #{},
+        session_seq = #{},
+        idle_seq_ids = lists:seq(0, Data#data.n_seq_max - 1),
+        pending = []
+    }.
+
+%% Reply {error, Err} to every queued (not-yet-admitted) caller so a
+%% recovery doesn't leave them parked on their gen_statem:call.
+fail_pending_admits(#data{pending = Pending}, Err) ->
+    lists:foreach(
+        fun(Item) ->
+            case pending_from_of(Item) of
+                undefined -> ok;
+                From -> _ = gen_statem:reply(From, Err)
+            end
+        end,
+        Pending
+    ),
+    ok.
+
+pending_from_of({complete, From, _, _}) -> From;
+pending_from_of({prefill_only, From, _, _}) -> From;
+pending_from_of({infer, From, _, _, _}) -> From;
+pending_from_of({continue, From, _, _}) -> From;
+pending_from_of(_) -> undefined.
 
 %% Public end_session handler: drop the session's sticky mapping,
 %% free the seq's KV cells, and return the seq to the idle pool.
@@ -1964,15 +2052,30 @@ step_tick(Data) ->
                     Pairs = pair_ops_with_results(OpList, Results),
                     Data2 = apply_step_results(Pairs, Data1),
                     tick_after_step(Data2, FinishersFirst, []);
-                {error, _} = Err ->
-                    %% A backend error mid-tick poisons every in-flight
-                    %% request — we cannot attribute it to a single row.
-                    %% Stop with an error to every live caller; the
-                    %% supervisor restarts the gen_statem.
-                    fail_all_requests(Data1, Err),
-                    {stop, {step_failed, Err}, Data1}
+                {error, Reason} = Err ->
+                    case is_recoverable_decode_error(Reason) of
+                        true ->
+                            %% Bounded/interrupted decode: recover the
+                            %% context in place, keep the model loaded.
+                            recover_in_place(Data1, Err);
+                        false ->
+                            %% Any other backend error poisons every
+                            %% in-flight request and cannot be attributed
+                            %% to a single row. Stop; the supervisor
+                            %% restarts the gen_statem.
+                            fail_all_requests(Data1, Err),
+                            {stop, {step_failed, Err}, Data1}
+                    end
             end
     end.
+
+%% Decode errors the engine recovers from in place (without a
+%% supervisor reload): the per-step budget tripped (`decode_timeout`)
+%% or an external `request_abort` fired (`decode_aborted`).
+is_recoverable_decode_error(decode_timeout) -> true;
+is_recoverable_decode_error(decode_aborted) -> true;
+is_recoverable_decode_error({decode_timeout, _}) -> true;
+is_recoverable_decode_error(_) -> false.
 
 %% Pair each op with its result by matching on seq_id. The backend
 %% returns results in op-list order but we tolerate reordering by

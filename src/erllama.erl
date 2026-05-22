@@ -346,6 +346,14 @@ Cancel an in-flight streaming inference. Idempotent and
 fire-and-forget; cancellation is observed at the next inter-token
 boundary. The caller still receives a final `{erllama_done, Ref,
 Stats}` with `cancelled => true`.
+
+A healthy decode is fast, so the next inter-token boundary is
+typically milliseconds away. As a safety net, cancel also asks the
+backend to interrupt the in-flight decode directly (via the
+context's abort callback), so a stalled or wedged decode is bounded
+rather than blocking forever. An interrupt that actually fires
+recreates the context in place (the model stays loaded), so under
+`n_seq_max > 1` co-batched siblings on other seqs are reset too.
 """.
 -spec cancel(reference()) -> ok.
 cancel(Ref) ->

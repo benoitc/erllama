@@ -70,6 +70,9 @@ kv_pack_rejects_non_resource_test() ->
 kv_unpack_rejects_non_resource_test() ->
     ?assertError(badarg, erllama_nif:kv_unpack(make_ref(), <<>>, 0)).
 
+request_abort_rejects_non_resource_test() ->
+    ?assertError(badarg, erllama_nif:request_abort(make_ref())).
+
 %% First call to nif_load_model triggers the lazy
 %% llama_backend_init (pthread_once), which on macOS includes Metal
 %% device discovery and can take several seconds. eunit's default
