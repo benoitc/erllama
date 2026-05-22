@@ -47,7 +47,11 @@
     %% Test helper: force the next step/2 to return {error, Reason},
     %% simulating a wedged/aborted decode so recovery can be tested
     %% without a real backend.
-    wedge_next_step/1
+    wedge_next_step/1,
+    %% Test helpers: read / clear the list of cfgs passed to
+    %% sampler_new/2 since the last reset.
+    sampler_new_cfgs/0,
+    reset_sampler_new_cfgs/0
 ]).
 
 %% Stub state.
@@ -269,10 +273,23 @@ wedge_next_step(Reason) ->
     persistent_term:put({?MODULE, wedge}, Reason),
     ok.
 
+%% Test helper: cfgs passed to sampler_new/2 since the last reset.
+sampler_new_cfgs() ->
+    persistent_term:get({?MODULE, sampler_new_cfgs}, []).
+
+reset_sampler_new_cfgs() ->
+    persistent_term:put({?MODULE, sampler_new_cfgs}, []),
+    ok.
+
 %% Sampler refs are opaque references. Free drops the per-sampler
 %% per-sampler stub phase (a no-op when neither thinking_capable nor
 %% tool_call_capable is set).
-sampler_new(_S, _Cfg) ->
+sampler_new(_S, Cfg) ->
+    %% Record the cfg so tests can assert which sampler chains the
+    %% scheduler built (e.g. the grammar-less greedy `#{temperature
+    %% => 0.0}` chain vs a request chain carrying a grammar).
+    Prev = persistent_term:get({?MODULE, sampler_new_cfgs}, []),
+    persistent_term:put({?MODULE, sampler_new_cfgs}, Prev ++ [Cfg]),
     {ok, make_ref()}.
 
 sampler_free(_Sampler) ->

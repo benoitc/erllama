@@ -253,6 +253,13 @@ generated token ids for this turn in order, so a caller can feed a
 byte-exact suffix to `continue/3` without re-tokenising detokenised
 text.
 
+When `Params` carries a binary `grammar`, it constrains every token
+of the turn, including tool-call syntax: the greedy-on-syntax swap
+(used for byte-deterministic tool-call markers on the default
+no-grammar path) is disabled for the request, so a
+`tool_choice = required` / `response_format` grammar is honoured
+end to end rather than abandoned once a tool-call span opens.
+
 When `Params` carries `thinking_budget_tokens => N` and the
 thinking phase emits `N` or more `{thinking_delta, _}` payloads,
 the scheduler synthesises the `{erllama_thinking_end, _, _}` close
@@ -307,7 +314,11 @@ KV without re-tokenising the prior turns.
 
 All other `infer_params()` keys are honoured
 (`response_tokens`, `temperature`, `top_p`, `grammar`,
-`thinking`, `thinking_budget_tokens`, `stop_sequences`, ...).
+`thinking`, `thinking_budget_tokens`, `stop_sequences`, ...), exactly
+as on `infer/4`. A binary `grammar` is applied identically here: it
+governs tool-call syntax tokens too (the greedy-on-syntax swap is
+disabled for the request), so `tool_choice` / `response_format`
+constraints hold on continued rounds.
 `parent_key` is ignored on this path because no cache lookup runs.
 
 Contract: the caller asserts that `SuffixTokens` is the exact
