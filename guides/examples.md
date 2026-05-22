@@ -576,10 +576,36 @@ Errors:
 - `{error, sticky_busy}` - an earlier request on the same session
   is still in flight. Serialise calls per session id (typical HTTP
   per-user pipelines do this naturally).
+- `{error, {transcript_mismatch, Detail}}` - only when the optional
+  `expect_committed` guard is set and diverges (see below).
 
 `parent_key` is ignored on the `continue/3` path because no cache
 lookup runs. The caller-asserted tail is the entire admission
 contract.
+
+### Guarding the splice (`expect_committed`)
+
+`continue/3` trusts the tail, so a caller whose view of the session
+drifted will silently produce garbage. To catch that, reconstruct
+the prior turn's exact committed tokens from `Stats.generated` (the
+`erllama_done` Stats now carry the exact generated token ids) and
+pass them as `expect_committed`. The engine checks they equal the
+session's stored context before prefilling:
+
+```erlang
+PriorCommitted = Turn1Prompt ++ maps:get(generated, Stats1),
+{ok, Ref2} = erllama:continue(ModelId, Suffix,
+                              #{session_id => SessionId,
+                                caller_pid => self(),
+                                response_tokens => 64,
+                                expect_committed => PriorCommitted}),
+```
+
+On a mismatch the call returns
+`{error, {transcript_mismatch, #{stored_len, expected_len, diverge_at}}}`
+and prefills nothing; the seq stays pinned, so the caller can re-sync
+its transcript and retry (or fall back to `infer/4`). Omit
+`expect_committed` to keep the historical trust-the-tail behaviour.
 
 ## 15. Multi-tenant concurrent decoding (`n_seq_max`)
 

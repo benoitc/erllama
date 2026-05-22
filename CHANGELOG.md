@@ -6,6 +6,59 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-23
+
+Engine-robustness release covering the `erllama_server` hardening
+brief observed under real 30B/Metal load (cold-admit decode wedges,
+agentic tool-continue loops).
+
+### Added
+
+- Bounded, interruptible, self-recovering decode. Every context
+  installs a ggml abort callback. Each decode step arms a per-step
+  wall-clock budget (`context_opts.decode_budget_ms`, default 30000,
+  0 disables); exceeding it aborts the decode and returns
+  `{error, decode_timeout}` instead of blocking forever.
+  `erllama_nif:request_abort/1` sets an atomic flag the callback
+  honours without taking the context mutex, so a running decode can
+  be interrupted from outside the (blocked) gen_statem and returns
+  `{error, decode_aborted}`; `cancel/1` fires it best-effort. On
+  `decode_timeout`/`decode_aborted` the engine recovers in place:
+  fails in-flight and queued callers, recreates the context via the
+  new backend `reset_context/1` (model stays loaded), resets seq and
+  session state, and returns to idle. Recovery drops only the live
+  in-context KV cells and sticky-session pins; the persistent tiered
+  cache (RAM/disk rows) is untouched, so the next admission still
+  warm-restores from cache where a saved row matches rather than
+  starting fully cold.
+- `on_full => block | error` admission option on `complete/3`,
+  `prefill_only/3`, `infer/4` (default `block`). `error` fails fast
+  with `{error, seq_capacity}` instead of queueing when no seq is
+  free — pair with `available_seqs` / `n_seq_max` from `model_info/1`.
+- `generated => [token_id()]` in the `erllama_done` Stats map: the
+  exact generated token ids in order, so a caller can build a
+  byte-exact suffix for `continue/3` without re-tokenising
+  detokenised text.
+- `expect_committed => [token_id()]` option on `continue/3`: the
+  caller's view of the session's committed tokens. When supplied it
+  must equal the stored context exactly, otherwise `continue/3`
+  returns `{error, {transcript_mismatch, #{stored_len, expected_len,
+  diverge_at}}}` without prefilling, leaving the seq pinned for a
+  re-sync and retry.
+
+### Changed
+
+- A binary `grammar` is now authoritative through tool-call syntax
+  tokens. Previously, on a model with `tool_call_markers`, a
+  `tool_choice=required` / `response_format` grammar was abandoned
+  once a tool-call span opened (syntax tokens went through a
+  grammar-less greedy sampler), letting output drift to free-form.
+  The greedy-on-syntax swap is now disabled for any request carrying
+  a grammar, so the constraint holds end to end on `infer/4` and
+  `continue/3`.
+- `nif_decode_one` now returns `{error, {decode_failed, Rc}}` instead
+  of a bare `{error, Rc}`, matching `nif_step`.
+
 ## [0.7.0] - 2026-05-20
 
 ### Added
