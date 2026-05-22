@@ -215,6 +215,11 @@ concurrently through one decode call per tick.
 -type stats() :: #{
     prompt_tokens := non_neg_integer(),
     completion_tokens := non_neg_integer(),
+    %% Exact generated token ids for this turn, in order. Lets a
+    %% caller reconstruct a byte-exact suffix for `continue/3`
+    %% without re-tokenising detokenised text. Mirrors the
+    %% `generated` key in the standard-mode (`complete`) result map.
+    generated := [non_neg_integer()],
     prefill_ms := non_neg_integer(),
     generation_ms := non_neg_integer(),
     cache_hit_kind := cache_hit_kind(),
@@ -1106,6 +1111,16 @@ caller_from_of({complete, From, _, _}) -> From;
 caller_from_of({prefill_only, From, _, _}) -> From;
 caller_from_of({infer, From, _, _, _}) -> From.
 
+%% Admission behaviour when no seq_id is free. `block` (default)
+%% queues the request and the caller stays parked on its
+%% `gen_statem:call` until a seq frees up; `error` fails fast with
+%% `{error, seq_capacity}` so a caller that has sized capacity via
+%% `model_info/1` (`available_seqs` / `n_seq_max`) can avoid an
+%% unbounded wait.
+on_full_of({complete, _, _, Opts}) -> maps:get(on_full, Opts, block);
+on_full_of({prefill_only, _, _, Opts}) -> maps:get(on_full, Opts, block);
+on_full_of({infer, _, _, Params, _}) -> maps:get(on_full, Params, block).
+
 %% Admit a caller-asserted continuation on a pinned sticky session.
 %% Unlike `admit/2` this path performs no prompt prefix-equality
 %% check: the caller has rendered the new tail and trusts the
@@ -1131,14 +1146,22 @@ admit_continue(Item = {continue, From, _Suffix, Opts}, Data) ->
     end.
 
 admit_normal(Item, Data = #data{idle_seq_ids = []}) ->
-    %% No seq_ids available — queue. The caller stays blocked on
-    %% gen_statem:call until step_tick frees a slot and the
-    %% dispatch path runs this admit. For streaming infer/4 the
-    %% caller still doesn't get its Ref until then.
-    NewData = enqueue(Item, Data),
-    case Data#data.req_table of
-        Empty when map_size(Empty) =:= 0 -> {next_state, idle, NewData};
-        _ -> {keep_state, NewData}
+    %% No seq_ids available. Default `block` queues the request and
+    %% the caller stays parked on gen_statem:call until step_tick
+    %% frees a slot and the dispatch path runs this admit. With
+    %% `on_full => error` the caller fails fast instead of waiting
+    %% on a slot that may never free (e.g. all seqs pinned to other
+    %% sticky sessions).
+    case on_full_of(Item) of
+        error ->
+            From = caller_from_of(Item),
+            {keep_state, Data, [{reply, From, {error, seq_capacity}}]};
+        _ ->
+            NewData = enqueue(Item, Data),
+            case Data#data.req_table of
+                Empty when map_size(Empty) =:= 0 -> {next_state, idle, NewData};
+                _ -> {keep_state, NewData}
+            end
     end;
 admit_normal(Item, Data = #data{idle_seq_ids = [SeqId | Rest]}) ->
     start_admission(Item, SeqId, normal, Data#data{idle_seq_ids = Rest}).
@@ -2819,6 +2842,7 @@ build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
     Stats0 = #{
         prompt_tokens => length(Req#req.prompt_tokens),
         completion_tokens => length(Req#req.generated),
+        generated => Req#req.generated,
         prefill_ms => PrefillMs,
         generation_ms => GenMs,
         cache_hit_kind => Req#req.cache_hit_kind,

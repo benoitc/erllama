@@ -751,6 +751,117 @@ drain_stream_messages(Ref) ->
     after 50 -> ok
     end.
 
+%% Drain a stream collecting the {erllama_token_id, _, _} ids in
+%% order; returns {Stats, CollectedIds} at the done message.
+drain_done_collecting_ids(Ref, TimeoutMs) ->
+    drain_done_collecting_ids(Ref, TimeoutMs, []).
+
+drain_done_collecting_ids(Ref, TimeoutMs, Acc) ->
+    receive
+        {erllama_done, Ref, Stats} -> {Stats, lists:reverse(Acc)};
+        {erllama_token_id, Ref, Id} -> drain_done_collecting_ids(Ref, TimeoutMs, [Id | Acc]);
+        {erllama_token, Ref, _} -> drain_done_collecting_ids(Ref, TimeoutMs, Acc);
+        {erllama_thinking_end, Ref, _} -> drain_done_collecting_ids(Ref, TimeoutMs, Acc);
+        {erllama_tool_call_end, Ref, _} -> drain_done_collecting_ids(Ref, TimeoutMs, Acc)
+    after TimeoutMs ->
+        erlang:error({timeout, drain_done_collecting_ids})
+    end.
+
+%% #3: the erllama_done Stats map carries the exact generated token
+%% ids, in order, matching the {erllama_token_id, _, _} stream.
+infer_stats_carries_generated_token_ids_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        {ok, Ref} = erllama_model:infer(
+            <<"test_model">>,
+            prompt_tokens(long_prompt()),
+            #{response_tokens => 4},
+            self()
+        ),
+        {Stats, StreamedIds} = drain_done_collecting_ids(Ref, 5000),
+        Generated = maps:get(generated, Stats),
+        ?assert(is_list(Generated)),
+        ?assertEqual(length(Generated), maps:get(completion_tokens, Stats)),
+        ?assertEqual(StreamedIds, Generated)
+    end).
+
+%% #5: on_full => error fails fast with {error, seq_capacity} when no
+%% seq is free, instead of blocking. Default still queues.
+admit_on_full_error_returns_seq_capacity_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, fun(_Cfg) ->
+            %% Take the only seq (n_seq_max defaults to 1) with a
+            %% long-running streaming infer.
+            {ok, Ref1} = erllama_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 10000},
+                self()
+            ),
+            receive
+                {erllama_token, Ref1, _} -> ok;
+                {erllama_token_id, Ref1, _} -> ok
+            after 2000 -> erlang:error(no_first_token)
+            end,
+            %% Second admit with on_full => error must fail fast.
+            ?assertEqual(
+                {error, seq_capacity},
+                erllama_model:complete(
+                    <<"test_model">>,
+                    long_prompt(),
+                    #{response_tokens => 2, on_full => error}
+                )
+            ),
+            ok = erllama_model:cancel(Ref1),
+            receive
+                {erllama_done, Ref1, _} -> ok
+            after 5000 -> erlang:error(timeout_drain)
+            end,
+            drain_stream_messages(Ref1)
+        end)
+    end}.
+
+%% #5: default on_full (block) still queues — the second admit
+%% completes once the first frees its seq.
+admit_default_blocks_and_queues_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, fun(_Cfg) ->
+            {ok, Ref1} = erllama_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 10000},
+                self()
+            ),
+            receive
+                {erllama_token, Ref1, _} -> ok;
+                {erllama_token_id, Ref1, _} -> ok
+            after 2000 -> erlang:error(no_first_token)
+            end,
+            %% Queue a second infer (default block) from a helper proc
+            %% so we don't deadlock the test process on gen_statem:call.
+            Parent = self(),
+            _ = spawn(fun() ->
+                R = erllama_model:infer(
+                    <<"test_model">>,
+                    prompt_tokens(long_prompt()),
+                    #{response_tokens => 2},
+                    Parent
+                ),
+                Parent ! {second_admit, R}
+            end),
+            %% Free the first seq so the queued admit dispatches.
+            ok = erllama_model:cancel(Ref1),
+            receive
+                {second_admit, {ok, Ref2}} ->
+                    _ = drain_stream_messages(Ref2),
+                    ok;
+                {second_admit, Other} ->
+                    erlang:error({unexpected_admit, Other})
+            after 5000 -> erlang:error(queued_admit_never_dispatched)
+            end,
+            drain_stream_messages(Ref1)
+        end)
+    end}.
+
 %% =============================================================================
 %% continue/3 — caller-asserted continuation on a pinned sticky session
 %% =============================================================================
