@@ -1,12 +1,12 @@
 # NIF safety
 
-The single NIF (`erllama_nif`) is the only place erllama touches
+The single NIF (`barrel_inference_nif`) is the only place Barrel Inference touches
 unmanaged memory. This document captures the patterns that keep the
 BEAM alive in the face of llama.cpp's quirks.
 
 ## One NIF, dirty schedulers only
 
-There is exactly one `.so` (`priv/erllama_nif.so`) housing every
+There is exactly one `.so` (`priv/barrel_inference_nif.so`) housing every
 native call: cache pack/unpack, model load, context construction,
 tokenisation, decode, kv-pack, kv-unpack. Every export is marked
 `ERL_NIF_DIRTY_JOB_CPU_BOUND` or `ERL_NIF_DIRTY_JOB_IO_BOUND`. None
@@ -24,7 +24,7 @@ scheduler would starve every other process on the system.
 
 ## Two-resource lifetime
 
-`erllama_nif` has two resource types whose interplay matters:
+`barrel_inference_nif` has two resource types whose interplay matters:
 
 ```
   model_ref       owns: weights mmap, vocab, llama_model*
@@ -47,7 +47,7 @@ Each resource carries a `pthread_mutex` that every NIF function
 acquires before touching the underlying llama struct. This serves
 two ends:
 
-1. **Race-free explicit free.** `erllama_nif:free_context/1`
+1. **Race-free explicit free.** `barrel_inference_nif:free_context/1`
    acquires the mutex, sets a freed flag, and calls
    `llama_free_context` from a deferred destructor. Subsequent NIF
    calls see the freed flag and return `{error, freed}` cleanly,
@@ -71,19 +71,19 @@ across the C-NIF boundary into BEAM's stack is undefined behaviour
 and crashes the VM in ugly ways.
 
 Every llama call is wrapped in a thin shim
-(`c_src/erllama_safe.cpp`):
+(`c_src/barrel_inference_safe.cpp`):
 
 ```cpp
-extern "C" int erllama_safe_decode(llama_context* ctx,
+extern "C" int barrel_inference_safe_decode(llama_context* ctx,
                                    const llama_batch* batch) noexcept {
     try {
         return llama_decode(ctx, *batch);
     } catch (const std::bad_alloc&) {
-        return ERLLAMA_E_OOM;
+        return BARREL_INFERENCE_E_OOM;
     } catch (const std::exception&) {
-        return ERLLAMA_E_EXCEPTION;
+        return BARREL_INFERENCE_E_EXCEPTION;
     } catch (...) {
-        return ERLLAMA_E_EXCEPTION;
+        return BARREL_INFERENCE_E_EXCEPTION;
     }
 }
 ```
@@ -125,7 +125,7 @@ shows up at sizes where the trade-off ceases to be acceptable.
 
 ## `fsync_dir` and link durability
 
-`erllama_nif:fsync_dir/1` opens a directory fd and `fsync(2)`s it.
+`barrel_inference_nif:fsync_dir/1` opens a directory fd and `fsync(2)`s it.
 The publish protocol calls this after `link(2)` to ensure the
 directory entry is on stable storage; without it, a crash between
 `link` and the next inode flush could lose the linked file.
@@ -137,11 +137,11 @@ paths constructed from user input.
 
 | Concern | Test |
 |---|---|
-| Concurrent free + decode | `erllama_nif_safety_tests:free_during_decode/0` |
-| `decode_one` without prefill | `erllama_nif_safety_tests:decode_one_no_logits/0` |
-| llama exception caught at boundary | `erllama_nif_safety_tests:bad_input_returns_error/0` |
-| Two-resource model survives last context drop | `erllama_nif_lifetime_tests:deferred_free/0` |
-| `fsync_dir` rejects NUL paths | `erllama_nif_tests:fsync_dir_rejects_nul/0` |
+| Concurrent free + decode | `barrel_inference_nif_safety_tests:free_during_decode/0` |
+| `decode_one` without prefill | `barrel_inference_nif_safety_tests:decode_one_no_logits/0` |
+| llama exception caught at boundary | `barrel_inference_nif_safety_tests:bad_input_returns_error/0` |
+| Two-resource model survives last context drop | `barrel_inference_nif_lifetime_tests:deferred_free/0` |
+| `fsync_dir` rejects NUL paths | `barrel_inference_nif_tests:fsync_dir_rejects_nul/0` |
 
 If any of these flip on a change, the change is wrong. The tests
 exist precisely because the failure modes they cover crash the

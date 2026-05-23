@@ -1,5 +1,5 @@
 #!/bin/sh -x
-# CMake configure step: generate build files for the erllama NIF and
+# CMake configure step: generate build files for the barrel_inference NIF and
 # the vendored llama.cpp. Mirrors erlang-rocksdb's do_cmake.sh pattern.
 
 mkdir -p _build/cmake

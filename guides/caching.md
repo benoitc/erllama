@@ -1,6 +1,6 @@
 # Caching guide
 
-erllama's KV cache turns a multi-second prefill into a millisecond
+Barrel Inference's KV cache turns a multi-second prefill into a millisecond
 restore. This guide is the operator's-eye view: what it does, when
 it kicks in, and which knobs to touch.
 
@@ -11,7 +11,7 @@ produced while reading the prompt. Once you have them, generating
 the next token costs one forward pass. Without them, you have to
 re-read every token of the prompt from scratch.
 
-erllama's cache stores those tensors keyed on the **exact tokens
+Barrel Inference's cache stores those tensors keyed on the **exact tokens
 that produced them**:
 
 ```
@@ -52,7 +52,7 @@ each with its own `save_reason`:
 | `evict` | When a holder is asked to release its slab. Sync (pause decode, pack, release). |
 | `shutdown` | On `prep_stop` or `unload/1`. Sync, capped by `evict_save_timeout_ms`. |
 
-Async saves go through `erllama_cache_writer` — a pool of dirty-IO
+Async saves go through `barrel_inference_cache_writer` — a pool of dirty-IO
 workers. Sync saves block the calling process until the file is on
 stable storage.
 
@@ -71,11 +71,11 @@ Three lookup paths, in order of preference:
 
 For stateless callers — OpenAI/Anthropic-shaped HTTP APIs that
 resend the full conversation each turn — option 3 is what you want.
-You don't have to do anything; just call `erllama:complete/2`.
+You don't have to do anything; just call `barrel_inference:complete/2`.
 
 ## Save policy gates
 
-Saving every prefix would flood the writer pool. erllama gates saves
+Saving every prefix would flood the writer pool. Barrel Inference gates saves
 behind a few thresholds, all overridable per-model.
 
 | Gate | Default | What it does |
@@ -95,12 +95,12 @@ hits more likely on shorter prompts at the cost of more probes.
 
 ## Memory-pressure-driven eviction
 
-`erllama_scheduler` is a polling gen_server that watches a pluggable
+`barrel_inference_scheduler` is a polling gen_server that watches a pluggable
 pressure source and evicts cache slabs when pressure crosses a
 watermark. Off by default. Enable in `sys.config`:
 
 ```erlang
-{erllama, [
+{barrel_inference, [
   {scheduler, #{
     enabled         => true,
     pressure_source => system,        %% portable, memsup-backed
@@ -118,7 +118,7 @@ Sources shipped:
 - `system` — OTP `memsup`. Linux, macOS, BSD, Windows.
 - `nvidia_smi` — sums VRAM across all visible NVIDIA GPUs.
 - `{module, M}` — calls `M:sample/0`. Implement
-  `-behaviour(erllama_pressure)` to write your own.
+  `-behaviour(barrel_inference_pressure)` to write your own.
 
 When the source reports `Used / Total >= high_watermark`, the
 scheduler asks the cache to evict enough bytes to drop the ratio
@@ -128,23 +128,23 @@ below `low_watermark`, scoped to the configured tiers.
 
 ```erlang
 %% Hit/miss/save counters and per-path latency totals.
-erllama_cache:get_counters().
+barrel_inference_cache:get_counters().
 
 %% Every row in the index, raw tuples:
 %%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin,
 %%    Location, TokensRef, Hits}
-erllama_cache_meta_srv:dump().
+barrel_inference_cache_meta_srv:dump().
 
 %% Synchronous full eviction pass: returns {evicted, N}.
-erllama_cache:gc().
+barrel_inference_cache:gc().
 
 %% Free at least N bytes, oldest LRU first: returns {evicted, N, BytesFreed}.
-erllama_cache:evict_bytes(256 * 1024 * 1024).
-erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
+barrel_inference_cache:evict_bytes(256 * 1024 * 1024).
+barrel_inference_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 ```
 
 The counter map is documented inline on
-`erllama_cache:get_counters/0` — call it from a shell to see the
+`barrel_inference_cache:get_counters/0` — call it from a shell to see the
 keys for your build.
 
 ## Disabling the cache
@@ -154,7 +154,7 @@ and a tiny `min_tokens` to bypass saves entirely, or set the
 application env to disable all saves at the policy level:
 
 ```erlang
-{erllama, [
+{barrel_inference, [
   {min_tokens, infinity}       %% nothing ever clears the gate
 ]}.
 ```

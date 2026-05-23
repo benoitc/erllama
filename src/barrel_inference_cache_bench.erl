@@ -1,0 +1,84 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
+-module(barrel_inference_cache_bench).
+-moduledoc """
+Microbench helpers for the cache subsystem.
+
+These do NOT measure realistic prefill / decode latency — that
+requires the real `barrel_inference_nif` against llama.cpp (step 2b).
+What they do measure: framing / CRC / link-publish / disk-load
+latency. Useful as a regression guard on the I/O path and as a
+template for the post-2b benchmark that will assert the >=10x
+cold-vs-warm speedup target on NVMe.
+
+Usage from the shell:
+
+  1> application:ensure_all_started(barrel_inference).
+  2> {ok, _} = barrel_inference_cache_disk_srv:start_link(b_disk, "/tmp/b").
+  3> barrel_inference_cache_bench:save_load(b_disk, 100, 4096).
+""".
+
+-export([save_load/3]).
+
+-spec save_load(atom(), pos_integer(), pos_integer()) ->
+    #{
+        save_us_avg := non_neg_integer(),
+        load_us_avg := non_neg_integer(),
+        runs := pos_integer(),
+        payload_bytes := pos_integer()
+    }.
+save_load(DiskSrv, Runs, PayloadBytes) when
+    is_atom(DiskSrv),
+    is_integer(Runs),
+    Runs > 0,
+    is_integer(PayloadBytes),
+    PayloadBytes > 0
+->
+    Payload = binary:copy(<<"x">>, PayloadBytes),
+    SaveMicros = bench_loop(Runs, fun(I) -> bench_save(DiskSrv, I, Payload) end),
+    LoadMicros = bench_loop(Runs, fun(I) -> bench_load(DiskSrv, I) end),
+    #{
+        save_us_avg => SaveMicros div Runs,
+        load_us_avg => LoadMicros div Runs,
+        runs => Runs,
+        payload_bytes => PayloadBytes
+    }.
+
+bench_loop(Runs, Fun) ->
+    lists:foldl(
+        fun(I, Acc) ->
+            T0 = erlang:monotonic_time(microsecond),
+            _ = Fun(I),
+            T1 = erlang:monotonic_time(microsecond),
+            Acc + (T1 - T0)
+        end,
+        0,
+        lists:seq(1, Runs)
+    ).
+
+bench_save(DiskSrv, I, Payload) ->
+    Tokens = [I],
+    Meta = #{
+        save_reason => cold,
+        quant_bits => 16,
+        fingerprint => binary:copy(<<16#AA>>, 32),
+        fingerprint_mode => safe,
+        quant_type => f16,
+        ctx_params_hash => binary:copy(<<16#BB>>, 32),
+        tokens => Tokens,
+        context_size => 4096,
+        prompt_text => <<>>,
+        hostname => <<"bench">>,
+        barrel_inference_version => <<"0.1.0">>
+    },
+    barrel_inference_cache_disk_srv:save(DiskSrv, Meta, Payload).
+
+bench_load(DiskSrv, I) ->
+    Key = barrel_inference_cache_key:make(#{
+        fingerprint => binary:copy(<<16#AA>>, 32),
+        quant_type => f16,
+        ctx_params_hash => binary:copy(<<16#BB>>, 32),
+        tokens => [I]
+    }),
+    barrel_inference_cache_disk_srv:load(DiskSrv, Key).

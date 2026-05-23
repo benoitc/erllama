@@ -4,24 +4,24 @@ Instructions for AI coding agents working on this project.
 
 ## Project Overview
 
-erllama is a native Erlang/OTP wrapper around llama.cpp providing
+Barrel Inference is a native Erlang/OTP wrapper around llama.cpp providing
 OpenAI-compatible inference with full supervision and a tiered KV
 cache. Requires Erlang/OTP 28 and rebar3 3.25+.
 
 Single application, flat layout:
 
 ```
-src/        Erlang sources (erllama_*, erllama_cache_*, erllama_nif)
-include/    Shared headers (erllama_cache.hrl)
-c_src/      C sources for the single NIF (erllama_nif.so)
+src/        Erlang sources (barrel_inference_*, barrel_inference_cache_*, barrel_inference_nif)
+include/    Shared headers (barrel_inference_cache.hrl)
+c_src/      C sources for the single NIF (barrel_inference_nif.so)
 test/       eunit + PropEr property tests
-priv/       Build artefact: erllama_nif.so
+priv/       Build artefact: barrel_inference_nif.so
 config/     sys.config
 ```
 
 The KV cache is logically a subsystem (its own supervisor, modules
-prefixed `erllama_cache_*`) but lives in the same OTP application as
-the rest of erllama. There is one NIF (`erllama_nif`) that holds the
+prefixed `barrel_inference_cache_*`) but lives in the same OTP application as
+the rest of barrel_inference. There is one NIF (`barrel_inference_nif`) that holds the
 entire native surface (cache pipeline + future llama.cpp wrappers).
 
 Authoritative behaviour is encoded in the test suites under `test/`
@@ -49,9 +49,9 @@ rebar3 xref         # Cross-reference analysis
 rebar3 compile                                    # Build
 rebar3 shell                                      # Boot the umbrella
 rebar3 eunit                                      # All EUnit tests
-rebar3 eunit --module=erllama_cache_kvc_tests     # Specific test module
+rebar3 eunit --module=barrel_inference_cache_kvc_tests     # Specific test module
 rebar3 proper                                     # All PropEr property-based tests
-rebar3 ct --suite=erllama_cache_meta_SUITE        # Specific Common Test suite
+rebar3 ct --suite=barrel_inference_cache_meta_SUITE        # Specific Common Test suite
 rebar3 fmt                                        # Auto-format (erlfmt)
 rebar3 fmt --check                                # Format check, no writes
 rebar3 lint                                       # Elvis linter
@@ -62,22 +62,22 @@ rebar3 ex_doc                                     # Generate docs
 
 ## Architecture
 
-### Cache subsystem (`erllama_cache_*` modules)
+### Cache subsystem (`barrel_inference_cache_*` modules)
 
 ```
-erllama_cache_sup
-├── erllama_cache_meta_srv     sole writer for meta + LRU + reservations
-├── erllama_cache_ram          RAM tier (ETS slab store)
-├── erllama_cache_ramfile_sup
-│   └── erllama_cache_ramfile_srv  per ram_file root dir
-├── erllama_cache_disk_sup
-│   └── erllama_cache_disk_srv     per disk root dir (plain read/write)
-└── erllama_cache_writer       dirty-IO save workers
+barrel_inference_cache_sup
+├── barrel_inference_cache_meta_srv     sole writer for meta + LRU + reservations
+├── barrel_inference_cache_ram          RAM tier (ETS slab store)
+├── barrel_inference_cache_ramfile_sup
+│   └── barrel_inference_cache_ramfile_srv  per ram_file root dir
+├── barrel_inference_cache_disk_sup
+│   └── barrel_inference_cache_disk_srv     per disk root dir (plain read/write)
+└── barrel_inference_cache_writer       dirty-IO save workers
 ```
 
-Public API lives in `erllama_cache.erl` (a stateless facade). Hot-path
+Public API lives in `barrel_inference_cache.erl` (a stateless facade). Hot-path
 read lookups go through ETS directly. Writes (claim, release, evict,
-save announce) go through `erllama_cache_meta_srv` via
+save announce) go through `barrel_inference_cache_meta_srv` via
 `gen_server:call`.
 
 ### Save pipeline correctness invariants (do not change without review)
@@ -121,13 +121,13 @@ response.
 
 ### Real-model CT suite
 
-`erllama_real_model_SUITE` exercises the llama.cpp backend against a
+`barrel_inference_real_model_SUITE` exercises the llama.cpp backend against a
 real GGUF file. Disabled unless `LLAMA_TEST_MODEL` points at a valid
 model:
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-q4_k_m.gguf rebar3 ct \
-    --suite=test/erllama_real_model_SUITE
+    --suite=test/barrel_inference_real_model_SUITE
 ```
 
 Without the env var the suite skips so default `rebar3 ct` runs stay

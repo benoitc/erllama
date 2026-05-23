@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# erllama bench driver.
+# barrel_inference bench driver.
 #
 # Usage:
 #   bench/run.sh                   # all available models
@@ -23,10 +23,10 @@ EBIN_PATHS=$(find _build/default/lib -maxdepth 2 -name ebin -type d | xargs -I {
 # Bench module lives in bench/ (not part of rebar3 src tree). Compile it
 # on the fly into _build so its deps resolve via the same paths.
 mkdir -p _build/bench/ebin
-erlc -o _build/bench/ebin -I include -pa _build/default/lib/erllama/ebin \
-    bench/erllama_bench.erl
+erlc -o _build/bench/ebin -I include -pa _build/default/lib/barrel_inference/ebin \
+    bench/barrel_inference_bench.erl
 
 # shellcheck disable=SC2086
 exec erl -noinput -boot start_clean \
     $EBIN_PATHS -pa _build/bench/ebin \
-    -s erllama_bench main "$MODE"
+    -s barrel_inference_bench main "$MODE"

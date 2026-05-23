@@ -102,7 +102,7 @@ The model fires cache saves at stable boundaries:
 | `evict` | When a holder must release a slab under pressure. |
 | `shutdown` | During unload or model process stop. |
 
-Async saves go through `erllama_cache_writer`. Synchronous saves block the
+Async saves go through `barrel_inference_cache_writer`. Synchronous saves block the
 caller because the backing resource is about to be released.
 
 Disk publication is handled by the reservation protocol described in
@@ -120,17 +120,17 @@ When a request finishes, the model reports final stats, including:
 
 One-shot requests release their sequence back to the idle pool. Sticky
 requests keep the sequence pinned until a later request diverges or the
-caller invokes `erllama:end_session/2`.
+caller invokes `barrel_inference:end_session/2`.
 
 ## Observability
 
 Routers can inspect model state without crossing the model `gen_statem`:
 
 ```erlang
-erllama:phase(ModelId).
-erllama:pending_len(ModelId).
-erllama:queue_depth(ModelId).
-erllama:last_cache_hit(ModelId).
+barrel_inference:phase(ModelId).
+barrel_inference:pending_len(ModelId).
+barrel_inference:queue_depth(ModelId).
+barrel_inference:last_cache_hit(ModelId).
 ```
 
 These read a public ETS row and are safe to call from a hot path.

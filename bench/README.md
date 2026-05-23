@@ -1,4 +1,4 @@
-# erllama bench
+# barrel_inference bench
 
 Two harnesses live here:
 
@@ -17,14 +17,14 @@ Two harnesses live here:
 bench/collect.sh /path/to/model.gguf
 
 # one-shot (clone, build, run):
-curl -fsSL https://raw.githubusercontent.com/erllama/erllama/main/bench/bootstrap.sh \
+curl -fsSL https://raw.githubusercontent.com/barrel-platform/barrel_inference/main/apps/barrel_inference/bench/bootstrap.sh \
   | bash -s -- /path/to/model.gguf
 ```
 
 Output lands in `bench/results/` with a deterministic name:
 
 ```
-<gpu-slug>__<model-basename>__erllama-<vsn>__<utc-ts>.json
+<gpu-slug>__<model-basename>__barrel_inference-<vsn>__<utc-ts>.json
 ```
 
 The script auto-detects the host (kernel, arch, CPU brand, RAM) and
@@ -44,8 +44,8 @@ Tunables (env vars on `collect.sh` or `bootstrap.sh`):
 | `BENCH_LONG_TOKENS` | `500` | Long-prompt target length |
 | `BENCH_RESPONSE_TOKENS` | `32` | Tokens to generate per workload |
 | `SKIP_SHA256=1` | unset | Skip GGUF sha256 (faster, less model identity info) |
-| `ERLLAMA_REF` | `main` | (bootstrap only) git ref to check out |
-| `ERLLAMA_DIR` | `~/.erllama-bench/erllama` | (bootstrap only) clone target |
+| `BARREL_INFERENCE_REF` | `main` | (bootstrap only) git ref to check out |
+| `BARREL_INFERENCE_DIR` | `~/.barrel_inference-bench/barrel_inference` | (bootstrap only) clone target |
 
 The collect harness runs four workloads:
 
@@ -57,7 +57,7 @@ The collect harness runs four workloads:
    via `continue/3`. Captures per-turn Stats including the new
    `cache_hit_kind => continuation`.
 
-The cache is cleared with `erllama_cache_meta_srv:gc/0` between
+The cache is cleared with `barrel_inference_cache_meta_srv:gc/0` between
 unrelated workloads so cross-prompt prefix overlap doesn't accidentally
 warm a "cold" number. The `cold_long` → `warm_long` pair deliberately
 shares state.

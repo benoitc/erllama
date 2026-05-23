@@ -14,8 +14,8 @@
  * (PCLMULQDQ on x86-64, CRC extension on ARM64) is a future
  * optimisation if profiling shows this becomes a bottleneck.
  */
-#ifndef ERLLAMA_CRC32C_H
-#define ERLLAMA_CRC32C_H
+#ifndef BARREL_INFERENCE_CRC32C_H
+#define BARREL_INFERENCE_CRC32C_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -25,7 +25,7 @@
  * success, or the platform error code if the once-control could not
  * be initialised (extremely rare; only happens for an invalid
  * once-control or out-of-resources). */
-int erllama_crc32c_init(void);
+int barrel_inference_crc32c_init(void);
 
 /* Update an existing CRC32C state with `len` bytes of `data`.
  *
@@ -34,6 +34,6 @@ int erllama_crc32c_init(void);
  * exit so that a single call computes the full digest. To run an
  * incremental computation, pass the previous return value as `crc`.
  */
-uint32_t erllama_crc32c_update(uint32_t crc, const uint8_t *data, size_t len);
+uint32_t barrel_inference_crc32c_update(uint32_t crc, const uint8_t *data, size_t len);
 
 #endif

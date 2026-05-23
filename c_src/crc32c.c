@@ -20,7 +20,7 @@ static void crc32c_table_build(void) {
     }
 }
 
-int erllama_crc32c_init(void) {
+int barrel_inference_crc32c_init(void) {
     /* pthread_once guarantees crc32c_table_build runs exactly once
      * across concurrent callers; subsequent calls are a single
      * relaxed atomic load on the once-control. The return is
@@ -29,7 +29,7 @@ int erllama_crc32c_init(void) {
     return pthread_once(&crc32c_table_once, crc32c_table_build);
 }
 
-uint32_t erllama_crc32c_update(uint32_t crc, const uint8_t *data, size_t len) {
+uint32_t barrel_inference_crc32c_update(uint32_t crc, const uint8_t *data, size_t len) {
     uint32_t c = ~crc;
     for (size_t i = 0; i < len; i++) {
         c = crc32c_table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);

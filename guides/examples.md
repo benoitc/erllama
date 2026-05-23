@@ -1,8 +1,8 @@
 # Examples
 
-Drop-in patterns for common erllama workflows. Each block is a
+Drop-in patterns for common Barrel Inference workflows. Each block is a
 self-contained snippet that runs from `rebar3 shell` after
-`{ok, _} = application:ensure_all_started(erllama)` (the boot is
+`{ok, _} = application:ensure_all_started(barrel_inference)` (the boot is
 omitted from the snippets; assume it's there).
 
 ## 10-second smoke test (no model required)
@@ -10,20 +10,20 @@ omitted from the snippets; assume it's there).
 The cache subsystem is independently usable. From `rebar3 shell`:
 
 ```erlang
-1> {ok, _} = application:ensure_all_started(erllama).
+1> {ok, _} = application:ensure_all_started(barrel_inference).
 2> ok = filelib:ensure_path("/tmp/edemo").
-3> {ok, _} = erllama_cache_disk_srv:start_link(d, "/tmp/edemo").
+3> {ok, _} = barrel_inference_cache_disk_srv:start_link(d, "/tmp/edemo").
 4> Meta = #{save_reason => cold, quant_bits => 16,
            fingerprint => binary:copy(<<170>>, 32),
            fingerprint_mode => safe, quant_type => f16,
            ctx_params_hash => binary:copy(<<187>>, 32),
            tokens => [1,2,3], context_size => 4096,
            prompt_text => <<>>, hostname => <<"d">>,
-           erllama_version => <<"0.1.0">>}.
+           barrel_inference_version => <<"0.1.0">>}.
 5> {ok, K, _Header, Size} =
-       erllama_cache_disk_srv:save(d, Meta, <<"hi">>).
-6> {ok, _Info, <<"hi">>} = erllama_cache_disk_srv:load(d, K).
-7> erllama_cache:get_counters().
+       barrel_inference_cache_disk_srv:save(d, Meta, <<"hi">>).
+6> {ok, _Info, <<"hi">>} = barrel_inference_cache_disk_srv:load(d, K).
+7> barrel_inference_cache:get_counters().
 ```
 
 Verified end-to-end: a published .kvc file, the meta-server
@@ -34,12 +34,12 @@ exact hit. **No model loaded — `llama_backend_init` doesn't run.**
 ## 1. Load a model and run a one-shot completion
 
 ```erlang
-{ok, _} = erllama_cache_disk_srv:start_link(my_disk, "/var/lib/erllama/kvc"),
+{ok, _} = barrel_inference_cache_disk_srv:start_link(my_disk, "/var/lib/barrel_inference/kvc"),
 {ok, Bin} = file:read_file("/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf"),
 Fp = crypto:hash(sha256, Bin),
 
-{ok, M} = erllama:load_model(#{
-    backend          => erllama_model_llama,
+{ok, M} = barrel_inference:load_model(#{
+    backend          => barrel_inference_model_llama,
     model_path       => "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf",
     fingerprint      => Fp,
     fingerprint_mode => safe,
@@ -52,10 +52,10 @@ Fp = crypto:hash(sha256, Bin),
 }),
 
 {ok, #{reply := Reply}} =
-    erllama:complete(M, <<"Once upon a time, in a quiet village">>),
+    barrel_inference:complete(M, <<"Once upon a time, in a quiet village">>),
 
 io:format("~s~n", [Reply]),
-ok = erllama:unload(M).
+ok = barrel_inference:unload(M).
 ```
 
 First call cold-prefills the prompt and async-saves cold + finish
@@ -69,11 +69,11 @@ rows. Repeating the same call hits the cache via the exact-key path.
 %% longest published prefix automatically — no parent_key needed.
 handle_chat(ModelId, Prompt) ->
     {ok, #{reply := Reply}} =
-        erllama:complete(ModelId, Prompt, #{response_tokens => 256}),
+        barrel_inference:complete(ModelId, Prompt, #{response_tokens => 256}),
     {200, [{"Content-Type", "text/plain"}], Reply}.
 ```
 
-Hits show up as `hits_longest_prefix` in `erllama_cache:get_counters/0`.
+Hits show up as `hits_longest_prefix` in `barrel_inference_cache:get_counters/0`.
 
 ## 3. Multi-turn Erlang-native session (tracks parent_key)
 
@@ -84,11 +84,11 @@ returns the `finish_key` for the full context — pass it as
 ```erlang
 chat(Model, Prompt, undefined) ->
     {ok, #{reply := Reply, finish_key := K}} =
-        erllama:complete(Model, Prompt, #{}),
+        barrel_inference:complete(Model, Prompt, #{}),
     {Reply, K};
 chat(Model, Prompt, ParentKey) ->
     {ok, #{reply := Reply, finish_key := K}} =
-        erllama:complete(Model, Prompt, #{parent_key => ParentKey}),
+        barrel_inference:complete(Model, Prompt, #{parent_key => ParentKey}),
     {Reply, K}.
 
 %% Driver.
@@ -111,17 +111,17 @@ that short.
 Model ids are `binary()` (the registered name).
 
 ```erlang
-{ok, _} = erllama:load_model(<<"tiny">>, TinyConfig),
-{ok, _} = erllama:load_model(<<"big">>,  BigConfig),
+{ok, _} = barrel_inference:load_model(<<"tiny">>, TinyConfig),
+{ok, _} = barrel_inference:load_model(<<"big">>,  BigConfig),
 
-{ok, #{reply := R1}} = erllama:complete(<<"tiny">>, <<"summarise: ...">>),
-{ok, #{reply := R2}} = erllama:complete(<<"big">>,  <<"deep analysis of: ...">>),
+{ok, #{reply := R1}} = barrel_inference:complete(<<"tiny">>, <<"summarise: ...">>),
+{ok, #{reply := R2}} = barrel_inference:complete(<<"big">>,  <<"deep analysis of: ...">>),
 
-ok = erllama:unload(<<"tiny">>),
-ok = erllama:unload(<<"big">>).
+ok = barrel_inference:unload(<<"tiny">>),
+ok = barrel_inference:unload(<<"big">>).
 ```
 
-Both share one `erllama_cache` instance. Cache rows are scoped by
+Both share one `barrel_inference_cache` instance. Cache rows are scoped by
 fingerprint, so the two models never collide.
 
 ## 5. Concurrent agents on a shared system prompt
@@ -139,7 +139,7 @@ Workers = [
     spawn(fun() ->
         Q = list_to_binary(io_lib:format("Worker ~p question.", [N])),
         Prompt = <<SharedPrefix/binary, Q/binary>>,
-        {ok, #{reply := Reply}} = erllama:complete(ModelId, Prompt),
+        {ok, #{reply := Reply}} = barrel_inference:complete(ModelId, Prompt),
         Parent ! {N, Reply}
     end) || N <- lists:seq(1, 8)
 ],
@@ -152,29 +152,29 @@ Replies.
 ## 6. Streaming tokens (`infer/4`) with cancellation
 
 ```erlang
-{ok, Tokens} = erllama:tokenize(ModelId, <<"Once upon a time">>),
-{ok, Ref} = erllama:infer(ModelId, Tokens,
+{ok, Tokens} = barrel_inference:tokenize(ModelId, <<"Once upon a time">>),
+{ok, Ref} = barrel_inference:infer(ModelId, Tokens,
                            #{response_tokens => 200}, self()),
 
 loop(Ref) ->
     receive
-        {erllama_token, Ref, Fragment} ->
+        {barrel_inference_token, Ref, Fragment} ->
             io:put_chars(Fragment),
             loop(Ref);
-        {erllama_done, Ref, _Stats} ->
+        {barrel_inference_done, Ref, _Stats} ->
             io:nl(),
             ok;
-        {erllama_error, Ref, Reason} ->
+        {barrel_inference_error, Ref, Reason} ->
             {error, Reason}
     after 30000 ->
-        erllama:cancel(Ref),
+        barrel_inference:cancel(Ref),
         %% Still drain the final done message after cancel.
         loop(Ref)
     end.
 ```
 
 `cancel/1` is observed at the next inter-token boundary; the model
-always emits a final `{erllama_done, Ref, Stats}` with
+always emits a final `{barrel_inference_done, Ref, Stats}` with
 `#{cancelled => true}`.
 
 ## 7. Chat template + embeddings
@@ -182,21 +182,21 @@ always emits a final `{erllama_done, Ref, Stats}` with
 ```erlang
 %% Render a chat request through the model's built-in GGUF template
 %% and tokenise it in one shot. Backed by llama_chat_apply_template.
-{ok, ChatTokens} = erllama:apply_chat_template(ModelId, #{
+{ok, ChatTokens} = barrel_inference:apply_chat_template(ModelId, #{
     messages => [
         #{role => system,    content => <<"You are concise.">>},
         #{role => user,      content => <<"What's 2+2?">>}
     ]
 }),
-{ok, Ref} = erllama:infer(ModelId, ChatTokens, #{response_tokens => 8}, self()).
+{ok, Ref} = barrel_inference:infer(ModelId, ChatTokens, #{response_tokens => 8}, self()).
 ```
 
 ```erlang
 %% Pooled sentence embedding via llama_get_embeddings_seq.
 %% The model must have been loaded with embedding-friendly settings
 %% (see guides/loading.md). Returns a list of floats.
-{ok, Toks}      = erllama:tokenize(ModelId, <<"The quick brown fox.">>),
-{ok, Embedding} = erllama:embed(ModelId, Toks).
+{ok, Toks}      = barrel_inference:tokenize(ModelId, <<"The quick brown fox.">>),
+{ok, Embedding} = barrel_inference:embed(ModelId, Toks).
 ```
 
 ## 8. Grammar-constrained sampling (GBNF)
@@ -208,8 +208,8 @@ Grammar = <<
     "digit ::= [0-9]\n"
     "ws    ::= [ \\t\\n]*"
 >>,
-{ok, Toks} = erllama:tokenize(ModelId, <<"Reply with JSON:">>),
-{ok, Ref}  = erllama:infer(ModelId, Toks,
+{ok, Toks} = barrel_inference:tokenize(ModelId, <<"Reply with JSON:">>),
+{ok, Ref}  = barrel_inference:infer(ModelId, Toks,
                            #{response_tokens => 32, grammar => Grammar},
                            self()).
 ```
@@ -228,7 +228,7 @@ streaming `Stats`.
 
 ```erlang
 {ok, #{reply := Reply, finish_reason := FinishReason} = Result} =
-    erllama:complete(ModelId, <<"Write a short list, then say END.">>,
+    barrel_inference:complete(ModelId, <<"Write a short list, then say END.">>,
                      #{response_tokens => 64,
                        stop_sequences => [<<"END">>, <<"\n\nUser:">>]}),
 case maps:find(stop_sequence, Result) of
@@ -245,20 +245,20 @@ end.
 ```
 
 Streaming works the same way: the matched string never appears in
-any `{erllama_token, _, _}` chunk, and the final
-`{erllama_done, _, Stats}` carries the matched value:
+any `{barrel_inference_token, _, _}` chunk, and the final
+`{barrel_inference_done, _, Stats}` carries the matched value:
 
 ```erlang
-{ok, Tokens} = erllama:tokenize(ModelId, Prompt),
-{ok, Ref} = erllama:infer(ModelId, Tokens,
+{ok, Tokens} = barrel_inference:tokenize(ModelId, Prompt),
+{ok, Ref} = barrel_inference:infer(ModelId, Tokens,
                           #{response_tokens => 200,
                             stop_sequences => [<<"\n\nUser:">>]},
                           self()),
 
 receive
-    {erllama_done, Ref, #{stop_sequence := <<"\n\nUser:">>}} ->
+    {barrel_inference_done, Ref, #{stop_sequence := <<"\n\nUser:">>}} ->
         stopped_at_user_turn;
-    {erllama_done, Ref, _Stats} ->
+    {barrel_inference_done, Ref, _Stats} ->
         finished_without_match
 end.
 ```
@@ -272,7 +272,7 @@ on terminal end when no match fired.
 
 Some LLMs emit a "thinking" phase before their actual answer —
 typically text wrapped in template-defined markers like
-`<think>...</think>`. erllama surfaces those thoughts as a
+`<think>...</think>`. Barrel Inference surfaces those thoughts as a
 separate stream so Anthropic-Messages SDKs can render and verify
 them.
 
@@ -285,8 +285,8 @@ strings are tokenised through the model's own vocabulary at load
 time.
 
 ```erlang
-erllama:load_model(<<"qwen3-thinking">>, #{
-    backend => erllama_model_llama,
+barrel_inference:load_model(<<"qwen3-thinking">>, #{
+    backend => barrel_inference_model_llama,
     model_path => "/models/qwen3-7b.gguf",
     context_size => 8192,
     policy => default_policy(),
@@ -306,12 +306,12 @@ For tamper-proof signatures on each thinking block, set a
 node-wide HMAC key once at boot:
 
 ```erlang
-{erllama, [
+{barrel_inference, [
     {thinking_signing_key, <<"a-32-byte-secret-or-longer">>}
 ]}.
 ```
 
-`erllama_model_llama:thinking_signature/3` HMACs the observed
+`barrel_inference_model_llama:thinking_signature/3` HMACs the observed
 thinking text with this key. Leaving it unset returns `<<>>`, the
 documented "no signature" path — the downstream forwards no
 `signature_delta` event.
@@ -319,21 +319,21 @@ documented "no signature" path — the downstream forwards no
 ### Per-request usage
 
 ```erlang
-{ok, Tokens} = erllama:tokenize(<<"qwen3-thinking">>, <<"Solve: 23 * 17.">>),
-{ok, Ref} = erllama:infer(<<"qwen3-thinking">>, Tokens,
+{ok, Tokens} = barrel_inference:tokenize(<<"qwen3-thinking">>, <<"Solve: 23 * 17.">>),
+{ok, Ref} = barrel_inference:infer(<<"qwen3-thinking">>, Tokens,
                           #{response_tokens => 256,
                             thinking => enabled},
                           self()),
 
 loop(Ref, _Thinking = <<>>, _Answer = <<>>, _Sig = <<>>) ->
     receive
-        {erllama_token, Ref, {thinking_delta, Bin}} ->
+        {barrel_inference_token, Ref, {thinking_delta, Bin}} ->
             loop(Ref, <<Thinking/binary, Bin/binary>>, Answer, Sig);
-        {erllama_thinking_end, Ref, NewSig} ->
+        {barrel_inference_thinking_end, Ref, NewSig} ->
             loop(Ref, Thinking, Answer, NewSig);
-        {erllama_token, Ref, Bin} when is_binary(Bin) ->
+        {barrel_inference_token, Ref, Bin} when is_binary(Bin) ->
             loop(Ref, Thinking, <<Answer/binary, Bin/binary>>, Sig);
-        {erllama_done, Ref, _Stats} ->
+        {barrel_inference_done, Ref, _Stats} ->
             #{thinking => Thinking, answer => Answer, signature => Sig}
     end.
 ```
@@ -341,15 +341,15 @@ loop(Ref, _Thinking = <<>>, _Answer = <<>>, _Sig = <<>>) ->
 ### Capping the thinking phase (`thinking_budget_tokens`)
 
 Anthropic's API takes a `thinking.budget_tokens` hint that caps
-the thinking phase. erllama honours it as the maximum number of
+the thinking phase. Barrel Inference honours it as the maximum number of
 `{thinking_delta, _}` payloads to deliver. Once the budget is
-reached, the scheduler synthesises the `erllama_thinking_end`
+reached, the scheduler synthesises the `barrel_inference_thinking_end`
 close immediately and routes any further model-emitted thinking
 tokens through the normal post-thinking pipeline so generation
 still progresses.
 
 ```erlang
-{ok, Ref} = erllama:infer(<<"qwen3-thinking">>, Tokens,
+{ok, Ref} = barrel_inference:infer(<<"qwen3-thinking">>, Tokens,
                           #{response_tokens => 256,
                             thinking => enabled,
                             thinking_budget_tokens => 64},
@@ -369,8 +369,8 @@ under a tool id, and splice them back verbatim on the next turn.
 Declare the markers per model:
 
 ```erlang
-erllama:load_model(<<"qwen3-tool">>, #{
-    backend => erllama_model_llama,
+barrel_inference:load_model(<<"qwen3-tool">>, #{
+    backend => barrel_inference_model_llama,
     model_path => "/models/qwen3-7b.gguf",
     tool_call_markers => #{
         start => <<"<tool_call>">>,
@@ -382,8 +382,8 @@ erllama:load_model(<<"qwen3-tool">>, #{
 A streaming `infer/4` against this model receives:
 
 ```erlang
-{erllama_token, Ref, {tool_call_delta, Bin}}    %% one per chunk of the call body
-{erllama_tool_call_end, Ref, FullBin :: binary()} %% concatenated bytes of every delta
+{barrel_inference_token, Ref, {tool_call_delta, Bin}}    %% one per chunk of the call body
+{barrel_inference_tool_call_end, Ref, FullBin :: binary()} %% concatenated bytes of every delta
 ```
 
 `FullBin` is what to persist under a minted tool id — no need to
@@ -402,7 +402,7 @@ tool_call_markers => #{
 }
 ```
 
-With payload markers set, erllama swaps to a greedy
+With payload markers set, Barrel Inference swaps to a greedy
 (`temperature=0`) sampler for tool-call syntax tokens so the
 syntax stays byte-deterministic, then back to the request's normal
 sampler for payload bytes so long string arguments stay diverse.
@@ -419,7 +419,7 @@ or for holding a warm session across long pauses without consuming
 generation budget.
 
 ```erlang
-{ok, SysToks} = erllama:apply_chat_template(ModelId, #{
+{ok, SysToks} = barrel_inference:apply_chat_template(ModelId, #{
     messages => [
         #{role => system, content => SystemPrompt},
         #{role => user,   content => FirstUserTurn}
@@ -428,12 +428,12 @@ generation budget.
 {ok, #{finish_key := FK,
        committed_tokens := N,
        cache_hit_kind := cold}} =
-    erllama:prefill_only(ModelId, SysToks),
+    barrel_inference:prefill_only(ModelId, SysToks),
 
 %% Later turn: pass FK as parent_key so the next complete/3 skips
 %% the longest-prefix walk and resumes from the warm row.
 {ok, #{reply := R}} =
-    erllama:complete(ModelId, NextUserTurn, #{parent_key => FK}).
+    barrel_inference:complete(ModelId, NextUserTurn, #{parent_key => FK}).
 ```
 
 `finish_key` is `undefined` if the prompt was shorter than
@@ -445,14 +445,14 @@ than relying on the implicit longest-prefix walk:
 
 ```erlang
 %% Materialise turn-1 bytes into cache.
-{ok, #{finish_key := K1}} = erllama:prefill_only(ModelId, Turn1Tokens),
+{ok, #{finish_key := K1}} = barrel_inference:prefill_only(ModelId, Turn1Tokens),
 
 %% Extend the same prefix with turn 2's tokens; only the suffix
 %% runs through prefill, returning K2 for the longer prompt.
 {ok, #{finish_key := K2,
        cache_hit_kind := partial,
        cache_delta := #{read := R, created := C}}} =
-    erllama:prefill_only(ModelId,
+    barrel_inference:prefill_only(ModelId,
                          Turn1Tokens ++ Turn2Tokens,
                          #{parent_key => K1}).
 ```
@@ -471,7 +471,7 @@ SessionId = ConvId,  %% your auth layer's conversation identifier
 %% Turn 1: cold or partial via longest-prefix; on finish the
 %% seq_id stays pinned to SessionId.
 {ok, #{generated := Gen1}} =
-    erllama:complete(ModelId, Turn1Prompt,
+    barrel_inference:complete(ModelId, Turn1Prompt,
                      #{session_id => SessionId,
                        response_tokens => 32}),
 
@@ -479,13 +479,13 @@ SessionId = ConvId,  %% your auth layer's conversation identifier
 %% generated). cache_hit_kind comes back as `sticky`: no disk
 %% read, just suffix prefill on the live cells.
 {ok, #{cache_hit_kind := sticky}} =
-    erllama:complete(ModelId, Turn2Prompt,
+    barrel_inference:complete(ModelId, Turn2Prompt,
                      #{session_id => SessionId,
                        response_tokens => 32}),
 
 %% End the conversation explicitly when the user logs out / TTL
 %% expires. Idempotent; unknown ids are a no-op.
-ok = erllama:end_session(ModelId, SessionId).
+ok = barrel_inference:end_session(ModelId, SessionId).
 ```
 
 Constraints:
@@ -524,10 +524,10 @@ SessionId = ConvId,
 
 %% Turn 1: render the full conversation as today, infer/4 pins the
 %% session on finish.
-{ok, Turn1Tokens} = erllama:apply_chat_template(ModelId, #{
+{ok, Turn1Tokens} = barrel_inference:apply_chat_template(ModelId, #{
     messages => [#{role => <<"user">>, content => Q1}]
 }),
-{ok, Ref1} = erllama:infer(ModelId, Turn1Tokens,
+{ok, Ref1} = barrel_inference:infer(ModelId, Turn1Tokens,
                            #{session_id => SessionId,
                              response_tokens => 64},
                            self()),
@@ -541,7 +541,7 @@ PriorTokenCount = maps:get(prompt_tokens, Stats1)
 %% tokens the engine already has and pass only the new tail to
 %% continue/3. No need for the slice to match what the model
 %% actually decoded — continue/3 trusts the caller.
-{ok, Turn2Tokens} = erllama:apply_chat_template(ModelId, #{
+{ok, Turn2Tokens} = barrel_inference:apply_chat_template(ModelId, #{
     messages => [
         #{role => <<"user">>, content => Q1},
         #{role => <<"assistant">>, content => Reply1},
@@ -549,7 +549,7 @@ PriorTokenCount = maps:get(prompt_tokens, Stats1)
     ]
 }),
 Suffix = lists:nthtail(PriorTokenCount, Turn2Tokens),
-{ok, Ref2} = erllama:continue(ModelId, Suffix,
+{ok, Ref2} = barrel_inference:continue(ModelId, Suffix,
                               #{session_id => SessionId,
                                 caller_pid => self(),
                                 response_tokens => 64}),
@@ -558,7 +558,7 @@ Suffix = lists:nthtail(PriorTokenCount, Turn2Tokens),
 %% Stats2.cache_delta.read = PriorTokenCount
 %% Stats2.cache_delta.created = length(Suffix) + completion_tokens
 
-ok = erllama:end_session(ModelId, SessionId).
+ok = barrel_inference:end_session(ModelId, SessionId).
 ```
 
 During caller development it is worth running the slicing path in
@@ -588,13 +588,13 @@ contract.
 `continue/3` trusts the tail, so a caller whose view of the session
 drifted will silently produce garbage. To catch that, reconstruct
 the prior turn's exact committed tokens from `Stats.generated` (the
-`erllama_done` Stats now carry the exact generated token ids) and
+`barrel_inference_done` Stats now carry the exact generated token ids) and
 pass them as `expect_committed`. The engine checks they equal the
 session's stored context before prefilling:
 
 ```erlang
 PriorCommitted = Turn1Prompt ++ maps:get(generated, Stats1),
-{ok, Ref2} = erllama:continue(ModelId, Suffix,
+{ok, Ref2} = barrel_inference:continue(ModelId, Suffix,
                               #{session_id => SessionId,
                                 caller_pid => self(),
                                 response_tokens => 64,
@@ -614,7 +614,7 @@ and up to N requests prefill and decode concurrently through one
 `llama_decode` per tick.
 
 ```erlang
-{ok, _} = erllama:load_model(<<"chat">>, Config#{
+{ok, _} = barrel_inference:load_model(<<"chat">>, Config#{
     context_opts => #{n_ctx => 8192, n_batch => 4096, n_seq_max => 4}
 }),
 
@@ -622,7 +622,7 @@ Parent = self(),
 Workers = [
     spawn(fun() ->
         Q = list_to_binary(io_lib:format("Worker ~p question.", [N])),
-        {ok, #{reply := R}} = erllama:complete(<<"chat">>, Q),
+        {ok, #{reply := R}} = barrel_inference:complete(<<"chat">>, Q),
         Parent ! {N, R}
     end) || N <- lists:seq(1, 4)
 ],
@@ -633,7 +633,7 @@ Per-request samplers are isolated: each worker can pass its own
 `temperature`, `seed`, or `grammar` in the `Opts` map without
 spilling sampler state across the other in-flight requests.
 Admissions past `n_seq_max` queue FIFO in the model's `pending`
-list - observable via `erllama:pending_len/1`.
+list - observable via `barrel_inference:pending_len/1`.
 
 Long prompts are sliced by `prefill_chunk_size` (default
 `max(64, n_batch div 4)`) so a single heavy prompt cannot
@@ -647,15 +647,15 @@ should not serialise behind the work it is probing. These accessors
 read a public ETS row, never cross the model gen_statem:
 
 ```erlang
-1> erllama:phase(<<"chat">>).
+1> barrel_inference:phase(<<"chat">>).
 generating
-2> erllama:pending_len(<<"chat">>).
+2> barrel_inference:pending_len(<<"chat">>).
 3
-3> erllama:queue_depth(<<"chat">>).
+3> barrel_inference:queue_depth(<<"chat">>).
 1
-4> erllama:last_cache_hit(<<"chat">>).
+4> barrel_inference:last_cache_hit(<<"chat">>).
 #{kind => partial, prefix_len => 1024}
-5> erllama:queue_depth().
+5> barrel_inference:queue_depth().
 %% global: total admitted streaming infer/4 rows across all loaded models.
 4
 ```
@@ -678,7 +678,7 @@ populate Anthropic's `cache_read_input_tokens` and
 ```erlang
 {ok, #{cache_delta := #{read := R, created := C},
        cache_hit_kind := Hit}} =
-    erllama:complete(ModelId, Prompt, #{response_tokens => 64}),
+    barrel_inference:complete(ModelId, Prompt, #{response_tokens => 64}),
 io:format("hit=~p read=~p created=~p~n", [Hit, R, C]).
 ```
 
@@ -692,35 +692,35 @@ What each combination tells you:
 | any, save below `min_tokens` | warm prefix | `0` (no save fired) |
 
 Streaming consumers read the same map from the final
-`{erllama_done, Ref, Stats}` message; `prefill_only/2` exposes it
+`{barrel_inference_done, Ref, Stats}` message; `prefill_only/2` exposes it
 on its result map too.
 
 ## 18. Inspecting cache state
 
 ```erlang
 %% Hit/miss/save counters and per-path latency totals.
-Counters = erllama_cache:get_counters(),
+Counters = barrel_inference_cache:get_counters(),
 io:format("~p~n", [Counters]).
 
 %% Every row in the index. dump/0 returns raw ETS tuples; the layout
-%% is documented in include/erllama_cache.hrl:
+%% is documented in include/barrel_inference_cache.hrl:
 %%   {Key, Tier, Size, LastUsedNs, Refcount, Status, Header,
 %%    Location, TokensRef, Hits}
-Dump = erllama_cache_meta_srv:dump(),
+Dump = barrel_inference_cache_meta_srv:dump(),
 [io:format("tier=~p size=~p refs=~p~n", [Tier, Size, Refs])
  || {_Key, Tier, Size, _Lru, Refs, _Status, _Hdr, _Loc, _Tok, _Hits} <- Dump].
 
 %% Free at least 256 MiB, oldest LRU first, RAM tiers only.
-erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
+barrel_inference_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 
 %% Synchronous full eviction pass.
-erllama_cache:gc().
+barrel_inference_cache:gc().
 ```
 
 ## 19. Memory-pressure-driven eviction (in `sys.config`)
 
 ```erlang
-{erllama, [
+{barrel_inference, [
   {scheduler, #{
     enabled         => true,
     pressure_source => system,        %% memsup-backed, portable
@@ -733,7 +733,7 @@ erllama_cache:gc().
 ```
 
 Sources shipped: `noop`, `system`, `nvidia_smi`, `{module, M}`. Roll
-your own with `-behaviour(erllama_pressure)` and pass
+your own with `-behaviour(barrel_inference_pressure)` and pass
 `{module, M}` as the source.
 
 ## 20. Cache-only tests (no model required)
@@ -745,17 +745,17 @@ exercise save/load round-trips never touch llama.cpp:
 %% test/my_cache_test.erl
 -module(my_cache_test).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("erllama/include/erllama_cache.hrl").
+-include_lib("barrel_inference/include/barrel_inference_cache.hrl").
 
 with_disk(Body) ->
-    {ok, _} = erllama_cache_meta_srv:start_link(),
-    {ok, _} = erllama_cache_ram:start_link(),
+    {ok, _} = barrel_inference_cache_meta_srv:start_link(),
+    {ok, _} = barrel_inference_cache_ram:start_link(),
     {ok, Dir} = file:make_dir("/tmp/my_cache_test"), %% ensure exists
-    {ok, _} = erllama_cache_disk_srv:start_link(t, "/tmp/my_cache_test"),
+    {ok, _} = barrel_inference_cache_disk_srv:start_link(t, "/tmp/my_cache_test"),
     try Body() after
         catch gen_server:stop(t),
-        catch gen_server:stop(erllama_cache_ram),
-        catch gen_server:stop(erllama_cache_meta_srv)
+        catch gen_server:stop(barrel_inference_cache_ram),
+        catch gen_server:stop(barrel_inference_cache_meta_srv)
     end.
 
 round_trip_test() ->
@@ -770,9 +770,9 @@ round_trip_test() ->
             tokens => [1, 2, 3],
             context_size => 4096
         },
-        {ok, Key, _, _} = erllama_cache_disk_srv:save(t, Meta, <<"data">>),
+        {ok, Key, _, _} = barrel_inference_cache_disk_srv:save(t, Meta, <<"data">>),
         ?assertMatch({ok, _Info, <<"data">>},
-                     erllama_cache_disk_srv:load(t, Key))
+                     barrel_inference_cache_disk_srv:load(t, Key))
     end).
 ```
 
@@ -783,7 +783,7 @@ The lazy `llama_backend_init` means cache-only tests never trigger
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
-    rebar3 ct --suite=test/erllama_real_model_SUITE
+    rebar3 ct --suite=test/barrel_inference_real_model_SUITE
 ```
 
 The 6-case suite covers cold prefill, warm restore, multi-turn
@@ -804,7 +804,7 @@ shared-prefix scenario; see `bench/README.md`.
 ## See also
 
 - [Loading a model](loading.md) — every option to
-  `erllama:load_model/1,2`, with examples and pitfalls.
+  `barrel_inference:load_model/1,2`, with examples and pitfalls.
 - [Caching](caching.md) — tiers, save reasons, lookup paths,
   watermarks.
 - [Tool calls](tool-calls.md) — marker configuration, deterministic

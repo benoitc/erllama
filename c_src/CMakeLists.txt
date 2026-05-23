@@ -2,7 +2,7 @@
 # See the LICENSE file at the project root.
 
 cmake_minimum_required(VERSION 3.20)
-project(erllama_nif C CXX)
+project(barrel_inference_nif C CXX)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake")
 
@@ -15,21 +15,21 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # -----------------------------------------------------------------------------
 # Sanitizer options (developer / CI only).
 #
-# Applied to the erllama_nif target only; the vendored llama.cpp tree
+# Applied to the barrel_inference_nif target only; the vendored llama.cpp tree
 # is not instrumented because UBSan in particular fires on third-party
 # code we don't own. ASan and TSan are mutually exclusive.
 # -----------------------------------------------------------------------------
-option(ENABLE_ASAN  "Enable AddressSanitizer on erllama_nif"          OFF)
-option(ENABLE_TSAN  "Enable ThreadSanitizer on erllama_nif"           OFF)
-option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer on erllama_nif" OFF)
+option(ENABLE_ASAN  "Enable AddressSanitizer on barrel_inference_nif"          OFF)
+option(ENABLE_TSAN  "Enable ThreadSanitizer on barrel_inference_nif"           OFF)
+option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer on barrel_inference_nif" OFF)
 
 if(ENABLE_ASAN AND ENABLE_TSAN)
     message(FATAL_ERROR "ASan and TSan cannot be used together")
 endif()
 
-# Static analysis (developer / CI only). Scoped to the erllama_nif
+# Static analysis (developer / CI only). Scoped to the barrel_inference_nif
 # target so the vendored llama.cpp tree is not analyzed.
-option(ENABLE_CLANG_TIDY "Run clang-tidy on erllama_nif sources" OFF)
+option(ENABLE_CLANG_TIDY "Run clang-tidy on barrel_inference_nif sources" OFF)
 
 # -----------------------------------------------------------------------------
 # llama.cpp configuration
@@ -104,80 +104,80 @@ else()
 endif()
 
 # -----------------------------------------------------------------------------
-# erllama_nif shared library
+# barrel_inference_nif shared library
 # -----------------------------------------------------------------------------
-add_library(erllama_nif SHARED
-    erllama_nif.c
-    erllama_safe.cpp
+add_library(barrel_inference_nif SHARED
+    barrel_inference_nif.c
+    barrel_inference_safe.cpp
     crc32c.c
 )
 
-target_compile_options(erllama_nif PRIVATE
+target_compile_options(barrel_inference_nif PRIVATE
     -O2 -g -Wall -Wextra -Wpedantic -fPIC
 )
 
 if(ENABLE_ASAN)
-    message(STATUS "AddressSanitizer enabled on erllama_nif")
-    target_compile_options(erllama_nif PRIVATE
+    message(STATUS "AddressSanitizer enabled on barrel_inference_nif")
+    target_compile_options(barrel_inference_nif PRIVATE
         -fsanitize=address -fno-omit-frame-pointer -g -O1
     )
-    target_link_options(erllama_nif PRIVATE -fsanitize=address)
+    target_link_options(barrel_inference_nif PRIVATE -fsanitize=address)
 endif()
 
 if(ENABLE_TSAN)
-    message(STATUS "ThreadSanitizer enabled on erllama_nif")
-    target_compile_options(erllama_nif PRIVATE
+    message(STATUS "ThreadSanitizer enabled on barrel_inference_nif")
+    target_compile_options(barrel_inference_nif PRIVATE
         -fsanitize=thread -fno-omit-frame-pointer -g -O1
     )
-    target_link_options(erllama_nif PRIVATE -fsanitize=thread)
+    target_link_options(barrel_inference_nif PRIVATE -fsanitize=thread)
 endif()
 
 if(ENABLE_UBSAN)
-    message(STATUS "UndefinedBehaviorSanitizer enabled on erllama_nif")
-    target_compile_options(erllama_nif PRIVATE
+    message(STATUS "UndefinedBehaviorSanitizer enabled on barrel_inference_nif")
+    target_compile_options(barrel_inference_nif PRIVATE
         -fsanitize=undefined -fno-omit-frame-pointer -g -O1
     )
-    target_link_options(erllama_nif PRIVATE -fsanitize=undefined)
+    target_link_options(barrel_inference_nif PRIVATE -fsanitize=undefined)
 endif()
 
 if(ENABLE_CLANG_TIDY)
     find_program(CLANG_TIDY_EXE NAMES clang-tidy REQUIRED)
-    message(STATUS "clang-tidy enabled on erllama_nif: ${CLANG_TIDY_EXE}")
-    set_target_properties(erllama_nif PROPERTIES
+    message(STATUS "clang-tidy enabled on barrel_inference_nif: ${CLANG_TIDY_EXE}")
+    set_target_properties(barrel_inference_nif PROPERTIES
         C_CLANG_TIDY   "${CLANG_TIDY_EXE};--quiet"
         CXX_CLANG_TIDY "${CLANG_TIDY_EXE};--quiet"
     )
 endif()
 
-target_include_directories(erllama_nif PRIVATE
+target_include_directories(barrel_inference_nif PRIVATE
     ${ERTS_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/include
     ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/ggml/include
 )
 
-# pthread is used by erllama_nif.c for per-resource mutexes; depend
+# pthread is used by barrel_inference_nif.c for per-resource mutexes; depend
 # on the standard CMake Threads find module so toolchains that need
 # -pthread (e.g. some Linux distros) get it added.
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-target_link_libraries(erllama_nif PRIVATE
+target_link_libraries(barrel_inference_nif PRIVATE
     llama
     ggml
     Threads::Threads
 )
 
 # Erlang NIFs need this dance for symbol resolution.
-set_target_properties(erllama_nif PROPERTIES
+set_target_properties(barrel_inference_nif PROPERTIES
     PREFIX ""
     SUFFIX ".so"
-    OUTPUT_NAME "erllama_nif"
+    OUTPUT_NAME "barrel_inference_nif"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../priv"
 )
 
 if(APPLE)
-    target_link_options(erllama_nif PRIVATE
+    target_link_options(barrel_inference_nif PRIVATE
         -undefined dynamic_lookup
         -flat_namespace
     )

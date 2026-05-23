@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# One-shot bootstrap: clone erllama, build it, run the collect bench.
-# Designed for operators benchmarking erllama on hardware that
+# One-shot bootstrap: clone barrel_inference, build it, run the collect bench.
+# Designed for operators benchmarking barrel_inference on hardware that
 # doesn't already have a checkout. Safe to re-run; reuses the clone.
 #
 # Usage (either form works):
 #
-#   curl -fsSL https://raw.githubusercontent.com/erllama/erllama/main/bench/bootstrap.sh | bash -s -- /path/to/model.gguf
+#   curl -fsSL https://raw.githubusercontent.com/barrel-platform/barrel_inference/main/apps/barrel_inference/bench/bootstrap.sh | bash -s -- /path/to/model.gguf
 #
 #   bench/bootstrap.sh /path/to/model.gguf [out-json-path]
 #
 # Env knobs:
-#   ERLLAMA_REF        git ref to check out (default: main)
-#   ERLLAMA_DIR        clone target (default: $HOME/.erllama-bench/erllama)
+#   BARREL_INFERENCE_REF        git ref to check out (default: main)
+#   BARREL_INFERENCE_DIR        clone target (default: $HOME/.barrel_inference-bench/barrel_inference)
 #   N_GPU_LAYERS       passed through to collect.sh (default: 999)
 #   SKIP_SHA256=1      skip the GGUF sha256 (faster, less identity info)
 #
@@ -33,9 +33,9 @@ if [[ ! -f "$MODEL" ]]; then
     exit 2
 fi
 
-REF="${ERLLAMA_REF:-main}"
-DIR="${ERLLAMA_DIR:-$HOME/.erllama-bench/erllama}"
-REPO="${ERLLAMA_REPO:-https://github.com/erllama/erllama.git}"
+REF="${BARREL_INFERENCE_REF:-main}"
+DIR="${BARREL_INFERENCE_DIR:-$HOME/.barrel_inference-bench/barrel_inference}"
+REPO="${BARREL_INFERENCE_REPO:-https://github.com/barrel-platform/barrel_inference.git}"
 
 need() {
     command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 1; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# erllama bench, collect mode.
+# barrel_inference bench, collect mode.
 #
 # Runs a fixed set of workloads against one GGUF and writes a single
 # JSON file describing host, GPU, model, and per-workload Stats. The
@@ -9,7 +9,7 @@
 #   bench/collect.sh <model-gguf-path> [out-json-path]
 #
 # Defaults output to:
-#   bench/results/<gpu-slug>__<model-basename>__erllama-<vsn>__<utc-ts>.json
+#   bench/results/<gpu-slug>__<model-basename>__barrel_inference-<vsn>__<utc-ts>.json
 #
 # Tunables (env vars):
 #   N_GPU_LAYERS          how many model layers to offload to GPU (default 999)
@@ -120,7 +120,7 @@ fi
 GPU_SLUG="$(echo "$GPU_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g;s/^-//;s/-$//' | cut -c1-40)"
 [[ -z "$GPU_SLUG" ]] && GPU_SLUG="cpu"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-VSN="$(awk -F'"' '/vsn,/ {print $2; exit}' src/erllama.app.src 2>/dev/null || echo unknown)"
+VSN="$(awk -F'"' '/vsn,/ {print $2; exit}' src/barrel_inference.app.src 2>/dev/null || echo unknown)"
 GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null; then
     GIT_DIRTY="clean"
@@ -130,17 +130,17 @@ fi
 
 if [[ -z "$OUT" ]]; then
     mkdir -p bench/results
-    OUT="bench/results/${GPU_SLUG}__${MODEL_SLUG}__erllama-${VSN}__${TS}.json"
+    OUT="bench/results/${GPU_SLUG}__${MODEL_SLUG}__barrel_inference-${VSN}__${TS}.json"
 fi
 
 # ----- build + run ----------------------------------------------------------
 
-echo "building erllama..." >&2
+echo "building barrel_inference..." >&2
 rebar3 compile >/dev/null
 
 mkdir -p _build/bench/ebin
-erlc -o _build/bench/ebin -I include -pa _build/default/lib/erllama/ebin \
-    bench/erllama_bench_collect.erl
+erlc -o _build/bench/ebin -I include -pa _build/default/lib/barrel_inference/ebin \
+    bench/barrel_inference_bench_collect.erl
 
 EBIN_PATHS=$(find _build/default/lib -maxdepth 2 -name ebin -type d | xargs -I {} echo "-pa {}")
 
@@ -149,21 +149,21 @@ echo "gpu=$GPU_KIND name=\"$GPU_NAME\" memory_mb=$GPU_MEMORY_MB driver=\"$GPU_DR
 echo "model=$MODEL_BASENAME sha256=${MODEL_SHA256:-<skipped>}" >&2
 echo "writing to: $OUT" >&2
 
-ERLLAMA_BENCH_OS_KERNEL="$KERNEL" \
-ERLLAMA_BENCH_OS_RELEASE="$RELEASE" \
-ERLLAMA_BENCH_ARCH="$ARCH" \
-ERLLAMA_BENCH_CPU_BRAND="$CPU_BRAND" \
-ERLLAMA_BENCH_PHYSICAL_CORES="$PHYS_CORES" \
-ERLLAMA_BENCH_RAM_MB="$RAM_MB" \
-ERLLAMA_BENCH_GPU_KIND="$GPU_KIND" \
-ERLLAMA_BENCH_GPU_NAME="$GPU_NAME" \
-ERLLAMA_BENCH_GPU_MEMORY_MB="$GPU_MEMORY_MB" \
-ERLLAMA_BENCH_GPU_DRIVER="$GPU_DRIVER" \
-ERLLAMA_BENCH_MODEL_SHA256="$MODEL_SHA256" \
-ERLLAMA_BENCH_GIT_COMMIT="$GIT_COMMIT" \
-ERLLAMA_BENCH_GIT_DIRTY="$GIT_DIRTY" \
+BARREL_INFERENCE_BENCH_OS_KERNEL="$KERNEL" \
+BARREL_INFERENCE_BENCH_OS_RELEASE="$RELEASE" \
+BARREL_INFERENCE_BENCH_ARCH="$ARCH" \
+BARREL_INFERENCE_BENCH_CPU_BRAND="$CPU_BRAND" \
+BARREL_INFERENCE_BENCH_PHYSICAL_CORES="$PHYS_CORES" \
+BARREL_INFERENCE_BENCH_RAM_MB="$RAM_MB" \
+BARREL_INFERENCE_BENCH_GPU_KIND="$GPU_KIND" \
+BARREL_INFERENCE_BENCH_GPU_NAME="$GPU_NAME" \
+BARREL_INFERENCE_BENCH_GPU_MEMORY_MB="$GPU_MEMORY_MB" \
+BARREL_INFERENCE_BENCH_GPU_DRIVER="$GPU_DRIVER" \
+BARREL_INFERENCE_BENCH_MODEL_SHA256="$MODEL_SHA256" \
+BARREL_INFERENCE_BENCH_GIT_COMMIT="$GIT_COMMIT" \
+BARREL_INFERENCE_BENCH_GIT_DIRTY="$GIT_DIRTY" \
 HOSTNAME="$HOST" \
     erl -noinput -boot start_clean \
         $EBIN_PATHS -pa _build/bench/ebin \
-        -run erllama_bench_collect main "$MODEL" "$OUT" \
+        -run barrel_inference_bench_collect main "$MODEL" "$OUT" \
         -run init stop

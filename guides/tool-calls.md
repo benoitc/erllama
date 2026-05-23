@@ -6,21 +6,21 @@ templates all have the same practical problem: the HTTP layer needs to
 parse a tool call for the client, then put the exact same bytes back into
 the next prompt so the KV cache can still hit.
 
-erllama handles the model-facing half of that problem. It detects
+Barrel Inference handles the model-facing half of that problem. It detects
 configured tool-call boundaries, streams the exact bytes the model sampled,
 and can make the syntactic wrapper deterministic while leaving payload
 text free to sample normally.
 
 It does not mint tool ids, parse SDK JSON, or canonicalize tool arguments.
-Those belong in the server layer above erllama.
+Those belong in the server layer above Barrel Inference.
 
 ## Declaring markers
 
 Markers are per model because every chat template is different:
 
 ```erlang
-erllama:load_model(<<"qwen3-tool">>, #{
-    backend => erllama_model_llama,
+barrel_inference:load_model(<<"qwen3-tool">>, #{
+    backend => barrel_inference_model_llama,
     model_path => "/models/qwen3-7b.gguf",
     tool_call_markers => #{
         start => <<"<tool_call>">>,
@@ -41,8 +41,8 @@ tool-call messages and no sampler swap.
 A streaming `infer/4` against a tool-aware model receives:
 
 ```erlang
-{erllama_token, Ref, {tool_call_delta, Bin}}
-{erllama_tool_call_end, Ref, FullBin}
+{barrel_inference_token, Ref, {tool_call_delta, Bin}}
+{barrel_inference_tool_call_end, Ref, FullBin}
 ```
 
 `tool_call_delta` contains the bytes inside the tool-call span. At the end
@@ -56,7 +56,7 @@ prefix.
 
 ## Deterministic syntax
 
-When `tool_call_markers` are configured, erllama builds a second sampler
+When `tool_call_markers` are configured, Barrel Inference builds a second sampler
 chain for the request with `temperature = 0`. When the start marker is
 sampled, the scheduler swaps the request onto that greedy chain so the
 tool-call syntax stays stable from a fixed prefix.
@@ -72,7 +72,7 @@ tool_call_markers => #{
 }
 ```
 
-With payload markers set, erllama uses the greedy sampler for the wrapper
+With payload markers set, Barrel Inference uses the greedy sampler for the wrapper
 syntax and the request's normal sampler for payload bytes. That keeps large
 string arguments, file contents, or generated edits from becoming
 unnecessarily deterministic.
@@ -90,16 +90,16 @@ The downstream server is responsible for:
 - Falling back to deterministic rendering when the id is unknown.
 - Replaying stored bytes verbatim into later prompts when the id is known.
 
-erllama provides adjacent primitives that help compose the full flow:
+Barrel Inference provides adjacent primitives that help compose the full flow:
 
-- `erllama:prefill_only/3` with `parent_key` can warm a prompt prefix
+- `barrel_inference:prefill_only/3` with `parent_key` can warm a prompt prefix
   before generation.
 - `session_id` on `infer/4` and `complete/3` can pin a live sequence
   across turns.
-- `erllama:continue/3` extends a pinned sequence with a
+- `barrel_inference:continue/3` extends a pinned sequence with a
   caller-asserted token tail, for chat templates that render
   differently across turns.
-- `erllama:end_session/2` releases a pinned sequence explicitly.
+- `barrel_inference:end_session/2` releases a pinned sequence explicitly.
 
 See [Examples](examples.md#11-tool-call-streaming-tool_call_markers) for
 copyable streaming snippets.

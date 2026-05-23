@@ -1,0 +1,589 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
+-module(barrel_inference_cache_meta_srv_tests).
+-include_lib("eunit/include/eunit.hrl").
+-include("barrel_inference_cache.hrl").
+
+%% =============================================================================
+%% Fixtures
+%% =============================================================================
+
+with_srv(Body) ->
+    {ok, _Meta} = barrel_inference_cache_meta_srv:start_link(),
+    {ok, _Ram} = barrel_inference_cache_ram:start_link(),
+    try
+        Body()
+    after
+        catch gen_server:stop(barrel_inference_cache_ram),
+        catch gen_server:stop(barrel_inference_cache_meta_srv)
+    end.
+
+key(N) ->
+    crypto:hash(sha256, integer_to_binary(N)).
+
+base_meta(Key, Tokens) ->
+    #{
+        save_reason => cold,
+        quant_bits => 16,
+        fingerprint => binary:copy(<<16#AA>>, 32),
+        fingerprint_mode => safe,
+        quant_type => f16,
+        ctx_params_hash => binary:copy(<<16#BB>>, 32),
+        tokens => Tokens,
+        context_size => 4096,
+        creation_time => 1000,
+        last_used_time => 1000,
+        hit_count => 0,
+        prompt_text => <<>>,
+        hostname => <<"test">>,
+        barrel_inference_version => <<"0.1.0">>,
+        cache_key => Key
+    }.
+
+build_kvc_file(Path, Key, Tokens, Payload) ->
+    Meta = base_meta(Key, Tokens),
+    %% The cache_key the file actually carries is derived from its
+    %% contents, not the Key argument; pass through both so the
+    %% caller can choose whether to mismatch them in negative tests.
+    {ok, Prefix} = barrel_inference_cache_kvc:build(maps:remove(cache_key, Meta), Payload),
+    file:write_file(Path, <<Prefix/binary, Payload/binary>>).
+
+%% =============================================================================
+%% Read-only lookup
+%% =============================================================================
+
+lookup_exact_miss_test() ->
+    with_srv(fun() ->
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(1)))
+    end).
+
+insert_available_makes_lookup_hit_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        {ok, Row} = barrel_inference_cache_meta_srv:lookup_exact(key(1)),
+        ?assertEqual(key(1), element(?POS_KEY, Row)),
+        ?assertEqual(ram, element(?POS_TIER, Row)),
+        ?assertEqual(available, element(?POS_STATUS, Row)),
+        ?assertEqual(0, element(?POS_REFCOUNT, Row))
+    end).
+
+%% =============================================================================
+%% Checkout / checkin
+%% =============================================================================
+
+checkout_increments_refcount_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        {ok, Ref, ram, _Loc, <<"H">>, _Tokens} =
+            barrel_inference_cache_meta_srv:checkout(key(1), self()),
+        {ok, Row} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(1, element(?POS_REFCOUNT, Row)),
+        ok = barrel_inference_cache_meta_srv:checkin(Ref),
+        {ok, Row2} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(0, element(?POS_REFCOUNT, Row2))
+    end).
+
+checkout_misses_unknown_key_test() ->
+    with_srv(fun() ->
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:checkout(key(999), self()))
+    end).
+
+checkout_bumps_hit_counter_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        {ok, Row0} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(0, element(?POS_HITS, Row0)),
+        {ok, Ref1, _, _, _, _} = barrel_inference_cache_meta_srv:checkout(key(1), self()),
+        ok = barrel_inference_cache_meta_srv:checkin(Ref1),
+        {ok, Ref2, _, _, _, _} = barrel_inference_cache_meta_srv:checkout(key(1), self()),
+        ok = barrel_inference_cache_meta_srv:checkin(Ref2),
+        {ok, Row1} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(2, element(?POS_HITS, Row1))
+    end).
+
+install_restores_hits_from_header_test() ->
+    with_srv(fun() ->
+        %% A 48-byte KVC header with hit_count = 7 at offset 12.
+        Header =
+            <<"KVC", 1:8, 16:8, 1:8, 0:16, 12:32/little, 7:32/little, 4096:32/little, 0:32, 0:64,
+                0:64, 0:64>>,
+        ok = barrel_inference_cache_meta_srv:insert_available(
+            key(1), disk, 100, Header, {disk, "x"}
+        ),
+        {ok, Row} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(7, element(?POS_HITS, Row))
+    end).
+
+%% =============================================================================
+%% Longest-prefix lookup
+%% =============================================================================
+
+prefix_key_meta() ->
+    #{
+        fingerprint => binary:copy(<<16#AA>>, 32),
+        quant_type => f16,
+        ctx_params_hash => binary:copy(<<16#BB>>, 32)
+    }.
+
+prefix_key_for(Tokens) ->
+    Meta = prefix_key_meta(),
+    barrel_inference_cache_key:make(Meta#{tokens => Tokens}).
+
+lookup_longest_prefix_miss_test() ->
+    with_srv(fun() ->
+        Meta = prefix_key_meta(),
+        Tokens = lists:seq(1, 1000),
+        ?assertEqual(
+            miss,
+            barrel_inference_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 100, 100)
+        )
+    end).
+
+lookup_longest_prefix_hit_at_4096_test() ->
+    with_srv(fun() ->
+        Meta = prefix_key_meta(),
+        Tokens = lists:seq(1, 12000),
+        Prefix = lists:sublist(Tokens, 4096),
+        K = prefix_key_for(Prefix),
+        ok = barrel_inference_cache_meta_srv:insert_available(K, ram, 100, <<"H">>, {ram}),
+        {ok, 4096, Row} =
+            barrel_inference_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 2048, 512),
+        ?assertEqual(K, element(?POS_KEY, Row))
+    end).
+
+lookup_longest_prefix_returns_longest_test() ->
+    with_srv(fun() ->
+        Meta = prefix_key_meta(),
+        Tokens = lists:seq(1, 12000),
+        K2048 = prefix_key_for(lists:sublist(Tokens, 2048)),
+        K4096 = prefix_key_for(lists:sublist(Tokens, 4096)),
+        ok = barrel_inference_cache_meta_srv:insert_available(K2048, ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:insert_available(K4096, ram, 100, <<"H">>, {ram}),
+        {ok, 4096, Row} =
+            barrel_inference_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 2048, 512),
+        ?assertEqual(K4096, element(?POS_KEY, Row))
+    end).
+
+evict_bytes_zero_is_noop_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(2), ram, 200, <<"H">>, {ram}),
+        ?assertEqual({evicted, 0, 0}, barrel_inference_cache_meta_srv:evict_bytes(0)),
+        ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
+        ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(key(2)))
+    end).
+
+lookup_longest_prefix_floor_test() ->
+    with_srv(fun() ->
+        Meta = prefix_key_meta(),
+        Tokens = lists:seq(1, 1500),
+        %% Stride 2048 with 1500 tokens: aligned start = 0; never
+        %% reaches a checkable prefix length. Returns miss.
+        ?assertEqual(
+            miss,
+            barrel_inference_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 2048, 512)
+        )
+    end).
+
+checkout_two_holders_independent_refcounts_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        Parent = self(),
+        Pid =
+            spawn(fun() ->
+                {ok, Ref, _, _, _, _} = barrel_inference_cache_meta_srv:checkout(key(1), self()),
+                Parent ! {claimed, Ref},
+                receive
+                    release -> ok = barrel_inference_cache_meta_srv:checkin(Ref)
+                end,
+                Parent ! released
+            end),
+        {ok, Ref1, _, _, _, _} = barrel_inference_cache_meta_srv:checkout(key(1), self()),
+        receive
+            {claimed, _} -> ok
+        end,
+        {ok, Row} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(2, element(?POS_REFCOUNT, Row)),
+        Pid ! release,
+        receive
+            released -> ok
+        end,
+        {ok, Row2} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(1, element(?POS_REFCOUNT, Row2)),
+        ok = barrel_inference_cache_meta_srv:checkin(Ref1)
+    end).
+
+checkin_unknown_ref_is_noop_test() ->
+    with_srv(fun() ->
+        ?assertEqual(ok, barrel_inference_cache_meta_srv:checkin(make_ref()))
+    end).
+
+down_decrements_refcount_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        Parent = self(),
+        _Pid =
+            spawn(fun() ->
+                {ok, _Ref, _, _, _, _} = barrel_inference_cache_meta_srv:checkout(key(1), self()),
+                Parent ! claimed,
+                exit(normal)
+            end),
+        receive
+            claimed -> ok
+        end,
+        wait_for_refcount(key(1), 0, 2000),
+        ok
+    end).
+
+%% =============================================================================
+%% Reservation state machine
+%% =============================================================================
+
+reserve_creates_writing_row_test() ->
+    with_srv(fun() ->
+        {ok, _Token} = barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self()),
+        {ok, Row} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(writing, element(?POS_STATUS, Row))
+    end).
+
+reserve_rejects_already_present_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        ?assertEqual(
+            {error, already_present},
+            barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self())
+        )
+    end).
+
+reserve_rejects_concurrent_writer_test() ->
+    with_srv(fun() ->
+        Parent = self(),
+        Pid =
+            spawn(fun() ->
+                {ok, _T} = barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self()),
+                Parent ! reserved,
+                receive
+                    stop -> ok
+                end
+            end),
+        receive
+            reserved -> ok
+        end,
+        ?assertEqual(
+            {error, conflict},
+            barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self())
+        ),
+        Pid ! stop
+    end).
+
+check_reservation_ok_with_valid_token_test() ->
+    with_srv(fun() ->
+        {ok, Token} = barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self()),
+        ?assertEqual(ok, barrel_inference_cache_meta_srv:check_reservation(key(1), Token))
+    end).
+
+check_reservation_expired_for_unknown_token_test() ->
+    with_srv(fun() ->
+        {ok, _Token} = barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self()),
+        ?assertEqual(
+            {error, expired},
+            barrel_inference_cache_meta_srv:check_reservation(key(1), make_ref())
+        )
+    end).
+
+mark_published_advances_stage_test() ->
+    with_srv(fun() ->
+        {ok, Token} = barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self()),
+        ?assertEqual(
+            ok,
+            barrel_inference_cache_meta_srv:mark_published(key(1), Token, "/tmp/whatever")
+        )
+    end).
+
+announce_saved_promotes_to_available_test() ->
+    with_srv(fun() ->
+        {ok, Token} = barrel_inference_cache_meta_srv:reserve_save(key(1), ram, self()),
+        ok = barrel_inference_cache_meta_srv:announce_saved(key(1), Token, 100, <<"H">>),
+        {ok, Row} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(available, element(?POS_STATUS, Row)),
+        ?assertEqual(<<"H">>, element(?POS_HEADER_BIN, Row))
+    end).
+
+cancel_reservation_clears_row_test() ->
+    with_srv(fun() ->
+        {ok, Token} = barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self()),
+        ok = barrel_inference_cache_meta_srv:cancel_reservation(key(1), Token),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:dump(key(1)))
+    end).
+
+%% =============================================================================
+%% Reservation cleanup on writer DOWN
+%% =============================================================================
+
+down_pre_link_clears_placeholder_test() ->
+    with_srv(fun() ->
+        Parent = self(),
+        Pid =
+            spawn(fun() ->
+                {ok, _T} = barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self()),
+                Parent ! reserved
+            end),
+        receive
+            reserved -> ok
+        end,
+        wait_for_pid_dead(Pid, 1000),
+        wait_for_row_gone(key(1), 2000)
+    end).
+
+down_post_link_with_valid_file_adopts_test() ->
+    with_srv(fun() ->
+        TmpDir = make_tmp_dir(),
+        try
+            Tokens = [1, 2, 3, 4, 5, 6, 7, 8],
+            Payload = <<"x">>,
+            CKey = barrel_inference_cache_key:make(#{
+                fingerprint => binary:copy(<<16#AA>>, 32),
+                quant_type => f16,
+                ctx_params_hash => binary:copy(<<16#BB>>, 32),
+                tokens => Tokens
+            }),
+            Path = filename:join(TmpDir, "adopt.kvc"),
+            ok = build_kvc_file(Path, CKey, Tokens, Payload),
+            Parent = self(),
+            Pid =
+                spawn(fun() ->
+                    {ok, T} = barrel_inference_cache_meta_srv:reserve_save(CKey, disk, self()),
+                    ok = barrel_inference_cache_meta_srv:mark_published(CKey, T, Path),
+                    Parent ! ready
+                end),
+            receive
+                ready -> ok
+            end,
+            wait_for_pid_dead(Pid, 1000),
+            wait_until(
+                fun() ->
+                    case barrel_inference_cache_meta_srv:lookup_exact(CKey) of
+                        {ok, _} -> true;
+                        _ -> false
+                    end
+                end,
+                2000
+            )
+        after
+            rm_rf(TmpDir)
+        end
+    end).
+
+down_post_link_with_invalid_file_deletes_and_clears_test() ->
+    with_srv(fun() ->
+        TmpDir = make_tmp_dir(),
+        try
+            Path = filename:join(TmpDir, "bad.kvc"),
+            file:write_file(Path, <<"not a kvc file">>),
+            Parent = self(),
+            Pid =
+                spawn(fun() ->
+                    {ok, T} = barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self()),
+                    ok = barrel_inference_cache_meta_srv:mark_published(key(1), T, Path),
+                    Parent ! ready
+                end),
+            receive
+                ready -> ok
+            end,
+            wait_for_pid_dead(Pid, 1000),
+            wait_for_row_gone(key(1), 2000),
+            ?assertEqual({error, enoent}, file:read_file_info(Path))
+        after
+            rm_rf(TmpDir)
+        end
+    end).
+
+%% =============================================================================
+%% lookup_exact_or_wait
+%% =============================================================================
+
+wait_returns_immediately_on_available_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        {ok, _Row} = barrel_inference_cache_meta_srv:lookup_exact_or_wait(key(1), 100)
+    end).
+
+wait_returns_miss_immediately_on_no_row_test() ->
+    with_srv(fun() ->
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact_or_wait(key(1), 100))
+    end).
+
+wait_returns_miss_after_timeout_when_writing_test() ->
+    with_srv(fun() ->
+        Parent = self(),
+        Pid =
+            spawn(fun() ->
+                {ok, _T} = barrel_inference_cache_meta_srv:reserve_save(key(1), ram, self()),
+                Parent ! reserved,
+                receive
+                    stop -> ok
+                end
+            end),
+        receive
+            reserved -> ok
+        end,
+        Result = barrel_inference_cache_meta_srv:lookup_exact_or_wait(key(1), 50),
+        Pid ! stop,
+        ?assertEqual(miss, Result)
+    end).
+
+wait_replies_when_save_publishes_test() ->
+    with_srv(fun() ->
+        Parent = self(),
+        Pid =
+            spawn(fun() ->
+                {ok, T} = barrel_inference_cache_meta_srv:reserve_save(key(1), ram, self()),
+                Parent ! reserved,
+                receive
+                    publish -> ok
+                end,
+                ok = barrel_inference_cache_meta_srv:announce_saved(key(1), T, 100, <<"H">>)
+            end),
+        receive
+            reserved -> ok
+        end,
+        Caller =
+            spawn(fun() ->
+                R = barrel_inference_cache_meta_srv:lookup_exact_or_wait(key(1), 5000),
+                Parent ! {result, R}
+            end),
+        timer:sleep(50),
+        Pid ! publish,
+        receive
+            {result, Result} ->
+                ?assertMatch({ok, _Row}, Result)
+        after 5000 ->
+            erlang:error(timeout)
+        end,
+        _ = Caller
+    end).
+
+%% =============================================================================
+%% Eviction
+%% =============================================================================
+
+gc_evicts_unreferenced_rows_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(2), ram, 200, <<"H2">>, {ram}),
+        {evicted, N} = barrel_inference_cache_meta_srv:gc(),
+        ?assertEqual(2, N),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(2)))
+    end).
+
+gc_skips_referenced_rows_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(2), ram, 200, <<"H2">>, {ram}),
+        {ok, _Ref, _, _, _, _} = barrel_inference_cache_meta_srv:checkout(key(1), self()),
+        {evicted, N} = barrel_inference_cache_meta_srv:gc(),
+        ?assertEqual(1, N),
+        ?assertMatch({ok, _Row}, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(2)))
+    end).
+
+gc_skips_writing_rows_test() ->
+    with_srv(fun() ->
+        Parent = self(),
+        Pid =
+            spawn(fun() ->
+                {ok, _T} = barrel_inference_cache_meta_srv:reserve_save(key(1), disk, self()),
+                Parent ! reserved,
+                receive
+                    stop -> ok
+                end
+            end),
+        receive
+            reserved -> ok
+        end,
+        {evicted, N} = barrel_inference_cache_meta_srv:gc(),
+        ?assertEqual(0, N),
+        Pid ! stop
+    end).
+
+%% =============================================================================
+%% Helpers
+%% =============================================================================
+
+wait_for_refcount(Key, Expected, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    wait_for_refcount_loop(Key, Expected, Deadline).
+
+wait_for_refcount_loop(Key, Expected, Deadline) ->
+    case barrel_inference_cache_meta_srv:dump(Key) of
+        {ok, Row} ->
+            case element(?POS_REFCOUNT, Row) of
+                Expected -> ok;
+                _ -> retry_or_fail(Key, Expected, Deadline)
+            end;
+        miss when Expected =:= 0 ->
+            ok;
+        _ ->
+            retry_or_fail(Key, Expected, Deadline)
+    end.
+
+retry_or_fail(Key, Expected, Deadline) ->
+    case erlang:monotonic_time(millisecond) > Deadline of
+        true ->
+            erlang:error({refcount_not_reached, Key, Expected});
+        false ->
+            timer:sleep(10),
+            wait_for_refcount_loop(Key, Expected, Deadline)
+    end.
+
+wait_for_pid_dead(Pid, TimeoutMs) ->
+    Mon = erlang:monitor(process, Pid),
+    receive
+        {'DOWN', Mon, process, Pid, _} -> ok
+    after TimeoutMs ->
+        erlang:demonitor(Mon, [flush]),
+        erlang:error(timeout)
+    end.
+
+wait_for_row_gone(Key, TimeoutMs) ->
+    wait_until(fun() -> barrel_inference_cache_meta_srv:dump(Key) =:= miss end, TimeoutMs).
+
+wait_until(Pred, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    wait_until_loop(Pred, Deadline).
+
+wait_until_loop(Pred, Deadline) ->
+    case Pred() of
+        true ->
+            ok;
+        false ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true ->
+                    erlang:error(timeout);
+                false ->
+                    timer:sleep(10),
+                    wait_until_loop(Pred, Deadline)
+            end
+    end.
+
+make_tmp_dir() ->
+    Base = os:getenv("TMPDIR", "/tmp"),
+    Dir = filename:join(
+        Base,
+        "barrel_inference_cache_meta_srv_tests_" ++
+            integer_to_list(erlang:unique_integer([positive]))
+    ),
+    ok = file:make_dir(Dir),
+    Dir.
+
+rm_rf(Dir) ->
+    case file:list_dir(Dir) of
+        {ok, Entries} ->
+            [file:delete(filename:join(Dir, E)) || E <- Entries];
+        _ ->
+            ok
+    end,
+    file:del_dir(Dir).

@@ -1,6 +1,6 @@
 # Updating the vendored llama.cpp
 
-erllama vendors a pinned copy of llama.cpp under `c_src/llama.cpp/`.
+Barrel Inference vendors a pinned copy of llama.cpp under `c_src/llama.cpp/`.
 The current pin is **b9222**.
 
 This file documents the bump procedure.
@@ -47,7 +47,7 @@ Excluded (unused or out-of-scope for v1):
 - ggml backends we do not link: Vulkan, SYCL, OpenCL, CANN, Hexagon,
   HIP, MUSA, RPC, ZDNN, ZenDNN, Virtgpu, Webgpu, OpenVINO
 
-If a user needs one of the excluded backends they can build erllama
+If a user needs one of the excluded backends they can build Barrel Inference
 against an unvendored llama.cpp via `git+` rebar dep instead of the
 hex package; that path is supported but unsupported in this scaffold.
 
@@ -63,7 +63,7 @@ cd /tmp
 git clone --depth=1 --branch=<TAG> https://github.com/ggml-org/llama.cpp llama.cpp.new
 
 # 2. Sync the parts we vendor.
-cd /Users/benoitc/Projects/erllama
+cd /Users/benoitc/Projects/barrel_inference
 rm -rf c_src/llama.cpp
 mkdir -p c_src/llama.cpp/ggml/src
 
@@ -96,20 +96,20 @@ rebar3 fmt --check && rebar3 lint && rebar3 xref \
 ## Configuration knobs
 
 The CMake configure step honours these env vars (passed via
-`ERLLAMA_OPTS` to `do_cmake.sh`):
+`BARREL_INFERENCE_OPTS` to `do_cmake.sh`):
 
 ```
-ERLLAMA_OPTS="-DGGML_CUDA=ON"           # enable CUDA on Linux x86-64
-ERLLAMA_OPTS="-DGGML_METAL=OFF"         # disable Metal on Darwin
-ERLLAMA_OPTS="-DGGML_BLAS=OFF"          # disable BLAS
-ERLLAMA_OPTS="-DCMAKE_BUILD_TYPE=Debug" # debug build
+BARREL_INFERENCE_OPTS="-DGGML_CUDA=ON"           # enable CUDA on Linux x86-64
+BARREL_INFERENCE_OPTS="-DGGML_METAL=OFF"         # disable Metal on Darwin
+BARREL_INFERENCE_OPTS="-DGGML_BLAS=OFF"          # disable BLAS
+BARREL_INFERENCE_OPTS="-DCMAKE_BUILD_TYPE=Debug" # debug build
 ```
 
-The build step honours `ERLLAMA_BUILDOPTS` (passed to `cmake --build`).
+The build step honours `BARREL_INFERENCE_BUILDOPTS` (passed to `cmake --build`).
 
 ## Why we drop `common/`
 
 llama.cpp's `common/` carries HTTP / Hugging Face download helpers
-that pull in cpp-httplib (5 MB). erllama uses the public `llama.h` API
+that pull in cpp-httplib (5 MB). Barrel Inference uses the public `llama.h` API
 directly and provides its own thin sampling / tokenization helpers in
 the NIF; nothing in `common/` is on our critical path.

@@ -1,7 +1,7 @@
 # C / NIF safety audit
 
-Audit branch: `audit/c-safety-review`. Scope: `c_src/erllama_nif.c`,
-`c_src/erllama_safe.cpp`, `c_src/crc32c.{c,h}`. The upstream
+Audit branch: `audit/c-safety-review`. Scope: `c_src/barrel_inference_nif.c`,
+`c_src/barrel_inference_safe.cpp`, `c_src/crc32c.{c,h}`. The upstream
 `c_src/llama.cpp/` submodule was not examined.
 
 The audit looked for segfaults, deadlocks, infinite loops, leaks, and
@@ -12,19 +12,19 @@ numbers are against the tree at the time of audit.
 
 ### H1. Adapter outlives its underlying `llama_model` — use-after-free on adapter free
 
-- Sites: `nif_free_model` (`c_src/erllama_nif.c:602-633`),
-  `nif_adapter_load` (`c_src/erllama_nif.c:2051-2095`),
-  `nif_adapter_free` (`c_src/erllama_nif.c:2097-2113`),
-  `adapter_dtor` (`c_src/erllama_nif.c:351-366`).
+- Sites: `nif_free_model` (`c_src/barrel_inference_nif.c:602-633`),
+  `nif_adapter_load` (`c_src/barrel_inference_nif.c:2051-2095`),
+  `nif_adapter_free` (`c_src/barrel_inference_nif.c:2097-2113`),
+  `adapter_dtor` (`c_src/barrel_inference_nif.c:351-366`).
 - Failure mode: `llama.h` documents that "loaded adapters that are not
   manually freed will be freed when the associated model is deleted".
   `nif_free_model` ignores adapters: when `active_contexts == 0` it
   frees the model immediately, which implicitly frees every adapter
-  derived from it. The wrapping `erllama_adapter_t` keeps the *resource*
+  derived from it. The wrapping `barrel_inference_adapter_t` keeps the *resource*
   alive (via `enif_keep_resource`) but `a->adapter` is now a dangling
   pointer. A subsequent `nif_adapter_free` or `adapter_dtor` calls
   `llama_adapter_lora_free` on freed memory — UAF / double-free.
-- Fix sketch: track `active_adapters` on `erllama_model_t` next to
+- Fix sketch: track `active_adapters` on `barrel_inference_model_t` next to
   `active_contexts`. `nif_free_model` should set `release_pending`
   whenever either counter is non-zero. Decrement `active_adapters`
   from the adapter destructor (mirror of `context_drops_model`) and
@@ -32,17 +32,17 @@ numbers are against the tree at the time of audit.
 
 ### H2. Adapter pointer race in `nif_set_adapters`
 
-- Site: `c_src/erllama_nif.c:2144-2191`.
+- Site: `c_src/barrel_inference_nif.c:2144-2191`.
 - Failure mode: for each adapter the code locks `a->mu`, copies
   `a->adapter` into the array, then unlocks immediately. The pointer
-  array is then passed to `erllama_safe_set_adapters_lora` outside any
+  array is then passed to `barrel_inference_safe_set_adapters_lora` outside any
   adapter lock. A concurrent `nif_adapter_free` on any of the listed
   adapters will null the underlying llama object between the unlock
   and the llama call — the call sees a dangling pointer.
 - Fix sketch: either (a) hold every `a->mu` for the duration of
   `set_adapters_lora` (lock them in deterministic order — e.g. by
   resource pointer — to avoid AB-BA), or (b) add an `in_use` counter
-  to `erllama_adapter_t` that `nif_adapter_free` waits on, or (c)
+  to `barrel_inference_adapter_t` that `nif_adapter_free` waits on, or (c)
   serialise adapter mutation through a coarser lock (one per model
   is enough since adapters are always model-scoped).
 
@@ -50,8 +50,8 @@ numbers are against the tree at the time of audit.
 
 ### M1. Partial chat-message build leaks role/content pairs
 
-- Site: `build_chat_msgs_from_list` (`c_src/erllama_nif.c:1377-1405`),
-  caller `nif_apply_chat_template` (`c_src/erllama_nif.c:1533-1541`).
+- Site: `build_chat_msgs_from_list` (`c_src/barrel_inference_nif.c:1377-1405`),
+  caller `nif_apply_chat_template` (`c_src/barrel_inference_nif.c:1533-1541`).
 - Failure mode: when the loop fails on message k > 0 (bad map,
   missing role/content, or OOM allocating the content string), the
   helper returns `-1` / `-2` without freeing the role+content pairs
@@ -68,7 +68,7 @@ numbers are against the tree at the time of audit.
 
 ### L1. `nif_detokenize` holds `m->mu` across the whole token loop
 
-- Site: `c_src/erllama_nif.c:1165-1263`.
+- Site: `c_src/barrel_inference_nif.c:1165-1263`.
 - Not a deadlock, but the model lock is held across N
   `llama_token_to_piece` calls plus per-call `enif_realloc`. For a
   multi-MB detokenize the entire model surface (tokenize,
@@ -78,7 +78,7 @@ numbers are against the tree at the time of audit.
 
 ### L2. `nif_kv_pack` allocates a fresh empty binary on `need == 0`
 
-- Site: `c_src/erllama_nif.c:873-880`. Minor. Returning a shared
+- Site: `c_src/barrel_inference_nif.c:873-880`. Minor. Returning a shared
   empty term would be cheaper, but `enif_alloc_binary(0, ...)` is
   legal per ERTS docs and the path is rare.
 
@@ -86,8 +86,8 @@ numbers are against the tree at the time of audit.
 
 ### Per-resource mutex pattern
 
-`erllama_model_t`, `erllama_context_t`, `erllama_adapter_t`, and
-`erllama_sampler_t` each carry a `pthread_mutex_t` that every NIF
+`barrel_inference_model_t`, `barrel_inference_context_t`, `barrel_inference_adapter_t`, and
+`barrel_inference_sampler_t` each carry a `pthread_mutex_t` that every NIF
 entry takes before dereferencing the wrapped llama pointer. This
 serialises concurrent dirty-NIF calls with explicit `free_*` calls
 on the same resource: a free cannot interleave with a live llama
@@ -124,7 +124,7 @@ Clean.
 
 ### `enif_alloc(sizeof(T) * n)` overflow
 
-`n` is always a validated `int32_t` capped at `ERLLAMA_MAX_TOKENS`
+`n` is always a validated `int32_t` capped at `BARREL_INFERENCE_MAX_TOKENS`
 (`1 << 20`) or `(1 << 24)` in detokenize, or it comes from
 `enif_get_list_length` (unsigned int) and ends up multiplied by
 small `sizeof`s. On 64-bit platforms `size_t` is 8 bytes; no
@@ -134,22 +134,22 @@ overflow is reachable. 32-bit BEAM would be exposed in the
 ### `llama_context` thread-safety
 
 `llama.cpp` contexts are not thread-safe. Every entry that touches a
-context (`erllama_safe_decode`, `erllama_safe_state_seq_*`,
-`erllama_safe_sampler_sample`, `erllama_safe_get_embeddings*`,
-`erllama_safe_set_adapters_lora`, `erllama_safe_set_embeddings`) is
+context (`barrel_inference_safe_decode`, `barrel_inference_safe_state_seq_*`,
+`barrel_inference_safe_sampler_sample`, `barrel_inference_safe_get_embeddings*`,
+`barrel_inference_safe_set_adapters_lora`, `barrel_inference_safe_set_embeddings`) is
 gated by the matching `c->mu`. Same for `m->mu` on model calls.
 Single-threaded per resource is the design.
 
-### `pthread_once` use in `crc32c_init` and `erllama_safe_backend_init_once`
+### `pthread_once` use in `crc32c_init` and `barrel_inference_safe_backend_init_once`
 
 Both correctly serialise one-time initialisation; the static `rc`
-read by `erllama_safe_backend_init_once` after `pthread_once`
+read by `barrel_inference_safe_backend_init_once` after `pthread_once`
 returns is covered by the happens-before guarantees of pthread_once.
 
 ### Infinite loops
 
 None found. Every loop is bounded by validated input size
-(`ERLLAMA_MAX_TOKENS`, `(1 << 24)`, `ERLLAMA_MAX_TOKEN_TEXT`,
+(`BARREL_INFERENCE_MAX_TOKENS`, `(1 << 24)`, `BARREL_INFERENCE_MAX_TOKEN_TEXT`,
 `grammar_bin.size`, `enif_get_list_length` capped), by external
 list iteration with `enif_get_list_cell` returning false on
 exhaustion, or by `pthread_once`.

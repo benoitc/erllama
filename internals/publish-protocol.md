@@ -121,12 +121,12 @@ Each invariant has a dedicated case:
 
 | Invariant | Test |
 |---|---|
-| `EEXIST` adopted when header matches | `erllama_cache_writer_tests:eexist_adopt/0` |
-| `EEXIST` replaced when header is junk | `erllama_cache_writer_tests:eexist_replace/0` |
-| Stale reservation reaped, file adopted | `erllama_cache_meta_SUITE:ttl_orphan_adopt/0` |
-| Stale reservation reaped, file unlinked | `erllama_cache_meta_SUITE:ttl_orphan_drop/0` |
+| `EEXIST` adopted when header matches | `barrel_inference_cache_writer_tests:eexist_adopt/0` |
+| `EEXIST` replaced when header is junk | `barrel_inference_cache_writer_tests:eexist_replace/0` |
+| Stale reservation reaped, file adopted | `barrel_inference_cache_meta_SUITE:ttl_orphan_adopt/0` |
+| Stale reservation reaped, file unlinked | `barrel_inference_cache_meta_SUITE:ttl_orphan_drop/0` |
 | Concurrent writers: one wins, others abandon | `prop_cache_publish:prop_publish_serialises/0` |
-| Multi-turn `parent_key` waits for in-flight finish | `erllama_cache_tests:resume_waits_for_finish/0` |
+| Multi-turn `parent_key` waits for in-flight finish | `barrel_inference_cache_tests:resume_waits_for_finish/0` |
 
 If you change any stage of the protocol, surface tension with these
 tests to a reviewer before landing.

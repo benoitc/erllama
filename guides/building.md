@@ -1,7 +1,7 @@
-# Building erllama
+# Building Barrel Inference
 
-erllama is a single OTP application with a single NIF
-(`erllama_nif.so`). The first compile builds the vendored
+Barrel Inference is a single OTP application with a single NIF
+(`barrel_inference_nif.so`). The first compile builds the vendored
 `c_src/llama.cpp/` (~3 minutes on a fast machine), then compiles the
 small NIF surface and a CRC table. Subsequent builds reuse the cmake
 cache and finish in seconds.
@@ -39,7 +39,7 @@ OpenMP at the ggml level avoids that entirely; the GPU paths
 CUDA is off by default. Enable with:
 
 ```bash
-ERLLAMA_OPTS=-DGGML_CUDA=ON rebar3 compile
+BARREL_INFERENCE_OPTS=-DGGML_CUDA=ON rebar3 compile
 ```
 
 ## macOS (Apple Silicon and Intel)
@@ -61,7 +61,7 @@ default. Compile is ~30 s after the first ggml build is cached.
 # expects (PCRE2_10.47 not defined). Refresh first so git can load.
 pkg install -y pcre2
 
-# erllama needs OTP 28+; the base `erlang` package is 26.x.
+# barrel_inference needs OTP 28+; the base `erlang` package is 26.x.
 # erlang-runtime28 installs OTP 28 under /usr/local/lib/erlang28.
 pkg install -y erlang-runtime28 cmake bash gmake git
 
@@ -81,7 +81,7 @@ chmod +x rebar3
 
 ## Erlang ERTS detection
 
-The build needs `erl_nif.h` from the Erlang installation. erllama
+The build needs `erl_nif.h` from the Erlang installation. Barrel Inference
 uses `c_src/CMake/FindErlang.cmake` (adopted from erlang-rocksdb)
 which runs `erl -noshell -eval` to read `code:lib_dir/0` /
 `code:root_dir/0` and exports `ERLANG_ERTS_INCLUDE_PATH`. If the
@@ -90,10 +90,10 @@ takes precedence (useful for cross-compilation or pinned headers).
 
 ## What the build produces
 
-- `priv/erllama_nif.so` — the single NIF, statically linked against
+- `priv/barrel_inference_nif.so` — the single NIF, statically linked against
   the vendored `c_src/llama.cpp` (libllama, libggml, ggml-cpu, plus
   the platform GPU/BLAS backends) and `c_src/crc32c.c`.
-- `_build/default/lib/erllama/ebin/*.beam` — Erlang modules.
+- `_build/default/lib/barrel_inference/ebin/*.beam` — Erlang modules.
 - `_build/cmake/` — CMake build dir; cached for incremental builds.
 
 ## Common build issues
@@ -103,17 +103,17 @@ takes precedence (useful for cross-compilation or pinned headers).
   set the env var explicitly:
   `ERTS_INCLUDE_DIR=$(erl -noshell -eval 'io:format("~s",[filename:join([code:root_dir(),"erts-"++erlang:system_info(version),"include"])]),halt().') rebar3 compile`.
 - **`R_X86_64_TPOFF32 against hidden symbol gomp_tls_data`** — your
-  `libgomp.a` is non-PIC. erllama's CMakeLists already sets
+  `libgomp.a` is non-PIC. Barrel Inference's CMakeLists already sets
   `GGML_OPENMP OFF` to avoid this. If you re-enabled OpenMP, build
   a PIC `libgomp` or leave it off.
 - **`PCRE2_10.47 not defined`** when running git on FreeBSD — refresh
   `pcre2` first: `pkg install -y pcre2`. The cached VM image lags
   the latest repo.
 - **macOS metal init slow on first model load** — the lazy
-  `llama_backend_init` runs on the first `erllama:load_model/1` call
+  `llama_backend_init` runs on the first `barrel_inference:load_model/1` call
   and discovers Metal devices. eunit cases that load a model need
   a generator timeout >5 s; see
-  `test/erllama_nif_tests.erl:load_model_rejects_non_existent_path_test_/0`
+  `test/barrel_inference_nif_tests.erl:load_model_rejects_non_existent_path_test_/0`
   for the pattern.
 
 ## Verifying the build
@@ -132,7 +132,7 @@ End-to-end against a real GGUF:
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.gguf \
-    rebar3 ct --suite=test/erllama_real_model_SUITE
+    rebar3 ct --suite=test/barrel_inference_real_model_SUITE
 ```
 
 Without the env var the suite skips, so default `rebar3 ct` stays

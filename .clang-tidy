@@ -1,5 +1,5 @@
 ---
-# Scoped to c_src/erllama_nif.c, erllama_safe.cpp, crc32c.c via
+# Scoped to c_src/barrel_inference_nif.c, barrel_inference_safe.cpp, crc32c.c via
 # CMake's C_CLANG_TIDY / CXX_CLANG_TIDY target properties; the vendored
 # llama.cpp tree is not linted.
 #
@@ -14,7 +14,7 @@
 #     which is the correct pattern for typed allocations.
 #   - bugprone-easily-swappable-parameters / bugprone-macro-parentheses:
 #     stylistic, high false-positive rate.
-#   - bugprone-empty-catch: erllama_safe.cpp uses empty catch(...) as a
+#   - bugprone-empty-catch: barrel_inference_safe.cpp uses empty catch(...) as a
 #     deliberate barrier so C++ exceptions never unwind into the BEAM
 #     across the C ABI; that's the whole purpose of those wrappers.
 #   - performance-enum-size: stylistic; not a correctness check.
@@ -32,5 +32,5 @@ Checks: >
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -performance-enum-size
 WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*'
-HeaderFilterRegex: '^.*/c_src/(erllama_nif|erllama_safe|crc32c)\.(h|hpp)$'
+HeaderFilterRegex: '^.*/c_src/(barrel_inference_nif|barrel_inference_safe|crc32c)\.(h|hpp)$'
 FormatStyle: none

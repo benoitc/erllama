@@ -63,7 +63,7 @@ enough to keep restore cost in the millisecond range.
 
 ## Sole-writer arbitration
 
-The meta server (`erllama_cache_meta_srv`) is the only process that
+The meta server (`barrel_inference_cache_meta_srv`) is the only process that
 mutates the meta ETS, the LRU, and the reservation table. Every
 write — claim, release, evict, save announce — goes through a
 gen_server call. Reads stay on ETS directly via `ets:lookup/2`.

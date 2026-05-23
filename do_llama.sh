@@ -1,5 +1,5 @@
 #!/bin/sh -x
-# CMake build step: compile the vendored llama.cpp + erllama_nif.so.
+# CMake build step: compile the vendored llama.cpp + barrel_inference_nif.so.
 # Mirrors erlang-rocksdb's do_rocksdb.sh pattern.
 
 cd _build/cmake

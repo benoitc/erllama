@@ -1,18 +1,18 @@
 # Roadmap
 
-What erllama does not do yet, with rough scope and rationale for each
+What Barrel Inference does not do yet, with rough scope and rationale for each
 item. Issues / PRs welcome.
 
 ## Recently shipped: engine robustness
 
-The `erllama_server` hardening brief (cold-admit decode wedges and
+The `barrel_inference_server` hardening brief (cold-admit decode wedges and
 agentic tool-continue loops under real 30B/Metal load) is fully
 shipped. For reference so these are not re-filed:
 
 - **Bounded, interruptible, self-recovering decode** (0.8.0). Per-step
   wall-clock budget via a ggml abort callback
   (`context_opts.decode_budget_ms`, default 30000) returning
-  `{error, decode_timeout}`; `erllama_nif:request_abort/1` for
+  `{error, decode_timeout}`; `barrel_inference_nif:request_abort/1` for
   mid-decode interruption (`{error, decode_aborted}`, wired into
   `cancel/1`); in-place recovery via the backend `reset_context/1`
   (model stays loaded). Recovery drops only live KV + sticky pins; the
@@ -27,15 +27,15 @@ shipped. For reference so these are not re-filed:
   `tool_choice=required` / `response_format` hold end to end on
   `infer/4` and `continue/3`.
 - **Byte-exact continuation aids** (0.8.0). `generated` token ids in
-  the `erllama_done` Stats map, and `continue/3` `expect_committed`
+  the `barrel_inference_done` Stats map, and `continue/3` `expect_committed`
   verification (`{error, {transcript_mismatch, _}}`).
 - **Structured NIF errors** (0.7.0/0.8.0). `nif_decode_one` and
   `nif_step` surface `{error, {decode_failed, Rc}}`.
 
-## Sister project: erllama_cluster (in development)
+## Sister project: barrel_inference_cluster (in development)
 
-A separate OTP application that coordinates a fleet of erllama nodes
-into one inference cluster. Each node still runs erllama as a
+A separate OTP application that coordinates a fleet of Barrel Inference nodes
+into one inference cluster. Each node still runs Barrel Inference as a
 standalone library; the cluster layer sits on top and decides which
 node serves which request.
 
@@ -50,7 +50,7 @@ Three v1 strategies:
 
 Transport is QUIC via [erlang_quic](https://github.com/benoitc/erlang_quic)
 (pure Erlang, no C NIF in the protocol path). Repository:
-<https://github.com/erllama/erllama_cluster>.
+<https://github.com/barrel-platform/barrel_inference>.
 
 ### Pipeline parallelism: blocked on upstream llama.cpp
 
@@ -65,7 +65,7 @@ llama.cpp itself, which the cluster brief
 (`AGENTS_TASKS.md`) puts out of scope.
 
 The cluster already gates pipeline mode on
-`erlang:function_exported(erllama, forward_partial, 3)` and
+`erlang:function_exported(barrel_inference, forward_partial, 3)` and
 falls back to the other strategies (request distribution and
 speculative decoding) when the export is missing, so this is a
 graceful degradation rather than a blocker for the cluster's
@@ -113,19 +113,19 @@ extensions for multi-modal messages.
 
 A different model class than the GGUF chat models 0.1 targets;
 `whisper.cpp` has its own context shape. Could be a sister
-application (`erllama_whisper`) sharing the cache subsystem.
+application (`barrel_inference_whisper`) sharing the cache subsystem.
 
 ### Non-GGUF model loading
 
 ONNX, safetensors, raw PyTorch checkpoints. llama.cpp doesn't load
 these natively, so the path is either a converter step at
-`fetch`-time (the `erllama_server` repo handles fetch) or a second
+`fetch`-time (the `barrel_inference_server` repo handles fetch) or a second
 backend that targets a different runtime.
 
 ### Stateful streaming with bit-exact KV resume
 
 Today's warm restore re-prefills the last KV cell to regenerate
-logits, which can shift a near-tied sample. `erllama:continue/3`
+logits, which can shift a near-tied sample. `barrel_inference:continue/3`
 (0.6.0) extends a pinned sticky session with a caller-asserted
 token tail and avoids the warm-restore primer cost entirely for
 multi-turn workloads, but it's still not bit-exact: the sampler
@@ -143,13 +143,13 @@ exact same sampler internal state is a 0.2 nice-to-have.
 ### Telemetry / OTel hooks
 
 Counters today are bare atomics. A telemetry-style event surface
-(`telemetry:execute([erllama, complete, start], ...)`) would let
+(`telemetry:execute([barrel_inference, complete, start], ...)`) would let
 operators wire Prometheus, OTel, statsd without forking the metrics
 module.
 
 ### Memory-pressure NVIDIA-multi-GPU
 
-`erllama_pressure_nvidia_smi` reads `nvidia-smi` once and sums; a
+`barrel_inference_pressure_nvidia_smi` reads `nvidia-smi` once and sums; a
 real multi-GPU deployment wants per-GPU pressure with per-context
 eviction. The single-source pressure model in 0.1 collapses to "all
 GPUs together".
@@ -165,7 +165,7 @@ deferred.
 
 ds4 packs its tool-id → bytes map ("KTM") as appended sections
 inside the disk KV cache files. Tempting because the lifetime
-matches the KV row, but couples erllama's stable cache binary
+matches the KV row, but couples Barrel Inference's stable cache binary
 format to an evolving HTTP-layer concept. Keep the two stores
 separate; revisit only if running them side-by-side produces
 measurable I/O amplification.
@@ -178,7 +178,7 @@ filesystem, or a small announce protocol) is a 0.3+ topic.
 
 ### Incremental chat-template render
 
-`erllama:continue/3` (0.6.0) lets callers pass only the new turn's
+`barrel_inference:continue/3` (0.6.0) lets callers pass only the new turn's
 tokens, but they still have to render the full conversation through
 `apply_chat_template/2` and slice off the prior tokens — wasteful
 when the history is large. A companion `apply_chat_template_delta/3`
@@ -189,7 +189,7 @@ plumbing through the existing chat-template detector.
 
 ### Streaming tokenize for very large prompts
 
-`erllama:tokenize/2` and `apply_chat_template/2` allocate the full
+`barrel_inference:tokenize/2` and `apply_chat_template/2` allocate the full
 output buffer up front (worst case ~256 MB at the new 64 MiB text
 cap). A streaming variant that yields tokens in chunks would let
 the prefill scheduler start work before tokenization completes and

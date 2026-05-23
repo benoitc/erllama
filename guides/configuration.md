@@ -1,13 +1,13 @@
 # Configuration reference
 
-erllama configuration lives in two places: the OTP application
+Barrel Inference configuration lives in two places: the OTP application
 environment (`config/sys.config`) and the per-model option map
-passed to `erllama:load_model/1,2`. This page is the full set.
+passed to `barrel_inference:load_model/1,2`. This page is the full set.
 
 ## Application environment
 
 ```erlang
-{erllama, [
+{barrel_inference, [
   %% --------------- Save-policy gates -----------------------------
   {min_tokens,             512},
   {cold_min_tokens,        512},
@@ -36,15 +36,15 @@ passed to `erllama:load_model/1,2`. This page is the full set.
 
 ### Tiers
 
-The RAM tier (`erllama_cache_ram`) starts automatically with the
+The RAM tier (`barrel_inference_cache_ram`) starts automatically with the
 application. For `ram_file` or `disk` tiers, start an
-`erllama_cache_disk_srv` per root in your own supervision tree (or
+`barrel_inference_cache_disk_srv` per root in your own supervision tree (or
 from a release start hook) and pass its registered name as `tier_srv`
 on the relevant `load_model/1,2` call:
 
 ```erlang
-{ok, _} = erllama_cache_disk_srv:start_link(my_disk,    "/var/lib/erllama/kvc"),
-{ok, _} = erllama_cache_ramfile_srv:start_link(my_shm,  "/dev/shm/erllama").
+{ok, _} = barrel_inference_cache_disk_srv:start_link(my_disk,    "/var/lib/barrel_inference/kvc"),
+{ok, _} = barrel_inference_cache_ramfile_srv:start_link(my_shm,  "/dev/shm/barrel_inference").
 ```
 
 There is no single `tiers` env key in v0.1: per-process supervision
@@ -85,11 +85,11 @@ See the [caching guide](caching.md#memory-pressure-driven-eviction).
 
 ## Per-model options
 
-Passed to `erllama:load_model/1,2`:
+Passed to `barrel_inference:load_model/1,2`:
 
 ```erlang
 #{
-  backend           => erllama_model_llama,
+  backend           => barrel_inference_model_llama,
   model_path        => "/path/to/x.gguf",
   model_opts        => #{n_gpu_layers => 99},
   context_opts      => #{
@@ -155,7 +155,7 @@ loaded) rather than cold-reloading. Recovery drops only the live
 in-context KV cells and sticky-session pins - the tiered cache
 (RAM/disk rows) persists, so a subsequent request still reuses
 cached prefixes through the normal warm-restore lookup rather than
-starting fully cold. The same callback honours `erllama:cancel/1`,
+starting fully cold. The same callback honours `barrel_inference:cancel/1`,
 which interrupts an in-flight decode and surfaces
 `{error, decode_aborted}`. A legitimate step is sub-second on a
 loaded model, so the default only trips on a genuine wedge; lower it
@@ -166,14 +166,14 @@ See [loading a model](loading.md) for the per-field walkthrough.
 ## Inspecting effective config
 
 ```erlang
-1> application:get_env(erllama, scheduler).
+1> application:get_env(barrel_inference, scheduler).
 {ok, #{enabled => true, ...}}
 
-2> erllama_scheduler:status().
+2> barrel_inference_scheduler:status().
 #{enabled => true, pressure_source => system, ...}
 
-3> erllama_cache_meta_srv:dump().
-%% List of raw ETS tuples; see include/erllama_cache.hrl for the
+3> barrel_inference_cache_meta_srv:dump().
+%% List of raw ETS tuples; see include/barrel_inference_cache.hrl for the
 %% position layout.
 [{<<_:256>>, disk, 8388608, _, 0, available, _, _, _, 4}, ...]
 ```
