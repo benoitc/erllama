@@ -3,6 +3,35 @@
 What erllama does not do yet, with rough scope and rationale for each
 item. Issues / PRs welcome.
 
+## Recently shipped: engine robustness
+
+The `erllama_server` hardening brief (cold-admit decode wedges and
+agentic tool-continue loops under real 30B/Metal load) is fully
+shipped. For reference so these are not re-filed:
+
+- **Bounded, interruptible, self-recovering decode** (0.8.0). Per-step
+  wall-clock budget via a ggml abort callback
+  (`context_opts.decode_budget_ms`, default 30000) returning
+  `{error, decode_timeout}`; `erllama_nif:request_abort/1` for
+  mid-decode interruption (`{error, decode_aborted}`, wired into
+  `cancel/1`); in-place recovery via the backend `reset_context/1`
+  (model stays loaded). Recovery drops only live KV + sticky pins; the
+  persistent tiered cache survives.
+- **`reset_session/2`** (0.7.0). Forcibly drop a wedged session's live
+  KV and in-flight req, reachable when the hot path is blocked.
+- **Non-blocking admission** (0.8.0). `on_full => error` returns
+  `{error, seq_capacity}` instead of queueing; `model_info/1` exposes
+  `available_seqs` / `n_seq_max` (0.7.0).
+- **Grammar honoured through tool-call syntax** (0.8.0). A binary
+  `grammar` disables the greedy-on-syntax swap, so
+  `tool_choice=required` / `response_format` hold end to end on
+  `infer/4` and `continue/3`.
+- **Byte-exact continuation aids** (0.8.0). `generated` token ids in
+  the `erllama_done` Stats map, and `continue/3` `expect_committed`
+  verification (`{error, {transcript_mismatch, _}}`).
+- **Structured NIF errors** (0.7.0/0.8.0). `nif_decode_one` and
+  `nif_step` surface `{error, {decode_failed, Rc}}`.
+
 ## Sister project: erllama_cluster (in development)
 
 A separate OTP application that coordinates a fleet of erllama nodes
