@@ -47,7 +47,6 @@
     %% packaging scripts).
     {files, [
         "rebar.config",
-        "rebar.lock",
         "do_cmake.sh",
         "do_llama.sh",
         "README.md",
