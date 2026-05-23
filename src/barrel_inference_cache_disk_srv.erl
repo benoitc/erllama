@@ -206,11 +206,12 @@ scan(SrvName) ->
 touch_hits(Path, Hits) ->
     case prim_file:open(Path, [write, read, raw, binary]) of
         {ok, Fd} ->
-            try
-                _ = prim_file:pwrite(Fd, ?KVC_HEADER_HITS_OFFSET, <<Hits:32/little>>)
-            after
-                prim_file:close(Fd)
-            end,
+            _ =
+                try
+                    _ = prim_file:pwrite(Fd, ?KVC_HEADER_HITS_OFFSET, <<Hits:32/little>>)
+                after
+                    prim_file:close(Fd)
+                end,
             ok;
         {error, _} ->
             ok
@@ -380,7 +381,7 @@ do_delete(Key, Root) ->
 sweep_tmps(Root) ->
     case file:list_dir(Root) of
         {ok, Entries} ->
-            [
+            _ = [
                 _ = prim_file:delete(filename:join(Root, E))
              || E <- Entries, lists:suffix(".tmp", E)
             ],

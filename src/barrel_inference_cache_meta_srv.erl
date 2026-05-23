@@ -296,8 +296,8 @@ init([]) ->
         {keypos, 1},
         {read_concurrency, true}
     ],
-    ets:new(?TBL_META, [set | EtsOpts]),
-    ets:new(?TBL_LRU, [ordered_set | EtsOpts]),
+    _ = ets:new(?TBL_META, [set | EtsOpts]),
+    _ = ets:new(?TBL_LRU, [ordered_set | EtsOpts]),
     Timer = erlang:send_after(?SWEEP_INTERVAL_MS, self(), sweep),
     State = #state{
         holders = #{},

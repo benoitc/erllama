@@ -67,7 +67,7 @@ size_bytes() ->
 
 -spec init([]) -> {ok, []}.
 init([]) ->
-    ets:new(?SLABS, [
+    _ = ets:new(?SLABS, [
         named_table,
         public,
         set,

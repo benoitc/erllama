@@ -731,16 +731,17 @@ cancel(Ref) when is_reference(Ref) ->
             %% effect if a decode is actually running and the backend
             %% has an interruptible context; otherwise the cast below
             %% is honoured at the next tick (the existing path).
-            case barrel_inference_inflight:get_abort_handle(ModelPid) of
-                {ok, Ctx} ->
-                    try
-                        barrel_inference_nif:request_abort(Ctx)
-                    catch
-                        _:_ -> ok
-                    end;
-                undefined ->
-                    ok
-            end,
+            _ =
+                case barrel_inference_inflight:get_abort_handle(ModelPid) of
+                    {ok, Ctx} ->
+                        try
+                            barrel_inference_nif:request_abort(Ctx)
+                        catch
+                            _:_ -> ok
+                        end;
+                    undefined ->
+                        ok
+                end,
             gen_statem:cast(ModelPid, {cancel, Ref}),
             ok;
         {error, not_found} ->
@@ -2397,12 +2398,13 @@ req_stream_emit(
     Token,
     Data
 ) ->
-    case backend_call(Data, detokenize, [[Token]]) of
-        Bin when is_binary(Bin), Bin =/= <<>> ->
-            Pid ! {barrel_inference_token, Ref, Bin};
-        _ ->
-            ok
-    end,
+    _ =
+        case backend_call(Data, detokenize, [[Token]]) of
+            Bin when is_binary(Bin), Bin =/= <<>> ->
+                Pid ! {barrel_inference_token, Ref, Bin};
+            _ ->
+                ok
+        end,
     Pid ! {barrel_inference_token_id, Ref, Token},
     Req;
 req_stream_emit(#req{stop_pattern = undefined} = Req, _Token, _Data) ->
@@ -2440,10 +2442,11 @@ maybe_emit_stream(
 ) when
     is_pid(Pid), is_reference(Ref)
 ->
-    case Text of
-        <<>> -> ok;
-        _ -> Pid ! {barrel_inference_token, Ref, Text}
-    end,
+    _ =
+        case Text of
+            <<>> -> ok;
+            _ -> Pid ! {barrel_inference_token, Ref, Text}
+        end,
     Pid ! {barrel_inference_token_id, Ref, Token},
     ok;
 maybe_emit_stream(_Req, _Text, _Token) ->
@@ -2549,10 +2552,11 @@ req_tool_call_emit(
             B when is_binary(B) -> B;
             _ -> <<>>
         end,
-    case Bin of
-        <<>> -> ok;
-        _ -> Pid ! {barrel_inference_token, Ref, {tool_call_delta, Bin}}
-    end,
+    _ =
+        case Bin of
+            <<>> -> ok;
+            _ -> Pid ! {barrel_inference_token, Ref, {tool_call_delta, Bin}}
+        end,
     Req#req{tool_call_bytes = <<(Req#req.tool_call_bytes)/binary, Bin/binary>>};
 req_tool_call_emit(Req, Token, Data) ->
     Bin =
@@ -2789,28 +2793,25 @@ send_done_for_req(_Req, _Stats) ->
 %% to a single row (e.g. llama_decode exception).
 fail_all_requests(Data, Err) ->
     Reqs = maps:values(Data#data.req_table),
-    lists:foreach(
-        fun(R) ->
-            case R#req.mode of
-                streaming ->
-                    case {R#req.request_ref, R#req.caller_pid} of
-                        {Ref, Pid} when is_pid(Pid), is_reference(Ref) ->
-                            barrel_inference_inflight:unregister(Ref),
-                            Pid ! {barrel_inference_error, Ref, Err};
-                        _ ->
-                            ok
-                    end;
-                _ ->
-                    %% sync callers have to receive a reply or they
-                    %% deadlock; gen_statem will fail the call on
-                    %% stop, surfacing {error, _} to them.
-                    ok
-            end,
-            _ = release_sampler(R, Data),
-            _ = release_seq(R#req.seq_id, Data)
-        end,
-        Reqs
-    ),
+    lists:foreach(fun(R) -> fail_request(R, Data, Err) end, Reqs),
+    ok.
+
+%% Fail one in-flight request: notify a streaming caller, release its
+%% sampler and seq.
+fail_request(R, Data, Err) ->
+    _ = notify_failure(R, Err),
+    _ = release_sampler(R, Data),
+    _ = release_seq(R#req.seq_id, Data),
+    ok.
+
+notify_failure(#req{mode = streaming, request_ref = Ref, caller_pid = Pid}, Err) when
+    is_pid(Pid), is_reference(Ref)
+->
+    barrel_inference_inflight:unregister(Ref),
+    Pid ! {barrel_inference_error, Ref, Err};
+notify_failure(_R, _Err) ->
+    %% Sync callers receive their reply when the gen_statem call fails
+    %% on stop, surfacing {error, _} to them.
     ok.
 
 release_sampler(#req{sampler_ref = SRef, tool_call_greedy_sampler_ref = GRef}, #data{
