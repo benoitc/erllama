@@ -685,6 +685,17 @@ barrel_inference_safe_sampler_init_grammar(const struct llama_vocab *vocab,
     }
 }
 
+// Clone a sampler: copies a parsed grammar's rules without re-parsing,
+// with fresh per-decode state. nullptr on a thrown exception.
+struct llama_sampler *
+barrel_inference_safe_sampler_clone(const struct llama_sampler *smpl) noexcept {
+    try {
+        return llama_sampler_clone(smpl);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LoRA adapters
 // ---------------------------------------------------------------------------

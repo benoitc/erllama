@@ -95,6 +95,8 @@ extern struct llama_sampler *barrel_inference_safe_sampler_init_penalties(
 extern int barrel_inference_safe_sampler_chain_add(struct llama_sampler *chain,
                                           struct llama_sampler *s);
 extern int barrel_inference_safe_sampler_free(struct llama_sampler *s);
+extern struct llama_sampler *barrel_inference_safe_sampler_clone(
+    const struct llama_sampler *smpl);
 extern llama_token barrel_inference_safe_sampler_sample(struct llama_sampler *s,
                                                 struct llama_context *ctx,
                                                 int32_t idx);
@@ -252,8 +254,11 @@ static void adapter_dtor(ErlNifEnv *env, void *obj);
 /* Forward decl: sampler_dtor + the build helper, defined in the
  * sampler section. */
 static void sampler_dtor(ErlNifEnv *env, void *obj);
+/* Forward-declared so the sampler builder can take the context resource
+ * (it owns the per-context grammar cache); full struct defined below. */
+struct barrel_inference_context_s;
 static struct llama_sampler *build_sampler_chain_from_map(
-    ErlNifEnv *env, ERL_NIF_TERM cfg, struct llama_context *ctx,
+    ErlNifEnv *env, ERL_NIF_TERM cfg, struct barrel_inference_context_s *c,
     ERL_NIF_TERM *out_err_atom);
 
 /* =========================================================================
@@ -305,7 +310,20 @@ typedef struct {
     int32_t next_pos;
 } barrel_inference_per_seq_t;
 
+#define BARREL_INFERENCE_GRAMMAR_CACHE_N 4
+
+/* One cached compiled grammar. `bytes` is an owned copy of the GBNF used
+ * to verify identity (a hash alone is not identity); `tmpl` is the parsed
+ * grammar sampler, cloned per request and never used for decode directly. */
 typedef struct {
+    unsigned char *bytes;
+    size_t len;
+    uint64_t hash;
+    struct llama_sampler *tmpl;
+    uint64_t lru;
+} barrel_inference_grammar_cache_entry_t;
+
+typedef struct barrel_inference_context_s {
     pthread_mutex_t mu;
     int mu_inited;
     struct llama_context *ctx;     /* NULL after successful release */
@@ -329,7 +347,20 @@ typedef struct {
      * leave this untouched and continue using seq_id=0 semantics
      * implicit in their callers. */
     barrel_inference_per_seq_t per_seq[BARREL_INFERENCE_N_SEQ_MAX_CAP];
+    /* Compiled-grammar cache. Claude Code (and agentic clients) send the
+     * same GBNF every turn; re-parsing it per request dominates infer
+     * admission for large tool grammars. Cache the parsed template keyed
+     * by the GBNF bytes and clone per request. All access is under c->mu
+     * (the sampler builder runs with the lock held), so no extra locking. */
+    barrel_inference_grammar_cache_entry_t gcache[BARREL_INFERENCE_GRAMMAR_CACHE_N];
+    uint64_t gcache_tick;
+    uint64_t gcache_hits;
+    uint64_t gcache_misses;
 } barrel_inference_context_t;
+
+/* Grammar cache: defined near the sampler builder, but ctx_dtor (above the
+ * definition) frees the cache, so forward-declare it here. */
+static void grammar_cache_clear(barrel_inference_context_t *c);
 
 /* LoRA adapter resource. The adapter is bound to a model and stays
  * valid until the model is freed or adapter_lora_free is called
@@ -442,6 +473,7 @@ static void model_dtor(ErlNifEnv *env, void *obj) {
 static void ctx_dtor(ErlNifEnv *env, void *obj) {
     (void) env;
     barrel_inference_context_t *c = (barrel_inference_context_t *) obj;
+    grammar_cache_clear(c);
     if (c->smpl) {
         (void) barrel_inference_safe_sampler_free(c->smpl);
         c->smpl = NULL;
@@ -835,6 +867,28 @@ static ERL_NIF_TERM nif_model_n_layer(ErlNifEnv *env, int argc, const ERL_NIF_TE
     int32_t n = barrel_inference_safe_model_n_layer(m->model);
     pthread_mutex_unlock(&m->mu);
     return enif_make_int(env, n);
+}
+
+/* Per-context grammar-cache stats: #{hits => N, misses => N}. Advisory
+ * metric so callers can confirm the compiled-grammar cache is taking
+ * effect (repeat tool turns should be hits). */
+static ERL_NIF_TERM
+nif_grammar_cache_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    barrel_inference_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&c->mu);
+    uint64_t hits = c->gcache_hits;
+    uint64_t misses = c->gcache_misses;
+    pthread_mutex_unlock(&c->mu);
+    ERL_NIF_TERM m = enif_make_new_map(env);
+    enif_make_map_put(
+        env, m, enif_make_atom(env, "hits"), enif_make_uint64(env, hits), &m);
+    enif_make_map_put(
+        env, m, enif_make_atom(env, "misses"), enif_make_uint64(env, misses), &m);
+    return m;
 }
 
 /* =========================================================================
@@ -2890,14 +2944,99 @@ static int chain_append(struct llama_sampler *chain,
     return 0;
 }
 
+/* FNV-1a 64-bit over the GBNF bytes; a fast pre-filter for the grammar
+ * cache. Identity is still confirmed by length + memcmp on lookup. */
+static uint64_t grammar_hash(const unsigned char *p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t) p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* Return the cached parsed grammar template for these exact GBNF bytes, or
+ * NULL. Caller holds c->mu. Bumps LRU + hit/miss counters. */
+static struct llama_sampler *
+grammar_cache_get(barrel_inference_context_t *c, const unsigned char *bytes, size_t len) {
+    uint64_t h = grammar_hash(bytes, len);
+    for (int i = 0; i < BARREL_INFERENCE_GRAMMAR_CACHE_N; i++) {
+        barrel_inference_grammar_cache_entry_t *e = &c->gcache[i];
+        if (e->tmpl && e->hash == h && e->len == len &&
+            memcmp(e->bytes, bytes, len) == 0) {
+            e->lru = ++c->gcache_tick;
+            c->gcache_hits++;
+            return e->tmpl;
+        }
+    }
+    c->gcache_misses++;
+    return NULL;
+}
+
+/* Store a parsed grammar template under its GBNF bytes, evicting the LRU
+ * slot if full. Takes ownership of `tmpl`: on its own alloc failure it
+ * frees `tmpl` (the caller has already cloned what it needs). Caller holds
+ * c->mu. */
+static void
+grammar_cache_put(barrel_inference_context_t *c, const unsigned char *bytes,
+                  size_t len, struct llama_sampler *tmpl) {
+    int victim = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (int i = 0; i < BARREL_INFERENCE_GRAMMAR_CACHE_N; i++) {
+        if (!c->gcache[i].tmpl) {
+            victim = i;
+            break;
+        }
+        if (c->gcache[i].lru < oldest) {
+            oldest = c->gcache[i].lru;
+            victim = i;
+        }
+    }
+    unsigned char *copy = enif_alloc(len);
+    if (!copy) {
+        (void) barrel_inference_safe_sampler_free(tmpl);
+        return;
+    }
+    memcpy(copy, bytes, len);
+    barrel_inference_grammar_cache_entry_t *e = &c->gcache[victim];
+    if (e->tmpl) {
+        (void) barrel_inference_safe_sampler_free(e->tmpl);
+        enif_free(e->bytes);
+    }
+    e->bytes = copy;
+    e->len = len;
+    e->hash = grammar_hash(bytes, len);
+    e->tmpl = tmpl;
+    e->lru = ++c->gcache_tick;
+}
+
+/* Free every cached grammar template + its bytes. Caller holds c->mu (or
+ * is the destructor, where no other thread can reach the resource). */
+static void grammar_cache_clear(barrel_inference_context_t *c) {
+    for (int i = 0; i < BARREL_INFERENCE_GRAMMAR_CACHE_N; i++) {
+        barrel_inference_grammar_cache_entry_t *e = &c->gcache[i];
+        if (e->tmpl) {
+            (void) barrel_inference_safe_sampler_free(e->tmpl);
+            e->tmpl = NULL;
+        }
+        if (e->bytes) {
+            enif_free(e->bytes);
+            e->bytes = NULL;
+        }
+        e->len = 0;
+        e->hash = 0;
+    }
+}
+
 /* Build a sampler chain from a config map. On failure returns NULL and
  * sets *out_err_atom to one of: atom_oom, atom_grammar_failed,
  * atom_badarg. The lock must already be held by the caller (vocab
  * lookup uses c->ctx). */
 static struct llama_sampler *
 build_sampler_chain_from_map(ErlNifEnv *env, ERL_NIF_TERM cfg,
-                             struct llama_context *ctx,
+                             barrel_inference_context_t *c,
                              ERL_NIF_TERM *out_err_atom) {
+    struct llama_context *ctx = c->ctx;
     if (!enif_is_map(env, cfg)) {
         *out_err_atom = enif_make_atom(env, "badarg");
         return NULL;
@@ -2967,23 +3106,42 @@ build_sampler_chain_from_map(ErlNifEnv *env, ERL_NIF_TERM cfg,
             *out_err_atom = atom_exception;
             return NULL;
         }
-        char *gstr = enif_alloc(grammar_bin.size + 1);
-        if (!gstr) {
-            (void) barrel_inference_safe_sampler_free(chain);
-            *out_err_atom = atom_oom;
-            return NULL;
+        /* Parse the GBNF at most once per distinct grammar (per context):
+         * cache the parsed template and clone it per request. Re-parsing a
+         * large tool grammar every turn dominates infer admission. */
+        struct llama_sampler *tmpl =
+            grammar_cache_get(c, grammar_bin.data, grammar_bin.size);
+        int from_cache = (tmpl != NULL);
+        if (!tmpl) {
+            char *gstr = enif_alloc(grammar_bin.size + 1);
+            if (!gstr) {
+                (void) barrel_inference_safe_sampler_free(chain);
+                *out_err_atom = atom_oom;
+                return NULL;
+            }
+            memcpy(gstr, grammar_bin.data, grammar_bin.size);
+            gstr[grammar_bin.size] = '\0';
+            tmpl = barrel_inference_safe_sampler_init_grammar(vocab, gstr, "root");
+            enif_free(gstr);
+            if (!tmpl) {
+                (void) barrel_inference_safe_sampler_free(chain);
+                *out_err_atom = atom_grammar_failed;
+                return NULL;
+            }
         }
-        memcpy(gstr, grammar_bin.data, grammar_bin.size);
-        gstr[grammar_bin.size] = '\0';
-        struct llama_sampler *g =
-            barrel_inference_safe_sampler_init_grammar(vocab, gstr, "root");
-        enif_free(gstr);
+        /* Clone before caching: grammar_cache_put may free `tmpl` on its own
+         * alloc failure, and a cache hit must not be mutated by decode. */
+        struct llama_sampler *g = barrel_inference_safe_sampler_clone(tmpl);
+        if (!from_cache) {
+            grammar_cache_put(c, grammar_bin.data, grammar_bin.size, tmpl);
+        }
         if (!g) {
             (void) barrel_inference_safe_sampler_free(chain);
             *out_err_atom = atom_grammar_failed;
             return NULL;
         }
         if (chain_append(chain, g) != 0) {
+            (void) barrel_inference_safe_sampler_free(g);
             (void) barrel_inference_safe_sampler_free(chain);
             *out_err_atom = atom_oom;
             return NULL;
@@ -3069,7 +3227,7 @@ static ERL_NIF_TERM nif_configure_sampler(ErlNifEnv *env, int argc,
     }
     ERL_NIF_TERM err = atom_oom;
     struct llama_sampler *chain =
-        build_sampler_chain_from_map(env, argv[1], c->ctx, &err);
+        build_sampler_chain_from_map(env, argv[1], c, &err);
     if (!chain) {
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, err);
@@ -3373,7 +3531,7 @@ static ERL_NIF_TERM nif_sampler_new(ErlNifEnv *env, int argc,
     }
     ERL_NIF_TERM err = atom_oom;
     struct llama_sampler *chain =
-        build_sampler_chain_from_map(env, argv[1], c->ctx, &err);
+        build_sampler_chain_from_map(env, argv[1], c, &err);
     pthread_mutex_unlock(&c->mu);
     if (!chain) {
         return enif_make_tuple2(env, atom_error, err);
@@ -3422,6 +3580,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_vram_info",    0, nif_vram_info,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_size",   1, nif_model_size,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_n_layer",1, nif_model_n_layer,ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_grammar_cache_stats", 1, nif_grammar_cache_stats, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_forward_with_argmax", 2, nif_forward_with_argmax,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},

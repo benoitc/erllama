@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Per-context compiled-grammar cache. An identical GBNF (agentic clients like
+  Claude Code resend the same tool grammar every turn) is now parsed once and
+  cloned per request via `llama_sampler_clone` instead of re-parsed, which
+  dominated infer admission for large tool grammars. The cache is a small
+  byte-verified LRU on the context resource (a hash is only a pre-filter; identity
+  is confirmed by length + `memcmp`), freed with the context. New
+  `barrel_inference_nif:grammar_cache_stats/1` (`#{hits, misses}`) exposes whether
+  the cache is taking effect.
+
 ## [0.8.0] - 2026-05-23
 
 Engine-robustness release covering the `barrel_inference_server` hardening

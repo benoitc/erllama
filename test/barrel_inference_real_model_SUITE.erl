@@ -46,6 +46,7 @@
     apply_chat_template_includes_system/1,
     set_grammar_constrains_output/1,
     clear_sampler_resets_to_greedy/1,
+    grammar_cache_reuses_compiled_template/1,
     seed_determinism/1,
     seed_varies/1,
     temperature_zero_is_greedy/1,
@@ -89,6 +90,7 @@ all() ->
         apply_chat_template_includes_system,
         set_grammar_constrains_output,
         clear_sampler_resets_to_greedy,
+        grammar_cache_reuses_compiled_template,
         seed_determinism,
         seed_varies,
         temperature_zero_is_greedy,
@@ -368,6 +370,27 @@ set_grammar_constrains_output(Config) ->
             ?assert(Trimmed =:= <<"yes">> orelse Trimmed =:= <<"no">>);
         timeout ->
             ct:fail(grammar_timeout)
+    end.
+
+%% The compiled-grammar cache (per NIF context) parses an identical GBNF
+%% once and clones it per request. Build a sampler twice with the same
+%% grammar and assert the second is a cache hit; a different grammar misses.
+grammar_cache_reuses_compiled_template(Config) ->
+    Path = ?config(model_path, Config),
+    {ok, Model} = barrel_inference_nif:load_model(Path, #{}),
+    try
+        {ok, Ctx} = barrel_inference_nif:new_context(Model, #{n_ctx => 512}),
+        G = <<"root ::= \"yes\" | \"no\"">>,
+        ok = barrel_inference_nif:configure_sampler(Ctx, #{grammar => G}),
+        ?assertMatch(#{hits := 0, misses := 1}, barrel_inference_nif:grammar_cache_stats(Ctx)),
+        ok = barrel_inference_nif:configure_sampler(Ctx, #{grammar => G}),
+        ?assertMatch(#{hits := 1, misses := 1}, barrel_inference_nif:grammar_cache_stats(Ctx)),
+        %% A different grammar is a miss, not a false hit.
+        ok = barrel_inference_nif:configure_sampler(Ctx, #{grammar => <<"root ::= \"a\"">>}),
+        ?assertMatch(#{hits := 1, misses := 2}, barrel_inference_nif:grammar_cache_stats(Ctx)),
+        ok = barrel_inference_nif:free_context(Ctx)
+    after
+        barrel_inference_nif:free_model(Model)
     end.
 
 clear_sampler_resets_to_greedy(Config) ->

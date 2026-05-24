@@ -53,6 +53,7 @@
     vram_info/0,
     model_size/1,
     model_n_layer/1,
+    grammar_cache_stats/1,
     forward_with_argmax/2
 ]).
 
@@ -357,6 +358,14 @@ model_size(Model) ->
 model_n_layer(Model) ->
     nif_model_n_layer(Model).
 
+%% Per-context grammar-cache stats. Advisory metric to confirm the
+%% compiled-grammar cache is taking effect: a client that resends the same
+%% tool grammar each turn should accrue hits after the first request.
+-spec grammar_cache_stats(context_ref()) ->
+    #{hits => non_neg_integer(), misses => non_neg_integer()}.
+grammar_cache_stats(Ctx) ->
+    nif_grammar_cache_stats(Ctx).
+
 %% Per-position argmax over the model vocab. Decodes `Tokens` with
 %% logits flagged on every position, then returns the argmax id at
 %% each position (mapped to the atom `eos` for end-of-generation
@@ -406,4 +415,5 @@ nif_sampler_free(_Sampler) -> erlang:nif_error(nif_not_loaded).
 nif_vram_info() -> erlang:nif_error(nif_not_loaded).
 nif_model_size(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_model_n_layer(_Model) -> erlang:nif_error(nif_not_loaded).
+nif_grammar_cache_stats(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_forward_with_argmax(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
