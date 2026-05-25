@@ -2137,11 +2137,18 @@ step_tick(Data) ->
     end.
 
 %% Decode errors the engine recovers from in place (without a
-%% supervisor reload): the per-step budget tripped (`decode_timeout`)
-%% or an external `request_abort` fired (`decode_aborted`).
+%% supervisor reload): the per-step budget tripped (`decode_timeout`),
+%% an external `request_abort` fired (`decode_aborted`), or `llama_decode`
+%% returned a hard failure (`decode_failed`, e.g. "no KV slot" from a
+%% prompt that overflows the context). Recovery resets the context and
+%% fails the in-flight requests cleanly rather than crash-looping the
+%% model; recovery is coarse (it cannot attribute the failure to a single
+%% row), so the server keeps over-length prompts out via truncation.
 is_recoverable_decode_error(decode_timeout) -> true;
 is_recoverable_decode_error(decode_aborted) -> true;
+is_recoverable_decode_error(decode_failed) -> true;
 is_recoverable_decode_error({decode_timeout, _}) -> true;
+is_recoverable_decode_error({decode_failed, _}) -> true;
 is_recoverable_decode_error(_) -> false.
 
 %% Pair each op with its result by matching on seq_id. The backend
@@ -2809,9 +2816,14 @@ notify_failure(#req{mode = streaming, request_ref = Ref, caller_pid = Pid}, Err)
 ->
     barrel_inference_inflight:unregister(Ref),
     Pid ! {barrel_inference_error, Ref, Err};
+notify_failure(#req{caller = From}, Err) when From =/= undefined ->
+    %% Sync caller (complete/3, prefill_only/3). Reply explicitly: on the
+    %% {stop} path the call would also fail on termination, but on the
+    %% recover-in-place path the gen_statem stays alive, so without this
+    %% reply the caller would hang until its own timeout.
+    _ = gen_statem:reply(From, {error, Err}),
+    ok;
 notify_failure(_R, _Err) ->
-    %% Sync callers receive their reply when the gen_statem call fails
-    %% on stop, surfacing {error, _} to them.
     ok.
 
 release_sampler(#req{sampler_ref = SRef, tool_call_greedy_sampler_ref = GRef}, #data{

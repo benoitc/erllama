@@ -906,6 +906,55 @@ decode_timeout_recovers_in_place_test_() ->
         end)
     end}.
 
+%% A hard llama_decode failure (e.g. "no KV slot" from an over-long
+%% prompt) recovers in place like a timeout, rather than crash-looping
+%% the model.
+decode_failed_recovers_in_place_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, fun(_Cfg) ->
+            Pid = barrel_inference_registry:whereis_name(<<"test_model">>),
+            ok = barrel_inference_model_stub:wedge_next_step({decode_failed, 1}),
+            {ok, Ref1} = barrel_inference_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 4},
+                self()
+            ),
+            receive
+                {barrel_inference_error, Ref1, _Reason} -> ok
+            after 5000 -> erlang:error(no_error_on_decode_failed)
+            end,
+            %% Same pid: recovered in place, not restarted.
+            ?assertEqual(Pid, barrel_inference_registry:whereis_name(<<"test_model">>)),
+            ?assertEqual(idle, barrel_inference_model:status(<<"test_model">>)),
+            {ok, Ref2} = barrel_inference_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 2},
+                self()
+            ),
+            _ = drain_done(Ref2, 5000),
+            ?assertEqual(idle, barrel_inference_model:status(<<"test_model">>))
+        end)
+    end}.
+
+%% A synchronous complete/3 caller in flight when the decode fails must
+%% get an {error,_} reply. Recovery keeps the gen_statem alive, so without
+%% the notify_failure/2 sync-reply fix the call would hang to its timeout.
+decode_failed_sync_caller_replies_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, fun(_Cfg) ->
+            ok = barrel_inference_model_stub:wedge_next_step({decode_failed, 1}),
+            ?assertMatch(
+                {error, _},
+                barrel_inference_model:complete(
+                    <<"test_model">>, long_prompt(), #{response_tokens => 4}
+                )
+            ),
+            ?assertEqual(idle, barrel_inference_model:status(<<"test_model">>))
+        end)
+    end}.
+
 %% Recovery clears sticky sessions: after a wedge the seq pool is fully
 %% available again and the old session is gone.
 recover_in_place_clears_sessions_test_() ->
