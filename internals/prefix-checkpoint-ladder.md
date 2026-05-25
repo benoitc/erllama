@@ -62,10 +62,14 @@ Concretely:
   in `apply_step_results`, `maybe_fire_cold_save/2`): fire a `cold` save
   each time the prefill cursor crosses a ladder boundary, reusing the
   existing async save plumbing (`fire_save_for_tokens(cold, ...)`).
-- Consumer (`lookup_longest_prefix`, `try_longest_prefix`) is unchanged.
+- Consumer (`lookup_longest_text_prefix`, `try_longest_prefix`) is
+  unchanged by the ladder. Note: the cache is now byte-keyed (see
+  cache-design.md), so each ladder row is keyed over its rendered-byte
+  prefix and the longest-prefix lookup scans byte lengths, not token
+  strides.
 
 No new save reason; the rows are ordinary `cold` rows at more boundaries.
-Token-exactness, sole-writer arbitration, and the slab format are all
+Byte-exactness, sole-writer arbitration, and the slab format are all
 untouched.
 
 ## The cost tradeoff (the part that needs a decision)

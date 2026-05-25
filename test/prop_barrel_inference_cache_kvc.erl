@@ -78,7 +78,7 @@ key_for(Meta) ->
         fingerprint => maps:get(fingerprint, Meta),
         quant_type => maps:get(quant_type, Meta),
         ctx_params_hash => maps:get(ctx_params_hash, Meta),
-        tokens => maps:get(tokens, Meta)
+        text => maps:get(prompt_text, Meta)
     }).
 
 %% Round-trip: build then parse returns the same payload and the
@@ -98,7 +98,7 @@ prop_round_trip() ->
         end
     ).
 
-%% Header always starts with the magic bytes and version 1.
+%% Header always starts with the magic bytes and version 2.
 prop_header_magic_and_version() ->
     ?FORALL(
         {Meta, Payload},
@@ -106,7 +106,7 @@ prop_header_magic_and_version() ->
         begin
             {ok, Prefix} = barrel_inference_cache_kvc:build(Meta, Payload),
             <<Magic:3/binary, Version:8, _/binary>> = Prefix,
-            Magic =:= <<"KVC">> andalso Version =:= 1
+            Magic =:= <<"KVC">> andalso Version =:= 2
         end
     ).
 

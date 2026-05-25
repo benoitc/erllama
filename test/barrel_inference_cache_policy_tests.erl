@@ -101,6 +101,74 @@ cold_save_split_at_lower_bound_test() ->
     ?assertEqual(32, length(Rest)).
 
 %% =============================================================================
+%% cold_save_segments/2
+%% =============================================================================
+
+%% No ladder keys (max_ladder_rows defaults to 0): exactly the legacy
+%% single trim boundary plus the sub-align remainder.
+cold_save_segments_no_ladder_matches_legacy_test() ->
+    Tokens = lists:seq(1, 4500),
+    Segs = barrel_inference_cache_policy:cold_save_segments(Tokens, cfg()),
+    ?assertEqual([4096, 404], [length(S) || S <- Segs]),
+    ?assertEqual(Tokens, lists:append(Segs)).
+
+%% Out of the [cold_min, cold_max] band: one remainder segment, no save.
+cold_save_segments_out_of_band_is_single_remainder_test() ->
+    Tokens = lists:seq(1, 400),
+    ?assertEqual([Tokens], barrel_inference_cache_policy:cold_save_segments(Tokens, cfg())).
+
+%% Ladder points sit BELOW the trim boundary; the trim boundary is still a
+%% save. Cold saves = length(Segs) - 1.
+cold_save_segments_ladder_below_trim_test() ->
+    Cfg = #{
+        min_tokens => 8,
+        cold_min_tokens => 8,
+        cold_max_tokens => 1000,
+        continued_interval => 2048,
+        boundary_trim_tokens => 0,
+        boundary_align_tokens => 8,
+        ladder_interval => 16,
+        max_ladder_rows => 3
+    },
+    Tokens = lists:seq(1, 100),
+    %% trim_count(100,0,8)=96; ladder 16,32,48 (<96); boundaries [16,32,48,96].
+    Segs = barrel_inference_cache_policy:cold_save_segments(Tokens, Cfg),
+    ?assertEqual([16, 16, 16, 48, 4], [length(S) || S <- Segs]),
+    ?assertEqual(Tokens, lists:append(Segs)),
+    %% Every cumulative save boundary is a multiple of boundary_align_tokens.
+    Boundaries = save_boundaries(Segs),
+    ?assert(lists:all(fun(B) -> B rem 8 =:= 0 end, Boundaries)).
+
+%% The ladder (boundaries below the trim) is bounded by max_ladder_rows.
+cold_save_segments_bounded_by_max_ladder_rows_test() ->
+    Cfg = #{
+        min_tokens => 8,
+        cold_min_tokens => 8,
+        cold_max_tokens => 1000,
+        continued_interval => 2048,
+        boundary_trim_tokens => 0,
+        boundary_align_tokens => 8,
+        ladder_interval => 16,
+        max_ladder_rows => 2
+    },
+    Tokens = lists:seq(1, 100),
+    Segs = barrel_inference_cache_policy:cold_save_segments(Tokens, Cfg),
+    %% ladder 16,32 (max 2) + trim 96 -> boundaries [16,32,96].
+    ?assertEqual([16, 16, 64, 4], [length(S) || S <- Segs]),
+    LadderCount = length(save_boundaries(Segs)) - 1,
+    ?assert(LadderCount =< 2).
+
+%% Cumulative lengths of all but the final (remainder) segment = the save
+%% boundaries.
+save_boundaries(Segs) ->
+    {Bs, _} = lists:foldl(
+        fun(Seg, {Acc, Pos}) -> {[Pos + length(Seg) | Acc], Pos + length(Seg)} end,
+        {[], 0},
+        lists:droplast(Segs)
+    ),
+    lists:reverse(Bs).
+
+%% =============================================================================
 %% should_continued_save/3
 %% =============================================================================
 

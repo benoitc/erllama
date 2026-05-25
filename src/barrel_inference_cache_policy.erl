@@ -26,6 +26,7 @@
 -export([
     trim_boundary/3,
     cold_save_split/2,
+    cold_save_segments/2,
     should_continued_save/3,
     should_finish_save/2,
     validate_config/1
@@ -42,9 +43,19 @@
     continued_interval := pos_integer(),
     boundary_trim_tokens := non_neg_integer(),
     boundary_align_tokens := pos_integer(),
+    %% Cold-save checkpoint ladder. Optional: when absent, no ladder
+    %% checkpoints are written (`cold_save_segments/2` yields one remainder
+    %% segment). `max_ladder_rows` is the maximum number of cold-save
+    %% checkpoints; `ladder_interval` is their spacing (aligned down to
+    %% boundary_align_tokens).
+    ladder_interval => pos_integer(),
+    max_ladder_rows => non_neg_integer(),
     session_resume_wait_ms => non_neg_integer(),
     prefill_chunk_size => pos_integer() | infinity
 }.
+
+-define(DEFAULT_LADDER_INTERVAL, 16384).
+-define(DEFAULT_MAX_LADDER_ROWS, 0).
 
 %% =============================================================================
 %% Boundary trim
@@ -98,6 +109,61 @@ cold_save_split(Tokens, Cfg) ->
             end
     end.
 
+%% Split a cold prompt into prefill SEGMENTS for the checkpoint ladder. A
+%% cold save fires at each internal segment boundary; the final segment is
+%% the non-saving sub-align remainder (covered by the finish save). The
+%% boundaries are: up to `max_ladder_rows` stride-aligned ladder points
+%% spaced ~`ladder_interval` apart, PLUS the legacy trim boundary (the
+%% largest aligned prefix, `cold_save_split`'s boundary). So with
+%% `max_ladder_rows = 0` (or the key absent) the result is exactly the
+%% legacy single-checkpoint behaviour; a positive value adds that many
+%% head checkpoints below the trim boundary. Every boundary is a multiple
+%% of `boundary_align_tokens`, so the longest-prefix walk (which probes
+%% only stride-aligned lengths) can hit every persisted row. Returns
+%% `[Tokens]` (one remainder, no cold save) when the prompt is out of the
+%% [cold_min_tokens, cold_max_tokens] band or too short to align.
+-spec cold_save_segments([token()], config()) -> [[token()]].
+cold_save_segments(Tokens, Cfg) ->
+    Len = length(Tokens),
+    Min = maps:get(cold_min_tokens, Cfg),
+    Max = maps:get(cold_max_tokens, Cfg),
+    Trim = maps:get(boundary_trim_tokens, Cfg),
+    Align = maps:get(boundary_align_tokens, Cfg),
+    case Len < Min orelse Len > Max of
+        true ->
+            [Tokens];
+        false ->
+            case trim_count(Len, Trim, Align) of
+                {skip, _} ->
+                    [Tokens];
+                {ok, TrimBoundary} ->
+                    Ladder = ladder_boundaries(TrimBoundary, Min, Align, Cfg),
+                    split_at(Ladder ++ [TrimBoundary], Tokens)
+            end
+    end.
+
+%% Stride-aligned ladder points strictly below the trim boundary, spaced
+%% ~ladder_interval apart, at most max_ladder_rows of them (ascending).
+-spec ladder_boundaries(non_neg_integer(), non_neg_integer(), pos_integer(), config()) ->
+    [pos_integer()].
+ladder_boundaries(TrimBoundary, Min, Align, Cfg) ->
+    MaxRows = maps:get(max_ladder_rows, Cfg, ?DEFAULT_MAX_LADDER_ROWS),
+    Interval = maps:get(ladder_interval, Cfg, ?DEFAULT_LADDER_INTERVAL),
+    Step = max(Align, (Interval div Align) * Align),
+    [B || K <- lists:seq(1, MaxRows), B <- [K * Step], B >= Min, B < TrimBoundary].
+
+%% Cut Tokens at the given absolute cumulative positions, returning the
+%% segments plus the trailing remainder (which may be empty when the last
+%% boundary is the full length).
+-spec split_at([pos_integer()], [token()]) -> [[token()]].
+split_at(Boundaries, Tokens) -> split_at(Boundaries, 0, Tokens, []).
+
+split_at([], _Pos, Rest, Acc) ->
+    lists:reverse([Rest | Acc]);
+split_at([B | Bs], Pos, Tokens, Acc) ->
+    {Seg, Rest} = lists:split(B - Pos, Tokens),
+    split_at(Bs, B, Rest, [Seg | Acc]).
+
 %% Continued saves fire every `continued_interval` tokens of *new*
 %% generation (i.e. live token count minus the count at the last save).
 -spec should_continued_save(non_neg_integer(), non_neg_integer(), config()) ->
@@ -145,6 +211,9 @@ check_invariants(Cfg) ->
     Interval = maps:get(continued_interval, Cfg),
     Trim = maps:get(boundary_trim_tokens, Cfg),
     Align = maps:get(boundary_align_tokens, Cfg),
+    %% Ladder keys are optional; validate the effective value.
+    LadderInterval = maps:get(ladder_interval, Cfg, ?DEFAULT_LADDER_INTERVAL),
+    MaxRows = maps:get(max_ladder_rows, Cfg, ?DEFAULT_MAX_LADDER_ROWS),
     Checks = [
         {is_integer(Min) andalso Min >= 0, {invalid, min_tokens, Min}},
         {is_integer(ColdMin) andalso ColdMin >= Min, {ordering, cold_min_tokens_lt_min_tokens}},
@@ -154,7 +223,12 @@ check_invariants(Cfg) ->
         },
         {is_integer(Interval) andalso Interval > 0, {invalid, continued_interval, Interval}},
         {is_integer(Trim) andalso Trim >= 0, {invalid, boundary_trim_tokens, Trim}},
-        {is_integer(Align) andalso Align > 0, {invalid, boundary_align_tokens, Align}}
+        {is_integer(Align) andalso Align > 0, {invalid, boundary_align_tokens, Align}},
+        {
+            is_integer(LadderInterval) andalso LadderInterval > 0,
+            {invalid, ladder_interval, LadderInterval}
+        },
+        {is_integer(MaxRows) andalso MaxRows >= 0, {invalid, max_ladder_rows, MaxRows}}
     ],
     case lists:dropwhile(fun({Pass, _}) -> Pass end, Checks) of
         [] -> ok;

@@ -5,9 +5,13 @@
 %% Cache-key derivation.
 %%
 %% A cache key is the SHA-256 of model_fingerprint || quant_byte ||
-%% ctx_params_hash || tokens_le32. Cache hits are token-exact by
-%% construction; semantic / approximate matching is not allowed at
-%% this layer.
+%% ctx_params_hash || rendered_prompt_bytes. The key is over the
+%% DETOKENISED rendered prompt bytes (ds4-style), not the token-id
+%% list, so the same logical prompt still hits when it retokenises
+%% across turns (chat-template / tool rendering). The exact tokens are
+%% carried in the checkpoint payload (for KV resume), not in the key.
+%% A byte-prefix of the new prompt that matches a stored checkpoint's
+%% bytes is a hit; lookup is the longest such prefix.
 %%
 %% The quant byte is a stable cache-internal enumeration of
 %% quantisation types. It is intentionally decoupled from llama.cpp's
@@ -18,7 +22,7 @@
 
 -export([
     make/1,
-    make/4,
+    make_text/4,
     effective_fingerprint/2,
     quant_byte/1,
     quant_atom/1,
@@ -67,7 +71,7 @@
     fingerprint := <<_:256>>,
     quant_type := quant_type(),
     ctx_params_hash := <<_:256>>,
-    tokens := [non_neg_integer()]
+    text := binary()
 }.
 
 -spec make(components()) -> key().
@@ -75,35 +79,33 @@ make(#{
     fingerprint := Fp,
     quant_type := QT,
     ctx_params_hash := CtxHash,
-    tokens := Tokens
+    text := Text
 }) when
     is_binary(Fp),
     byte_size(Fp) =:= 32,
     is_binary(CtxHash),
     byte_size(CtxHash) =:= 32,
-    is_list(Tokens)
+    is_binary(Text)
 ->
-    make(Fp, QT, CtxHash, encode_tokens(Tokens)).
+    make_text(Fp, QT, CtxHash, Text).
 
 -doc """
-Variant taking a pre-encoded TokensBin (u32-LE per token, matching
-`encode_tokens/1`). Used by the longest-prefix walk so a caller can
-encode once and pass `binary:part(AllTokensBin, 0, N*4)`
-sub-binaries per probe, avoiding the per-attempt list traversal +
-list comprehension allocation. Sub-binaries are O(1) views, so this
-turns the per-probe cost into just the SHA-256 work.
+Hash a pre-sliced rendered-byte prefix directly. Used by the
+longest-prefix scan: a caller slices `binary:part(PromptBytes, 0,
+TextBytes)` per checkpoint and we hash that. Sub-binaries are O(1)
+views, so the per-probe cost is just the SHA-256. The byte prefix has
+no alignment constraint (unlike the old u32-token encoding).
 """.
--spec make(<<_:256>>, quant_type(), <<_:256>>, binary()) -> key().
-make(Fp, QT, CtxHash, TokensBin) when
+-spec make_text(<<_:256>>, quant_type(), <<_:256>>, binary()) -> key().
+make_text(Fp, QT, CtxHash, Text) when
     is_binary(Fp),
     byte_size(Fp) =:= 32,
     is_binary(CtxHash),
     byte_size(CtxHash) =:= 32,
-    is_binary(TokensBin),
-    byte_size(TokensBin) rem 4 =:= 0
+    is_binary(Text)
 ->
     QuantByte = quant_byte(QT),
-    crypto:hash(sha256, [Fp, <<QuantByte:8>>, CtxHash, TokensBin]).
+    crypto:hash(sha256, [Fp, <<QuantByte:8>>, CtxHash, Text]).
 
 -doc """
 Compute an effective fingerprint from a base model fingerprint and a

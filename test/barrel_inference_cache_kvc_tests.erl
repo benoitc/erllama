@@ -30,7 +30,7 @@ key_for(Meta) ->
         fingerprint => maps:get(fingerprint, Meta),
         quant_type => maps:get(quant_type, Meta),
         ctx_params_hash => maps:get(ctx_params_hash, Meta),
-        tokens => maps:get(tokens, Meta)
+        text => maps:get(prompt_text, Meta, <<>>)
     }).
 
 %% =============================================================================
@@ -92,10 +92,10 @@ header_starts_with_magic_test() ->
     <<Magic:3/binary, _/binary>> = Prefix,
     ?assertEqual(<<"KVC">>, Magic).
 
-header_version_is_one_test() ->
+header_version_is_two_test() ->
     {ok, Prefix} = barrel_inference_cache_kvc:build(base_meta(), <<"x">>),
     <<_:3/binary, Version:8, _/binary>> = Prefix,
-    ?assertEqual(1, Version).
+    ?assertEqual(2, Version).
 
 header_save_reason_byte_test() ->
     Cases = [{cold, 1}, {continued, 2}, {evict, 3}, {shutdown, 4}, {finish, 5}],

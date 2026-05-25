@@ -50,15 +50,25 @@ The result is reported as `cache_hit_kind`:
 | `sticky` | A pinned session sequence already contains the prefix live. |
 | `continuation` | Caller asserted the tail on a pinned session via `continue/3`; no prefix check, no cache lookup. |
 
+The cache is byte-addressed (ds4-style): the key is SHA-256 over the
+rendered prompt bytes (`detokenize(tokens)`), not the token-id list.
 The lookup order is:
 
-1. Supplied `parent_key`, if present.
-2. Resume from an in-flight finish save, waiting up to
-   `session_resume_wait_ms`.
-3. Longest-prefix walk over the new prompt's tokens.
+1. Exact byte-key hit on the whole rendered prompt.
+2. Supplied `parent_key`, if present (session fast path), accepted
+   when its rendered bytes are a byte-prefix of this prompt; it also
+   waits up to `session_resume_wait_ms` for an in-flight finish save.
+3. Longest-byte-prefix lookup over the new prompt's rendered bytes.
 
-The longest-prefix walk is still exact. It probes aligned token prefixes and
-uses the longest row that actually exists.
+Any failure of 1 or 2 falls through to 3; only a byte-prefix miss is
+cold. The longest-byte-prefix lookup is still exact: it picks the
+longest stored rendered-byte prefix whose recomputed SHA-256 key
+matches and resumes from that checkpoint's exact tokens. The suffix
+beyond the match reuses the caller's ORIGINAL tokens when the byte
+boundary lands on a token boundary (token-exact, the common case);
+only a mid-token boundary re-tokenises the byte remainder
+(`checkpoint_tokens ++ tokenize(byte_suffix)` - identical byte
+stream, ds4's contract).
 
 ## Restore or prefill
 

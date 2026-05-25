@@ -10,7 +10,7 @@ File layout (little-endian throughout):
 ```
 [0..47]    Header (48 bytes, ds4-compatible):
               u8[3]  magic = "KVC"
-              u8     version = 1
+              u8     version = 2
               u8     quant_bits
               u8     save_reason (0..5)
               u8[2]  reserved
@@ -28,8 +28,10 @@ File layout (little-endian throughout):
               u32    payload_crc32c
               u32    reserved
 
-[72..]     Prompt section: u32_le length, then UTF-8 bytes
-           (observability only; untrusted on load)
+[72..]     Prompt section: u32_le length, then the rendered prompt
+           UTF-8 bytes. These bytes ARE the cache-key source (v2):
+           the key is sha256(fp || quant || ctx_hash || prompt_bytes),
+           and text_bytes = this section's length.
 
 [..]       TLV section: u32_le length, then a sequence of
            (u8 tag, u32_le length, value) records
@@ -126,7 +128,10 @@ Parse paths come in two flavours:
 %% =============================================================================
 
 -define(MAGIC, <<"KVC">>).
--define(VERSION, 1).
+%% v2: cache key is over the rendered prompt BYTES (prompt section),
+%% not the token-id list. Old v1 files key over tokens and must be
+%% rejected on the startup disk scan (no backward compatibility).
+-define(VERSION, 2).
 -define(HEADER_SIZE, 48).
 -define(TRAILER_SIZE, 24).
 
@@ -303,7 +308,7 @@ verify(Info, Payload, ExpectedCrc, ExpectedKey) ->
                 fingerprint => maps:get(fingerprint, Info),
                 quant_type => maps:get(quant_type, Info),
                 ctx_params_hash => maps:get(ctx_params_hash, Info),
-                tokens => maps:get(tokens, Info)
+                text => maps:get(prompt_text, Info, <<>>)
             }),
             case ActualKey =:= ExpectedKey of
                 false -> {error, {key_mismatch, ExpectedKey, ActualKey}};

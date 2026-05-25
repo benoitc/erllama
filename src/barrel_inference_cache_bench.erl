@@ -68,7 +68,7 @@ bench_save(DiskSrv, I, Payload) ->
         ctx_params_hash => binary:copy(<<16#BB>>, 32),
         tokens => Tokens,
         context_size => 4096,
-        prompt_text => <<>>,
+        prompt_text => integer_to_binary(I),
         hostname => <<"bench">>,
         barrel_inference_version => <<"0.1.0">>
     },
@@ -79,6 +79,6 @@ bench_load(DiskSrv, I) ->
         fingerprint => binary:copy(<<16#AA>>, 32),
         quant_type => f16,
         ctx_params_hash => binary:copy(<<16#BB>>, 32),
-        tokens => [I]
+        text => integer_to_binary(I)
     }),
     barrel_inference_cache_disk_srv:load(DiskSrv, Key).

@@ -82,10 +82,13 @@ save announce) go through `barrel_inference_cache_meta_srv` via
 
 ### Save pipeline correctness invariants (do not change without review)
 
-- Cache hits are token-exact by construction. The cache key includes
-  model fingerprint, quant byte, ctx hash, and the full token list as
-  little-endian u32. Approximate match is **not** allowed at this
-  layer.
+- Cache hits are byte-exact by construction. The cache key is SHA-256
+  over model fingerprint, quant byte, ctx hash, and the **rendered
+  prompt bytes** (`detokenize(tokens)`, ds4-style), not the token-id
+  list — so a prompt that retokenises across turns still hits. The
+  exact tokens travel in the checkpoint payload for KV resume.
+  Approximate / semantic match is **not** allowed at this layer; the
+  longest-byte-prefix lookup is still an exact SHA-256 match.
 - A save's payload is read from a paused live `llama_context*`. The
   context worker pauses decode for the pack window; no off-thread
   reads of the live context occur.

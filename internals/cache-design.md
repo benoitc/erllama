@@ -5,34 +5,57 @@ it does. The user-facing description of *what* the cache provides
 lives in the [caching guide](../guides/caching.md). This document
 is the *why*.
 
-## Token-exact, not approximate
+## Byte-prefix addressing, not approximate
 
 Cache keys are SHA-256 over `(model_fp || quant || ctx_params ||
-tokens_le32)`. The full token list goes into the hash, encoded as
-little-endian u32. Two calls with different tokenisations of the
-"same" prompt produce different keys — and rightly so, because the
-KV state is a function of the tokens, not the surface text.
+rendered_prompt_bytes)`, where `rendered_prompt_bytes =
+detokenize(tokens)`. The key is over the **rendered bytes**, not the
+token-id list (the model layer detokenises before keying). This is
+the ds4 model: content-addressed by the surface text, no session id.
 
-Approximate or fuzzy matching was an early temptation. We rejected
-it for two reasons:
+Why bytes and not tokens? Across agent turns the *same* logical
+prompt routinely retokenises — chat-template wrapping, tool
+rendering, the assistant's generated ids vs the re-tokenised
+assistant text. Keying on tokens makes those turns miss and re-cold-
+prefill every time. Keying on the rendered bytes makes the leading
+system + tools + history (stable text) hit even when the
+tokenisation drifts. The exact tokens still travel in the checkpoint
+payload (TLV `0x09`) for KV resume; only the *key* is byte-based.
+
+A hit is still exact, not fuzzy: SHA-256 over the bytes means a key
+match implies the bytes match (collision-negligible), so there is no
+memcmp and no approximate distance metric. Approximate / semantic
+matching was an early temptation and stays rejected:
 
 1. **Correctness is not a tunable.** A "close enough" cache hit
-   silently changes the model's output for the user. There is no
-   useful way to surface "we used a similar but not identical
-   cache row" to a downstream caller. Either the state is the right
-   state or it isn't.
-2. **Approximate match needs a candidate proposer.** The proposer
-   has to know what semantic neighbours look like. That bakes in a
-   policy decision (which embedding model? which distance metric?)
-   that does not generalise across tenants. Out of scope for v1;
-   tracked but not roadmapped.
+   silently changes the model's output for the user. Either the
+   state is the right state or it isn't.
+2. **Approximate match needs a candidate proposer** (which embedding
+   model? which distance metric?) that does not generalise across
+   tenants. Out of scope for v1; tracked but not roadmapped.
 
-The longest-prefix walk solves the practical case approximate
-matching tries to address — "this prompt is yesterday's prompt plus
-a new turn" — without weakening the guarantee. It walks the new
-prompt's tokens backward by the configured stride and probes the
-exact-key index at each alignment. The longest hit wins. Strictly
-exact, by construction.
+The **longest byte-prefix** lookup
+(`barrel_inference_cache_meta_srv:lookup_longest_text_prefix/2`)
+solves "this prompt is yesterday's prompt plus a new turn": over the
+`available` rows it picks the longest stored `text_bytes <=
+byte_size(prompt_bytes)` whose recomputed key matches, restores that
+checkpoint's exact tokens + KV, and prefills only the uncovered
+suffix. When the checkpoint's byte boundary lands on a token boundary
+of the caller's prompt (the common case, including an identical
+re-send), the suffix is the caller's ORIGINAL remaining tokens, so
+resume is token-exact and a re-sent prompt reproduces its reply. Only
+when the boundary falls mid-token (a genuine retokenisation) is the
+byte remainder re-tokenised (`checkpoint_tokens ++
+tokenize(byte_suffix)`); the token boundaries at the seam then differ
+from a fresh full tokenisation, but the byte stream is identical, so
+the resume is sound (ds4's contract). The recomputed key folds in
+the current model's `fp/quant/ctx`, so rows from another
+model/quant/context never match — no separate namespace fields.
+
+Old token-keyed cache files (KVC format v1) are not adopted: the
+format version was bumped to v2 and v1 files are rejected on the
+startup disk scan. There is no backward-compatible reading of the
+old key scheme; the cache simply refills under the byte scheme.
 
 ## Multi-tier, not just RAM
 
@@ -99,7 +122,7 @@ because the holder is going away.
   capability.
 - **Not a request scheduler.** Concurrency, queueing, and rate
   limiting live above the cache. The cache only owns "the
-  on-disk/in-RAM mapping from token-prefix to KV bytes".
+  on-disk/in-RAM mapping from rendered-byte-prefix to KV bytes".
 - **Not a generic blob store.** Slab format is opinionated:
   fixed-size per-layer regions, 48-byte header, CRC32C trailer.
   Repurposing the format for non-llama.cpp data would be miserable.

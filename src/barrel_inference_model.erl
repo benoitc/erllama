@@ -392,12 +392,15 @@ concurrently through one decode call per tick.
     %% Tokens to prefill AFTER the next cold save fires. Cold-save
     %% policy splits the prompt into a trimmed prefix (which lands
     %% as the cold save) and a remainder. The trimmed prefix goes
-    %% into prefill_cursor; this field holds the remainder. After
-    %% the trim's prefill tick fires the cold save, this gets
-    %% rotated into prefill_cursor on the next tick. `undefined`
-    %% when no cold save is pending (no_save policy, prefill_only
-    %% mode, or warm-restore path).
-    cold_save_remaining = undefined :: undefined | [non_neg_integer()],
+    %% Cold-prefill checkpoint ladder: the prompt is split into prefill
+    %% segments; the first goes into prefill_cursor and this field holds
+    %% the segments still to prefill. Each time the cursor drains to a
+    %% (non-final) segment boundary, maybe_fire_cold_save/2 fires a cold
+    %% save and rotates the next segment in. The final segment is a
+    %% non-saving remainder, so cold saves = length(initial segments) - 1.
+    %% `undefined` when no cold ladder is pending (prefill_only mode or
+    %% warm-restore path); `[]` once the final remainder is reached.
+    cold_save_segments = undefined :: undefined | [[non_neg_integer()]],
     %% Set when this request has emitted its final result. The next
     %% step_tick iteration drops it from req_table; deferring the
     %% removal lets the tick walk results without mid-iteration
@@ -593,7 +596,7 @@ complete(Model, Prompt, Opts) ->
 Decode a prompt into KV state and fire a finish save, without
 sampling any output tokens. Returns the `finish_key` so the caller
 can hand it as `parent_key` to a subsequent `complete/3` or
-`infer/4` for token-exact warm restore.
+`infer/4` for byte-exact warm restore.
 
 `PromptTokens` is the prompt as a list of token ids. Tokenisation
 is the caller's responsibility (use `tokenize/2` or apply a chat
@@ -1136,6 +1139,8 @@ admit(Item, Data) ->
     case resolve_admission_seq(Item, Data) of
         {sticky, SeqId, StoredTokens, NewData} ->
             start_admission(Item, SeqId, {sticky, StoredTokens}, NewData);
+        {sticky_partial, SeqId, L, NewData} ->
+            start_admission(Item, SeqId, {sticky_partial, L}, NewData);
         {normal, NewData} ->
             admit_normal(Item, NewData);
         {sticky_busy, _SessionId} ->
@@ -1263,6 +1268,7 @@ start_admission(Item, SeqId, Mode, Data) ->
             Data1 =
                 case Mode of
                     {sticky, _} -> Data;
+                    {sticky_partial, _} -> Data;
                     {continue, _} -> Data;
                     normal -> Data#data{idle_seq_ids = [SeqId | Data#data.idle_seq_ids]}
                 end,
@@ -1310,16 +1316,33 @@ resolve_sticky_continuation(SessionId, SeqId, StoredTokens, Item, Data) ->
         true ->
             {sticky, SeqId, StoredTokens, Data};
         false ->
-            %% Divergence: drop the sticky mapping, free the seq's
-            %% live KV, return the seq to the idle pool. The
-            %% caller's normal admission picks it back up.
-            backend_seq_clear_for(SeqId, Data),
-            NewData = Data#data{
-                session_seq = maps:remove(SessionId, Data#data.session_seq),
-                idle_seq_ids = [SeqId | Data#data.idle_seq_ids]
-            },
-            {normal, NewData}
+            %% Not a clean extension (re-render, retokenisation, or a
+            %% mid-history edit). Reuse the longest common prefix of the
+            %% pinned seq's live KV in place: keep cells [0, L), re-prefill
+            %% the divergent suffix. L >= max(1, min_tokens) is required -
+            %% min_tokens may be 0, and an L = 0 partial would leave the
+            %% stale KV uncleared (setup_warm with an empty prefix is a
+            %% no-op). Below the floor, fall back to a full cold admit.
+            L = longest_common_prefix_len(StoredTokens, Prompt),
+            Floor = max(1, maps:get(min_tokens, Data#data.policy, 1)),
+            case L >= Floor of
+                true ->
+                    {sticky_partial, SeqId, L, Data};
+                false ->
+                    backend_seq_clear_for(SeqId, Data),
+                    NewData = Data#data{
+                        session_seq = maps:remove(SessionId, Data#data.session_seq),
+                        idle_seq_ids = [SeqId | Data#data.idle_seq_ids]
+                    },
+                    {normal, NewData}
+            end
     end.
+
+%% Length of the longest common prefix of two token lists.
+longest_common_prefix_len(A, B) -> lcp_len(A, B, 0).
+
+lcp_len([X | As], [X | Bs], N) -> lcp_len(As, Bs, N + 1);
+lcp_len(_, _, N) -> N.
 
 backend_seq_clear_for(SeqId, #data{backend = Mod, backend_state = S}) ->
     case erlang:function_exported(Mod, seq_rm, 2) of
@@ -1660,7 +1683,18 @@ setup_admission_path(Req, {continue, StoredTokens}, Suffix, _Opts, _Data) ->
         context_tokens = StoredTokens,
         cache_hit_kind = continuation,
         cache_hit_prefix_len = length(StoredTokens)
-    }.
+    };
+setup_admission_path(Req, {sticky_partial, L}, Prompt, _Opts, Data) ->
+    %% Reuse the longest common prefix of the pinned seq's live KV. Keep
+    %% the first L prompt tokens and route through setup_warm/5: its
+    %% warm_restore_primer/3 calls seq_rm_last(SeqId, L), which removes the
+    %% position RANGE [L-1, inf) - dropping the stale tail [L, M) AND
+    %% priming cell L-1 - then re-prefills cell L-1 plus the divergent
+    %% suffix, regenerating correct logits.
+    barrel_inference_cache_counters:incr(?C_HITS_STICKY_PARTIAL),
+    Keep = lists:sublist(Prompt, L),
+    Suffix = lists:nthtail(L, Prompt),
+    setup_warm(Req, Keep, Suffix, partial, Data).
 
 %% Run the cache lookup for this request's prompt and set up the
 %% #req's `prefill_cursor` and `context_tokens` accordingly. The
@@ -1698,31 +1732,27 @@ setup_warm(Req, ContextTokens, RemainingTokens, HitKind, Data) ->
     end.
 
 %% Reset the seq's KV before a cold prefill so per_seq.next_pos
-%% starts at 0, then split the prompt per the cold-save policy.
-%% The trim slice goes into prefill_cursor; the remainder is held
-%% in cold_save_remaining and rotated in by maybe_fire_cold_save
-%% after the trim's prefill tick has fired the save.
+%% starts at 0, then split the prompt into checkpoint-ladder segments.
+%% The first segment goes into prefill_cursor; the rest are held in
+%% cold_save_segments and rotated in by maybe_fire_cold_save as each
+%% boundary's prefill tick fires its cold save. cold_save_segments/2
+%% always returns at least one (remainder) segment, so the split is
+%% total.
 setup_cold(Req, Data) ->
     ok = backend_seq_clear(Req#req.seq_id, Data),
     Tokens = Req#req.prompt_tokens,
-    case barrel_inference_cache_policy:cold_save_split(Tokens, Data#data.policy) of
-        {trim, TrimmedPrefix, RemainingTokens} ->
-            Req#req{
-                prefill_cursor = TrimmedPrefix,
-                cold_save_remaining = RemainingTokens,
-                context_tokens = [],
-                cache_hit_kind = cold,
-                cache_hit_prefix_len = 0
-            };
-        no_save ->
-            Req#req{
-                prefill_cursor = Tokens,
-                cold_save_remaining = undefined,
-                context_tokens = [],
-                cache_hit_kind = cold,
-                cache_hit_prefix_len = 0
-            }
-    end.
+    [Seg1 | Rest] = barrel_inference_cache_policy:cold_save_segments(Tokens, Data#data.policy),
+    Req#req{
+        prefill_cursor =
+            case Seg1 of
+                [] -> undefined;
+                _ -> Seg1
+            end,
+        cold_save_segments = Rest,
+        context_tokens = [],
+        cache_hit_kind = cold,
+        cache_hit_prefix_len = 0
+    }.
 
 %% Wipe seq's KV state so prefill starts at position 0. Used on the
 %% cold path to defend against leftover cells from a prior
@@ -2646,27 +2676,33 @@ mark_terminal(Data) ->
         Reqs
     ).
 
-%% Cold-save firing between the trim-prefill tick and the remainder
-%% tick. At this point the seq's KV holds exactly the trimmed
-%% prefix — kv_pack captures that state. The remainder is rotated
-%% into prefill_cursor so the next tick continues the prefill. With
-%% cold_save_remaining = undefined nothing fires (no_save policy,
-%% prefill_only mode, or warm path).
-maybe_fire_cold_save(Req = #req{cold_save_remaining = undefined}, _Data) ->
+%% Cold-save firing as each ladder segment finishes prefilling. When
+%% cold_save_segments still has entries, the just-drained boundary is an
+%% internal one: the seq's KV holds exactly context_tokens (an aligned
+%% prefix), kv_pack captures it, and the next segment rotates into
+%% prefill_cursor. An empty list means the final remainder just drained:
+%% no cold save (the finish save covers the full prompt). `undefined`
+%% means no cold ladder (prefill_only mode or warm path).
+maybe_fire_cold_save(Req = #req{cold_save_segments = undefined}, _Data) ->
     Req;
+maybe_fire_cold_save(Req = #req{cold_save_segments = []}, _Data) ->
+    Req#req{cold_save_segments = undefined, prefill_cursor = undefined};
 maybe_fire_cold_save(
-    Req = #req{cold_save_remaining = Remaining, context_tokens = Trimmed},
+    Req = #req{cold_save_segments = [Next | Rest], context_tokens = Ctx},
     Data
 ) ->
-    Req0 = fire_save_for_tokens(cold, Trimmed, Req, Data),
+    Req0 = fire_save_for_tokens(cold, Ctx, Req, Data),
+    %% Next is the following segment to prefill. When the trim boundary is
+    %% the full prompt length the trailing remainder is empty: treat it as
+    %% no further prefill (undefined cursor) rather than an empty cursor.
     NextCursor =
-        case Remaining of
+        case Next of
             [] -> undefined;
-            _ -> Remaining
+            _ -> Next
         end,
     Req0#req{
-        cold_save_remaining = undefined,
-        last_save_at = length(Trimmed),
+        cold_save_segments = Rest,
+        last_save_at = length(Ctx),
         prefill_cursor = NextCursor
     }.
 
@@ -3105,66 +3141,117 @@ flush_pending_text(_Req) ->
 
 %% Multi-seq variant: takes the #req that's being admitted so the
 %% fingerprint and kv_unpack/seq_rm calls target the correct seq.
+%%
+%% The cache is content-addressed by the rendered prompt BYTES
+%% (ds4-style): we detokenise once here and reuse the bytes for the
+%% exact-key probe and the byte-prefix scan. The exact-byte hit and
+%% the parent-key session path are optimisations; ANY of their
+%% failures falls through to the byte-prefix scan, and only a
+%% byte-prefix miss returns cold.
 lookup_or_resume(PromptTokens, ParentKey, Req, Data) ->
-    Key = make_key(PromptTokens, Req, Data),
+    PromptBytes = backend_call(Data, detokenize, [PromptTokens]),
+    Key = make_key_bytes(PromptBytes, Req, Data),
     case pin_and_load(Key, Req#req.seq_id, Data) of
         {ok, ContextTokens} ->
             barrel_inference_cache_counters:incr(?C_HITS_EXACT),
             {warm, ContextTokens, [], exact};
         miss when ParentKey =/= undefined ->
-            try_session_resume(PromptTokens, ParentKey, Req, Data);
+            try_session_resume(PromptTokens, PromptBytes, ParentKey, Req, Data);
         miss ->
-            try_longest_prefix(PromptTokens, Req, Data)
+            try_longest_prefix(PromptTokens, PromptBytes, Req, Data)
     end.
 
-%% Stateless callers (HTTP front-end, agent loops that resend the
-%% full conversation each turn) don't have a parent_key to thread.
-%% Walk back through the prompt by stride and pick the longest
-%% cached prefix; fall through to cold if nothing matches.
-try_longest_prefix(PromptTokens, Req, Data) ->
+%% Content-addressed byte-prefix lookup: find the longest stored
+%% rendered-byte prefix of PromptBytes and resume from it. Falls
+%% through to cold only when nothing matches.
+try_longest_prefix(PromptTokens, PromptBytes, Req, Data) ->
     KeyMeta = #{
         fingerprint => request_fp(Req, Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash
     },
-    Stride = maps:get(boundary_align_tokens, Data#data.policy, 2048),
-    Min = maps:get(min_tokens, Data#data.policy, 512),
-    case
-        barrel_inference_cache_meta_srv:lookup_longest_prefix(KeyMeta, PromptTokens, Stride, Min)
-    of
-        {ok, PrefixLen, Row} ->
+    case barrel_inference_cache_meta_srv:lookup_longest_text_prefix(KeyMeta, PromptBytes) of
+        {ok, MatchBytes, Row} ->
             resume_at_prefix(
-                element(?POS_KEY, Row), PrefixLen, PromptTokens, Req, Data, partial
+                element(?POS_KEY, Row), MatchBytes, PromptTokens, PromptBytes, Req, Data
             );
         miss ->
             barrel_inference_cache_counters:incr(?C_MISSES),
             cold
     end.
 
-%% Pin + load the row, then verify the tokens really are the first
-%% PrefixLen of PromptTokens. The key is sha256 of the tokens, so a
-%% hit implies equality, but we belt-and-braces it here.
-resume_at_prefix(Key, PrefixLen, PromptTokens, Req, Data, HitKind) ->
+%% Pin + load the matched row's exact tokens + KV, then build the
+%% suffix the checkpoint did not cover. The SHA-256 byte key is the
+%% whole verification (no token-prefix check): the matched row's
+%% stored bytes ARE the leading MatchBytes of PromptBytes.
+resume_at_prefix(Key, MatchBytes, PromptTokens, PromptBytes, Req, Data) ->
     case pin_and_load(Key, Req#req.seq_id, Data) of
-        {ok, ParentTokens} when length(ParentTokens) =:= PrefixLen ->
-            case is_strict_prefix(ParentTokens, PromptTokens) of
-                true ->
-                    Remaining = lists:nthtail(PrefixLen, PromptTokens),
-                    barrel_inference_cache_counters:incr(?C_HITS_LONGEST_PREFIX),
-                    {warm, ParentTokens, Remaining, HitKind};
-                false ->
-                    barrel_inference_cache_counters:incr(?C_MISSES),
-                    cold
-            end;
-        _ ->
+        {ok, CheckpointTokens} ->
+            barrel_inference_cache_counters:incr(?C_HITS_LONGEST_PREFIX),
+            Suffix = resume_suffix(PromptTokens, PromptBytes, MatchBytes, Data),
+            {warm, CheckpointTokens, Suffix, partial};
+        miss ->
             barrel_inference_cache_counters:incr(?C_MISSES),
             cold
     end.
 
-%% Note: the resume hit counter is bumped inside `try_session_resume`
-%% only on a verified strict-prefix match.
+%% Tokens for the part of the prompt a checkpoint of MatchBytes length
+%% did not cover. When the byte boundary lands exactly on a token
+%% boundary of the caller's PromptTokens (the common case: identical
+%% or cleanly-extended prompt), reuse the ORIGINAL suffix tokens so
+%% warm resume stays token-exact and a re-sent prompt reproduces its
+%% reply. Only a genuine retokenisation - the checkpoint's bytes
+%% ending mid-token - falls back to tokenising the byte remainder
+%% (`CheckpointTokens ++ tokenize(byte_suffix)`, byte-identical, ds4's
+%% contract).
+resume_suffix(PromptTokens, PromptBytes, MatchBytes, Data) ->
+    case byte_size(PromptBytes) - MatchBytes of
+        0 ->
+            [];
+        SuffixLen ->
+            case split_tokens_at_byte(PromptTokens, MatchBytes, Data) of
+                {aligned, SuffixTokens} ->
+                    SuffixTokens;
+                misaligned ->
+                    SuffixBytes = binary:part(PromptBytes, MatchBytes, SuffixLen),
+                    backend_call(Data, tokenize, [SuffixBytes])
+            end
+    end.
 
-try_session_resume(PromptTokens, ParentKey, Req, Data) ->
+%% Find K such that detokenising the first K of Tokens yields exactly
+%% TargetBytes bytes, and return `{aligned, drop-first-K}`. Returns
+%% `misaligned` when TargetBytes falls inside a token. The prefix byte
+%% length is non-decreasing in K, so a binary search converges in
+%% O(log N) detokenise probes (once per warm admission, off the
+%% per-token decode path).
+split_tokens_at_byte(Tokens, TargetBytes, Data) ->
+    split_tokens_at_byte(Tokens, TargetBytes, Data, 0, length(Tokens)).
+
+split_tokens_at_byte(Tokens, TargetBytes, Data, Lo, Hi) when Lo =< Hi ->
+    Mid = (Lo + Hi) div 2,
+    case prefix_byte_size(Tokens, Mid, Data) of
+        TargetBytes ->
+            {aligned, lists:nthtail(Mid, Tokens)};
+        Bytes when Bytes < TargetBytes ->
+            split_tokens_at_byte(Tokens, TargetBytes, Data, Mid + 1, Hi);
+        _ ->
+            split_tokens_at_byte(Tokens, TargetBytes, Data, Lo, Mid - 1)
+    end;
+split_tokens_at_byte(_Tokens, _TargetBytes, _Data, _Lo, _Hi) ->
+    misaligned.
+
+prefix_byte_size(_Tokens, 0, _Data) ->
+    0;
+prefix_byte_size(Tokens, K, Data) ->
+    byte_size(backend_call(Data, detokenize, [lists:sublist(Tokens, K)])).
+
+%% Session fast path: the previous turn threaded its finish key as
+%% ParentKey. If that checkpoint is cached and its rendered bytes are
+%% a byte-prefix of this turn's bytes, resume from it directly.
+%% Otherwise fall through to the general byte-prefix scan (NOT cold) -
+%% retokenisation across turns means a token-level check would
+%% needlessly miss.
+try_session_resume(PromptTokens, PromptBytes, ParentKey, Req, Data) ->
     Wait = maps:get(session_resume_wait_ms, Data#data.policy, 500),
     %% First wait for the row to publish (the previous turn's
     %% finish-save may still be in flight), then pin via checkout.
@@ -3172,22 +3259,26 @@ try_session_resume(PromptTokens, ParentKey, Req, Data) ->
         {ok, _Row} ->
             case pin_and_load(ParentKey, Req#req.seq_id, Data) of
                 {ok, ParentTokens} ->
-                    case is_strict_prefix(ParentTokens, PromptTokens) of
-                        true ->
-                            Remaining = lists:nthtail(length(ParentTokens), PromptTokens),
-                            barrel_inference_cache_counters:incr(?C_HITS_RESUME),
-                            {warm, ParentTokens, Remaining, partial};
-                        false ->
-                            barrel_inference_cache_counters:incr(?C_MISSES),
-                            cold
-                    end;
+                    resume_session_or_fallthrough(
+                        PromptTokens, PromptBytes, ParentTokens, Req, Data
+                    );
                 miss ->
-                    barrel_inference_cache_counters:incr(?C_MISSES),
-                    cold
+                    try_longest_prefix(PromptTokens, PromptBytes, Req, Data)
             end;
         miss ->
-            barrel_inference_cache_counters:incr(?C_MISSES),
-            cold
+            try_longest_prefix(PromptTokens, PromptBytes, Req, Data)
+    end.
+
+resume_session_or_fallthrough(PromptTokens, PromptBytes, ParentTokens, Req, Data) ->
+    ParentBytes = backend_call(Data, detokenize, [ParentTokens]),
+    PLen = byte_size(ParentBytes),
+    case PromptBytes of
+        <<ParentBytes:PLen/binary, _/binary>> ->
+            barrel_inference_cache_counters:incr(?C_HITS_RESUME),
+            Suffix = resume_suffix(PromptTokens, PromptBytes, PLen, Data),
+            {warm, ParentTokens, Suffix, partial};
+        _ ->
+            try_longest_prefix(PromptTokens, PromptBytes, Req, Data)
     end.
 
 %% checkout the row, load + unpack the payload under the pin (into
@@ -3332,15 +3423,24 @@ build_meta_for(SaveReason, Tokens, Req, Data) ->
         ctx_params_hash => Data#data.ctx_params_hash,
         tokens => Tokens,
         context_size => Data#data.context_size,
-        prompt_text => <<>>
+        %% The rendered prompt bytes are the cache-key source (v2) and
+        %% are stored in the KVC prompt section. The token list stays
+        %% in the TLV for KV resume.
+        prompt_text => backend_call(Data, detokenize, [Tokens])
     }.
 
+%% Cache key over the rendered prompt BYTES. The token list is
+%% detokenised first so the same logical prompt still hits when it
+%% retokenises across turns.
 make_key(Tokens, Req, Data) ->
+    make_key_bytes(backend_call(Data, detokenize, [Tokens]), Req, Data).
+
+make_key_bytes(Bytes, Req, Data) ->
     barrel_inference_cache_key:make(#{
         fingerprint => request_fp(Req, Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash,
-        tokens => Tokens
+        text => Bytes
     }).
 
 %% Fingerprint to use for cache identity. Returns the per-request
@@ -3364,10 +3464,6 @@ backend_kv_unpack(Bin, SeqId, #data{backend = Mod, backend_state = S}) ->
         true -> Mod:kv_unpack(S, Bin, SeqId);
         false -> Mod:kv_unpack(S, Bin)
     end.
-
-is_strict_prefix([], _) -> true;
-is_strict_prefix([H | T1], [H | T2]) -> is_strict_prefix(T1, T2);
-is_strict_prefix(_, _) -> false.
 
 %% =============================================================================
 %% Internal: backend dispatch

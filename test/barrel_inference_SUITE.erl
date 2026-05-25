@@ -142,7 +142,7 @@ multi_turn_session_resume(Config) ->
         ctx_params_hash => binary:copy(<<16#BB>>, 32),
         tokens => PrefixTokens,
         context_size => 4096,
-        prompt_text => <<>>,
+        prompt_text => stub_detok(PrefixTokens),
         hostname => <<"ct">>,
         barrel_inference_version => <<"0.1.0">>
     },
@@ -306,12 +306,17 @@ long_prompt() ->
         string:join([integer_to_list(N) || N <- lists:seq(1, 12)], " ")
     ).
 
+%% Mirror the stub backend's detokenise: a token list renders to its
+%% space-joined decimal ids. The cache key (v2) is over these bytes.
+stub_detok(Tokens) ->
+    list_to_binary(string:join([integer_to_list(T) || T <- Tokens], " ")).
+
 key_for_tokens(Tokens) ->
     barrel_inference_cache_key:make(#{
         fingerprint => binary:copy(<<16#AA>>, 32),
         quant_type => f16,
         ctx_params_hash => binary:copy(<<16#BB>>, 32),
-        tokens => Tokens
+        text => stub_detok(Tokens)
     }).
 
 wait_until(Pred, TimeoutMs) ->

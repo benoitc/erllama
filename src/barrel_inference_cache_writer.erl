@@ -285,7 +285,7 @@ derive_key(BuildMeta) ->
                 fingerprint => maps:get(fingerprint, BuildMeta),
                 quant_type => maps:get(quant_type, BuildMeta),
                 ctx_params_hash => maps:get(ctx_params_hash, BuildMeta),
-                tokens => maps:get(tokens, BuildMeta)
+                text => maps:get(prompt_text, BuildMeta, <<>>)
             })}
     catch
         error:{badkey, K} -> {error, {missing_key, K}};
@@ -336,9 +336,10 @@ after_publish(Key, Token, BuildMeta, FinalPath, Header, Size) ->
     case barrel_inference_cache_meta_srv:mark_published(Key, Token, FinalPath) of
         ok ->
             TokensBin = barrel_inference_cache_key:encode_tokens(maps:get(tokens, BuildMeta)),
+            TextBytes = byte_size(maps:get(prompt_text, BuildMeta, <<>>)),
             case
                 barrel_inference_cache_meta_srv:announce_saved(
-                    Key, Token, Size, Header, TokensBin
+                    Key, Token, Size, Header, TokensBin, TextBytes
                 )
             of
                 ok ->

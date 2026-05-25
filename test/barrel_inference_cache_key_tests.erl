@@ -12,7 +12,7 @@ make_returns_32_bytes_test() ->
         fingerprint => fp(),
         quant_type => f16,
         ctx_params_hash => ctx(),
-        tokens => [1, 2, 3]
+        text => <<"1 2 3">>
     }),
     ?assertEqual(32, byte_size(Key)).
 
@@ -21,40 +21,61 @@ make_is_deterministic_test() ->
         fingerprint => fp(),
         quant_type => q4_k_m,
         ctx_params_hash => ctx(),
-        tokens => [1, 2, 3, 4]
+        text => <<"1 2 3 4">>
     },
     ?assertEqual(
         barrel_inference_cache_key:make(Components),
         barrel_inference_cache_key:make(Components)
     ).
 
-make_distinct_for_token_change_test() ->
+%% The key is over the rendered bytes, not the token-id list: two
+%% token sequences that detokenise to the same bytes produce the
+%% same key. make/1 and make_text/4 must agree.
+make_text_matches_make_test() ->
+    Key1 = barrel_inference_cache_key:make(#{
+        fingerprint => fp(),
+        quant_type => f16,
+        ctx_params_hash => ctx(),
+        text => <<"hello world">>
+    }),
+    Key2 = barrel_inference_cache_key:make_text(fp(), f16, ctx(), <<"hello world">>),
+    ?assertEqual(Key1, Key2).
+
+make_distinct_for_text_change_test() ->
     A = barrel_inference_cache_key:make(#{
         fingerprint => fp(),
         quant_type => f16,
         ctx_params_hash => ctx(),
-        tokens => [1, 2, 3]
+        text => <<"1 2 3">>
     }),
     B = barrel_inference_cache_key:make(#{
         fingerprint => fp(),
         quant_type => f16,
         ctx_params_hash => ctx(),
-        tokens => [1, 2, 4]
+        text => <<"1 2 4">>
     }),
     ?assertNotEqual(A, B).
+
+%% A byte-prefix has a distinct key from the full bytes: the
+%% longest-prefix scan relies on each stored byte length keying
+%% uniquely.
+make_distinct_for_prefix_test() ->
+    Full = barrel_inference_cache_key:make_text(fp(), f16, ctx(), <<"abcde">>),
+    Prefix = barrel_inference_cache_key:make_text(fp(), f16, ctx(), <<"abc">>),
+    ?assertNotEqual(Full, Prefix).
 
 make_distinct_for_quant_change_test() ->
     A = barrel_inference_cache_key:make(#{
         fingerprint => fp(),
         quant_type => f16,
         ctx_params_hash => ctx(),
-        tokens => [1]
+        text => <<"1">>
     }),
     B = barrel_inference_cache_key:make(#{
         fingerprint => fp(),
         quant_type => q4_k_m,
         ctx_params_hash => ctx(),
-        tokens => [1]
+        text => <<"1">>
     }),
     ?assertNotEqual(A, B).
 
@@ -63,13 +84,13 @@ make_distinct_for_fingerprint_change_test() ->
         fingerprint => binary:copy(<<16#AA>>, 32),
         quant_type => f16,
         ctx_params_hash => ctx(),
-        tokens => [1]
+        text => <<"1">>
     }),
     B = barrel_inference_cache_key:make(#{
         fingerprint => binary:copy(<<16#AB>>, 32),
         quant_type => f16,
         ctx_params_hash => ctx(),
-        tokens => [1]
+        text => <<"1">>
     }),
     ?assertNotEqual(A, B).
 
@@ -78,13 +99,13 @@ make_distinct_for_ctx_change_test() ->
         fingerprint => fp(),
         quant_type => f16,
         ctx_params_hash => binary:copy(<<16#BB>>, 32),
-        tokens => [1]
+        text => <<"1">>
     }),
     B = barrel_inference_cache_key:make(#{
         fingerprint => fp(),
         quant_type => f16,
         ctx_params_hash => binary:copy(<<16#BC>>, 32),
-        tokens => [1]
+        text => <<"1">>
     }),
     ?assertNotEqual(A, B).
 
@@ -95,7 +116,7 @@ make_badarg_short_fingerprint_test() ->
             fingerprint => <<1, 2, 3>>,
             quant_type => f16,
             ctx_params_hash => ctx(),
-            tokens => []
+            text => <<>>
         })
     ).
 

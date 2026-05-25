@@ -24,6 +24,9 @@ with_ramfile(Body) ->
         rm_rf(Dir)
     end.
 
+prompt_bytes(Tokens) ->
+    iolist_to_binary(lists:join(<<" ">>, [integer_to_binary(T) || T <- Tokens])).
+
 base_meta(Tokens) ->
     #{
         save_reason => cold,
@@ -37,7 +40,7 @@ base_meta(Tokens) ->
         creation_time => 1000,
         last_used_time => 1000,
         hit_count => 0,
-        prompt_text => <<>>,
+        prompt_text => prompt_bytes(Tokens),
         hostname => <<"test">>,
         barrel_inference_version => <<"0.1.0">>
     }.
@@ -47,7 +50,7 @@ key_for(Meta) ->
         fingerprint => maps:get(fingerprint, Meta),
         quant_type => maps:get(quant_type, Meta),
         ctx_params_hash => maps:get(ctx_params_hash, Meta),
-        tokens => maps:get(tokens, Meta)
+        text => maps:get(prompt_text, Meta)
     }).
 
 save_then_load_round_trip_test() ->

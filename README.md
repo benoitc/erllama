@@ -6,7 +6,7 @@
 Run `llama.cpp` from Erlang. Keep prompts warm. Stay inside OTP.
 
 barrel_inference is a native Erlang/OTP runtime for `llama.cpp` with supervised
-model processes, OpenAI-shaped completion APIs, and a token-exact KV
+model processes, OpenAI-shaped completion APIs, and a byte-exact KV
 cache that turns repeated prompt prefill from seconds into milliseconds.
 
 If your app sends the same system prompt, agent scaffold, or conversation
@@ -188,10 +188,11 @@ Disk and `ram_file` tier servers are started by the operator, one per
 root directory, then referenced by loaded models through `tier_srv` and
 `tier`.
 
-The important invariant is simple: cache hits are token-exact. A key is
-derived from the model fingerprint, quantization, context shape, and full
-token list. Barrel Inference may find a shorter saved prefix for a longer prompt,
-but it never returns an approximate match.
+The important invariant is simple: cache hits are byte-exact. A key is
+SHA-256 over the model fingerprint, quantization, context shape, and the
+**rendered prompt bytes** (`detokenize(tokens)`), so a prompt that
+retokenises across turns still hits. Barrel Inference may find a shorter saved
+byte-prefix for a longer prompt, but it never returns an approximate match.
 
 ## Requirements
 

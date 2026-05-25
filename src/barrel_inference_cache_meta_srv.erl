@@ -36,7 +36,7 @@ may have left a valid `.kvc` we can validate-and-adopt.
     start_link/0,
     %% Read-only (no server hop)
     lookup_exact/1,
-    lookup_longest_prefix/4,
+    lookup_longest_text_prefix/2,
     %% Read with bounded wait for an in-flight save
     lookup_exact_or_wait/2,
     %% Claim/release (active reader of a slab)
@@ -47,7 +47,7 @@ may have left a valid `.kvc` we can validate-and-adopt.
     check_reservation/2,
     mark_published/3,
     announce_saved/4,
-    announce_saved/5,
+    announce_saved/6,
     cancel_reservation/2,
     %% Operator/test helpers
     gc/0,
@@ -56,7 +56,7 @@ may have left a valid `.kvc` we can validate-and-adopt.
     dump/0,
     dump/1,
     insert_available/5,
-    insert_available/6
+    insert_available/7
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -121,49 +121,64 @@ lookup_exact_or_wait(Key, MaxWaitMs) ->
     gen_server:call(?SERVER, {lookup_or_wait, Key, MaxWaitMs}, infinity).
 
 -doc """
-Walk Tokens backward in Stride steps and return the row for the
-longest cached prefix. Pure ETS reads, no server hop. Used by
-stateless callers (HTTP front-end, agent loops) that resend a full
-conversation each turn and don't have a parent_key to thread.
+Return the row whose stored rendered-prompt bytes are the longest
+byte-prefix of `PromptBytes` (ds4-style content-addressed lookup).
+Pure ETS reads, no server hop.
 
-Stops at MinTokens floor and returns `miss` if nothing matches.
-Walks at most `length(Tokens) / Stride` rows; with the default
-2048-token stride that's ~15 lookups for a 30k-token prompt.
+A stored row carries `?POS_TEXT_BYTES` = the byte length of the
+rendered prompt its key was computed over. A row matches when
+`cache_key:make_text(Fp, QT, CtxHash, prefix-of-PromptBytes of that
+length) == RowKey`. The SHA-256 match is the entire verification: a
+key match means the bytes match (collision-negligible), so there is
+no byte memcmp and no `prompt_text` re-read.
 
-Encodes the full token list to a binary once at entry, then passes
-`binary:part(TokensBin, 0, N*4)` sub-binaries (O(1) views) to
-`barrel_inference_cache_key:make/4` per probe. Avoids re-traversing the list
-and re-allocating the binary on every step; the only per-probe cost
-is the SHA-256 over N*4 bytes plus the ETS lookup.
+We gather the distinct stored byte-lengths `=< byte_size(PromptBytes)`
+among `available` rows, longest first, and for each compute the
+candidate key and do an exact lookup. The first hit is the longest
+prefix. The recomputed key folds in the current model's
+fp/quant/ctx, so rows from another model/quant/context simply never
+match - no separate namespace fields are needed. O(distinct lengths)
+SHA-256 + ETS lookups per call.
 """.
--spec lookup_longest_prefix(map(), [barrel_inference_nif:token_id()], pos_integer(), pos_integer()) ->
-    {ok, pos_integer(), tuple()} | miss.
-lookup_longest_prefix(KeyMeta, Tokens, Stride, MinTokens) when
-    is_integer(Stride), Stride > 0, is_integer(MinTokens), MinTokens > 0
-->
+-spec lookup_longest_text_prefix(map(), binary()) ->
+    {ok, non_neg_integer(), tuple()} | miss.
+lookup_longest_text_prefix(KeyMeta, PromptBytes) when is_binary(PromptBytes) ->
     T0 = erlang:monotonic_time(nanosecond),
-    Len = length(Tokens),
-    Start = (Len div Stride) * Stride,
-    Floor = max(MinTokens, Stride),
-    AllTokensBin = barrel_inference_cache_key:encode_tokens(Tokens),
+    PromptLen = byte_size(PromptBytes),
     #{fingerprint := Fp, quant_type := QT, ctx_params_hash := CtxHash} = KeyMeta,
-    Result = walk_prefix(Fp, QT, CtxHash, AllTokensBin, Start, Stride, Floor, 0),
+    Lens = available_text_lengths(PromptLen),
+    Result = probe_text_prefix(Fp, QT, CtxHash, PromptBytes, Lens, 0),
     Elapsed = erlang:monotonic_time(nanosecond) - T0,
     barrel_inference_cache_counters:add(?C_LONGEST_PREFIX_NS, max(Elapsed, 0)),
     Result.
 
-walk_prefix(_Fp, _QT, _CtxHash, _Bin, N, _Stride, Floor, Probes) when N < Floor ->
+%% Distinct rendered-byte lengths among `available` rows that are
+%% `=< MaxLen`, returned longest-first. Rows with text_bytes = 0
+%% (RAM/test inserts without a prompt section) are not byte-matchable
+%% and are excluded.
+available_text_lengths(MaxLen) ->
+    MS = [
+        {
+            {'_', '_', '_', '_', '_', available, '_', '_', '_', '_', '$1'},
+            [{'>', '$1', 0}, {'=<', '$1', MaxLen}],
+            ['$1']
+        }
+    ],
+    lists:reverse(lists:usort(ets:select(?TBL_META, MS))).
+
+probe_text_prefix(_Fp, _QT, _CtxHash, _Bytes, [], Probes) ->
     barrel_inference_cache_counters:add(?C_LONGEST_PREFIX_PROBES, Probes),
     miss;
-walk_prefix(Fp, QT, CtxHash, Bin, N, Stride, Floor, Probes) ->
-    PrefixBin = binary:part(Bin, 0, N * 4),
-    Key = barrel_inference_cache_key:make(Fp, QT, CtxHash, PrefixBin),
-    case lookup_exact(Key) of
+probe_text_prefix(Fp, QT, CtxHash, Bytes, [Len | Rest], Probes) ->
+    Candidate = barrel_inference_cache_key:make_text(
+        Fp, QT, CtxHash, binary:part(Bytes, 0, Len)
+    ),
+    case lookup_exact(Candidate) of
         {ok, Row} ->
             barrel_inference_cache_counters:add(?C_LONGEST_PREFIX_PROBES, Probes + 1),
-            {ok, N, Row};
+            {ok, Len, Row};
         miss ->
-            walk_prefix(Fp, QT, CtxHash, Bin, N - Stride, Stride, Floor, Probes + 1)
+            probe_text_prefix(Fp, QT, CtxHash, Bytes, Rest, Probes + 1)
     end.
 
 -spec checkout(barrel_inference_cache:cache_key(), pid()) ->
@@ -196,19 +211,22 @@ mark_published(Key, Token, Path) when is_reference(Token) ->
     barrel_inference_cache:cache_key(), reference(), non_neg_integer(), binary()
 ) -> ok | {error, expired}.
 announce_saved(Key, Token, Size, Header) ->
-    announce_saved(Key, Token, Size, Header, undefined).
+    announce_saved(Key, Token, Size, Header, undefined, 0).
 
 -spec announce_saved(
     barrel_inference_cache:cache_key(),
     reference(),
     non_neg_integer(),
     binary(),
-    binary() | undefined
+    binary() | undefined,
+    non_neg_integer()
 ) -> ok | {error, expired}.
-announce_saved(Key, Token, Size, Header, TokensBin) when
-    is_reference(Token), is_binary(Header)
+announce_saved(Key, Token, Size, Header, TokensBin, TextBytes) when
+    is_reference(Token), is_binary(Header), is_integer(TextBytes)
 ->
-    gen_server:call(?SERVER, {announce_saved, Key, Token, Size, Header, TokensBin}).
+    gen_server:call(
+        ?SERVER, {announce_saved, Key, Token, Size, Header, TokensBin, TextBytes}
+    ).
 
 -spec cancel_reservation(barrel_inference_cache:cache_key(), reference()) -> ok.
 cancel_reservation(Key, Token) when is_reference(Token) ->
@@ -225,7 +243,7 @@ cancel_reservation(Key, Token) when is_reference(Token) ->
     term()
 ) -> ok.
 insert_available(Key, Tier, Size, Header, Location) ->
-    insert_available(Key, Tier, Size, Header, Location, undefined).
+    insert_available(Key, Tier, Size, Header, Location, undefined, 0).
 
 -spec insert_available(
     barrel_inference_cache:cache_key(),
@@ -233,11 +251,13 @@ insert_available(Key, Tier, Size, Header, Location) ->
     non_neg_integer(),
     binary(),
     term(),
-    binary() | undefined
+    binary() | undefined,
+    non_neg_integer()
 ) -> ok.
-insert_available(Key, Tier, Size, Header, Location, TokensBin) ->
+insert_available(Key, Tier, Size, Header, Location, TokensBin, TextBytes) ->
     gen_server:call(
-        ?SERVER, {insert_available, Key, Tier, Size, Header, Location, TokensBin}
+        ?SERVER,
+        {insert_available, Key, Tier, Size, Header, Location, TokensBin, TextBytes}
     ).
 
 -spec gc() -> {evicted, non_neg_integer()}.
@@ -360,16 +380,12 @@ handle_call({mark_published, Key, Token, Path}, _From, S) ->
         _ ->
             {reply, {error, expired}, S}
     end;
-handle_call({announce_saved, Key, Token, Size, Header, TokensBin}, _From, S) ->
+handle_call({announce_saved, Key, Token, Size, Header, TokensBin, TextBytes}, _From, S) ->
     case maps:get(Key, S#state.reservations, undefined) of
         #reservation{token = Token, monref = MonRef, tier = Tier, path = Path} ->
             erlang:demonitor(MonRef, [flush]),
-            install_available_row(
-                Key, Tier, Size, Header, location_for(Tier, Path), TokensBin
-            ),
-            S1 = S#state{reservations = maps:remove(Key, S#state.reservations)},
-            S2 = notify_waiters(Key, S1),
-            {reply, ok, S2};
+            S1 = adopt_row(Key, Tier, Path, Size, Header, TokensBin, TextBytes, S),
+            {reply, ok, S1};
         _ ->
             {reply, {error, expired}, S}
     end;
@@ -383,8 +399,10 @@ handle_call({cancel_reservation, Key, Token}, _From, S) ->
         _ ->
             {reply, ok, S}
     end;
-handle_call({insert_available, Key, Tier, Size, Header, Location, TokensBin}, _From, S) ->
-    install_available_row(Key, Tier, Size, Header, Location, TokensBin),
+handle_call(
+    {insert_available, Key, Tier, Size, Header, Location, TokensBin, TextBytes}, _From, S
+) ->
+    install_available_row(Key, Tier, Size, Header, Location, TokensBin, TextBytes),
     S1 = notify_waiters(Key, S),
     {reply, ok, S1};
 handle_call(gc, _From, S) ->
@@ -468,7 +486,7 @@ decrement_refcount(Key) ->
         error:badarg -> ok
     end.
 
-install_available_row(Key, Tier, Size, Header, Location, TokensBin) ->
+install_available_row(Key, Tier, Size, Header, Location, TokensBin, TextBytes) ->
     NowNs = monotonic_ns(),
     try ets:lookup_element(?TBL_META, Key, ?POS_LAST_USED) of
         OldLastUsed -> ets:delete(?TBL_LRU, {OldLastUsed, Key})
@@ -484,7 +502,7 @@ install_available_row(Key, Tier, Size, Header, Location, TokensBin) ->
     %% checked out at runtime, recency takes over.
     LastUsed = NowNs + Hits * 1_000_000_000,
     Row =
-        {Key, Tier, Size, LastUsed, 0, available, Header, Location, TokensBin, Hits},
+        {Key, Tier, Size, LastUsed, 0, available, Header, Location, TokensBin, Hits, TextBytes},
     ets:insert(?TBL_META, Row),
     ets:insert(?TBL_LRU, {{LastUsed, Key}, []}),
     ok.
@@ -544,7 +562,8 @@ create_reservation(Key, Tier, Pid, S) ->
         tier = Tier,
         path = undefined
     },
-    Placeholder = {Key, Tier, 0, NowNs, 0, writing, <<>>, undefined, undefined},
+    Placeholder =
+        {Key, Tier, 0, NowNs, 0, writing, <<>>, undefined, undefined, 0, 0},
     ets:insert(?TBL_META, Placeholder),
     {reply, {ok, Token}, S#state{reservations = (S#state.reservations)#{Key => R}}}.
 
@@ -557,17 +576,23 @@ cleanup_by_stage(Key, #reservation{stage = pre_link}, S) ->
     S#state{reservations = maps:remove(Key, S#state.reservations)};
 cleanup_by_stage(Key, #reservation{stage = post_link, path = Path, tier = Tier}, S) ->
     case validate_and_adopt(Key, Path) of
-        {ok, Size, Header, TokensBin} ->
-            install_available_row(
-                Key, Tier, Size, Header, location_for(Tier, Path), TokensBin
-            ),
-            S1 = S#state{reservations = maps:remove(Key, S#state.reservations)},
-            notify_waiters(Key, S1);
+        {ok, Size, Header, TokensBin, TextBytes} ->
+            adopt_row(Key, Tier, Path, Size, Header, TokensBin, TextBytes, S);
         {error, _Reason} ->
             _ = file:delete(Path),
             ets:delete(?TBL_META, Key),
             S#state{reservations = maps:remove(Key, S#state.reservations)}
     end.
+
+%% Install the available row, drop the reservation, and release any
+%% waiters parked on the key. Shared by announce_saved and the
+%% post-link validate-and-adopt cleanup.
+adopt_row(Key, Tier, Path, Size, Header, TokensBin, TextBytes, S) ->
+    install_available_row(
+        Key, Tier, Size, Header, location_for(Tier, Path), TokensBin, TextBytes
+    ),
+    S1 = S#state{reservations = maps:remove(Key, S#state.reservations)},
+    notify_waiters(Key, S1).
 
 validate_and_adopt(Key, Path) ->
     case file:read_file(Path) of
@@ -576,7 +601,8 @@ validate_and_adopt(Key, Path) ->
                 {ok, Info, _Payload} ->
                     Tokens = maps:get(tokens, Info, []),
                     TokensBin = barrel_inference_cache_key:encode_tokens(Tokens),
-                    {ok, byte_size(Bin), header_slice(Bin), TokensBin};
+                    TextBytes = byte_size(maps:get(prompt_text, Info, <<>>)),
+                    {ok, byte_size(Bin), header_slice(Bin), TokensBin, TextBytes};
                 {error, R} ->
                     {error, R}
             end;

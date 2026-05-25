@@ -11,15 +11,21 @@ produced while reading the prompt. Once you have them, generating
 the next token costs one forward pass. Without them, you have to
 re-read every token of the prompt from scratch.
 
-Barrel Inference's cache stores those tensors keyed on the **exact tokens
-that produced them**:
+Barrel Inference's cache stores those tensors keyed on the **rendered
+prompt bytes that produced them** (ds4-style, content-addressed):
 
 ```
-key = sha256(model_fingerprint || quant || ctx_params || tokens_le32)
+key = sha256(model_fingerprint || quant || ctx_params || rendered_prompt_bytes)
 ```
 
-Same tokens → same key → guaranteed-correct restore. There is no
-fuzzy matching layer; "close enough" is not allowed at this level.
+where `rendered_prompt_bytes = detokenize(tokens)`. Keying on the
+rendered bytes rather than the token-id list means the *same* logical
+prompt still hits when it retokenises across turns (chat-template
+wrapping, tool rendering). Same bytes → same key → guaranteed-correct
+restore. There is no fuzzy matching layer; "close enough" is not
+allowed at this level (the longest-byte-prefix lookup is still an
+exact SHA-256 match). The exact tokens travel in the checkpoint
+payload for KV resume.
 
 ## Three tiers
 

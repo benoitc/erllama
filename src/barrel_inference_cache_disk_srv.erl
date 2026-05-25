@@ -119,7 +119,7 @@ write_tmp(Root, BuildMeta, Payload) ->
         fingerprint => maps:get(fingerprint, BuildMeta),
         quant_type => maps:get(quant_type, BuildMeta),
         ctx_params_hash => maps:get(ctx_params_hash, BuildMeta),
-        tokens => maps:get(tokens, BuildMeta)
+        text => maps:get(prompt_text, BuildMeta, <<>>)
     }),
     HexKey = bin_to_hex(Key),
     FinalPath = filename:join(Root, HexKey ++ ".kvc"),
@@ -415,14 +415,16 @@ scan_kvc(Path, Acc) ->
                 {ok, Info} ->
                     Header = binary:part(Bin, 0, 48),
                     Tokens = maps:get(tokens, Info),
+                    PromptText = maps:get(prompt_text, Info, <<>>),
                     Key = barrel_inference_cache_key:make(#{
                         fingerprint => maps:get(fingerprint, Info),
                         quant_type => maps:get(quant_type, Info),
                         ctx_params_hash => maps:get(ctx_params_hash, Info),
-                        tokens => Tokens
+                        text => PromptText
                     }),
                     TokensBin = barrel_inference_cache_key:encode_tokens(Tokens),
-                    [{Key, Header, byte_size(Bin), TokensBin} | Acc];
+                    TextBytes = byte_size(PromptText),
+                    [{Key, Header, byte_size(Bin), TokensBin, TextBytes} | Acc];
                 {error, _} ->
                     _ = prim_file:delete(Path),
                     Acc
@@ -434,10 +436,10 @@ scan_kvc(Path, Acc) ->
 register_existing(Tier, Root) ->
     Entries = scan_dir(Root),
     lists:foreach(
-        fun({Key, Header, Size, TokensBin}) ->
+        fun({Key, Header, Size, TokensBin, TextBytes}) ->
             Path = filename:join(Root, bin_to_hex(Key) ++ ".kvc"),
             barrel_inference_cache_meta_srv:insert_available(
-                Key, Tier, Size, Header, {Tier, Path}, TokensBin
+                Key, Tier, Size, Header, {Tier, Path}, TokensBin, TextBytes
             )
         end,
         Entries

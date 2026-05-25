@@ -51,7 +51,12 @@
     %% Test helpers: read / clear the list of cfgs passed to
     %% sampler_new/2 since the last reset.
     sampler_new_cfgs/0,
-    reset_sampler_new_cfgs/0
+    reset_sampler_new_cfgs/0,
+    %% Optional backend callback exercised by warm_restore_primer/3
+    %% (range KV trim). Instrumented so tests can assert it was called.
+    seq_rm_last/3,
+    seq_rm_last_calls/0,
+    reset_seq_rm_last_calls/0
 ]).
 
 %% Stub state.
@@ -138,6 +143,21 @@ kv_unpack(_S, _Bin, _SeqId) ->
 %% seq_id would inherit the prior request's state.
 seq_rm(_S, SeqId) ->
     erlang:erase({stub_phase, SeqId}),
+    ok.
+
+%% Optional callback: warm_restore_primer/3 calls this to trim a seq's KV
+%% to a prefix. The stub holds no real KV, so it just records the call so
+%% tests can assert the range-trim ran with the expected N (= prefix len).
+seq_rm_last(_S, SeqId, N) ->
+    Prev = persistent_term:get({?MODULE, seq_rm_last_calls}, []),
+    persistent_term:put({?MODULE, seq_rm_last_calls}, [{SeqId, N} | Prev]),
+    ok.
+
+seq_rm_last_calls() ->
+    lists:reverse(persistent_term:get({?MODULE, seq_rm_last_calls}, [])).
+
+reset_seq_rm_last_calls() ->
+    _ = persistent_term:erase({?MODULE, seq_rm_last_calls}),
     ok.
 
 %% Per-tick batched step. Prefill rows just acknowledge. Decode rows

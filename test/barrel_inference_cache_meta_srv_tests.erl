@@ -22,6 +22,11 @@ with_srv(Body) ->
 key(N) ->
     crypto:hash(sha256, integer_to_binary(N)).
 
+%% Mirror the stub backend's detokenise: a token list renders to its
+%% space-joined decimal ids. The cache key (v2) is over these bytes.
+prompt_bytes(Tokens) ->
+    iolist_to_binary(lists:join(<<" ">>, [integer_to_binary(T) || T <- Tokens])).
+
 base_meta(Key, Tokens) ->
     #{
         save_reason => cold,
@@ -35,7 +40,7 @@ base_meta(Key, Tokens) ->
         creation_time => 1000,
         last_used_time => 1000,
         hit_count => 0,
-        prompt_text => <<>>,
+        prompt_text => prompt_bytes(Tokens),
         hostname => <<"test">>,
         barrel_inference_version => <<"0.1.0">>,
         cache_key => Key
@@ -116,7 +121,7 @@ install_restores_hits_from_header_test() ->
     end).
 
 %% =============================================================================
-%% Longest-prefix lookup
+%% Longest byte-prefix lookup (ds4-style, content-addressed)
 %% =============================================================================
 
 prefix_key_meta() ->
@@ -126,43 +131,82 @@ prefix_key_meta() ->
         ctx_params_hash => binary:copy(<<16#BB>>, 32)
     }.
 
-prefix_key_for(Tokens) ->
-    Meta = prefix_key_meta(),
-    barrel_inference_cache_key:make(Meta#{tokens => Tokens}).
+%% Insert an available row keyed over the rendered-byte prefix
+%% `TextPrefix`, recording its byte length so the byte-prefix scan
+%% can find it.
+insert_text_row(Meta, TextPrefix) ->
+    #{fingerprint := Fp, quant_type := QT, ctx_params_hash := Ctx} = Meta,
+    K = barrel_inference_cache_key:make_text(Fp, QT, Ctx, TextPrefix),
+    ok = barrel_inference_cache_meta_srv:insert_available(
+        K, ram, 100, <<"H">>, {ram}, undefined, byte_size(TextPrefix)
+    ),
+    K.
 
-lookup_longest_prefix_miss_test() ->
+lookup_longest_text_prefix_miss_test() ->
     with_srv(fun() ->
         Meta = prefix_key_meta(),
-        Tokens = lists:seq(1, 1000),
         ?assertEqual(
             miss,
-            barrel_inference_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 100, 100)
+            barrel_inference_cache_meta_srv:lookup_longest_text_prefix(
+                Meta, <<"some prompt bytes">>
+            )
         )
     end).
 
-lookup_longest_prefix_hit_at_4096_test() ->
+lookup_longest_text_prefix_hit_test() ->
     with_srv(fun() ->
         Meta = prefix_key_meta(),
-        Tokens = lists:seq(1, 12000),
-        Prefix = lists:sublist(Tokens, 4096),
-        K = prefix_key_for(Prefix),
-        ok = barrel_inference_cache_meta_srv:insert_available(K, ram, 100, <<"H">>, {ram}),
-        {ok, 4096, Row} =
-            barrel_inference_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 2048, 512),
+        K = insert_text_row(Meta, <<"the quick brown">>),
+        {ok, 15, Row} =
+            barrel_inference_cache_meta_srv:lookup_longest_text_prefix(
+                Meta, <<"the quick brown fox jumps">>
+            ),
         ?assertEqual(K, element(?POS_KEY, Row))
     end).
 
-lookup_longest_prefix_returns_longest_test() ->
+lookup_longest_text_prefix_returns_longest_test() ->
     with_srv(fun() ->
         Meta = prefix_key_meta(),
-        Tokens = lists:seq(1, 12000),
-        K2048 = prefix_key_for(lists:sublist(Tokens, 2048)),
-        K4096 = prefix_key_for(lists:sublist(Tokens, 4096)),
-        ok = barrel_inference_cache_meta_srv:insert_available(K2048, ram, 100, <<"H">>, {ram}),
-        ok = barrel_inference_cache_meta_srv:insert_available(K4096, ram, 100, <<"H">>, {ram}),
-        {ok, 4096, Row} =
-            barrel_inference_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 2048, 512),
-        ?assertEqual(K4096, element(?POS_KEY, Row))
+        _KShort = insert_text_row(Meta, <<"the quick">>),
+        KLong = insert_text_row(Meta, <<"the quick brown">>),
+        {ok, 15, Row} =
+            barrel_inference_cache_meta_srv:lookup_longest_text_prefix(
+                Meta, <<"the quick brown fox jumps">>
+            ),
+        ?assertEqual(KLong, element(?POS_KEY, Row))
+    end).
+
+%% A stored byte string that is not a prefix of the prompt must not
+%% match, even when it is shorter than the prompt.
+lookup_longest_text_prefix_non_prefix_test() ->
+    with_srv(fun() ->
+        Meta = prefix_key_meta(),
+        _K = insert_text_row(Meta, <<"different text">>),
+        ?assertEqual(
+            miss,
+            barrel_inference_cache_meta_srv:lookup_longest_text_prefix(
+                Meta, <<"the quick brown fox">>
+            )
+        )
+    end).
+
+%% A row keyed under a different fingerprint/quant/ctx never matches:
+%% the recomputed candidate key folds in the querying namespace, so
+%% no separate namespace fields are needed.
+lookup_longest_text_prefix_namespace_isolated_test() ->
+    with_srv(fun() ->
+        OtherMeta = #{
+            fingerprint => binary:copy(<<16#CC>>, 32),
+            quant_type => f16,
+            ctx_params_hash => binary:copy(<<16#BB>>, 32)
+        },
+        _K = insert_text_row(OtherMeta, <<"the quick">>),
+        ?assertEqual(
+            miss,
+            barrel_inference_cache_meta_srv:lookup_longest_text_prefix(
+                prefix_key_meta(), <<"the quick brown fox">>
+            )
+        )
     end).
 
 evict_bytes_zero_is_noop_test() ->
@@ -172,18 +216,6 @@ evict_bytes_zero_is_noop_test() ->
         ?assertEqual({evicted, 0, 0}, barrel_inference_cache_meta_srv:evict_bytes(0)),
         ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
         ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(key(2)))
-    end).
-
-lookup_longest_prefix_floor_test() ->
-    with_srv(fun() ->
-        Meta = prefix_key_meta(),
-        Tokens = lists:seq(1, 1500),
-        %% Stride 2048 with 1500 tokens: aligned start = 0; never
-        %% reaches a checkable prefix length. Returns miss.
-        ?assertEqual(
-            miss,
-            barrel_inference_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 2048, 512)
-        )
     end).
 
 checkout_two_holders_independent_refcounts_test() ->
@@ -347,7 +379,7 @@ down_post_link_with_valid_file_adopts_test() ->
                 fingerprint => binary:copy(<<16#AA>>, 32),
                 quant_type => f16,
                 ctx_params_hash => binary:copy(<<16#BB>>, 32),
-                tokens => Tokens
+                text => prompt_bytes(Tokens)
             }),
             Path = filename:join(TmpDir, "adopt.kvc"),
             ok = build_kvc_file(Path, CKey, Tokens, Payload),

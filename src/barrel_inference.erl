@@ -20,7 +20,7 @@ Typical usage:
   }).
   {ok, #{reply := Reply, finish_key := FK}} =
       barrel_inference:complete(Model, <<"hello">>).
-  %% On the next turn, pass FK as parent_key for token-exact warm
+  %% On the next turn, pass FK as parent_key for byte-exact warm
   %% restore:
   {ok, #{reply := Reply2}} =
       barrel_inference:complete(Model, <<"hello world">>, #{parent_key => FK}).
@@ -179,7 +179,7 @@ complete(Model, Prompt, Opts) ->
 Decode a prompt into KV state and fire a finish save without
 sampling any output tokens. Returns the `finish_key` so the caller
 can hand it as `parent_key` on a subsequent `complete/3` or
-`infer/4` for token-exact warm restore.
+`infer/4` for byte-exact warm restore.
 
 `PromptTokens` is the prompt as a list of token ids. Tokenisation
 is the caller's responsibility (use `tokenize/2` or apply a chat
@@ -651,9 +651,9 @@ Returns `undefined` if the model has not admitted any request yet
 or is not loaded.
 
 A `cold` kind with `prefix_len = 0` means the previous admission
-took the full cold path; an `exact` kind means token-exact warm
-restore; `partial` means a longest-prefix walk hit at `prefix_len`
-tokens.
+took the full cold path; an `exact` kind means a byte-exact warm
+restore (whole prompt cached); `partial` means a longest-byte-prefix
+lookup hit at `prefix_len` checkpoint tokens.
 
 Used by cache-affinity routers to bias new requests toward the node
 whose last admission for this model produced the longest warm
@@ -673,10 +673,12 @@ last_cache_hit(ModelId) when is_binary(ModelId) ->
 
 -doc """
 Probe how much of `PromptTokens` is already cached for `ModelId`
-on this node. Returns `{ok, MatchLen}` where `MatchLen` is the
-length of the longest cached prefix of `PromptTokens` (across all
-tiers: RAM, ram_file, disk). Returns `{ok, 0}` if no prefix is
-cached or the prompt is empty. Returns `{error, model_not_loaded}`
+on this node. Returns `{ok, MatchBytes}` where `MatchBytes` is the
+byte length of the longest cached rendered-prompt prefix (across all
+tiers: RAM, ram_file, disk). The cache is content-addressed by the
+detokenised prompt bytes (ds4-style), so the probe detokenises
+`PromptTokens` and matches on bytes. Returns `{ok, 0}` if no prefix
+is cached or the prompt is empty. Returns `{error, model_not_loaded}`
 if `ModelId` is not registered locally.
 
 Lookup uses the model's effective fingerprint, so attached LoRA
@@ -696,9 +698,18 @@ list_cached_prefixes(ModelId, PromptTokens) when is_binary(ModelId), is_list(Pro
             {error, model_not_loaded};
         _Pid ->
             KeyMeta = barrel_inference_model:cache_key_meta(ModelId),
-            case barrel_inference_cache:lookup_longest_prefix(KeyMeta, PromptTokens) of
-                {ok, MatchLen, _Row} -> {ok, MatchLen};
-                miss -> {ok, 0}
+            case barrel_inference_model:detokenize(ModelId, PromptTokens) of
+                {ok, PromptBytes} ->
+                    case
+                        barrel_inference_cache:lookup_longest_text_prefix(
+                            KeyMeta, PromptBytes
+                        )
+                    of
+                        {ok, MatchBytes, _Row} -> {ok, MatchBytes};
+                        miss -> {ok, 0}
+                    end;
+                {error, _} = E ->
+                    E
             end
     end.
 

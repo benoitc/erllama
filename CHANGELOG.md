@@ -6,6 +6,27 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- KV cache is now keyed by the **rendered prompt bytes**
+  (`detokenize(tokens)`), not the token-id list (ds4-style,
+  content-addressed). The same logical prompt now hits across turns
+  even when it retokenises (chat-template wrapping, tool rendering,
+  generated ids vs re-tokenised assistant text), where the old
+  token-keyed cache went cold every turn. The longest-prefix lookup
+  (`barrel_inference_cache_meta_srv:lookup_longest_text_prefix/2`)
+  scans stored byte-prefix lengths and resumes from the longest match.
+  The uncovered suffix reuses the caller's original tokens when the
+  byte boundary lands on a token boundary (token-exact resume - so a
+  re-sent prompt still reproduces its reply); only a mid-token boundary
+  re-tokenises the byte remainder (`checkpoint_tokens ++
+  tokenize(byte_suffix)`, identical byte stream, sound). Hits stay
+  exact (SHA-256 over the bytes; no fuzzy match). The KVC file format
+  version is bumped to **v2**; old v1 (token-keyed) files are rejected
+  on the startup disk scan, so the cache refills under the new scheme.
+  `barrel_inference:list_cached_prefixes/2` now reports the matched
+  **byte** length.
+
 ### Added
 
 - Per-context compiled-grammar cache. An identical GBNF (agentic clients like

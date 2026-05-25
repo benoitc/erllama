@@ -65,12 +65,15 @@ short_prompt() -> <<"hi">>.
 long_prompt() ->
     list_to_binary(string:join([integer_to_list(N) || N <- lists:seq(1, 12)], " ")).
 
+%% The cache key (v2) is over the rendered prompt bytes. The stub
+%% detokenises a token list to its space-joined decimals, so the key
+%% is computed over those bytes.
 key_for_tokens(Tokens, Cfg) ->
     barrel_inference_cache_key:make(#{
         fingerprint => maps:get(fingerprint, Cfg),
         quant_type => maps:get(quant_type, Cfg),
         ctx_params_hash => maps:get(ctx_params_hash, Cfg),
-        tokens => Tokens
+        text => list_to_binary(stub_detokenize_decimal(Tokens))
     }).
 
 prompt_tokens(Prompt) ->
@@ -202,6 +205,34 @@ long_prompt_fires_cold_save_test() ->
         ?assertMatch({ok, _Row}, wait_for_key(ColdKey, 1000))
     end).
 
+ladder_fires_multiple_cold_saves_test() ->
+    %% With max_ladder_rows > 0 a cold prefill writes a cold save at each
+    %% ladder boundary below the trim, plus the trim boundary itself -
+    %% more than the single legacy checkpoint.
+    Policy = #{
+        ladder_interval => 8,
+        max_ladder_rows => 3,
+        boundary_align_tokens => 1,
+        cold_min_tokens => 4
+    },
+    Prompt = list_to_binary(
+        string:join([integer_to_list(N) || N <- lists:seq(1, 40)], " ")
+    ),
+    with_model(Policy, fun(Cfg) ->
+        Before = maps:get(saves_cold, barrel_inference_cache:get_counters()),
+        {ok, _} = barrel_inference_model:complete(<<"test_model">>, Prompt, #{
+            response_tokens => 2
+        }),
+        timer:sleep(100),
+        After = maps:get(saves_cold, barrel_inference_cache:get_counters()),
+        %% ladder 8,16,24 + trim 40 = 4 cold saves (allow for a dropped
+        %% async write under the 2-worker test writer).
+        ?assert(After - Before >= 2),
+        %% A head-boundary cold row (first 8 tokens) is reusable.
+        HeadKey = key_for_tokens(lists:sublist(prompt_tokens(Prompt), 8), Cfg),
+        ?assertMatch({ok, _Row}, wait_for_key(HeadKey, 1000))
+    end).
+
 %% =============================================================================
 %% Finish save fires at end-of-stream when total is above min
 %% =============================================================================
@@ -258,6 +289,73 @@ parent_key_session_resume_test() ->
                 response_tokens => 2
             }),
         ?assertEqual(idle, barrel_inference_model:status(<<"test_model">>))
+    end).
+
+%% =============================================================================
+%% Byte-addressed reuse (ds4-style)
+%% =============================================================================
+
+byte_prefix_resumes_across_retokenisation_test() ->
+    %% The cache is content-addressed by rendered bytes. Turn 2's
+    %% tokens diverge from the stored checkpoint at the same position,
+    %% yet their rendered bytes share a prefix. The old token-prefix
+    %% walk would miss; the byte-prefix lookup resumes (partial, not
+    %% cold) with NO parent_key threaded.
+    with_model(#{}, fun(Cfg) ->
+        Stored = [10, 11, 12, 13],
+        {ok, #{finish_key := StoredKey, cache_hit_kind := cold}} =
+            barrel_inference_model:prefill_only(<<"test_model">>, Stored),
+        ?assertEqual(key_for_tokens(Stored, Cfg), StoredKey),
+        {ok, _} = wait_for_key(StoredKey, 1000),
+        %% "10 11 12 13" is a byte-prefix of "10 11 12 130 99", but
+        %% [10,11,12,13] is NOT a token-prefix of [10,11,12,130,99].
+        Turn2 = [10, 11, 12, 130, 99],
+        StoredBytes = list_to_binary(stub_detokenize_decimal(Stored)),
+        Turn2Bytes = list_to_binary(stub_detokenize_decimal(Turn2)),
+        ?assertEqual(StoredBytes, binary:part(Turn2Bytes, 0, byte_size(StoredBytes))),
+        ?assertNot(lists:prefix(Stored, Turn2)),
+        {ok, #{cache_hit_kind := Kind, cache_delta := #{read := Read}}} =
+            barrel_inference_model:prefill_only(<<"test_model">>, Turn2),
+        ?assertEqual(partial, Kind),
+        ?assertEqual(length(Stored), Read)
+    end).
+
+%% A turn that ends on a stop string saves a finish row whose
+%% prompt_text includes the stop-triggering token. That row simply
+%% will not byte-prefix-match a trimmed next turn (it is not corrupt:
+%% key, tokens and KV all describe the same with-stop prefix). The
+%% prompt-prefix cold checkpoint - saved before generation, without
+%% the stop bytes - is what serves next-turn reuse.
+stop_sequence_finish_save_does_not_block_prefix_reuse_test() ->
+    Digits = [
+        <<"0">>,
+        <<"1">>,
+        <<"2">>,
+        <<"3">>,
+        <<"4">>,
+        <<"5">>,
+        <<"6">>,
+        <<"7">>,
+        <<"8">>,
+        <<"9">>
+    ],
+    with_model(#{}, fun(Cfg) ->
+        {ok, R1} = barrel_inference_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 8, stop_sequences => Digits}
+        ),
+        ?assertEqual(stop, maps:get(finish_reason, R1)),
+        %% (a) The finish row is a valid, loadable checkpoint.
+        FinishKey = maps:get(finish_key, R1),
+        ?assertMatch({ok, _}, wait_for_key(FinishKey, 1000)),
+        %% (b) The prompt-prefix cold checkpoint (no stop bytes) exists
+        %% and a re-send of the same prompt warms from it (exact),
+        %% independent of the stop-including finish row.
+        PromptKey = key_for_tokens(prompt_tokens(long_prompt()), Cfg),
+        ?assertMatch({ok, _}, wait_for_key(PromptKey, 1000)),
+        {ok, R2} = barrel_inference_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        ?assertEqual(exact, maps:get(cache_hit_kind, R2))
     end).
 
 %% =============================================================================
@@ -545,10 +643,12 @@ prefill_only_returns_finish_key_and_warm_resumes_test() ->
 
 prefill_only_with_parent_key_chains_warm_contexts_test() ->
     %% Warm a prefix via prefill_only/2, then extend it via
-    %% prefill_only/3 with parent_key. The second call must take the
-    %% exact warm path (cache_hit_kind = exact), prefill only the
-    %% suffix tokens, and surface a fresh finish_key for the new
-    %% prefix-plus-suffix row.
+    %% prefill_only/3 with parent_key. The second call takes the
+    %% session-resume path (cache_hit_kind = partial), prefilling only
+    %% the suffix. The byte boundary lands on a token boundary of the
+    %% extended prompt (Prefix's rendered bytes are a clean prefix), so
+    %% resume stays token-exact: the rejoined context is the original
+    %% Extended and a fresh finish_key for the prefix-plus-suffix row.
     with_model(#{}, fun(Cfg) ->
         Prefix = prompt_tokens(long_prompt()),
         Suffix = prompt_tokens(short_prompt()),
@@ -573,8 +673,8 @@ prefill_only_with_parent_key_chains_warm_contexts_test() ->
         ?assertEqual(Extended, ExtCtx),
         ?assertEqual(length(Extended), ExtN),
         ?assertEqual(key_for_tokens(Extended, Cfg), ExtendedKey),
-        %% Read = prefix length restored from cache; Created = the
-        %% suffix tokens added by this call.
+        %% Read = checkpoint prefix length restored from cache;
+        %% Created = the suffix tokens added by this call.
         ?assertEqual(length(Prefix), Read),
         ?assertEqual(length(Suffix), Created)
     end).
@@ -612,6 +712,63 @@ sticky_seq_continues_on_same_session_test() ->
         ?assertEqual(ok, barrel_inference:end_session(<<"test_model">>, SessionId)),
         %% Idempotent: a second end_session on the same id is a no-op.
         ?assertEqual(ok, barrel_inference:end_session(<<"test_model">>, SessionId))
+    end).
+
+sticky_partial_reuses_common_prefix_on_divergence_test() ->
+    %% Same session, but turn 2 is NOT a strict extension of turn 1's
+    %% committed tokens (re-render / mid-history edit). The engine reuses
+    %% the longest common prefix of the pinned seq's live KV
+    %% (cache_hit_kind = partial) instead of admitting cold.
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        ok = barrel_inference_model_stub:reset_seq_rm_last_calls(),
+        {ok, #{generated := Gen1}} = barrel_inference_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        L = length(Turn1Tokens) - 2,
+        Shared = lists:sublist(Turn1Tokens, L),
+        Divergent = prompt_tokens(<<"a completely different tail here now">>),
+        FullTokens = Shared ++ Divergent,
+        {ok, Ref} = barrel_inference_model:infer(
+            <<"test_model">>,
+            FullTokens,
+            #{response_tokens => 2, session_id => SessionId},
+            self()
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(partial, maps:get(cache_hit_kind, Stats)),
+        Delta = maps:get(cache_delta, Stats),
+        ?assertEqual(L, maps:get(read, Delta)),
+        %% The range-trim primer ran with N = L (the common-prefix length).
+        Calls = barrel_inference_model_stub:seq_rm_last_calls(),
+        ?assert(lists:any(fun({_SeqId, N}) -> N =:= L end, Calls))
+    end).
+
+sticky_partial_below_floor_admits_cold_test() ->
+    %% A common prefix shorter than max(1, min_tokens) is not worth a
+    %% partial reuse: fall back to a full cold admit (which clears the
+    %% pinned stale KV).
+    SessionId = make_ref(),
+    with_model(#{min_tokens => 8}, fun(_Cfg) ->
+        {ok, _} = barrel_inference_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 2, session_id => SessionId}
+        ),
+        Shared = lists:sublist(prompt_tokens(long_prompt()), 2),
+        Divergent = prompt_tokens(<<"zzz yyy xxx www different entirely">>),
+        FullTokens = Shared ++ Divergent,
+        {ok, Ref} = barrel_inference_model:infer(
+            <<"test_model">>,
+            FullTokens,
+            #{response_tokens => 2, session_id => SessionId},
+            self()
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(cold, maps:get(cache_hit_kind, Stats))
     end).
 
 sticky_seq_does_not_affect_non_session_callers_test() ->
