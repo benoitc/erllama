@@ -1194,6 +1194,11 @@ static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     int b;
     if (get_map_bool(env, argv[1], "embeddings", &b)) params.embeddings = b ? true : false;
     if (get_map_bool(env, argv[1], "offload_kqv", &b)) params.offload_kqv = b ? true : false;
+    /* Unified KV cache: a single sequence may use the full n_ctx and up to
+     * n_seq_max sequences share that buffer, instead of splitting n_ctx
+     * into n_ctx/n_seq_max per sequence (the default). Lets concurrency
+     * (n_seq_max > 1) coexist with large per-request context. */
+    if (get_map_bool(env, argv[1], "kv_unified", &b)) params.kv_unified = b ? true : false;
 
     int enum_v;
     int fa_rc = get_map_atom_enum(
