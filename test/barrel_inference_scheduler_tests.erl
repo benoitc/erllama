@@ -6,7 +6,18 @@
 -include_lib("eunit/include/eunit.hrl").
 -include("barrel_inference_cache.hrl").
 
--export([sample/0]).
+-export([sample/0, evict_one/0]).
+
+%% Model-evictor callback for the proactive-eviction tests. Returns
+%% whatever the test stashed (default `none`), so a test can drive
+%% {unloaded, _} / none / garbage returns deterministically.
+-define(EVICT_RET_KEY, {?MODULE, evict_ret}).
+
+evict_one() ->
+    persistent_term:get(?EVICT_RET_KEY, none).
+
+evict_ret_set(V) -> persistent_term:put(?EVICT_RET_KEY, V).
+evict_ret_clear() -> catch persistent_term:erase(?EVICT_RET_KEY).
 
 %% =============================================================================
 %% Fixtures
@@ -232,6 +243,116 @@ disk_tier_evicted_when_explicit_test() ->
             ),
             {evicted, 1, 1024} = barrel_inference_scheduler:force_check()
         end
+    ).
+
+%% =============================================================================
+%% Proactive model eviction (escalation when cache can't relieve pressure)
+%% =============================================================================
+
+model_unload_config() ->
+    #{
+        enabled => true,
+        pressure_source => {module, ?MODULE},
+        high_watermark => 0.85,
+        low_watermark => 0.75,
+        min_evict_bytes => 1,
+        unload_models_under_pressure => true,
+        model_evictor => ?MODULE
+    }.
+
+model_unload_escalates_when_cache_empty_test() ->
+    stub_set(95, 100),
+    evict_ret_set({unloaded, <<"m1">>}),
+    try
+        with_scheduler(model_unload_config(), fun() ->
+            %% Empty cache -> evict_bytes returns {evicted,0,0} -> escalate.
+            ?assertEqual({unloaded_model, <<"m1">>}, barrel_inference_scheduler:force_check()),
+            S = barrel_inference_scheduler:status(),
+            ?assertEqual(1, maps:get(models_unloaded_total, S)),
+            ?assertEqual(<<"m1">>, maps:get(last_model_unloaded, S))
+        end)
+    after
+        evict_ret_clear()
+    end.
+
+model_unload_none_when_no_idle_test() ->
+    stub_set(95, 100),
+    evict_ret_set(none),
+    try
+        with_scheduler(model_unload_config(), fun() ->
+            ?assertEqual({skipped, nothing_to_evict}, barrel_inference_scheduler:force_check()),
+            ?assertEqual(0, maps:get(models_unloaded_total, barrel_inference_scheduler:status()))
+        end)
+    after
+        evict_ret_clear()
+    end.
+
+model_unload_garbage_return_falls_back_test() ->
+    stub_set(95, 100),
+    evict_ret_set({unloaded, not_a_binary}),
+    try
+        with_scheduler(model_unload_config(), fun() ->
+            %% Garbage return is normalised to none; scheduler must not crash.
+            ?assertEqual({skipped, nothing_to_evict}, barrel_inference_scheduler:force_check()),
+            ?assertEqual(0, maps:get(models_unloaded_total, barrel_inference_scheduler:status()))
+        end)
+    after
+        evict_ret_clear()
+    end.
+
+model_unload_disabled_by_default_test() ->
+    stub_set(95, 100),
+    evict_ret_set({unloaded, <<"m1">>}),
+    %% model_evictor set but unload_models_under_pressure absent (default false).
+    Cfg = #{
+        enabled => true,
+        pressure_source => {module, ?MODULE},
+        high_watermark => 0.85,
+        low_watermark => 0.75,
+        min_evict_bytes => 1,
+        model_evictor => ?MODULE
+    },
+    try
+        with_scheduler(Cfg, fun() ->
+            ?assertEqual({skipped, nothing_to_evict}, barrel_inference_scheduler:force_check())
+        end)
+    after
+        evict_ret_clear()
+    end.
+
+cache_relief_skips_model_unload_test() ->
+    stub_set(95, 100),
+    evict_ret_set({unloaded, <<"m1">>}),
+    try
+        with_scheduler(model_unload_config(), fun() ->
+            %% A slab larger than the target lets the cache relieve pressure,
+            %% so the evictor must not be consulted.
+            _K = insert_slab(1, 1000),
+            ?assertMatch({evicted, _, _}, barrel_inference_scheduler:force_check()),
+            ?assertEqual(0, maps:get(models_unloaded_total, barrel_inference_scheduler:status()))
+        end)
+    after
+        evict_ret_clear()
+    end.
+
+invalid_unload_flag_at_init_test() ->
+    ?assertMatch(
+        {error, {invalid_config, {unload_models_under_pressure, _}}},
+        barrel_inference_scheduler:validate_config(#{unload_models_under_pressure => yes})
+    ).
+
+invalid_model_evictor_at_init_test() ->
+    ?assertMatch(
+        {error, {invalid_config, {model_evictor, _}}},
+        barrel_inference_scheduler:validate_config(#{model_evictor => "not_an_atom"})
+    ).
+
+valid_model_unload_config_test() ->
+    ?assertEqual(
+        ok,
+        barrel_inference_scheduler:validate_config(#{
+            unload_models_under_pressure => true, model_evictor => some_module
+        })
     ).
 
 sample_records_reading_test() ->

@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Scheduler can proactively unload an idle model under sustained memory pressure
+  (opt-in `scheduler.unload_models_under_pressure => true`). After cache eviction runs,
+  if it could not free the target and pressure is still high, the scheduler calls the
+  configured `model_evictor` (new `barrel_inference_model_evictor` behaviour,
+  `evict_one/0`) to unload the least-recently-active idle model. Cache slabs are always
+  freed first; at most one model is unloaded per tick; the callback's return is
+  validated so a missing or misbehaving evictor degrades to no-op. `status/0` reports
+  `models_unloaded_total` / `last_model_unloaded`. The engine names the evictor module
+  via config only - no compile-time dependency on the server app that implements it.
+
 ### Changed
 
 - Cache eviction is now frecency-scored, not pure LRU. Byte-targeted eviction

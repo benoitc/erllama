@@ -70,12 +70,19 @@ The scheduler always starts (so it can be enabled at runtime via
     low_watermark :: float(),
     min_evict_bytes :: non_neg_integer(),
     evict_tiers :: all | [barrel_inference_cache:tier()],
+    %% When cache eviction cannot relieve sustained pressure, unload the
+    %% least-recently-active idle model via `model_evictor`. Opt-in.
+    unload_models_under_pressure :: boolean(),
+    model_evictor :: module() | undefined,
     timer_ref :: reference() | undefined,
     last_used :: non_neg_integer(),
     last_total :: non_neg_integer(),
     last_evicted_bytes :: non_neg_integer(),
     last_evicted_at :: integer() | undefined,
-    sampled_at :: integer() | undefined
+    sampled_at :: integer() | undefined,
+    models_unloaded_total :: non_neg_integer(),
+    last_model_unloaded :: binary() | undefined,
+    last_model_unloaded_at :: integer() | undefined
 }).
 
 -type state() :: #state{}.
@@ -86,7 +93,9 @@ The scheduler always starts (so it can be enabled at runtime via
     high_watermark => float(),
     low_watermark => float(),
     min_evict_bytes => non_neg_integer(),
-    evict_tiers => all | [barrel_inference_cache:tier()]
+    evict_tiers => all | [barrel_inference_cache:tier()],
+    unload_models_under_pressure => boolean(),
+    model_evictor => module() | undefined
 }.
 
 -export_type([config/0]).
@@ -135,6 +144,7 @@ result if one was triggered, `{skipped, Reason}` otherwise.
 """.
 -spec force_check() ->
     {evicted, non_neg_integer(), non_neg_integer()}
+    | {unloaded_model, binary()}
     | {skipped, below_watermark | disabled | nothing_to_evict}.
 force_check() ->
     gen_server:call(?SERVER, force_check).
@@ -163,9 +173,14 @@ init([Config]) ->
                 low_watermark = maps:get(low_watermark, Config, ?DEFAULT_LOW),
                 min_evict_bytes = maps:get(min_evict_bytes, Config, ?DEFAULT_MIN_EVICT),
                 evict_tiers = maps:get(evict_tiers, Config, ?DEFAULT_EVICT_TIERS),
+                unload_models_under_pressure = maps:get(
+                    unload_models_under_pressure, Config, false
+                ),
+                model_evictor = maps:get(model_evictor, Config, undefined),
                 last_used = 0,
                 last_total = 1,
-                last_evicted_bytes = 0
+                last_evicted_bytes = 0,
+                models_unloaded_total = 0
             },
             {ok, schedule_next(S0)}
     end.
@@ -230,9 +245,24 @@ validate_config(Cfg) ->
         true ->
             case is_integer(I) andalso I > 0 of
                 true ->
-                    ok;
+                    validate_model_unload(Cfg);
                 false ->
                     {error, {invalid_config, {interval_ms, "must be a positive integer"}}}
+            end
+    end.
+
+validate_model_unload(Cfg) ->
+    U = maps:get(unload_models_under_pressure, Cfg, false),
+    E = maps:get(model_evictor, Cfg, undefined),
+    case is_boolean(U) of
+        false ->
+            {error, {invalid_config, {unload_models_under_pressure, "must be a boolean"}}};
+        true ->
+            case is_atom(E) of
+                true ->
+                    ok;
+                false ->
+                    {error, {invalid_config, {model_evictor, "must be a module atom or undefined"}}}
             end
     end.
 
@@ -290,16 +320,50 @@ maybe_evict(Used, Total, S, NowNs) ->
 do_evict(Target, S, _NowNs) when Target =< 0 ->
     {{skipped, below_watermark}, S};
 do_evict(Target, S, NowNs) ->
-    case barrel_inference_cache:evict_bytes(Target, S#state.evict_tiers) of
-        {evicted, 0, 0} ->
-            {{skipped, nothing_to_evict}, S};
-        {evicted, _N, Bytes} = R ->
-            S1 = S#state{
-                last_evicted_bytes = Bytes,
-                last_evicted_at = NowNs
-            },
-            {R, S1}
+    {evicted, N, Bytes} = barrel_inference_cache:evict_bytes(Target, S#state.evict_tiers),
+    %% Only stamp the eviction timestamp on a real eviction; {evicted, 0, 0}
+    %% must not move last_evicted_at (preserves the prior status semantics).
+    S1 =
+        case Bytes > 0 of
+            true -> S#state{last_evicted_bytes = Bytes, last_evicted_at = NowNs};
+            false -> S
+        end,
+    case Bytes >= Target of
+        true -> {{evicted, N, Bytes}, S1};
+        false -> maybe_unload_model(N, Bytes, S1, NowNs)
     end.
+
+%% Cache eviction could not free the target. If model unloading is
+%% enabled, escalate to unloading one idle model; otherwise fall back to
+%% the prior cache-only outcome.
+maybe_unload_model(N, Bytes, S, NowNs) ->
+    case unload_enabled(S) of
+        false ->
+            cache_result(N, Bytes, S);
+        true ->
+            case barrel_inference_model_evictor:evict_one(S#state.model_evictor) of
+                {unloaded, Id} ->
+                    {{unloaded_model, Id}, record_model_unloaded(S, Id, NowNs)};
+                none ->
+                    cache_result(N, Bytes, S)
+            end
+    end.
+
+unload_enabled(#state{unload_models_under_pressure = true, model_evictor = M}) ->
+    M =/= undefined;
+unload_enabled(_) ->
+    false.
+
+cache_result(0, 0, S) -> {{skipped, nothing_to_evict}, S};
+cache_result(N, Bytes, S) -> {{evicted, N, Bytes}, S}.
+
+record_model_unloaded(S, Id, NowNs) ->
+    logger:notice("scheduler unloaded idle model ~ts under memory pressure", [Id]),
+    S#state{
+        models_unloaded_total = S#state.models_unloaded_total + 1,
+        last_model_unloaded = Id,
+        last_model_unloaded_at = NowNs
+    }.
 
 snapshot(S) ->
     Total = max(S#state.last_total, 1),
@@ -312,12 +376,17 @@ snapshot(S) ->
         low_watermark => S#state.low_watermark,
         min_evict_bytes => S#state.min_evict_bytes,
         evict_tiers => S#state.evict_tiers,
+        unload_models_under_pressure => S#state.unload_models_under_pressure,
+        model_evictor => S#state.model_evictor,
         last_used => S#state.last_used,
         last_total => S#state.last_total,
         last_ratio => Ratio,
         last_evicted_bytes => S#state.last_evicted_bytes,
         sampled_at => S#state.sampled_at,
-        last_evicted_at => S#state.last_evicted_at
+        last_evicted_at => S#state.last_evicted_at,
+        models_unloaded_total => S#state.models_unloaded_total,
+        last_model_unloaded => S#state.last_model_unloaded,
+        last_model_unloaded_at => S#state.last_model_unloaded_at
     }.
 
 monotonic_ns() ->
