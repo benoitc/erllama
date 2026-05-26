@@ -98,7 +98,9 @@ header_version_is_two_test() ->
     ?assertEqual(2, Version).
 
 header_save_reason_byte_test() ->
-    Cases = [{cold, 1}, {continued, 2}, {evict, 3}, {shutdown, 4}, {finish, 5}],
+    Cases = [
+        {cold, 1}, {continued, 2}, {evict, 3}, {shutdown, 4}, {finish, 5}, {agent_prefix, 6}
+    ],
     [
         begin
             Meta = (base_meta())#{save_reason => Atom},

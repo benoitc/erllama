@@ -115,4 +115,5 @@ slot_name(?C_HITS_LONGEST_PREFIX) -> hits_longest_prefix;
 slot_name(?C_LONGEST_PREFIX_PROBES) -> longest_prefix_probes;
 slot_name(?C_LONGEST_PREFIX_NS) -> longest_prefix_ns;
 slot_name(?C_SAVES_DROPPED) -> saves_dropped;
-slot_name(?C_HITS_STICKY_PARTIAL) -> hits_sticky_partial.
+slot_name(?C_HITS_STICKY_PARTIAL) -> hits_sticky_partial;
+slot_name(?C_SAVES_AGENT_PREFIX) -> saves_agent_prefix.

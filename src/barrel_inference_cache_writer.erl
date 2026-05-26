@@ -368,4 +368,5 @@ bump_save_counter(continued) -> barrel_inference_cache_counters:incr(?C_SAVES_CO
 bump_save_counter(finish) -> barrel_inference_cache_counters:incr(?C_SAVES_FINISH);
 bump_save_counter(evict) -> barrel_inference_cache_counters:incr(?C_SAVES_EVICT);
 bump_save_counter(shutdown) -> barrel_inference_cache_counters:incr(?C_SAVES_SHUTDOWN);
+bump_save_counter(agent_prefix) -> barrel_inference_cache_counters:incr(?C_SAVES_AGENT_PREFIX);
 bump_save_counter(_) -> ok.

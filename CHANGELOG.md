@@ -6,6 +6,20 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Pinned static-prefix (`agent_prefix`) checkpoints. When a caller supplies a
+  verified `prefix_checkpoint_len` (the end-of-tools token offset), the cold prefill
+  writes an `agent_prefix` KV checkpoint at exactly that boundary - independent of the
+  `cold_min/cold_max` band - and pins it so the hot, shared system+tools prefix is not
+  evicted under churn. The pin is bounded to one row per namespace
+  (`barrel_inference_cache_key:namespace/3`), survives restart (recovered from the
+  persisted save reason on the disk scan), and is re-applied on a warm resume that
+  lands on the boundary. New `barrel_inference_cache_meta_srv:pin_row/2`, `?POS_PINNED`
+  row field, `?C_SAVES_AGENT_PREFIX` counter (`saves_agent_prefix`), and KVC save
+  reason 6 (mirrors ds4 `AGENT_SYSTEM`). Cold-prefill segments now carry a per-boundary
+  save reason.
+
 ### Changed
 
 - KV cache is now keyed by the **rendered prompt bytes**

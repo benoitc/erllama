@@ -355,6 +355,11 @@ concurrently through one decode call per tick.
 %% State callbacks
 -export([idle/3, running/3]).
 
+%% Exported for unit tests (pure cold-ladder segmentation).
+-ifdef(TEST).
+-export([build_cold_ladder/3]).
+-endif.
+
 %% Per-request state. The scheduler holds one #req per in-flight
 %% request, indexed by seq_id in #data.req_table. With the default
 %% `n_seq_max => 1` exactly one request runs at a time; with
@@ -400,7 +405,13 @@ concurrently through one decode call per tick.
     %% non-saving remainder, so cold saves = length(initial segments) - 1.
     %% `undefined` when no cold ladder is pending (prefill_only mode or
     %% warm-restore path); `[]` once the final remainder is reached.
-    cold_save_segments = undefined :: undefined | [[non_neg_integer()]],
+    %% Each pending entry is `{ReasonForPrecedingBoundary, Segment}`: the
+    %% reason is for the save that fires WHEN THAT ENTRY REACHES THE HEAD
+    %% (the prior segment just finished; context_tokens is exactly that
+    %% boundary). The segment starting at the verified static-prefix
+    %% boundary is tagged `agent_prefix`; every other boundary is `cold`.
+    cold_save_segments =
+        undefined :: undefined | [{barrel_inference_cache_kvc:save_reason(), [non_neg_integer()]}],
     %% Set when this request has emitted its final result. The next
     %% step_tick iteration drops it from req_table; deferring the
     %% removal lets the tick walk results without mid-iteration
@@ -487,6 +498,13 @@ concurrently through one decode call per tick.
     %% emit; on overflow the scheduler synthesises the
     %% `barrel_inference_thinking_end` close immediately.
     thinking_count = 0 :: non_neg_integer(),
+    %% Verified static-prefix (end-of-tools) boundary from the server:
+    %% the token offset where the cold path forces an `agent_prefix`
+    %% checkpoint. The head's rendered byte length (for the warm re-pin
+    %% byte compare) is derived from this offset engine-side, where the
+    %% prompt tokens already live. `undefined` when the server supplied
+    %% no verified boundary.
+    prefix_checkpoint_len = undefined :: non_neg_integer() | undefined,
     %% Set after the budget-triggered `thinking_end`. Any further
     %% `{thinking_token, _}` step result is treated as a normal
     %% `{token, _, 0}` for the rest of the request so generation
@@ -1655,7 +1673,10 @@ start_request({continue, From, Suffix, Opts}, SeqId, {continue, StoredTokens} = 
 %% KV cells.
 setup_admission_path(Req, normal, _Prompt, OptsOrParams, Data) ->
     ParentKey = maps:get(parent_key, OptsOrParams, undefined),
-    setup_lookup(Req, ParentKey, Data);
+    Req1 = Req#req{
+        prefix_checkpoint_len = maps:get(prefix_checkpoint_len, OptsOrParams, undefined)
+    },
+    setup_lookup(Req1, ParentKey, Data);
 setup_admission_path(Req, {sticky, StoredTokens}, Prompt, _OptsOrParams, _Data) ->
     Suffix = lists:nthtail(length(StoredTokens), Prompt),
     Req#req{
@@ -1741,18 +1762,72 @@ setup_warm(Req, ContextTokens, RemainingTokens, HitKind, Data) ->
 setup_cold(Req, Data) ->
     ok = backend_seq_clear(Req#req.seq_id, Data),
     Tokens = Req#req.prompt_tokens,
-    [Seg1 | Rest] = barrel_inference_cache_policy:cold_save_segments(Tokens, Data#data.policy),
+    PlainSegs = barrel_inference_cache_policy:cold_save_segments(Tokens, Data#data.policy),
+    {Seg1, TaggedTail} = build_cold_ladder(Tokens, PlainSegs, Req#req.prefix_checkpoint_len),
     Req#req{
         prefill_cursor =
             case Seg1 of
                 [] -> undefined;
                 _ -> Seg1
             end,
-        cold_save_segments = Rest,
+        cold_save_segments = TaggedTail,
         context_tokens = [],
         cache_hit_kind = cold,
         cache_hit_prefix_len = 0
     }.
+
+%% Tag the cold-prefill segments with a per-boundary save reason and,
+%% when the server supplied a verified static-prefix boundary `N`,
+%% inject an `agent_prefix` boundary there (independent of the cold
+%% band). `PlainSegs` is the policy's plain `[[token()]]` partition of
+%% `Tokens`; the result is `{FirstSegment, TaggedTail}` where each tail
+%% entry is `{ReasonForPrecedingBoundary, Segment}` (the reason for the
+%% save that fires when that entry reaches the head). Invariant:
+%% `FirstSegment ++ concat(tail segments) == Tokens`.
+build_cold_ladder(Tokens, PlainSegs, N) ->
+    Total = length(Tokens),
+    Existing = seg_boundary_offsets(PlainSegs),
+    Offsets =
+        case is_integer(N) andalso N > 0 andalso N < Total of
+            true -> lists:usort([N | Existing]);
+            false -> Existing
+        end,
+    %% split_tokens_at_offsets/2 always returns at least one chunk.
+    [First | Tail] = split_tokens_at_offsets(Tokens, Offsets),
+    {First, [{ladder_reason(Off, N), Seg} || {Off, Seg} <- lists:zip(Offsets, Tail)]}.
+
+ladder_reason(Off, N) when Off =:= N -> agent_prefix;
+ladder_reason(_Off, _N) -> cold.
+
+%% Cumulative segment-end offsets, ascending, excluding the final total
+%% (no save fires at the very end; the remainder is covered by the
+%% finish save). These are exactly the boundaries where cold saves
+%% fire today.
+seg_boundary_offsets(Segs) ->
+    Cum = lists:droplast(cumulative_lengths(Segs)),
+    Cum.
+
+cumulative_lengths(Segs) ->
+    {Acc, _} = lists:mapfoldl(
+        fun(Seg, Sum) ->
+            Sum1 = Sum + length(Seg),
+            {Sum1, Sum1}
+        end,
+        0,
+        Segs
+    ),
+    Acc.
+
+%% Partition Tokens at the given ascending absolute offsets, yielding
+%% length(Offsets)+1 chunks (some possibly empty).
+split_tokens_at_offsets(Tokens, Offsets) ->
+    split_tokens_at_offsets(Tokens, Offsets, 0).
+
+split_tokens_at_offsets(Rest, [], _Pos) ->
+    [Rest];
+split_tokens_at_offsets(Rest, [Off | More], Pos) ->
+    {Chunk, Rest1} = lists:split(Off - Pos, Rest),
+    [Chunk | split_tokens_at_offsets(Rest1, More, Off)].
 
 %% Wipe seq's KV state so prefill starts at position 0. Used on the
 %% cold path to defend against leftover cells from a prior
@@ -2688,10 +2763,18 @@ maybe_fire_cold_save(Req = #req{cold_save_segments = undefined}, _Data) ->
 maybe_fire_cold_save(Req = #req{cold_save_segments = []}, _Data) ->
     Req#req{cold_save_segments = undefined, prefill_cursor = undefined};
 maybe_fire_cold_save(
-    Req = #req{cold_save_segments = [Next | Rest], context_tokens = Ctx},
+    Req = #req{cold_save_segments = [{Reason, Next} | Rest], context_tokens = Ctx},
     Data
 ) ->
-    Req0 = fire_save_for_tokens(cold, Ctx, Req, Data),
+    %% The head entry's reason is for the boundary that just drained
+    %% (ctx is exactly that boundary). `agent_prefix` goes through a
+    %% helper that also pins the row; every other boundary is a plain
+    %% cold save.
+    Req0 =
+        case Reason of
+            agent_prefix -> fire_agent_prefix_save(Ctx, Req, Data);
+            _ -> fire_save_for_tokens(Reason, Ctx, Req, Data)
+        end,
     %% Next is the following segment to prefill. When the trim boundary is
     %% the full prompt length the trailing remainder is empty: treat it as
     %% no further prefill (undefined cursor) rather than an empty cursor.
@@ -2705,6 +2788,27 @@ maybe_fire_cold_save(
         last_save_at = length(Ctx),
         prefill_cursor = NextCursor
     }.
+
+%% Fire the static-prefix (agent_prefix) checkpoint for `Ctx` (the
+%% first N tokens) and pin it. Bypasses the cold_min/cold_max band
+%% (only the min_tokens floor). Calls `fire_save_if/5` (NOT the writer
+%% directly) so the writer's `{error, already_present}` is normalised
+%% to `fired` — the row exists either way, which is exactly when we
+%% pin. Computes the key itself (deterministic from the tokens) so no
+%% other save path's return contract changes.
+fire_agent_prefix_save(Ctx, Req, Data) ->
+    Should = length(Ctx) >= maps:get(min_tokens, Data#data.policy, 0),
+    case fire_save_if(Should, agent_prefix, Ctx, Req, Data) of
+        fired ->
+            Key = make_key(Ctx, Req, Data),
+            Ns = barrel_inference_cache_key:namespace(
+                request_fp(Req, Data), Data#data.quant_type, Data#data.ctx_params_hash
+            ),
+            ok = barrel_inference_cache_meta_srv:pin_row(Ns, Key),
+            bump_cache_delta(Req, Ctx);
+        not_fired ->
+            Req
+    end.
 
 %% Continued-save: fire every continued_interval tokens since the
 %% last save fired.
@@ -3188,11 +3292,37 @@ resume_at_prefix(Key, MatchBytes, PromptTokens, PromptBytes, Req, Data) ->
     case pin_and_load(Key, Req#req.seq_id, Data) of
         {ok, CheckpointTokens} ->
             barrel_inference_cache_counters:incr(?C_HITS_LONGEST_PREFIX),
+            maybe_repin_prefix(Key, MatchBytes, Req, Data),
             Suffix = resume_suffix(PromptTokens, PromptBytes, MatchBytes, Data),
             {warm, CheckpointTokens, Suffix, partial};
         miss ->
             barrel_inference_cache_counters:incr(?C_MISSES),
             cold
+    end.
+
+%% Re-pin the resumed row when the warm match lands exactly on the
+%% server's verified static-prefix boundary. Byte compare (not token
+%% count) for robustness against retokenisation: derive the head byte
+%% length from the threaded token offset N and the live prompt tokens,
+%% and compare to the lookup's MatchBytes. Covers the case where the
+%% agent_prefix row was adopted from disk on restart and the next turn
+%% warm-hits it before any save would re-pin it. No verified boundary
+%% (`prefix_checkpoint_len = undefined`) is a no-op.
+maybe_repin_prefix(Key, MatchBytes, Req, Data) ->
+    case Req#req.prefix_checkpoint_len of
+        N when is_integer(N), N > 0 ->
+            HeadBytes = backend_call(Data, detokenize, [lists:sublist(Req#req.prompt_tokens, N)]),
+            case byte_size(HeadBytes) =:= MatchBytes of
+                true ->
+                    Ns = barrel_inference_cache_key:namespace(
+                        request_fp(Req, Data), Data#data.quant_type, Data#data.ctx_params_hash
+                    ),
+                    ok = barrel_inference_cache_meta_srv:pin_row(Ns, Key);
+                false ->
+                    ok
+            end;
+        _ ->
+            ok
     end.
 
 %% Tokens for the part of the prompt a checkpoint of MatchBytes length

@@ -49,6 +49,9 @@ may have left a valid `.kvc` we can validate-and-adopt.
     announce_saved/4,
     announce_saved/6,
     cancel_reservation/2,
+    %% Pin a static-prefix (agent_prefix) checkpoint (unpins the prior
+    %% pinned key for the namespace).
+    pin_row/2,
     %% Operator/test helpers
     gc/0,
     evict_bytes/1,
@@ -88,6 +91,10 @@ may have left a valid `.kvc` we can validate-and-adopt.
     reservations :: #{barrel_inference_cache:cache_key() => #reservation{}},
     waiters ::
         #{barrel_inference_cache:cache_key() => [{gen_server:from(), integer(), reference()}]},
+    %% namespace (sha256 of fp||quant||ctx) -> currently-pinned cache_key.
+    %% At most one pinned static-prefix checkpoint per namespace; pinning
+    %% a new key for a namespace unpins the prior one.
+    pinned :: #{binary() => barrel_inference_cache:cache_key()},
     sweep_timer :: reference() | undefined
 }).
 
@@ -159,7 +166,8 @@ lookup_longest_text_prefix(KeyMeta, PromptBytes) when is_binary(PromptBytes) ->
 available_text_lengths(MaxLen) ->
     MS = [
         {
-            {'_', '_', '_', '_', '_', available, '_', '_', '_', '_', '$1'},
+            %% row arity 12: ..., TextBytes ($1), Pinned ('_')
+            {'_', '_', '_', '_', '_', available, '_', '_', '_', '_', '$1', '_'},
             [{'>', '$1', 0}, {'=<', '$1', MaxLen}],
             ['$1']
         }
@@ -260,6 +268,17 @@ insert_available(Key, Tier, Size, Header, Location, TokensBin, TextBytes) ->
         {insert_available, Key, Tier, Size, Header, Location, TokensBin, TextBytes}
     ).
 
+-doc """
+Pin `Key` as the static-prefix (agent_prefix) checkpoint for namespace
+`Ns` (`barrel_inference_cache_key:namespace/3`). The pinned row is
+skipped by LRU eviction. At most one key per namespace stays pinned:
+pinning a new key unpins the prior one for the same `Ns`. A no-op if
+`Key` is not (yet) present.
+""".
+-spec pin_row(binary(), barrel_inference_cache:cache_key()) -> ok.
+pin_row(Ns, Key) when is_binary(Ns), is_binary(Key) ->
+    gen_server:call(?SERVER, {pin_row, Ns, Key}).
+
 -spec gc() -> {evicted, non_neg_integer()}.
 gc() ->
     gen_server:call(?SERVER, gc).
@@ -323,6 +342,7 @@ init([]) ->
         holders = #{},
         reservations = #{},
         waiters = #{},
+        pinned = #{},
         sweep_timer = Timer
     },
     {ok, State}.
@@ -403,8 +423,11 @@ handle_call(
     {insert_available, Key, Tier, Size, Header, Location, TokensBin, TextBytes}, _From, S
 ) ->
     install_available_row(Key, Tier, Size, Header, Location, TokensBin, TextBytes),
+    maybe_restore_pin(Key, S),
     S1 = notify_waiters(Key, S),
     {reply, ok, S1};
+handle_call({pin_row, Ns, Key}, _From, S) ->
+    {reply, ok, do_pin_row(Ns, Key, S)};
 handle_call(gc, _From, S) ->
     Evicted = run_eviction(),
     {reply, {evicted, Evicted}, S};
@@ -501,11 +524,38 @@ install_available_row(Key, Tier, Size, Header, Location, TokensBin, TextBytes) -
     %% row 1 second forward in the LRU. Once a row is actively
     %% checked out at runtime, recency takes over.
     LastUsed = NowNs + Hits * 1_000_000_000,
+    %% Pinned defaults false; pin_row/2 sets it after install (the engine
+    %% pins an agent_prefix save, and the disk scan re-pins adopted
+    %% agent_prefix rows). Re-installing a row resets the flag, so those
+    %% paths always pin AFTER the install they care about.
     Row =
-        {Key, Tier, Size, LastUsed, 0, available, Header, Location, TokensBin, Hits, TextBytes},
+        {Key, Tier, Size, LastUsed, 0, available, Header, Location, TokensBin, Hits, TextBytes,
+            false},
     ets:insert(?TBL_META, Row),
     ets:insert(?TBL_LRU, {{LastUsed, Key}, []}),
     ok.
+
+%% Pin Key for namespace Ns: unpin the prior pinned key for Ns (if any
+%% and still present), set Key's pin flag, and record the mapping. A
+%% no-op on the flag if Key isn't present (the map entry is still kept
+%% so a later install + re-pin is consistent).
+do_pin_row(Ns, Key, S) ->
+    Prior = maps:get(Ns, S#state.pinned, undefined),
+    case Prior of
+        undefined -> ok;
+        Key -> ok;
+        Other -> set_pinned_flag(Other, false)
+    end,
+    set_pinned_flag(Key, true),
+    S#state{pinned = (S#state.pinned)#{Ns => Key}}.
+
+set_pinned_flag(Key, Bool) ->
+    try
+        _ = ets:update_element(?TBL_META, Key, {?POS_PINNED, Bool}),
+        ok
+    catch
+        error:badarg -> ok
+    end.
 
 %% Extract the u32 hit_count from the on-disk header. RAM tier saves
 %% pass a placeholder header so we treat a too-short header as "no
@@ -563,7 +613,7 @@ create_reservation(Key, Tier, Pid, S) ->
         path = undefined
     },
     Placeholder =
-        {Key, Tier, 0, NowNs, 0, writing, <<>>, undefined, undefined, 0, 0},
+        {Key, Tier, 0, NowNs, 0, writing, <<>>, undefined, undefined, 0, 0, false},
     ets:insert(?TBL_META, Placeholder),
     {reply, {ok, Token}, S#state{reservations = (S#state.reservations)#{Key => R}}}.
 
@@ -591,8 +641,22 @@ adopt_row(Key, Tier, Path, Size, Header, TokensBin, TextBytes, S) ->
     install_available_row(
         Key, Tier, Size, Header, location_for(Tier, Path), TokensBin, TextBytes
     ),
+    maybe_restore_pin(Key, S),
     S1 = S#state{reservations = maps:remove(Key, S#state.reservations)},
     notify_waiters(Key, S1).
+
+%% Re-apply the pin flag after a (re)install: the engine pins an
+%% agent_prefix key right after firing its ASYNC save, so pin_row/2 may
+%% run before the row is published (the flag-set then no-ops, but the
+%% `pinned` map still records the key). When the writer finally
+%% publishes the row here, restore the flag from the map so the pin
+%% isn't lost to the race. Also covers a row re-installed under a key
+%% that's still the namespace's pinned key.
+maybe_restore_pin(Key, S) ->
+    case lists:member(Key, maps:values(S#state.pinned)) of
+        true -> set_pinned_flag(Key, true);
+        false -> ok
+    end.
 
 validate_and_adopt(Key, Path) ->
     case file:read_file(Path) of
@@ -754,8 +818,18 @@ try_evict_one(LruKey, Key, TierPred) ->
     case ets:lookup(?TBL_META, Key) of
         [Row] ->
             Tier = element(?POS_TIER, Row),
-            case {element(?POS_STATUS, Row), element(?POS_REFCOUNT, Row), TierPred(Tier)} of
-                {available, 0, true} ->
+            %% Pinned (agent_prefix static-prefix) rows are skipped in
+            %% Phase 1; Phase 2 replaces this hard skip with a frecency
+            %% score bias.
+            case
+                {
+                    element(?POS_STATUS, Row),
+                    element(?POS_REFCOUNT, Row),
+                    TierPred(Tier),
+                    element(?POS_PINNED, Row)
+                }
+            of
+                {available, 0, true, false} ->
                     Location = element(?POS_LOCATION, Row),
                     Size = element(?POS_SIZE, Row),
                     delete_from_tier(Tier, Key, Location),

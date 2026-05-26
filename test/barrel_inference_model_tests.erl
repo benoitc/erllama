@@ -359,6 +359,80 @@ stop_sequence_finish_save_does_not_block_prefix_reuse_test() ->
     end).
 
 %% =============================================================================
+%% Static-prefix (agent_prefix) checkpoint + pin
+%% =============================================================================
+
+agent_prefix_checkpoint_fires_pinned_and_survives_evict_test() ->
+    with_model(#{}, fun(Cfg) ->
+        N = 6,
+        Tokens = prompt_tokens(long_prompt()),
+        Head = lists:sublist(Tokens, N),
+        %% A verified static-prefix boundary at N forces an agent_prefix
+        %% checkpoint of the first N tokens, independent of the cold band.
+        {ok, _} = barrel_inference_model:complete(
+            <<"test_model">>, long_prompt(), #{prefix_checkpoint_len => N, response_tokens => 4}
+        ),
+        AgentKey = key_for_tokens(Head, Cfg),
+        {ok, _} = wait_for_key(AgentKey, 1000),
+        ?assert(maps:get(saves_agent_prefix, barrel_inference_cache:get_counters()) >= 1),
+        %% The agent_prefix row is pinned (despite the async save / pin race).
+        {ok, Row} = barrel_inference_cache_meta_srv:dump(AgentKey),
+        ?assertEqual(true, element(?POS_PINNED, Row)),
+        %% A forced GC drops the unpinned cold/finish rows; the pinned
+        %% static-prefix row survives.
+        {evicted, _} = barrel_inference_cache_meta_srv:gc(),
+        ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(AgentKey)),
+        %% A later turn whose head matches resumes from the surviving
+        %% pinned row (longest-byte-prefix), not cold.
+        Before = maps:get(hits_longest_prefix, barrel_inference_cache:get_counters()),
+        {ok, _} = barrel_inference_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        After = maps:get(hits_longest_prefix, barrel_inference_cache:get_counters()),
+        ?assert(After - Before >= 1)
+    end).
+
+%% build_cold_ladder/3 (pure): tags the cold segments with per-boundary
+%% reasons and injects the agent_prefix boundary at N.
+ladder_seg_parts(Tail) -> lists:append([S || {_R, S} <- Tail]).
+
+build_cold_ladder_single_segment_injects_boundary_test() ->
+    Tokens = lists:seq(1, 10),
+    %% Out-of-band prompt: policy would return a single [Tokens] segment.
+    {First, Tail} = barrel_inference_model:build_cold_ladder(Tokens, [Tokens], 3),
+    ?assertEqual(lists:seq(1, 3), First),
+    ?assertEqual([{agent_prefix, lists:seq(4, 10)}], Tail),
+    ?assertEqual(Tokens, First ++ ladder_seg_parts(Tail)).
+
+build_cold_ladder_tags_only_N_agent_prefix_test() ->
+    Tokens = lists:seq(1, 10),
+    Plain = [lists:seq(1, 5), lists:seq(6, 10), []],
+    {First, Tail} = barrel_inference_model:build_cold_ladder(Tokens, Plain, 3),
+    ?assertEqual(Tokens, First ++ ladder_seg_parts(Tail)),
+    ?assertEqual(lists:seq(1, 3), First),
+    ?assertMatch([{agent_prefix, _} | _], Tail),
+    Reasons = [R || {R, _} <- Tail],
+    ?assertEqual([agent_prefix], [R || R <- Reasons, R =:= agent_prefix]).
+
+build_cold_ladder_no_boundary_all_cold_test() ->
+    Tokens = lists:seq(1, 10),
+    Plain = [lists:seq(1, 5), lists:seq(6, 10), []],
+    {First, Tail} = barrel_inference_model:build_cold_ladder(Tokens, Plain, undefined),
+    ?assertEqual(Tokens, First ++ ladder_seg_parts(Tail)),
+    ?assert(lists:all(fun({R, _}) -> R =:= cold end, Tail)).
+
+%% A prompt with no verified boundary (no prefix_checkpoint_len) fires
+%% no agent_prefix checkpoint.
+no_agent_prefix_without_boundary_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        {ok, _} = barrel_inference_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 4}
+        ),
+        timer:sleep(100),
+        ?assertEqual(0, maps:get(saves_agent_prefix, barrel_inference_cache:get_counters()))
+    end).
+
+%% =============================================================================
 %% Continued saves during generation
 %% =============================================================================
 

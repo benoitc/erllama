@@ -56,6 +56,25 @@ key_for(Meta) ->
 %% Save / load round-trip
 %% =============================================================================
 
+%% An agent_prefix checkpoint on disk is re-pinned when the startup
+%% scan adopts it (the save reason is persisted; the namespace is
+%% recomputed from the parsed meta).
+agent_prefix_repinned_on_disk_scan_test() ->
+    with_disk(fun(Dir) ->
+        Meta = (base_meta([1, 2, 3, 4]))#{save_reason => agent_prefix},
+        {ok, Key, _H, _Sz} = barrel_inference_cache_disk_srv:save(test_disk, Meta, <<"payload">>),
+        %% Simulate restart: drop the live meta + disk srv, then restart so
+        %% the disk scan re-adopts the on-disk .kvc. The scan + insert +
+        %% pin run synchronously in disk_srv init, so the row is pinned
+        %% by the time start_link returns.
+        catch gen_server:stop(test_disk),
+        catch gen_server:stop(barrel_inference_cache_meta_srv),
+        {ok, _} = barrel_inference_cache_meta_srv:start_link(),
+        {ok, _} = barrel_inference_cache_disk_srv:start_link(test_disk, Dir),
+        {ok, Row} = barrel_inference_cache_meta_srv:dump(Key),
+        ?assertEqual(true, element(?POS_PINNED, Row))
+    end).
+
 save_then_load_round_trip_test() ->
     with_disk(fun(_Dir) ->
         Meta = base_meta([1, 2, 3]),

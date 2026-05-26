@@ -11,7 +11,7 @@
 
 %% Meta row position constants. Layout:
 %%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin, Location,
-%%    TokensRef, Hits, TextBytes}
+%%    TokensRef, Hits, TextBytes, Pinned}
 %% Hits is a per-row count of warm reuses. Persisted at offset 12 of
 %% the on-disk KVC header so eviction scoring survives restarts.
 %% TextBytes is the byte length of the rendered prompt this row's key
@@ -29,6 +29,11 @@
 -define(POS_TOKENS_REF, 9).
 -define(POS_HITS, 10).
 -define(POS_TEXT_BYTES, 11).
+%% Pin flag (boolean). A pinned row (an agent_prefix static-prefix
+%% checkpoint) is skipped by LRU eviction in Phase 1; Phase 2 turns it
+%% into a strong frecency bias instead. At most one pinned row per
+%% namespace (the meta server's `pinned` map enforces this).
+-define(POS_PINNED, 12).
 
 %% Offset of the u32 hit_count inside the 48-byte KVC header.
 %% magic(3) + version(1) + quant(1) + reason(1) + reserved(2) +
@@ -68,7 +73,11 @@
 %% session's live KV in place (sticky_partial admission). Distinct from
 %% hits_longest_prefix, which counts the persisted-cache resume path.
 -define(C_HITS_STICKY_PARTIAL, 21).
--define(C_NSLOTS, 21).
+%% Bumped when an agent_prefix (static system+tools prefix) checkpoint
+%% is saved. Distinct from saves_cold; lets ops confirm the pinned
+%% prefix checkpoint is being written.
+-define(C_SAVES_AGENT_PREFIX, 22).
+-define(C_NSLOTS, 22).
 
 %% Public types live in `barrel_inference_cache.erl`. Refer to them as
 %% `barrel_inference_cache:cache_key()` etc. from outside this header.

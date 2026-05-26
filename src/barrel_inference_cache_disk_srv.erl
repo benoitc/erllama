@@ -413,18 +413,7 @@ scan_kvc(Path, Acc) ->
         {ok, Bin} ->
             case barrel_inference_cache_kvc:parse_meta(Bin) of
                 {ok, Info} ->
-                    Header = binary:part(Bin, 0, 48),
-                    Tokens = maps:get(tokens, Info),
-                    PromptText = maps:get(prompt_text, Info, <<>>),
-                    Key = barrel_inference_cache_key:make(#{
-                        fingerprint => maps:get(fingerprint, Info),
-                        quant_type => maps:get(quant_type, Info),
-                        ctx_params_hash => maps:get(ctx_params_hash, Info),
-                        text => PromptText
-                    }),
-                    TokensBin = barrel_inference_cache_key:encode_tokens(Tokens),
-                    TextBytes = byte_size(PromptText),
-                    [{Key, Header, byte_size(Bin), TokensBin, TextBytes} | Acc];
+                    [scan_entry_row(Bin, Info) | Acc];
                 {error, _} ->
                     _ = prim_file:delete(Path),
                     Acc
@@ -433,14 +422,42 @@ scan_kvc(Path, Acc) ->
             Acc
     end.
 
+scan_entry_row(Bin, Info) ->
+    Header = binary:part(Bin, 0, 48),
+    PromptText = maps:get(prompt_text, Info, <<>>),
+    Fp = maps:get(fingerprint, Info),
+    QuantType = maps:get(quant_type, Info),
+    CtxHash = maps:get(ctx_params_hash, Info),
+    Key = barrel_inference_cache_key:make(#{
+        fingerprint => Fp,
+        quant_type => QuantType,
+        ctx_params_hash => CtxHash,
+        text => PromptText
+    }),
+    TokensBin = barrel_inference_cache_key:encode_tokens(maps:get(tokens, Info)),
+    %% Re-pin static-prefix checkpoints across restart: the save reason
+    %% is persisted in the header, the namespace recomputable from meta.
+    PinNs =
+        case maps:get(save_reason, Info, undefined) of
+            agent_prefix -> barrel_inference_cache_key:namespace(Fp, QuantType, CtxHash);
+            _ -> undefined
+        end,
+    {Key, Header, byte_size(Bin), TokensBin, byte_size(PromptText), PinNs}.
+
 register_existing(Tier, Root) ->
     Entries = scan_dir(Root),
     lists:foreach(
-        fun({Key, Header, Size, TokensBin, TextBytes}) ->
+        fun({Key, Header, Size, TokensBin, TextBytes, PinNs}) ->
             Path = filename:join(Root, bin_to_hex(Key) ++ ".kvc"),
             barrel_inference_cache_meta_srv:insert_available(
                 Key, Tier, Size, Header, {Tier, Path}, TokensBin, TextBytes
-            )
+            ),
+            %% After install (synchronous), re-pin agent_prefix rows so
+            %% the pinned map and ?POS_PINNED flag survive restart.
+            case PinNs of
+                undefined -> ok;
+                Ns -> ok = barrel_inference_cache_meta_srv:pin_row(Ns, Key)
+            end
         end,
         Entries
     ).

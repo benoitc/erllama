@@ -70,13 +70,14 @@ Parse paths come in two flavours:
 
 -export([build/2, parse/2, parse_meta/1]).
 
--export_type([build_meta/0, info/0]).
+-export_type([build_meta/0, info/0, save_reason/0]).
 
 %% =============================================================================
 %% Types
 %% =============================================================================
 
--type save_reason() :: unknown | cold | continued | evict | shutdown | finish.
+-type save_reason() ::
+    unknown | cold | continued | evict | shutdown | finish | agent_prefix.
 
 -type fingerprint_mode() :: safe | gguf_chunked | fast_unsafe.
 
@@ -141,6 +142,9 @@ Parse paths come in two flavours:
 -define(SR_EVICT, 3).
 -define(SR_SHUTDOWN, 4).
 -define(SR_FINISH, 5).
+%% Static system+tools prefix checkpoint (mirrors ds4 AGENT_SYSTEM).
+%% Persisted so the row can be re-pinned on the startup disk scan.
+-define(SR_AGENT_PREFIX, 6).
 
 -define(FM_SAFE, 0).
 -define(FM_CHUNKED, 1).
@@ -454,7 +458,8 @@ save_reason_byte(cold) -> ?SR_COLD;
 save_reason_byte(continued) -> ?SR_CONTINUED;
 save_reason_byte(evict) -> ?SR_EVICT;
 save_reason_byte(shutdown) -> ?SR_SHUTDOWN;
-save_reason_byte(finish) -> ?SR_FINISH.
+save_reason_byte(finish) -> ?SR_FINISH;
+save_reason_byte(agent_prefix) -> ?SR_AGENT_PREFIX.
 
 save_reason_atom(?SR_UNKNOWN) -> unknown;
 save_reason_atom(?SR_COLD) -> cold;
@@ -462,6 +467,7 @@ save_reason_atom(?SR_CONTINUED) -> continued;
 save_reason_atom(?SR_EVICT) -> evict;
 save_reason_atom(?SR_SHUTDOWN) -> shutdown;
 save_reason_atom(?SR_FINISH) -> finish;
+save_reason_atom(?SR_AGENT_PREFIX) -> agent_prefix;
 save_reason_atom(B) -> throw({kvc_error, {unknown_save_reason, B}}).
 
 fingerprint_mode_byte(safe) -> ?FM_SAFE;

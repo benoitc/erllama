@@ -23,6 +23,7 @@
 -export([
     make/1,
     make_text/4,
+    namespace/3,
     effective_fingerprint/2,
     quant_byte/1,
     quant_atom/1,
@@ -106,6 +107,25 @@ make_text(Fp, QT, CtxHash, Text) when
 ->
     QuantByte = quant_byte(QT),
     crypto:hash(sha256, [Fp, <<QuantByte:8>>, CtxHash, Text]).
+
+-doc """
+Namespace digest for a `(fingerprint, quant_type, ctx_params_hash)`
+triple: `make_text/4` without the prompt bytes. Two cache keys share
+a namespace iff they would be produced by the same model / quant /
+context, so the pin map (which keeps at most one pinned static-prefix
+checkpoint per namespace) can group rows whose full keys are opaque
+SHA-256 digests. Uses the module's own `quant_byte/1` so the quant
+encoding is never duplicated by callers.
+""".
+-spec namespace(<<_:256>>, quant_type(), <<_:256>>) -> <<_:256>>.
+namespace(Fp, QT, CtxHash) when
+    is_binary(Fp),
+    byte_size(Fp) =:= 32,
+    is_binary(CtxHash),
+    byte_size(CtxHash) =:= 32
+->
+    QuantByte = quant_byte(QT),
+    crypto:hash(sha256, [Fp, <<QuantByte:8>>, CtxHash]).
 
 -doc """
 Compute an effective fingerprint from a base model fingerprint and a

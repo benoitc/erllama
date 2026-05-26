@@ -64,6 +64,20 @@ make_distinct_for_prefix_test() ->
     Prefix = barrel_inference_cache_key:make_text(fp(), f16, ctx(), <<"abc">>),
     ?assertNotEqual(Full, Prefix).
 
+namespace_is_32_bytes_and_text_independent_test() ->
+    %% The namespace folds in fp/quant/ctx but NOT the prompt bytes, so
+    %% it groups all keys produced by the same model/quant/context.
+    Ns = barrel_inference_cache_key:namespace(fp(), q4_k_m, ctx()),
+    ?assertEqual(32, byte_size(Ns)),
+    ?assertEqual(Ns, barrel_inference_cache_key:namespace(fp(), q4_k_m, ctx())).
+
+namespace_distinct_for_quant_and_fp_test() ->
+    A = barrel_inference_cache_key:namespace(fp(), f16, ctx()),
+    B = barrel_inference_cache_key:namespace(fp(), q4_k_m, ctx()),
+    C = barrel_inference_cache_key:namespace(binary:copy(<<16#AB>>, 32), f16, ctx()),
+    ?assertNotEqual(A, B),
+    ?assertNotEqual(A, C).
+
 make_distinct_for_quant_change_test() ->
     A = barrel_inference_cache_key:make(#{
         fingerprint => fp(),

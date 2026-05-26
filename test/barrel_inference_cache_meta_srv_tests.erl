@@ -22,6 +22,9 @@ with_srv(Body) ->
 key(N) ->
     crypto:hash(sha256, integer_to_binary(N)).
 
+ns(N) ->
+    crypto:hash(sha256, <<"ns-", (integer_to_binary(N))/binary>>).
+
 %% Mirror the stub backend's detokenise: a token list renders to its
 %% space-joined decimal ids. The cache key (v2) is over these bytes.
 prompt_bytes(Tokens) ->
@@ -70,7 +73,43 @@ insert_available_makes_lookup_hit_test() ->
         ?assertEqual(key(1), element(?POS_KEY, Row)),
         ?assertEqual(ram, element(?POS_TIER, Row)),
         ?assertEqual(available, element(?POS_STATUS, Row)),
-        ?assertEqual(0, element(?POS_REFCOUNT, Row))
+        ?assertEqual(0, element(?POS_REFCOUNT, Row)),
+        %% Rows install unpinned by default.
+        ?assertEqual(false, element(?POS_PINNED, Row))
+    end).
+
+%% =============================================================================
+%% Pinning (agent_prefix static-prefix protection)
+%% =============================================================================
+
+pin_protects_row_from_eviction_test() ->
+    with_srv(fun() ->
+        Ns = ns(1),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(2), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:pin_row(Ns, key(1)),
+        {ok, R1} = barrel_inference_cache_meta_srv:dump(key(1)),
+        ?assertEqual(true, element(?POS_PINNED, R1)),
+        %% Full GC drops the unpinned row and keeps the pinned one.
+        {evicted, _} = barrel_inference_cache_meta_srv:gc(),
+        ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(2)))
+    end).
+
+pin_new_key_unpins_prior_for_namespace_test() ->
+    with_srv(fun() ->
+        Ns = ns(1),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(2), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:pin_row(Ns, key(1)),
+        ok = barrel_inference_cache_meta_srv:pin_row(Ns, key(2)),
+        {ok, R1} = barrel_inference_cache_meta_srv:dump(key(1)),
+        {ok, R2} = barrel_inference_cache_meta_srv:dump(key(2)),
+        ?assertEqual(false, element(?POS_PINNED, R1)),
+        ?assertEqual(true, element(?POS_PINNED, R2)),
+        {evicted, _} = barrel_inference_cache_meta_srv:gc(),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
+        ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(key(2)))
     end).
 
 %% =============================================================================
