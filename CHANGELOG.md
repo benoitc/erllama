@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- Cache eviction is now frecency-scored, not pure LRU. Byte-targeted eviction
+  (`evict_bytes`, scheduler memory pressure) drops the lowest-scoring rows first, where
+  the score is recency biased forward by the row's hit count with a 6 h half-life decay
+  (`barrel_inference_cache_meta_srv:eviction_score/3`). Pinned static-prefix rows and the
+  currently-live session key (`set_live_key/1`, ds4 `protected_sha`) sort in a higher
+  rank so they survive `gc/0` and are evicted by `evict_bytes` only as a last resort
+  when nothing else frees enough. The old one-shot `last_used += hits*1s` install bias
+  is removed (hits now feed the score directly, so they are no longer double-counted).
+
 ### Added
 
 - Pinned static-prefix (`agent_prefix`) checkpoints. When a caller supplies a

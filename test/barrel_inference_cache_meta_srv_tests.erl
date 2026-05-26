@@ -96,6 +96,51 @@ pin_protects_row_from_eviction_test() ->
         ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(2)))
     end).
 
+%% Byte-targeted eviction drops the lowest-frecency row first: a row
+%% that was checked out (hit + recency bump) outscores a cold one, so
+%% the cold one goes when only one row's worth of bytes is targeted.
+frecency_evicts_coldest_first_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(2), ram, 100, <<"H">>, {ram}),
+        %% Warm key(2): bumps its hit count and recency above key(1).
+        {ok, Ref, _, _, _, _} = barrel_inference_cache_meta_srv:checkout(key(2), self()),
+        ok = barrel_inference_cache_meta_srv:checkin(Ref),
+        {evicted, 1, 100} = barrel_inference_cache_meta_srv:evict_bytes(100),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
+        ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(key(2)))
+    end).
+
+%% The live-session key is protected: gc keeps it, and byte-targeted
+%% eviction drops the non-live row first.
+live_key_protected_from_eviction_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(2), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:set_live_key(key(1)),
+        timer:sleep(20),
+        {evicted, 1, 100} = barrel_inference_cache_meta_srv:evict_bytes(100),
+        ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(2))),
+        %% gc also keeps the live key.
+        {evicted, _} = barrel_inference_cache_meta_srv:gc(),
+        ?assertMatch({ok, _}, barrel_inference_cache_meta_srv:lookup_exact(key(1)))
+    end).
+
+%% A pinned row survives gc, but byte-targeted eviction CAN drop it as a
+%% last resort once everything else is gone.
+pinned_evictable_under_extreme_pressure_test() ->
+    with_srv(fun() ->
+        ok = barrel_inference_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:insert_available(key(2), ram, 100, <<"H">>, {ram}),
+        ok = barrel_inference_cache_meta_srv:pin_row(ns(1), key(1)),
+        %% Target needs both rows: the unpinned one goes first, the pinned
+        %% one follows because nothing else frees enough.
+        {evicted, 2, 200} = barrel_inference_cache_meta_srv:evict_bytes(150),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(miss, barrel_inference_cache_meta_srv:lookup_exact(key(2)))
+    end).
+
 pin_new_key_unpins_prior_for_namespace_test() ->
     with_srv(fun() ->
         Ns = ns(1),
@@ -375,7 +420,9 @@ mark_published_advances_stage_test() ->
 announce_saved_promotes_to_available_test() ->
     with_srv(fun() ->
         {ok, Token} = barrel_inference_cache_meta_srv:reserve_save(key(1), ram, self()),
-        ok = barrel_inference_cache_meta_srv:announce_saved(key(1), Token, 100, <<"H">>),
+        ok = barrel_inference_cache_meta_srv:announce_saved(
+            key(1), Token, 100, <<"H">>, undefined, 0
+        ),
         {ok, Row} = barrel_inference_cache_meta_srv:dump(key(1)),
         ?assertEqual(available, element(?POS_STATUS, Row)),
         ?assertEqual(<<"H">>, element(?POS_HEADER_BIN, Row))
@@ -515,7 +562,9 @@ wait_replies_when_save_publishes_test() ->
                 receive
                     publish -> ok
                 end,
-                ok = barrel_inference_cache_meta_srv:announce_saved(key(1), T, 100, <<"H">>)
+                ok = barrel_inference_cache_meta_srv:announce_saved(
+                    key(1), T, 100, <<"H">>, undefined, 0
+                )
             end),
         receive
             reserved -> ok

@@ -46,12 +46,14 @@ may have left a valid `.kvc` we can validate-and-adopt.
     reserve_save/3,
     check_reservation/2,
     mark_published/3,
-    announce_saved/4,
     announce_saved/6,
     cancel_reservation/2,
     %% Pin a static-prefix (agent_prefix) checkpoint (unpins the prior
     %% pinned key for the namespace).
     pin_row/2,
+    %% Mark / clear the currently-live session's resolved key (protected
+    %% from eviction).
+    set_live_key/1,
     %% Operator/test helpers
     gc/0,
     evict_bytes/1,
@@ -76,6 +78,15 @@ may have left a valid `.kvc` we can validate-and-adopt.
 %% Periodic sweep for stale reservations and expired waiters.
 -define(SWEEP_INTERVAL_MS, 30 * 1000).
 
+%% Frecency eviction (ds4-style). Each accumulated hit biases a row's
+%% recency forward by HIT_BONUS_NS (1 s), decayed by a 6 h half-life on
+%% the row's age, so a hot-but-recently-hit row outranks an old one but
+%% stale hits fade. Byte-targeted eviction drops the lowest-scoring rows
+%% first; pinned and live-key rows sort last (a separate rank) so they
+%% are evicted only as a last resort under extreme pressure.
+-define(HIT_BONUS_NS, 1_000_000_000).
+-define(HIT_HALF_LIFE_NS, 6 * 60 * 60 * 1_000_000_000).
+
 -record(reservation, {
     writer :: pid(),
     token :: reference(),
@@ -95,6 +106,10 @@ may have left a valid `.kvc` we can validate-and-adopt.
     %% At most one pinned static-prefix checkpoint per namespace; pinning
     %% a new key for a namespace unpins the prior one.
     pinned :: #{binary() => barrel_inference_cache:cache_key()},
+    %% Resolved cache key of the currently-live session (ds4 protected_sha):
+    %% protected from eviction so a between-turns sticky session's KV row
+    %% isn't dropped out from under the next turn. `undefined` when idle.
+    live_key = undefined :: barrel_inference_cache:cache_key() | undefined,
     sweep_timer :: reference() | undefined
 }).
 
@@ -216,12 +231,6 @@ mark_published(Key, Token, Path) when is_reference(Token) ->
     gen_server:call(?SERVER, {mark_published, Key, Token, Path}).
 
 -spec announce_saved(
-    barrel_inference_cache:cache_key(), reference(), non_neg_integer(), binary()
-) -> ok | {error, expired}.
-announce_saved(Key, Token, Size, Header) ->
-    announce_saved(Key, Token, Size, Header, undefined, 0).
-
--spec announce_saved(
     barrel_inference_cache:cache_key(),
     reference(),
     non_neg_integer(),
@@ -278,6 +287,17 @@ pinning a new key unpins the prior one for the same `Ns`. A no-op if
 -spec pin_row(binary(), barrel_inference_cache:cache_key()) -> ok.
 pin_row(Ns, Key) when is_binary(Ns), is_binary(Key) ->
     gen_server:call(?SERVER, {pin_row, Ns, Key}).
+
+-doc """
+Mark `Key` as the currently-live session's resolved cache key, or
+`undefined` to clear. The live key is protected from eviction (it
+sorts last, like a pinned row) so a between-turns sticky session's KV
+row isn't evicted before the next turn reuses it. Cast (best-effort,
+off the admission hot path).
+""".
+-spec set_live_key(barrel_inference_cache:cache_key() | undefined) -> ok.
+set_live_key(Key) when is_binary(Key); Key =:= undefined ->
+    gen_server:cast(?SERVER, {set_live_key, Key}).
 
 -spec gc() -> {evicted, non_neg_integer()}.
 gc() ->
@@ -343,6 +363,7 @@ init([]) ->
         reservations = #{},
         waiters = #{},
         pinned = #{},
+        live_key = undefined,
         sweep_timer = Timer
     },
     {ok, State}.
@@ -429,18 +450,20 @@ handle_call(
 handle_call({pin_row, Ns, Key}, _From, S) ->
     {reply, ok, do_pin_row(Ns, Key, S)};
 handle_call(gc, _From, S) ->
-    Evicted = run_eviction(),
+    Evicted = run_eviction(S#state.live_key),
     {reply, {evicted, Evicted}, S};
 handle_call({evict_bytes, 0, _Tiers}, _From, S) ->
     %% "Evict at least 0 bytes" is a no-op. Use gc/0 for full GC.
     {reply, {evicted, 0, 0}, S};
 handle_call({evict_bytes, Target, Tiers}, _From, S) when Target > 0 ->
-    {N, Bytes} = run_eviction_bytes(Target, tier_pred(Tiers)),
+    {N, Bytes} = run_eviction_bytes(Target, tier_pred(Tiers), S#state.live_key),
     {reply, {evicted, N, Bytes}, S};
 handle_call(_Msg, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
 -spec handle_cast(term(), state()) -> {noreply, state()}.
+handle_cast({set_live_key, Key}, S) ->
+    {noreply, S#state{live_key = Key}};
 handle_cast(_Msg, S) ->
     {noreply, S}.
 
@@ -517,13 +540,10 @@ install_available_row(Key, Tier, Size, Header, Location, TokensBin, TextBytes) -
         error:badarg -> ok
     end,
     Hits = hits_from_header(Header),
-    %% Bias last_used by accumulated hits so a high-hit row survives
-    %% an LRU walk on a freshly-restarted server, where every row's
-    %% natural last_used would otherwise collapse to ~NowNs and leave
-    %% the order effectively random. Each accumulated hit pushes the
-    %% row 1 second forward in the LRU. Once a row is actively
-    %% checked out at runtime, recency takes over.
-    LastUsed = NowNs + Hits * 1_000_000_000,
+    %% `last_used` is plain recency now: the accumulated hit count feeds
+    %% the eviction frecency score directly (with a 6 h half-life decay),
+    %% so biasing last_used by hits here would double-count them.
+    LastUsed = NowNs,
     %% Pinned defaults false; pin_row/2 sets it after install (the engine
     %% pins an agent_prefix save, and the disk scan re-pins adopted
     %% agent_prefix rows). Re-installing a row resets the flag, so those
@@ -781,55 +801,97 @@ sweep_reservations(S) ->
 %% Internal: eviction
 %% =============================================================================
 
-run_eviction() ->
-    run_eviction(ets:first(?TBL_LRU), 0).
+%% Full GC pass (gc/0): drop every available, unreferenced row EXCEPT
+%% protected ones (pinned static-prefix checkpoints and the live-session
+%% key). Order is irrelevant here, so keep the cheap LRU walk.
+run_eviction(LiveKey) ->
+    run_eviction(ets:first(?TBL_LRU), LiveKey, 0).
 
-run_eviction('$end_of_table', N) ->
+run_eviction('$end_of_table', _LiveKey, N) ->
     N;
-run_eviction({_LastUsed, Key} = LruKey, N) ->
+run_eviction({_LastUsed, Key} = LruKey, LiveKey, N) ->
     Next = ets:next(?TBL_LRU, LruKey),
-    case try_evict_one(LruKey, Key) of
-        {ok, _Bytes} -> run_eviction(Next, N + 1);
-        skip -> run_eviction(Next, N);
-        gone -> run_eviction(Next, N)
+    case try_evict_one(LruKey, Key, fun(_) -> true end, LiveKey, protect) of
+        {ok, _Bytes} -> run_eviction(Next, LiveKey, N + 1);
+        _ -> run_eviction(Next, LiveKey, N)
     end.
 
-run_eviction_bytes(Target, TierPred) ->
-    run_eviction_bytes(ets:first(?TBL_LRU), Target, TierPred, 0, 0).
+%% Byte-targeted eviction (evict_bytes, scheduler pressure): drop the
+%% LOWEST-frecency rows first until Target bytes are freed. Protected
+%% rows (pinned / live key) score in a separate higher rank, so they are
+%% evicted only as a last resort when nothing else frees enough - they
+%% are NOT hard-skipped here (a long-unused pin can still go under
+%% extreme pressure).
+run_eviction_bytes(Target, TierPred, LiveKey) ->
+    Now = monotonic_ns(),
+    Sorted = lists:keysort(1, eviction_candidates(TierPred, LiveKey, Now)),
+    evict_sorted(Sorted, Target, 0, 0).
 
-run_eviction_bytes('$end_of_table', _Target, _TierPred, N, Bytes) ->
+evict_sorted([], _Target, N, Bytes) ->
     {N, Bytes};
-run_eviction_bytes(_LruKey, Target, _TierPred, N, Bytes) when
-    Bytes >= Target, Target > 0
-->
+evict_sorted(_, Target, N, Bytes) when Bytes >= Target, Target > 0 ->
     {N, Bytes};
-run_eviction_bytes({_LastUsed, Key} = LruKey, Target, TierPred, N, Bytes) ->
-    Next = ets:next(?TBL_LRU, LruKey),
-    case try_evict_one(LruKey, Key, TierPred) of
-        {ok, B} -> run_eviction_bytes(Next, Target, TierPred, N + 1, Bytes + B);
-        skip -> run_eviction_bytes(Next, Target, TierPred, N, Bytes);
-        gone -> run_eviction_bytes(Next, Target, TierPred, N, Bytes)
+evict_sorted([{_Score, Key, LruKey} | Rest], Target, N, Bytes) ->
+    case try_evict_one(LruKey, Key, fun(_) -> true end, undefined, allow) of
+        {ok, B} -> evict_sorted(Rest, Target, N + 1, Bytes + B);
+        _ -> evict_sorted(Rest, Target, N, Bytes)
     end.
 
-try_evict_one(LruKey, Key) ->
-    try_evict_one(LruKey, Key, fun(_) -> true end).
+%% Score every evictable (available, refcount 0, tier-matched) row as
+%% `{{ProtRank, Frecency}, Key, LruKey}`; lists:keysort/2 then evicts
+%% lowest-first. ProtRank 0 = normal (evict first), 1 = protected (last).
+eviction_candidates(TierPred, LiveKey, Now) ->
+    ets:foldl(
+        fun(Row, Acc) ->
+            case
+                element(?POS_STATUS, Row) =:= available andalso
+                    element(?POS_REFCOUNT, Row) =:= 0 andalso
+                    TierPred(element(?POS_TIER, Row))
+            of
+                true ->
+                    Key = element(?POS_KEY, Row),
+                    LruKey = {element(?POS_LAST_USED, Row), Key},
+                    [{eviction_score(Row, LiveKey, Now), Key, LruKey} | Acc];
+                false ->
+                    Acc
+            end
+        end,
+        [],
+        ?TBL_META
+    ).
 
-try_evict_one(LruKey, Key, TierPred) ->
+%% Frecency score, lower = evicted first. `{ProtRank, Frecency}` so
+%% protected rows always sort after non-protected ones regardless of
+%% recency. Frecency = last_used biased forward by hits, the hit bias
+%% decayed by a 6 h half-life on the row's age.
+eviction_score(Row, LiveKey, Now) ->
+    LastUsed = element(?POS_LAST_USED, Row),
+    Hits = element(?POS_HITS, Row),
+    Protected =
+        element(?POS_PINNED, Row) orelse element(?POS_KEY, Row) =:= LiveKey,
+    Age = max(Now - LastUsed, 0),
+    Decay = math:pow(0.5, Age / float(?HIT_HALF_LIFE_NS)),
+    Frecency = LastUsed + round(Hits * ?HIT_BONUS_NS * Decay),
+    ProtRank =
+        case Protected of
+            true -> 1;
+            false -> 0
+        end,
+    {ProtRank, Frecency}.
+
+%% Protect mode skips pinned / live-key rows (gc); allow mode evicts
+%% them too (byte-targeted last resort).
+try_evict_one(LruKey, Key, TierPred, LiveKey, Mode) ->
     case ets:lookup(?TBL_META, Key) of
         [Row] ->
             Tier = element(?POS_TIER, Row),
-            %% Pinned (agent_prefix static-prefix) rows are skipped in
-            %% Phase 1; Phase 2 replaces this hard skip with a frecency
-            %% score bias.
-            case
-                {
-                    element(?POS_STATUS, Row),
-                    element(?POS_REFCOUNT, Row),
-                    TierPred(Tier),
-                    element(?POS_PINNED, Row)
-                }
-            of
-                {available, 0, true, false} ->
+            Evictable =
+                element(?POS_STATUS, Row) =:= available andalso
+                    element(?POS_REFCOUNT, Row) =:= 0 andalso
+                    TierPred(Tier) andalso
+                    evictable_under(Mode, Row, Key, LiveKey),
+            case Evictable of
+                true ->
                     Location = element(?POS_LOCATION, Row),
                     Size = element(?POS_SIZE, Row),
                     delete_from_tier(Tier, Key, Location),
@@ -837,13 +899,21 @@ try_evict_one(LruKey, Key, TierPred) ->
                     ets:delete(?TBL_META, Key),
                     barrel_inference_cache_counters:incr(?C_EVICTIONS),
                     {ok, Size};
-                _ ->
+                false ->
                     skip
             end;
         [] ->
             ets:delete(?TBL_LRU, LruKey),
             gone
     end.
+
+%% `protect` (gc) keeps pinned and live-key rows; `allow` (byte-targeted
+%% eviction, already in lowest-frecency-first order) may drop them as a
+%% last resort.
+evictable_under(allow, _Row, _Key, _LiveKey) ->
+    true;
+evictable_under(protect, Row, Key, LiveKey) ->
+    not element(?POS_PINNED, Row) andalso Key =/= LiveKey.
 
 tier_pred(all) ->
     fun(_) -> true end;

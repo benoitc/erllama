@@ -2857,8 +2857,14 @@ finish_req(Req, FinishReason, Data, Actions) ->
     ),
     Req1 =
         case FinishKey of
-            undefined -> Req;
-            _ -> bump_cache_delta(Req, Req#req.context_tokens)
+            undefined ->
+                Req;
+            _ ->
+                %% Protect the just-written finish checkpoint from
+                %% eviction as the most likely next-turn resume target
+                %% (ds4 protected_sha; best-effort, latest-wins).
+                barrel_inference_cache_meta_srv:set_live_key(FinishKey),
+                bump_cache_delta(Req, Req#req.context_tokens)
         end,
     Stats = build_stats_for_req(
         FinishReason, Req1#req.cancel_pending, FinishKey, Req1
