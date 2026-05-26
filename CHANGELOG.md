@@ -34,6 +34,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Vendored llama.cpp bumped from `b9222` to `b9334` (ggml 0.12.0 -> 0.13.0). No Barrel
+  Inference source changes required; the C ABI surfaces the NIF wraps
+  (`barrel_inference_safe.cpp`: model load/free, context, sampler chain, `llama_decode`,
+  `llama_memory_seq_*`, `llama_state_seq_*`) are unchanged.
 - Cache eviction is now frecency-scored, not pure LRU. Byte-targeted eviction
   (`evict_bytes`, scheduler memory pressure) drops the lowest-scoring rows first, where
   the score is recency biased forward by the row's hit count with a 6 h half-life decay
