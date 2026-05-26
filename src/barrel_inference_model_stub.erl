@@ -233,7 +233,13 @@ advance_phase(SeqId, Sampler, tool_call_emit_0, true) ->
 advance_phase(SeqId, Sampler, tool_call_emit_0, false) ->
     with_phase_token(SeqId, Sampler, tool_call_emit_1, {tool_call, 0});
 advance_phase(SeqId, Sampler, tool_call_emit_1, _PC) ->
-    with_phase_token(SeqId, Sampler, tool_call_end_due, {tool_call, 1});
+    %% Tool-call BODY token. Real backends tag only the start/end marker
+    %% tokens (barrel_inference_model_llama:map_marker/2 is stateless); the body
+    %% in between arrives as an ordinary `{token, _}`. Emit it as such so
+    %% the stub exercises the engine's in-span body capture rather than
+    %% pre-tagging it as a tool_call_token.
+    erlang:put({stub_phase, SeqId}, tool_call_end_due),
+    decode_token(SeqId, Sampler);
 advance_phase(SeqId, Sampler, tool_call_payload_open_due, _PC) ->
     with_phase_marker(SeqId, Sampler, tool_call_payload_emit, payload_open);
 advance_phase(SeqId, Sampler, tool_call_payload_emit, _PC) ->

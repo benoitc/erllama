@@ -6,6 +6,20 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Native tool-call capture now keeps the body between the markers. The marker scanner
+  (`barrel_inference_model_llama:map_marker/2`) is stateless - it tags only the start/end
+  marker tokens - so for a model whose tool-call body is ordinary tokens (e.g.
+  Qwen3-Coder's `<tool_call><function=NAME><parameter=P>v</parameter></function></tool_call>`)
+  the body was streamed as content and the captured `tool_call_bytes` held only the
+  start marker, yielding an empty call (`name "unknown"`, `arguments {}`). The decode
+  loop now accumulates any token sampled while a tool-call span is open
+  (`active_sampler` = `tool_call_syntax` / `tool_call_payload`) into the tool-call bytes
+  instead of the content stream, so the full call reaches the parser. Models that emit
+  their call without the marker tokens (e.g. Qwen2.5 `qwen-xml` JSON) are unaffected -
+  they never open a span.
+
 ### Added
 
 - Scheduler can proactively unload an idle model under sustained memory pressure

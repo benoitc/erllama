@@ -439,6 +439,29 @@ tool_call_end_carries_full_concatenated_bytes_test() ->
         ?assertEqual(iolist_to_binary(Deltas), Full)
     end).
 
+%% Regression: the body token between the markers (a plain `{token, _}`
+%% from the stub, mirroring real backends where only the markers are
+%% tagged) is captured into the tool-call bytes, not leaked to the
+%% normal content stream. Without the in-span capture the body would
+%% arrive as a `token` event before `tool_call_end`.
+tool_call_body_token_is_captured_not_streamed_test() ->
+    with_model(#{tool_call_capable => true}, fun(Id) ->
+        {ok, Tokens} = barrel_inference:tokenize(Id, <<"hello">>),
+        {ok, Ref} = barrel_inference:infer(Id, Tokens, #{response_tokens => 2}, self()),
+        Events = collect_all(Ref, 5000),
+        Kinds = [K || {K, _} <- Events],
+        %% Start-marker token + body token both surface as deltas.
+        ?assert(length([1 || tool_call_delta <- Kinds]) >= 2),
+        %% No normal content token precedes the close.
+        EndIdx = idx_of(tool_call_end, Kinds),
+        ?assert(
+            lists:all(
+                fun({K, I}) -> K =/= token orelse I > EndIdx end,
+                indexed(Kinds)
+            )
+        )
+    end).
+
 %% A binary grammar disables the greedy-on-syntax swap for the
 %% request: the grammar-less greedy chain (#{temperature => 0.0}) is
 %% not built, so the request's grammar sampler governs tool-call

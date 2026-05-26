@@ -2424,23 +2424,41 @@ apply_step_results([{{SeqId, {prefill, Slice}}, prefilled} | T], Data) ->
     apply_step_results(T, put_req(Data, Req2));
 apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
-    Req1 = req_append_token(Req, Tok),
-    Req2 = req_stream_emit(Req1, Tok, Data),
-    %% Mark terminal if eog, response_target reached, or a stop
-    %% sequence fired. matched_stop is set inside req_stream_emit
-    %% on a hit; check it here so the request is marked finishing
-    %% at the same point the existing EOG/length paths are.
-    GenLen = length(Req2#req.generated),
-    Done =
-        EogFlag =:= 1 orelse
-            GenLen >= Req2#req.response_target orelse
-            Req2#req.matched_stop =/= undefined,
-    Req3 =
-        case Done of
-            true -> Req2#req{finishing = true};
-            false -> maybe_fire_continued_for_req(Req2, Data)
-        end,
-    apply_step_results(T, put_req(Data, Req3));
+    case in_tool_call_span(Req) of
+        true ->
+            %% A non-marker token sampled between the tool-call markers.
+            %% The marker scanner (barrel_inference_model_llama:map_marker/2) is
+            %% stateless: it tags only the start/end marker tokens, so the
+            %% body in between arrives here as a plain token. Accumulate it
+            %% into the tool-call bytes (it is part of the call, not user
+            %% content) instead of streaming it. An EOG inside a span that
+            %% never closes still finalises the request so it cannot hang.
+            Req1 = req_tool_call_emit(Req, Tok, Data),
+            Req2 =
+                case EogFlag =:= 1 of
+                    true -> Req1#req{finishing = true};
+                    false -> Req1
+                end,
+            apply_step_results(T, put_req(Data, Req2));
+        false ->
+            Req1 = req_append_token(Req, Tok),
+            Req2 = req_stream_emit(Req1, Tok, Data),
+            %% Mark terminal if eog, response_target reached, or a stop
+            %% sequence fired. matched_stop is set inside req_stream_emit
+            %% on a hit; check it here so the request is marked finishing
+            %% at the same point the existing EOG/length paths are.
+            GenLen = length(Req2#req.generated),
+            Done =
+                EogFlag =:= 1 orelse
+                    GenLen >= Req2#req.response_target orelse
+                    Req2#req.matched_stop =/= undefined,
+            Req3 =
+                case Done of
+                    true -> Req2#req{finishing = true};
+                    false -> maybe_fire_continued_for_req(Req2, Data)
+                end,
+            apply_step_results(T, put_req(Data, Req3))
+    end;
 apply_step_results([{{SeqId, {decode, S}}, {thinking_token, Tok}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     case Req#req.thinking_capped of
@@ -2493,6 +2511,14 @@ apply_step_results([{{SeqId, {decode, _}}, {tool_call_payload_close, Tok}} | T],
     %% greedy sampling for the rest of the tool-call body.
     Req1 = req_tool_call_emit(Req, Tok, Data),
     apply_step_results(T, put_req(Data, Req1#req{active_sampler = tool_call_syntax})).
+
+%% True while a tool-call span is open (the start marker has been seen
+%% and the end marker has not). The active sampler doubles as the span
+%% state: it is set to tool_call_syntax / tool_call_payload on the
+%% marker tokens and back to normal on tool_call_end.
+in_tool_call_span(#req{active_sampler = tool_call_syntax}) -> true;
+in_tool_call_span(#req{active_sampler = tool_call_payload}) -> true;
+in_tool_call_span(_) -> false.
 
 %% Append the token to both context_tokens and generated.
 req_append_token(Req, Token) ->
