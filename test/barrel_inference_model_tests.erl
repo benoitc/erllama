@@ -1101,6 +1101,117 @@ admit_default_blocks_and_queues_test_() ->
     end}.
 
 %% =============================================================================
+%% Idle sticky-seq pin reclamation under capacity pressure
+%% =============================================================================
+
+wait_first_token(Ref) ->
+    receive
+        {barrel_inference_token, Ref, _} -> ok;
+        {barrel_inference_token_id, Ref, _} -> ok
+    after 2000 -> erlang:error(no_first_token)
+    end.
+
+%% A full pool of IDLE pins must not lock out a new session: the
+%% least-recently-used idle pin is reclaimed so the new session admits,
+%% instead of a permanent {error, seq_capacity}.
+reclaim_lru_idle_pin_admits_new_session_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, #{context_opts => #{n_seq_max => 2, n_batch => 64}}, fun(_Cfg) ->
+            A = make_ref(),
+            B = make_ref(),
+            C = make_ref(),
+            %% Pin two sessions with completed turns (A pinned before B).
+            {ok, _} = barrel_inference_model:complete(
+                <<"test_model">>, long_prompt(), #{response_tokens => 2, session_id => A}
+            ),
+            {ok, _} = barrel_inference_model:complete(
+                <<"test_model">>, long_prompt(), #{response_tokens => 2, session_id => B}
+            ),
+            %% Pool full (n_seq_max=2). A third session with on_full=error must
+            %% reclaim the LRU idle pin (A) and SUCCEED, not seq_capacity.
+            ?assertMatch(
+                {ok, _},
+                barrel_inference_model:complete(
+                    <<"test_model">>,
+                    long_prompt(),
+                    #{response_tokens => 2, session_id => C, on_full => error}
+                )
+            ),
+            %% Black-box (the #data{} is private): A (LRU) was reclaimed, B kept.
+            ?assertEqual({ok, not_found}, barrel_inference:reset_session(<<"test_model">>, A)),
+            ?assertEqual({ok, recovered}, barrel_inference:reset_session(<<"test_model">>, B))
+        end)
+    end}.
+
+%% When every seq is genuinely in flight (no idle pin to reclaim), a new
+%% on_full=error admit still fails fast with seq_capacity.
+reclaim_skips_in_flight_seqs_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, #{context_opts => #{n_seq_max => 2, n_batch => 64}}, fun(_Cfg) ->
+            {ok, R1} = barrel_inference_model:infer(
+                <<"test_model">>, prompt_tokens(long_prompt()), #{response_tokens => 10000}, self()
+            ),
+            wait_first_token(R1),
+            {ok, R2} = barrel_inference_model:infer(
+                <<"test_model">>, prompt_tokens(long_prompt()), #{response_tokens => 10000}, self()
+            ),
+            wait_first_token(R2),
+            ?assertEqual(
+                {error, seq_capacity},
+                barrel_inference_model:complete(
+                    <<"test_model">>, long_prompt(), #{response_tokens => 2, on_full => error}
+                )
+            ),
+            ok = barrel_inference_model:cancel(R1),
+            ok = barrel_inference_model:cancel(R2),
+            _ = drain_stream_messages(R1),
+            _ = drain_stream_messages(R2)
+        end)
+    end}.
+
+%% A request queued (block) while all seqs are active is dispatched once
+%% an active sticky request finishes and PINS its seq: the dispatcher
+%% reclaims the idle pin instead of parking the queued caller forever.
+queued_block_request_dispatched_after_pin_reclaim_test_() ->
+    {timeout, 30, fun() ->
+        %% n_seq_max defaults to 1: one seq, occupied by a sticky request.
+        with_model(#{}, fun(_Cfg) ->
+            S1 = make_ref(),
+            {ok, R1} = barrel_inference_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 10, session_id => S1},
+                self()
+            ),
+            wait_first_token(R1),
+            %% Queue a non-sticky block request from a helper proc (it parks
+            %% on gen_statem:call until dispatched). R1 holds the only seq, so
+            %% it queues with no idle pin available at enqueue time.
+            Parent = self(),
+            _ = spawn(fun() ->
+                R = barrel_inference_model:infer(
+                    <<"test_model">>,
+                    prompt_tokens(long_prompt()),
+                    #{response_tokens => 2},
+                    Parent
+                ),
+                Parent ! {second_admit, R}
+            end),
+            %% R1 finishes its 10 tokens and PINS S1 (idle pin); the dispatch
+            %% path must reclaim it for the queued caller.
+            _ = drain_stream_messages(R1),
+            receive
+                {second_admit, {ok, Ref2}} ->
+                    _ = drain_stream_messages(Ref2),
+                    ok;
+                {second_admit, Other} ->
+                    erlang:error({unexpected_admit, Other})
+            after 5000 -> erlang:error(queued_request_never_dispatched)
+            end
+        end)
+    end}.
+
+%% =============================================================================
 %% #1: bounded/interruptible decode + in-place recovery
 %% =============================================================================
 

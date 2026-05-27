@@ -201,7 +201,12 @@ concurrently through one decode call per tick.
     %% sticky session with no in-flight req still holds its slot
     %% off the free list, so this counts only seqs the engine could
     %% admit a brand-new request onto right now.
-    available_seqs := non_neg_integer()
+    available_seqs := non_neg_integer(),
+    %% Sticky-session seqs that are pinned but idle (no in-flight
+    %% request) - reclaimable under seq-pool pressure. `available_seqs`
+    %% stays ~0 since an admitted request immediately re-pins, so this is
+    %% the meaningful "headroom" signal.
+    pinned_idle_seqs := non_neg_integer()
 }.
 
 -type cache_hit_kind() :: exact | partial | cold | sticky | continuation.
@@ -582,7 +587,13 @@ concurrently through one decode call per tick.
     %% persist until the caller calls `end_session/2` or the
     %% gen_statem terminates.
     session_seq = #{} :: #{
-        term() => {SeqId :: non_neg_integer(), StoredTokens :: [non_neg_integer()]}
+        term() => {
+            SeqId :: non_neg_integer(),
+            StoredTokens :: [non_neg_integer()],
+            %% erlang:monotonic_time() at last pin; recency for idle-pin
+            %% reclamation under seq-pool pressure. Not guaranteed >= 0.
+            LastUsed :: integer()
+        }
     }
 }).
 
@@ -1197,7 +1208,7 @@ admit_continue(Item = {continue, From, _Suffix, Opts}, Data) ->
             case maps:find(SessionId, Data#data.session_seq) of
                 error ->
                     {keep_state, Data, [{reply, From, {error, no_session}}]};
-                {ok, {SeqId, StoredTokens}} ->
+                {ok, {SeqId, StoredTokens, _LastUsed}} ->
                     admit_continue_pinned(Item, SeqId, StoredTokens, Data)
             end
     end.
@@ -1259,15 +1270,24 @@ admit_normal(Item, Data = #data{idle_seq_ids = []}) ->
     %% `on_full => error` the caller fails fast instead of waiting
     %% on a slot that may never free (e.g. all seqs pinned to other
     %% sticky sessions).
-    case on_full_of(Item) of
-        error ->
-            From = caller_from_of(Item),
-            {keep_state, Data, [{reply, From, {error, seq_capacity}}]};
-        _ ->
-            NewData = enqueue(Item, Data),
-            case Data#data.req_table of
-                Empty when map_size(Empty) =:= 0 -> {next_state, idle, NewData};
-                _ -> {keep_state, NewData}
+    %% No free seq. First try to reclaim a least-recently-used IDLE pinned
+    %% seq (sticky sessions never auto-release, so an idle pin would
+    %% otherwise lock the slot forever). Only on genuine capacity (every
+    %% seq in flight) fall back to the on_full policy.
+    case reclaim_lru_idle_seq(Data) of
+        {ok, Data1} ->
+            admit_normal(Item, Data1);
+        none ->
+            case on_full_of(Item) of
+                error ->
+                    From = caller_from_of(Item),
+                    {keep_state, Data, [{reply, From, {error, seq_capacity}}]};
+                _ ->
+                    NewData = enqueue(Item, Data),
+                    case Data#data.req_table of
+                        Empty when map_size(Empty) =:= 0 -> {next_state, idle, NewData};
+                        _ -> {keep_state, NewData}
+                    end
             end
     end;
 admit_normal(Item, Data = #data{idle_seq_ids = [SeqId | Rest]}) ->
@@ -1312,7 +1332,7 @@ resolve_admission_seq(Item, Data) ->
             case maps:find(SessionId, Data#data.session_seq) of
                 error ->
                     {normal, Data};
-                {ok, {SeqId, StoredTokens}} ->
+                {ok, {SeqId, StoredTokens, _LastUsed}} ->
                     case maps:is_key(SeqId, Data#data.req_table) of
                         true ->
                             %% Session's seq is currently in flight with
@@ -1448,7 +1468,7 @@ drop_session(SessionId, Data) ->
     case maps:find(SessionId, Data#data.session_seq) of
         error ->
             Data;
-        {ok, {SeqId, _StoredTokens}} ->
+        {ok, {SeqId, _StoredTokens, _LastUsed}} ->
             case maps:is_key(SeqId, Data#data.req_table) of
                 true ->
                     %% In-flight on this seq; leave the mapping
@@ -1464,6 +1484,24 @@ drop_session(SessionId, Data) ->
             end
     end.
 
+%% When the seq pool is full, pick the least-recently-used IDLE pinned
+%% session (its seq has no in-flight request) and free its seq via
+%% drop_session/2 (clears KV, returns the seq to idle_seq_ids). Returns
+%% {ok, Data'} when a pin was reclaimed, or `none` when every seq is
+%% genuinely in flight (true capacity). The reclaimed session re-admits
+%% cold (or warm-restores from the tiered cache) on its next turn; the
+%% in-flight session is never reclaimed (it is in req_table).
+reclaim_lru_idle_seq(#data{session_seq = SS, req_table = RT} = Data) ->
+    Idle = [
+        {LastUsed, SessionId}
+     || {SessionId, {SeqId, _Toks, LastUsed}} <- maps:to_list(SS),
+        not maps:is_key(SeqId, RT)
+    ],
+    case lists:sort(Idle) of
+        [{_LastUsed, SessionId} | _] -> {ok, drop_session(SessionId, Data)};
+        [] -> none
+    end.
+
 %% Recovery counterpart of drop_session/2. Force-fails any in-flight
 %% req on the session's seq, frees the seq's KV cells, and returns
 %% the seq to the idle pool. Returns {Data', recovered | not_found}.
@@ -1471,7 +1509,7 @@ reset_session_seq(SessionId, Data) ->
     case maps:find(SessionId, Data#data.session_seq) of
         error ->
             {Data, not_found};
-        {ok, {SeqId, _StoredTokens}} ->
+        {ok, {SeqId, _StoredTokens, _LastUsed}} ->
             Data1 = fail_inflight_for_seq(SeqId, Data, engine_reset),
             _ = release_seq(SeqId, Data1),
             NewData = Data1#data{
@@ -2171,8 +2209,16 @@ build_model_info(State, Data) ->
         loaded_at_monotonic => Data#data.loaded_at_monotonic,
         vram_estimate_b => Data#data.vram_estimate_b,
         n_seq_max => Data#data.n_seq_max,
-        available_seqs => length(Data#data.idle_seq_ids)
+        available_seqs => length(Data#data.idle_seq_ids),
+        pinned_idle_seqs => pinned_idle_seq_count(Data)
     }.
+
+%% Count of sticky-session seqs that are pinned but have no in-flight
+%% request - reclaimable headroom. Unlike `available_seqs` (which stays
+%% ~0 because an admitted request immediately re-pins), this reflects
+%% how many pinned seqs the pool can reclaim under pressure.
+pinned_idle_seq_count(#data{session_seq = SS, req_table = RT}) ->
+    length([1 || {_Sid, {SeqId, _Toks, _Last}} <- maps:to_list(SS), not maps:is_key(SeqId, RT)]).
 
 %% =============================================================================
 %% Internal: observability snapshot (per-model ETS row)
@@ -2916,7 +2962,9 @@ release_or_pin_seq(
     %% Sticky: keep the seq's KV cells alive and update the session
     %% map. No call to release_seq/2.
     Data#data{
-        session_seq = (Data#data.session_seq)#{SessionId => {SeqId, Tokens}}
+        session_seq = (Data#data.session_seq)#{
+            SessionId => {SeqId, Tokens, erlang:monotonic_time()}
+        }
     }.
 
 finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKey, Stats, Data) ->
@@ -3028,10 +3076,19 @@ release_seq(SeqId, #data{backend = Mod, backend_state = S}) ->
 %% slots remain and pending is non-empty.
 dispatch_pending_admits(Data, Actions) ->
     case {Data#data.idle_seq_ids, Data#data.pending} of
-        {[], _} ->
-            {Data, Actions};
         {_, []} ->
+            %% Nothing queued: never reclaim (don't evict a pin when no
+            %% one is waiting on a seq).
             {Data, Actions};
+        {[], _} ->
+            %% Queued admits but no free seq. The active requests that
+            %% just finished pinned their seqs (release_or_pin_seq/2), so
+            %% the pool can be full of idle pins. Reclaim the LRU idle pin
+            %% so the queued caller is served instead of parking forever.
+            case reclaim_lru_idle_seq(Data) of
+                {ok, Data1} -> dispatch_pending_admits(Data1, Actions);
+                none -> {Data, Actions}
+            end;
         {[SeqId | RestIds], [Head | RestPend]} ->
             Data1 = Data#data{
                 idle_seq_ids = RestIds,

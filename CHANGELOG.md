@@ -8,6 +8,18 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Idle sticky-session seq pins are now reclaimed under seq-pool pressure, so the pool no
+  longer permanently exhausts. A completed sticky turn keeps its sequence pinned for warm
+  continuation, but those pins were never released (only `end_session/2` or model stop
+  freed them) - so after `n_seq_max` distinct sessions, every new session got
+  `{error, seq_capacity}` (529) with retries never recovering. Admission now reclaims the
+  least-recently-used **idle** pin (a `session_seq` entry whose seq has no in-flight
+  request) when the pool is full, on both the fresh-admit (`admit_normal/2`) and queued-
+  dispatch (`dispatch_pending_admits/2`) paths, while never reclaiming an in-flight
+  session. `seq_capacity` now only fires when every seq is genuinely active. A reclaimed
+  session re-admits cold (or warm-restores from the tiered cache) on its next turn.
+  `model_info/1` gains `pinned_idle_seqs` (reclaimable headroom; `available_seqs` stays
+  ~0 since an admitted request immediately re-pins).
 - Native tool-call capture now keeps the body between the markers. The marker scanner
   (`barrel_inference_model_llama:map_marker/2`) is stateless - it tags only the start/end
   marker tokens - so for a model whose tool-call body is ordinary tokens (e.g.
