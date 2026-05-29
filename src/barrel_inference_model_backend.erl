@@ -250,8 +250,10 @@ inference, etc.) can plug in via this same surface.
     %% scheduler emits {barrel_inference_tool_call_end, Ref, Full :: binary()}
     %% carrying the concatenated bytes of every {tool_call_delta, _}
     %% it sent for this span, so the downstream does not have to
-    %% buffer chunks itself.
-    | tool_call_end
+    %% buffer chunks itself. The Eog field carries the source token's
+    %% eog flag so the scheduler can finalise the request when the
+    %% end marker IS the eos token (Mistral tekken uses `</s>` for both).
+    | {tool_call_end, Eog :: 0 | 1}
     %% Optional inner markers within a tool-call span. When the
     %% backend has `tool_call_markers.payload_start` / `payload_end`
     %% configured these mark the boundaries of string-payload

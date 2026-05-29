@@ -462,6 +462,86 @@ tool_call_body_token_is_captured_not_streamed_test() ->
         )
     end).
 
+%% Repeated start marker with one final end (the Mistral-tekken parallel-
+%% call shape: `[TOOL_CALLS]n1[ARGS]a1[TOOL_CALLS]n2[ARGS]a2</s>`) must
+%% emit one `barrel_inference_tool_call_end` per call. The
+%% `tool_call_token` clause in `apply_step_results/2` finalises the
+%% current span before opening the next when already in-span, reusing the
+%% upstream `captured_calls ++ [Call]` accumulation.
+span_split_on_repeated_start_emits_one_end_per_call_test() ->
+    Script = [start, body, body, start, body, body, end_tok],
+    with_model(#{tool_call_script => Script}, fun(Id) ->
+        {ok, Tokens} = barrel_inference:tokenize(Id, <<"hello">>),
+        {ok, Ref} = barrel_inference:infer(
+            Id, Tokens, #{response_tokens => 2}, self()
+        ),
+        Events = collect_all(Ref, 5000),
+        Kinds = [K || {K, _} <- Events],
+        Ends = [E || {tool_call_end, _} = E <- Events],
+        ?assertEqual(2, length(Ends)),
+        [{tool_call_end, Call1Full}, {tool_call_end, Call2Full}] = Ends,
+        %% Critical regression invariant: call 1 was finalised BEFORE the
+        %% second `start` was accumulated. Call 1's bytes are exactly the
+        %% deltas BEFORE the first `tool_call_end` event; call 2's bytes
+        %% are exactly the deltas BETWEEN the two ends. No carry-over.
+        {Pre1, [_FirstEnd | Mid0]} = lists:splitwith(
+            fun({K, _}) -> K =/= tool_call_end end, Events
+        ),
+        {Mid, _Tail} = lists:splitwith(
+            fun({K, _}) -> K =/= tool_call_end end, Mid0
+        ),
+        ?assertEqual(
+            iolist_to_binary([B || {tool_call_delta, B} <- Pre1]),
+            Call1Full
+        ),
+        ?assertEqual(
+            iolist_to_binary([B || {tool_call_delta, B} <- Mid]),
+            Call2Full
+        ),
+        %% No normal content token appears before the last close.
+        LastEndIdx = lists:max(
+            [I || {{K, _}, I} <- indexed(Events), K =:= tool_call_end]
+        ),
+        ?assert(
+            lists:all(
+                fun({K, I}) -> K =/= token orelse I > LastEndIdx end,
+                indexed(Kinds)
+            )
+        )
+    end).
+
+%% Non-Devstral regression: families with EXPLICIT per-call end markers
+%% (qwen-xml, qwen3-coder, dsml) drive `start, body, end, start, body,
+%% end`. The behaviour-preserving guard in the `tool_call_token` clause
+%% (only finalise when already in-span) must leave this path unchanged -
+%% two ordered, correctly-scoped tool_call_end messages.
+span_split_no_op_on_explicit_per_call_end_test() ->
+    Script = [start, body, end_tok, start, body, end_tok],
+    with_model(#{tool_call_script => Script}, fun(Id) ->
+        {ok, Tokens} = barrel_inference:tokenize(Id, <<"hello">>),
+        {ok, Ref} = barrel_inference:infer(
+            Id, Tokens, #{response_tokens => 2}, self()
+        ),
+        Events = collect_all(Ref, 5000),
+        Ends = [E || {tool_call_end, _} = E <- Events],
+        ?assertEqual(2, length(Ends)),
+        [{tool_call_end, Call1Full}, {tool_call_end, Call2Full}] = Ends,
+        {Pre1, [_FirstEnd | Mid0]} = lists:splitwith(
+            fun({K, _}) -> K =/= tool_call_end end, Events
+        ),
+        {Mid, _Tail} = lists:splitwith(
+            fun({K, _}) -> K =/= tool_call_end end, Mid0
+        ),
+        ?assertEqual(
+            iolist_to_binary([B || {tool_call_delta, B} <- Pre1]),
+            Call1Full
+        ),
+        ?assertEqual(
+            iolist_to_binary([B || {tool_call_delta, B} <- Mid]),
+            Call2Full
+        )
+    end).
+
 %% A binary grammar disables the greedy-on-syntax swap for the
 %% request: the grammar-less greedy chain (#{temperature => 0.0}) is
 %% not built, so the request's grammar sampler governs tool-call

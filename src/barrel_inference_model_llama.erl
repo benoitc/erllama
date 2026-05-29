@@ -272,7 +272,7 @@ all_markers_empty(#s{
 all_markers_empty(_) ->
     false.
 
-map_marker({SeqId, {token, Tok, _Eog}} = R, #s{
+map_marker({SeqId, {token, Tok, Eog}} = R, #s{
     thinking_start_ids = TSI,
     thinking_end_ids = TEI,
     tool_call_start_ids = USI,
@@ -292,7 +292,12 @@ map_marker({SeqId, {token, Tok, _Eog}} = R, #s{
         {true, _, _, _, _, _} -> {SeqId, {thinking_token, Tok}};
         {_, true, _, _, _, _} -> {SeqId, thinking_end};
         {_, _, true, _, _, _} -> {SeqId, {tool_call_token, Tok}};
-        {_, _, _, true, _, _} -> {SeqId, tool_call_end};
+        %% Carry Eog so the scheduler can finalise the request when
+        %% the end marker IS the eos token (e.g. Mistral tekken uses
+        %% `</s>` as both the per-span end marker AND the assistant
+        %% turn's eos; without this the request keeps decoding past
+        %% the close and the model spams repeated calls under greedy).
+        {_, _, _, true, _, _} -> {SeqId, {tool_call_end, Eog}};
         {_, _, _, _, true, _} -> {SeqId, {tool_call_payload_open, Tok}};
         {_, _, _, _, _, true} -> {SeqId, {tool_call_payload_close, Tok}};
         _ -> R

@@ -2531,17 +2531,36 @@ apply_step_results([{{SeqId, {decode, _}}, thinking_end} | T], Data) ->
     apply_step_results(T, put_req(Data, Req1));
 apply_step_results([{{SeqId, {decode, _}}, {tool_call_token, Tok}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
-    %% Entering or continuing the tool-call span: subsequent
-    %% decode ops run through the greedy sampler so syntax tokens
-    %% stay deterministic.
-    Req1 = req_tool_call_emit(Req#req{active_sampler = tool_call_syntax}, Tok, Data),
+    %% Some families delimit parallel calls by repeating the start
+    %% marker with no per-call end marker between them (e.g. Mistral
+    %% tekken: `[TOOL_CALLS]name1[ARGS]args1[TOOL_CALLS]name2...</s>`).
+    %% If the request is already in-span, finalise the current call so
+    %% the per-call accumulation upstream sees one `tool_call_end`
+    %% message per call, before opening the next span. Behaviour-
+    %% preserving for families with explicit per-call end markers - a
+    %% start never fires while in-span because the end fires first.
+    Req0 =
+        case in_tool_call_span(Req) of
+            true -> req_tool_call_end(Req, Data);
+            false -> Req
+        end,
+    Req1 = req_tool_call_emit(Req0#req{active_sampler = tool_call_syntax}, Tok, Data),
     apply_step_results(T, put_req(Data, Req1));
-apply_step_results([{{SeqId, {decode, _}}, tool_call_end} | T], Data) ->
+apply_step_results([{{SeqId, {decode, _}}, {tool_call_end, Eog}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     %% Close the span: emit the carrying close message and revert to
-    %% the request's normal sampler for any post-call tokens.
+    %% the request's normal sampler for any post-call tokens. If the
+    %% end marker IS the eos (Mistral tekken uses `</s>` for both the
+    %% per-span end marker and the assistant turn's eos), finalise the
+    %% request so the model does not keep decoding past the close and
+    %% spam repeated calls under the greedy continuation.
     Req1 = (req_tool_call_end(Req, Data))#req{active_sampler = normal},
-    apply_step_results(T, put_req(Data, Req1));
+    Req2 =
+        case Eog =:= 1 of
+            true -> Req1#req{finishing = true};
+            false -> Req1
+        end,
+    apply_step_results(T, put_req(Data, Req2));
 apply_step_results([{{SeqId, {decode, _}}, {tool_call_payload_open, Tok}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     %% The marker token itself is part of the captured tool-call

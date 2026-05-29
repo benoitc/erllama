@@ -8,6 +8,28 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- The native tool-call capture splits spans on a repeated start marker. Families like
+  Mistral tekken delimit parallel calls by emitting the start marker again
+  (`[TOOL_CALLS]n1[ARGS]a1[TOOL_CALLS]n2[ARGS]a2</s>`) with no per-call end between
+  them; the previous single-span capture concatenated every call into one
+  `barrel_inference_tool_call_end` message, which the server parsed as one garbled
+  call. `apply_step_results/2` now finalises the current span before opening the next
+  when a start marker fires while already in-span, so each call yields its own end
+  message and reuses the upstream per-call accumulation. Behaviour-preserving for
+  families with explicit per-call end markers (qwen-xml, qwen3-coder, dsml): a start
+  never fires while in-span because the end fires first. The stub backend gains an
+  optional `tool_call_script :: [start | body | end_tok]` config so tests can drive
+  exact decode-step sequences (the Mistral tekken `[start, body, body, start, body,
+  body, end_tok]` shape and the qwen-style `[start, body, end_tok, start, body,
+  end_tok]` regression guard run from the same harness).
+- The tool-call end marker now carries the source token's eog flag.
+  `barrel_inference_model_llama:map_marker/2` was discarding `EogFlag` on the end
+  marker, so a model whose end marker IS the eos token (Mistral tekken uses `</s>` as
+  both the per-span end marker and the assistant turn's eos) kept decoding past the
+  close and spammed repeated tool calls under the greedy continuation. Backend step
+  results emit `{tool_call_end, Eog}` instead of the bare atom; the scheduler sets
+  `Req.finishing = true` on eog so the turn ends cleanly. Backend type spec updated
+  accordingly.
 - `barrel_inference_model_stub` gains an opt-in `step_delay_ms :: non_neg_integer()`
   test knob that `timer:sleep`s for the configured number of milliseconds at the top
   of every `step/2` call. Lets server-side concurrency tests deterministically keep a
