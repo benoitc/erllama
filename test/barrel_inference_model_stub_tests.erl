@@ -81,3 +81,37 @@ stub_seq_rm_is_noop_test() ->
     {ok, S} = barrel_inference_model_stub:init(#{}),
     ?assertEqual(ok, barrel_inference_model_stub:seq_rm(S, 0)),
     ?assertEqual(ok, barrel_inference_model_stub:seq_rm(S, 7)).
+
+%% step_delay_ms knob: each `step/2' call holds for at least the
+%% configured number of ms before returning. Used by server-side
+%% concurrency tests (e.g. `chat_busy_returns_429') to keep a holder
+%% request deterministically in-flight while other requests race for
+%% the queue, instead of relying on the test sleeping long enough.
+stub_step_delay_ms_holds_step_for_at_least_that_long_test() ->
+    {ok, S} = barrel_inference_model_stub:init(#{step_delay_ms => 50}),
+    T0 = erlang:monotonic_time(millisecond),
+    {ok, _} =
+        barrel_inference_model_stub:step(S, [{0, {prefill, [1, 2, 3]}}]),
+    T1 = erlang:monotonic_time(millisecond),
+    ?assert(T1 - T0 >= 50).
+
+stub_step_delay_ms_default_is_zero_test() ->
+    %% Default (knob unset) must add no measurable delay so the cache
+    %% / integration tests using the stub keep their hot path.
+    {ok, S} = barrel_inference_model_stub:init(#{}),
+    T0 = erlang:monotonic_time(millisecond),
+    {ok, _} =
+        barrel_inference_model_stub:step(S, [{0, {prefill, [1, 2, 3]}}]),
+    T1 = erlang:monotonic_time(millisecond),
+    ?assert(T1 - T0 < 20).
+
+stub_step_delay_ms_rejects_non_neg_integer_test() ->
+    %% Invalid configs (non-integer, negative) coerce to 0, matching
+    %% the surrounding `bool_opt/2' tolerance pattern. A typo can't
+    %% wedge a test by silently turning into a giant sleep.
+    {ok, S} = barrel_inference_model_stub:init(#{step_delay_ms => bad}),
+    T0 = erlang:monotonic_time(millisecond),
+    {ok, _} =
+        barrel_inference_model_stub:step(S, [{0, {prefill, [1, 2, 3]}}]),
+    T1 = erlang:monotonic_time(millisecond),
+    ?assert(T1 - T0 < 20).

@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- `barrel_inference_model_stub` gains an opt-in `step_delay_ms :: non_neg_integer()`
+  test knob that `timer:sleep`s for the configured number of milliseconds at the top
+  of every `step/2` call. Lets server-side concurrency tests deterministically keep a
+  holder request in-flight while other requests race for the queue (used by the e2e
+  suite's `chat_busy_returns_429` to fix a pre-existing CI timing flake where the
+  holder's stream could finish before the racing requests arrived). Default 0 is a
+  true no-op for the cache / integration tests that already use the stub. Invalid
+  configs coerce to 0.
+
 ### Fixed
 
 - Idle sticky-session seq pins are now reclaimed under seq-pool pressure, so the pool no
