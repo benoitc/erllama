@@ -52,8 +52,18 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     verify/4,
     thinking_signature/3,
     reset_context/1,
-    abort_handle/1
+    abort_handle/1,
+    tool_call_end_is_eos/1
 ]).
+
+%% Marker value that opts a model into "EOS bounds the tool-call
+%% span". Configured as `tool_call_markers => #{start => Bytes,
+%% 'end' => ?EOS_END_SENTINEL}'. Families whose wire shape ends at
+%% EOS (Granite-3.x, Phi-4-mini) use this; the scheduler flushes
+%% the tool_call_bytes buffer via the existing
+%% `barrel_inference_tool_call_end' message when EogFlag = 1 fires
+%% inside an open span.
+-define(EOS_END_SENTINEL, <<"$eos">>).
 
 -record(s, {
     model :: barrel_inference_nif:model_ref(),
@@ -84,7 +94,13 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     %% recognition; the backend then behaves identically to a
     %% non-tool-call backend.
     tool_call_start_ids = [] :: [barrel_inference_nif:token_id()],
-    tool_call_end_ids = [] :: [barrel_inference_nif:token_id()],
+    %% End-marker storage: either a list of token ids (the model
+    %% emits a byte-string end marker the scanner matches per token
+    %% via `map_marker/2'), or the atom `eos' (the model has no
+    %% per-call byte-string end marker and the span is bounded by
+    %% EOS - `tool_call_end_is_eos/1' surfaces this for the
+    %% scheduler's in-span EogFlag-flush path).
+    tool_call_end_ids = [] :: [barrel_inference_nif:token_id()] | eos,
     %% Inner payload markers inside a tool-call span. When set the
     %% scheduler switches the request's sampler off the greedy
     %% variant for tokens between them, so caller-supplied string
@@ -145,7 +161,17 @@ tokenize_markers(_Model, Markers) when map_size(Markers) =:= 0 ->
     {[], []};
 tokenize_markers(Model, Markers) when is_map(Markers) ->
     Start = tokenize_marker(Model, maps:get(start, Markers, undefined)),
-    End = tokenize_marker(Model, maps:get('end', Markers, undefined)),
+    End =
+        case maps:get('end', Markers, undefined) of
+            ?EOS_END_SENTINEL ->
+                %% Special-case: the family has no byte-string per-call
+                %% end marker; the scheduler flushes the open span on
+                %% EOS instead. `map_marker/2' walks ids only, so the
+                %% atom never collides with any sampled token id.
+                eos;
+            Other ->
+                tokenize_marker(Model, Other)
+        end,
     {Start, End};
 tokenize_markers(_Model, _Other) ->
     {[], []}.
@@ -284,7 +310,13 @@ map_marker({SeqId, {token, Tok, Eog}} = R, #s{
         lists:member(Tok, TSI),
         lists:member(Tok, TEI),
         lists:member(Tok, USI),
-        lists:member(Tok, UEI),
+        %% `tool_call_end_ids' may be the atom `eos' when the
+        %% family is configured with the EOS-bounded end-marker
+        %% sentinel. `lists:member/2' would crash on a non-list,
+        %% and there is nothing to match against per-token in
+        %% that mode (the scheduler's in-span EogFlag-flush path
+        %% drives the close); short-circuit to `false'.
+        end_id_member(Tok, UEI),
         lists:member(Tok, PSI),
         lists:member(Tok, PEI)
     },
@@ -304,6 +336,19 @@ map_marker({SeqId, {token, Tok, Eog}} = R, #s{
     end;
 map_marker(R, _S) ->
     R.
+
+end_id_member(_Tok, eos) -> false;
+end_id_member(Tok, Ids) when is_list(Ids) -> lists:member(Tok, Ids).
+
+%% Whether the model's tool-call end marker is the EOS sentinel
+%% (`tool_call_markers => #{'end' => <<"$eos">>}'). Read by
+%% `barrel_inference_model:apply_step_results/2' to decide
+%% whether an in-span EogFlag = 1 should flush the buffered
+%% tool_call_bytes via `barrel_inference_tool_call_end' instead
+%% of silently dropping them as the byte-string-end case does.
+-spec tool_call_end_is_eos(#s{}) -> boolean().
+tool_call_end_is_eos(#s{tool_call_end_ids = eos}) -> true;
+tool_call_end_is_eos(#s{}) -> false.
 
 %% Build a per-request sampler chain. The opaque sampler_ref is held
 %% by the scheduler for the request's lifetime and freed when the

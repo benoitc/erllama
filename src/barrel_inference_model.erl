@@ -2482,8 +2482,32 @@ apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
             Req1 = req_tool_call_emit(Req, Tok, Data),
             Req2 =
                 case EogFlag =:= 1 of
-                    true -> Req1#req{finishing = true};
-                    false -> Req1
+                    true ->
+                        %% Models opted into the EOS-bounded end-marker
+                        %% sentinel (`tool_call_markers => #{'end' =>
+                        %% <<"$eos">>}', e.g. Granite-3.x, Phi-4-mini)
+                        %% have no per-call byte-string end marker the
+                        %% scanner can match; the span CLOSES at EOS.
+                        %% Flush the accumulated tool_call_bytes via
+                        %% the existing `req_tool_call_end/2' path
+                        %% before marking the request finishing so the
+                        %% caller receives one `barrel_inference_tool_call_end'
+                        %% per turn (otherwise the buffer would silently
+                        %% drop, matching the byte-string-end behaviour
+                        %% where the model failed to emit its end
+                        %% marker).
+                        Req1F =
+                            case backend_tool_call_end_is_eos(Data) of
+                                true ->
+                                    (req_tool_call_end(Req1, Data))#req{
+                                        active_sampler = normal
+                                    };
+                                false ->
+                                    Req1
+                            end,
+                        Req1F#req{finishing = true};
+                    false ->
+                        Req1
                 end,
             apply_step_results(T, put_req(Data, Req2));
         false ->
@@ -2584,6 +2608,17 @@ apply_step_results([{{SeqId, {decode, _}}, {tool_call_payload_close, Tok}} | T],
 in_tool_call_span(#req{active_sampler = tool_call_syntax}) -> true;
 in_tool_call_span(#req{active_sampler = tool_call_payload}) -> true;
 in_tool_call_span(_) -> false.
+
+%% Whether the model's tool-call end marker was configured with the
+%% EOS sentinel. Drives the in-span EogFlag = 1 flush in
+%% `apply_step_results/2'. Backends that have not been updated to
+%% export `tool_call_end_is_eos/1' default to `false' (the
+%% byte-string-end behaviour stays byte-exact).
+backend_tool_call_end_is_eos(#data{backend = B, backend_state = S}) ->
+    case erlang:function_exported(B, tool_call_end_is_eos, 1) of
+        true -> B:tool_call_end_is_eos(S);
+        false -> false
+    end.
 
 %% Append the token to both context_tokens and generated.
 req_append_token(Req, Token) ->

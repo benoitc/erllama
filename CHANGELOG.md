@@ -6,6 +6,28 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- EOS-bounded tool-call end-marker capture. Models configured with
+  `tool_call_markers => #{start => Bytes, 'end' => <<"$eos">>}` opt
+  into the new path: when the scheduler is inside an open tool-call
+  span and the model samples a token with `EogFlag = 1`, the
+  accumulated `tool_call_bytes` buffer is flushed via the existing
+  `barrel_inference_tool_call_end` message before the request
+  finishes. Previously the buffer was silently dropped in that
+  branch (the only emission site was the byte-string end-marker
+  match in `barrel_inference_model_llama:map_marker/2`). The
+  byte-string-end families (Mistral `</s>`, Qwen `</tool_call>`,
+  DeepSeek `<｜tool▁call▁end｜>`, Llama 3.1 `<|eom_id|>`) are
+  byte-exact unchanged; the new path is opt-in via the sentinel
+  binary `<<"$eos">>` on the `end' key. Backend behaviour gains
+  one optional `tool_call_end_is_eos/1` callback (the scheduler
+  defaults to `false` for backends that have not been updated).
+  Targets the IBM Granite-3.x and Microsoft Phi-4-mini families
+  whose wire shape bounds the call at EOS rather than a
+  byte-string end marker; the server-side migrations land in
+  follow-up PRs.
+
 ### Changed
 
 - The native tool-call capture splits spans on a repeated start marker. Families like

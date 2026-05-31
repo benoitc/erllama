@@ -39,6 +39,7 @@
     thinking_signature/3,
     reset_context/1,
     abort_handle/1,
+    tool_call_end_is_eos/1,
     %% Test helpers: read back what the most recent configure_sampler
     %% / clear_sampler / apply_adapters call saw.
     last_sampler_cfg/1,
@@ -380,6 +381,11 @@ reset_context(S) ->
 %% No interruptible context; the engine relies on the per-step budget.
 abort_handle(_S) ->
     undefined.
+
+%% Stub backend has no marker configuration plumbing; report false so
+%% the scheduler's in-span EogFlag-flush path is a no-op when tests
+%% swap in the stub.
+tool_call_end_is_eos(_S) -> false.
 
 %% Test knob: arm the next step/2 to return {error, Reason} once.
 wedge_next_step(Reason) ->

@@ -188,6 +188,16 @@ inference, etc.) can plug in via this same surface.
 %% alone.
 -callback abort_handle(state()) -> {ok, term()} | undefined.
 
+%% Optional. Whether the model's tool-call end marker was configured
+%% with the EOS sentinel (`tool_call_markers => #{'end' => <<"$eos">>}`).
+%% When true, `barrel_inference_model:apply_step_results/2' flushes
+%% the in-span tool_call_bytes buffer via `barrel_inference_tool_call_end'
+%% on the first EogFlag = 1 token instead of dropping it as it does
+%% for byte-string-end families. Backends that have not been
+%% updated return `false' (or omit the callback; the scheduler
+%% checks `function_exported/3' and defaults to false).
+-callback tool_call_end_is_eos(state()) -> boolean().
+
 -optional_callbacks([
     kv_pack/3,
     kv_unpack/3,
@@ -210,7 +220,8 @@ inference, etc.) can plug in via this same surface.
     verify/4,
     thinking_signature/3,
     reset_context/1,
-    abort_handle/1
+    abort_handle/1,
+    tool_call_end_is_eos/1
 ]).
 
 -type sampler_opts() :: #{
