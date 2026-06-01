@@ -146,6 +146,8 @@ concurrently through one decode call per tick.
     tokenize/2,
     detokenize/2,
     apply_chat_template/2,
+    chat_apply/3,
+    chat_purge/1,
     embed/2,
     load_adapter/2,
     unload_adapter/2,
@@ -866,6 +868,20 @@ chat templating.
     {ok, [non_neg_integer()]} | {error, term()}.
 apply_chat_template(Model, Request) when is_map(Request) ->
     gen_statem:call(via(Model), {apply_chat_template, Request}).
+
+%% Build (or fetch from cache) a chat_params_ref + rendered prompt for
+%% this model and the given tools-set. `ToolsHash' is a stable
+%% binary identifier for the (canonicalised) tools array - same hash
+%% => same cached params_ref + prompt. `Inputs' is the map fed
+%% verbatim to `barrel_inference_chat:apply/2'.
+chat_apply(Model, ToolsHash, Inputs) when is_binary(ToolsHash), is_map(Inputs) ->
+    gen_statem:call(via(Model), {chat_apply, ToolsHash, Inputs}).
+
+%% Drop every chat-cache entry for this model. Called on model
+%% terminate so the cache does not extend templates_ref / params_ref
+%% lifetimes past unload.
+chat_purge(Model) ->
+    gen_statem:call(via(Model), chat_purge).
 
 -doc """
 Compute an embedding vector for the given prompt tokens.
@@ -1985,6 +2001,11 @@ handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
     reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
     reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
+handle_common(_State, {call, From}, {chat_apply, ToolsHash, Inputs}, Data) ->
+    reply(From, do_chat_apply(Data, ToolsHash, Inputs), Data);
+handle_common(_State, {call, From}, chat_purge, Data) ->
+    barrel_inference_chat_cache:purge(Data#data.model_id),
+    reply(From, ok, Data);
 handle_common(_State, {call, From}, {embed, Tokens}, Data) ->
     reply(From, optional_backend_call(Data, embed, [Tokens]), Data);
 handle_common(State, {call, From}, {load_adapter, Path}, Data) ->
@@ -2173,6 +2194,36 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
     case erlang:function_exported(Mod, Fn, Arity) of
         true -> apply(Mod, Fn, [S | Args]);
         false -> {error, not_supported}
+    end.
+
+%% Resolve a chat templates_ref via the cache (init-once per model id)
+%% and apply the inputs to get a params_ref + rendered prompt
+%% (cached per (model_id, tools-hash)). Reaches the underlying NIF
+%% model resource via the backend module's `get_model_ref/1' getter;
+%% backends without that callback (the stub) return
+%% `{error, chat_not_supported}'.
+do_chat_apply(
+    #data{backend = Mod, backend_state = S, model_id = ModelId},
+    ToolsHash,
+    Inputs
+) ->
+    case erlang:function_exported(Mod, get_model_ref, 1) of
+        false ->
+            {error, chat_not_supported};
+        true ->
+            ModelRef = Mod:get_model_ref(S),
+            case
+                barrel_inference_chat_cache:get_or_init(
+                    ModelId, ModelRef, undefined
+                )
+            of
+                {ok, Templates} ->
+                    barrel_inference_chat_cache:get_or_apply(
+                        ModelId, ToolsHash, Templates, Inputs
+                    );
+                Err ->
+                    Err
+            end
     end.
 
 build_model_info(State, Data) ->

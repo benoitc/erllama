@@ -61,6 +61,8 @@ an explicit `model_id` in the config map.
     tokenize/2,
     detokenize/2,
     apply_chat_template/2,
+    chat_apply/3,
+    chat_parse/3,
     embed/2,
     load_adapter/2,
     unload_adapter/2,
@@ -509,6 +511,30 @@ tokenise. The Request map carries `messages`, `system`, and `tools`.
     {ok, [barrel_inference_nif:token_id()]} | {error, term()}.
 apply_chat_template(Model, Request) ->
     barrel_inference_model:apply_chat_template(Model, Request).
+
+-doc """
+Build a chat_params_ref + rendered prompt for `Model' via llama.cpp's
+autoparser. `ToolsHash' is a stable identifier for the tools set
+(same hash <=> same cached params_ref + prompt). `Inputs' is the
+map fed to `barrel_inference_chat:apply/2'.
+""".
+-spec chat_apply(model(), binary(), map()) ->
+    {ok, barrel_inference_nif:chat_params_ref(), binary()} | {error, term()}.
+chat_apply(Model, ToolsHash, Inputs) ->
+    barrel_inference_model:chat_apply(Model, ToolsHash, Inputs).
+
+-doc """
+Parse a model output string into a structured assistant message via
+llama.cpp's autoparser. `IsPartial' = true accepts streaming
+prefixes. See `barrel_inference_chat:parse/3' for the returned map
+shape.
+""".
+-spec chat_parse(
+    barrel_inference_nif:chat_params_ref(), binary(), boolean()
+) ->
+    {ok, map()} | {error, term()}.
+chat_parse(Params, Input, IsPartial) ->
+    barrel_inference_chat:parse(Params, Input, IsPartial).
 
 -doc "Compute an embedding vector for the given prompt tokens.".
 -spec embed(model(), [barrel_inference_nif:token_id()]) ->

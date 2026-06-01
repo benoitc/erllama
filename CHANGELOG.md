@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Public `barrel_inference:chat_apply/3` + `chat_parse/3` that delegate
+  to `barrel_inference_chat` via the model gen_statem so callers can
+  build a `chat_params_ref' (cached per (`ModelId`, `ToolsHash`)) and
+  parse model output without touching the underlying NIF model
+  resource. Backend gains an optional `get_model_ref/1' callback;
+  the stub backend (no NIF resource) returns
+  `{error, chat_not_supported}'. `chat_purge/1' drops cached entries
+  on demand for a given model id.
+
 ### Fixed
 
 - EOS-bounded tool-call flush: don't capture the EOS token's bytes

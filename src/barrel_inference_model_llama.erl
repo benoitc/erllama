@@ -53,7 +53,8 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     thinking_signature/3,
     reset_context/1,
     abort_handle/1,
-    tool_call_end_is_eos/1
+    tool_call_end_is_eos/1,
+    get_model_ref/1
 ]).
 
 %% Marker value that opts a model into "EOS bounds the tool-call
@@ -349,6 +350,15 @@ end_id_member(Tok, Ids) when is_list(Ids) -> lists:member(Tok, Ids).
 -spec tool_call_end_is_eos(#s{}) -> boolean().
 tool_call_end_is_eos(#s{tool_call_end_ids = eos}) -> true;
 tool_call_end_is_eos(#s{}) -> false.
+
+%% Surface the underlying NIF model resource for callers that need to
+%% hand it to `barrel_inference_chat:init/2' (the autoparser
+%% templates init expects a model_ref). The scheduler holds the
+%% backend state; the chat-API path goes through a model gen_statem
+%% call (`barrel_inference_model:chat_apply/2') so the resource
+%% lifetime is tied to the model the same way it is for other ops.
+-spec get_model_ref(#s{}) -> barrel_inference_nif:model_ref().
+get_model_ref(#s{model = Model}) -> Model.
 
 %% Build a per-request sampler chain. The opaque sampler_ref is held
 %% by the scheduler for the request's lifetime and freed when the
