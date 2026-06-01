@@ -38,7 +38,7 @@ option(ENABLE_CLANG_TIDY "Run clang-tidy on barrel_inference_nif sources" OFF)
 # Backend selection is platform-driven by default; users override via
 # environment variables consumed in do_cmake.sh.
 
-set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS  OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS  OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -109,6 +109,7 @@ endif()
 add_library(barrel_inference_nif SHARED
     barrel_inference_nif.c
     barrel_inference_safe.cpp
+    barrel_inference_chat_nif.cpp
     crc32c.c
 )
 
@@ -154,6 +155,8 @@ target_include_directories(barrel_inference_nif PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/include
     ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/ggml/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/vendor
 )
 
 # pthread is used by barrel_inference_nif.c for per-resource mutexes; depend
@@ -165,6 +168,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(barrel_inference_nif PRIVATE
     llama
     ggml
+    llama-common
     Threads::Threads
 )
 

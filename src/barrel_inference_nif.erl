@@ -54,8 +54,15 @@
     model_size/1,
     model_n_layer/1,
     grammar_cache_stats/1,
-    forward_with_argmax/2
+    forward_with_argmax/2,
+    chat_templates_init/2,
+    chat_templates_apply/2,
+    chat_parse/3
 ]).
+
+-export_type([chat_templates_ref/0, chat_params_ref/0]).
+-type chat_templates_ref() :: reference().
+-type chat_params_ref() :: reference().
 
 -export_type([adapter_ref/0, sampler_ref/0]).
 
@@ -382,6 +389,36 @@ grammar_cache_stats(Ctx) ->
 forward_with_argmax(Ctx, Tokens) when is_list(Tokens) ->
     nif_forward_with_argmax(Ctx, Tokens).
 
+%% Initialise a llama.cpp `common_chat_templates_ptr' from a loaded
+%% model. The TemplateOverride is either the chat-template binary to
+%% use (overriding the GGUF's default) or the atom `undefined' to use
+%% the model's own template. Returned ref is the input to
+%% `chat_templates_apply/2'.
+-spec chat_templates_init(model_ref(), binary() | undefined) ->
+    {ok, chat_templates_ref()} | {error, term()}.
+chat_templates_init(Model, TemplateOverride) ->
+    nif_chat_templates_init(Model, TemplateOverride).
+
+%% Apply a tools-set + chat inputs to a templates_ref. Returns the
+%% synthesised parser params and the rendered prompt bytes.
+%% Phase 3.B ships this as `{error, not_implemented}'; the
+%% inputs-translation lands in the follow-up.
+-spec chat_templates_apply(chat_templates_ref(), map()) ->
+    {ok, chat_params_ref(), binary()} | {error, term()}.
+chat_templates_apply(Templates, Inputs) when is_map(Inputs) ->
+    nif_chat_templates_apply(Templates, Inputs).
+
+%% Parse a model output string into a structured assistant message
+%% via llama.cpp's autoparser. `IsPartial' = true accepts streaming
+%% prefixes. Phase 3.B ships this as `{error, not_implemented}'; the
+%% term marshalling lands in the follow-up.
+-spec chat_parse(chat_params_ref(), binary(), boolean()) ->
+    {ok, map()} | {error, term()}.
+chat_parse(Params, Input, IsPartial) when
+    is_binary(Input), is_boolean(IsPartial)
+->
+    nif_chat_parse(Params, Input, IsPartial).
+
 %% =============================================================================
 %% NIF stubs (replaced at on_load time)
 %% =============================================================================
@@ -417,3 +454,6 @@ nif_model_size(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_model_n_layer(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_grammar_cache_stats(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_forward_with_argmax(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
+nif_chat_templates_init(_Model, _Override) -> erlang:nif_error(nif_not_loaded).
+nif_chat_templates_apply(_Templates, _Inputs) -> erlang:nif_error(nif_not_loaded).
+nif_chat_parse(_Params, _Input, _IsPartial) -> erlang:nif_error(nif_not_loaded).

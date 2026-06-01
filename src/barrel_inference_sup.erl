@@ -18,6 +18,7 @@ init([]) ->
         sup_child(barrel_inference_cache_sup),
         worker_child(barrel_inference_registry),
         worker_child(barrel_inference_inflight),
+        worker_child(barrel_inference_chat_cache),
         sup_child(barrel_inference_model_sup),
         worker_child(barrel_inference_scheduler)
     ],

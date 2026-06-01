@@ -22,6 +22,7 @@
  * long as any context derived from it does.
  */
 #include <erl_nif.h>
+#include "barrel_inference_chat_nif.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -272,23 +273,12 @@ static struct llama_sampler *build_sampler_chain_from_map(
  * cannot interleave with a live llama call. The lock is held for the
  * duration of a llama op, but ops on different resources stay
  * independent. */
-typedef struct {
-    pthread_mutex_t mu;
-    int mu_inited;                 /* guard pthread_mutex_destroy on error path */
-    struct llama_model *model;     /* NULL after successful release */
-    int active_contexts;           /* nif_new_context bumps; ctx_dtor decrements */
-    int active_adapters;           /* nif_adapter_load bumps; adapter_dtor decrements */
-    int release_pending;           /* free_model defers while either counter > 0 */
-    /* `tensor_split` storage owned by the resource. llama_model copies
-     * llama_model_params by value at load time but the
-     * `tensor_split` pointer inside is not copied — it still aliases
-     * caller memory and must outlive the model. Parking the array on
-     * the resource lets `llama_model_free` find a valid pointer for
-     * the model's entire life. `has_tensor_split = 0` means
-     * params.tensor_split was left NULL (llama.cpp default). */
-    float tensor_split[BARREL_INFERENCE_MAX_DEVICES];
-    int has_tensor_split;
-} barrel_inference_model_t;
+/* The barrel_inference_model_t layout + the resource type pointers
+ * (MODEL_RT etc.) live in barrel_inference_resources.h so C++ TUs
+ * (e.g. barrel_inference_chat_nif.cpp) can `enif_get_resource' the
+ * model and reach `m->model'. The header declares; this file defines
+ * the resource pointers further down. */
+#include "barrel_inference_resources.h"
 
 /* Per-seq state tracked across nif_step ticks so the next tick
  * knows where each seq's logits live (for sampling) and where its
@@ -387,10 +377,12 @@ typedef struct {
     barrel_inference_context_t *ctx_res;    /* keep_resource'd at init */
 } barrel_inference_sampler_t;
 
-static ErlNifResourceType *MODEL_RT;
-static ErlNifResourceType *CTX_RT;
-static ErlNifResourceType *ADAPTER_RT;
-static ErlNifResourceType *SAMPLER_RT;
+/* Declared in barrel_inference_resources.h so the C++ chat NIF TU can
+ * reference them through extern visibility. */
+ErlNifResourceType *MODEL_RT;
+ErlNifResourceType *CTX_RT;
+ErlNifResourceType *ADAPTER_RT;
+ErlNifResourceType *SAMPLER_RT;
 
 /* Drop the context's (or adapter's) reference on its model; if a
  * previous free_model/1 returned {ok, deferred} and the model is now
@@ -611,6 +603,12 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     SAMPLER_RT = enif_open_resource_type(
         env, NULL, "barrel_inference_sampler", sampler_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!SAMPLER_RT) {
+        return -1;
+    }
+
+    /* Register the chat-autoparser resources (defined in
+     * barrel_inference_chat_nif.cpp). */
+    if (chat_nif_load(env) != 0) {
         return -1;
     }
 
@@ -3613,7 +3611,13 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_adapter_free", 1, nif_adapter_free, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_set_adapters", 2, nif_set_adapters, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_sampler_new",  2, nif_sampler_new,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_sampler_free", 1, nif_sampler_free, ERL_NIF_DIRTY_JOB_CPU_BOUND}
+    {"nif_sampler_free", 1, nif_sampler_free, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_chat_templates_init",  2, nif_chat_templates_init,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_chat_templates_apply", 2, nif_chat_templates_apply,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_chat_parse",           3, nif_chat_parse,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(barrel_inference_nif, nif_funcs, load, NULL, NULL, unload)

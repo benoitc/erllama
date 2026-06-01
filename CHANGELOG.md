@@ -8,6 +8,25 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- NIF wrapper for llama.cpp's `common_chat_*` autoparser. Vendors
+  `common/` + `vendor/nlohmann` + `vendor/cpp-httplib` from the
+  pinned llama.cpp tree, flips `LLAMA_BUILD_COMMON=ON`, and links
+  `llama-common` into the NIF .so. Three new entry points
+  (`nif_chat_templates_init/2`, `nif_chat_templates_apply/2`,
+  `nif_chat_parse/3`) run on dirty CPU; two new resources
+  (`chat_templates_ref`, `chat_params_ref`) wrap
+  `common_chat_templates_ptr` and `common_chat_params`. New Erlang
+  facade `barrel_inference_chat` (raw NIF shim) and
+  `barrel_inference_chat_cache` (LRU cache keyed on
+  `{ModelIdBin, ToolsHash}`, with `purge/1` for model unload). The
+  refactored `barrel_inference_resources.h` exposes the existing
+  C resource type pointers + `barrel_inference_model_t` to C++
+  TUs behind an `extern "C"` guard. `templates_init` works
+  end-to-end; `templates_apply` and `parse` ship as
+  `{error, not_implemented}` placeholders (the Erlang-term marshalling
+  lands in the follow-up). Dormant capability: the chat / messages /
+  responses handlers do not consume this surface yet; Phase 3.C
+  wires them up.
 - EOS-bounded tool-call end-marker capture. Models configured with
   `tool_call_markers => #{start => Bytes, 'end' => <<"$eos">>}` opt
   into the new path: when the scheduler is inside an open tool-call
