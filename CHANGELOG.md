@@ -8,6 +8,20 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Complete the chat-autoparser NIF wiring. `nif_chat_templates_apply`
+  now translates an Erlang inputs map (`messages` + `tools` JSON
+  binaries, optional `tool_choice`) into `common_chat_templates_inputs`
+  via `common_chat_msgs_parse_oaicompat` / `common_chat_tools_parse_oaicompat`,
+  calls upstream, and returns the synthesized `chat_params_ref` plus
+  the rendered prompt bytes. `nif_chat_parse` deserialises the
+  per-template PEG arena from the cached params string and dispatches
+  to `common_chat_parse`. The parsed `common_chat_msg` is marshalled
+  to `#{role, content, reasoning_content, tool_calls}`; tool-call
+  arguments come back as raw JSON binaries and are decoded to maps
+  at the Erlang facade boundary (`barrel_inference_chat:parse/3`).
+  New `barrel_inference_chat_SUITE` real-model CT (gated on
+  `LLAMA_TEST_MODEL`) covers init / apply / parse round-trip and a
+  partial-then-full streaming case.
 - NIF wrapper for llama.cpp's `common_chat_*` autoparser. Vendors
   `common/` + `vendor/nlohmann` + `vendor/cpp-httplib` from the
   pinned llama.cpp tree, flips `LLAMA_BUILD_COMMON=ON`, and links

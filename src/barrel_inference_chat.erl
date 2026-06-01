@@ -49,4 +49,31 @@ apply(Templates, Inputs) when is_map(Inputs) ->
 parse(Params, Input, IsPartial) when
     is_binary(Input), is_boolean(IsPartial)
 ->
-    barrel_inference_nif:chat_parse(Params, Input, IsPartial).
+    case barrel_inference_nif:chat_parse(Params, Input, IsPartial) of
+        {ok, Msg} -> {ok, decode_tool_calls(Msg)};
+        Err -> Err
+    end.
+
+%% The NIF returns each tool call's arguments as a raw JSON binary
+%% (`arguments_json' key) so the C++ side carries no JSON-decode
+%% logic. Decode at the Erlang boundary into the documented map shape.
+decode_tool_calls(Msg = #{tool_calls := Calls}) ->
+    Decoded = [decode_call(C) || C <- Calls],
+    Msg#{tool_calls => Decoded};
+decode_tool_calls(Msg) ->
+    Msg.
+
+decode_call(#{name := Name, arguments_json := Json, id := Id}) ->
+    Args =
+        case Json of
+            <<>> ->
+                #{};
+            _ ->
+                try json:decode(Json) of
+                    M when is_map(M) -> M;
+                    _ -> #{}
+                catch
+                    _:_ -> #{}
+                end
+        end,
+    #{name => Name, arguments => Args, id => Id}.
