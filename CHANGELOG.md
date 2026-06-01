@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- EOS-bounded tool-call flush: don't capture the EOS token's bytes
+  before flushing the span. The previous in-span EogFlag path called
+  `req_tool_call_emit/3` unconditionally; for Granite / Phi-4 the EOS
+  is a special token that detokenizes empty under `special=false`,
+  so the buffer stayed clean in practice, but the path was fragile
+  for any future model whose EOS detokenises to visible bytes. Now
+  the EOS-end branch skips the emit and calls `req_tool_call_end/2`
+  directly, matching the byte-string-end-marker semantics.
+
 ### Added
 
 - Complete the chat-autoparser NIF wiring. `nif_chat_templates_apply`

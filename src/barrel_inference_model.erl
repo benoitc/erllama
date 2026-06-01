@@ -2479,35 +2479,29 @@ apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
             %% into the tool-call bytes (it is part of the call, not user
             %% content) instead of streaming it. An EOG inside a span that
             %% never closes still finalises the request so it cannot hang.
-            Req1 = req_tool_call_emit(Req, Tok, Data),
+            %%
+            %% EOS-bounded end-marker families (Granite-3.x, Phi-4-mini)
+            %% close the span on EOS itself. Skip emitting the EOS
+            %% token's bytes into the buffer in that case: under
+            %% `special=false' detok the special-token EOS is empty
+            %% anyway, but if a future opt-in carries a non-special
+            %% EOS its bytes would pollute FullBin. Flush via
+            %% `req_tool_call_end/2' and finish in one step.
+            EosEnd =
+                EogFlag =:= 1 andalso backend_tool_call_end_is_eos(Data),
             Req2 =
-                case EogFlag =:= 1 of
+                case EosEnd of
                     true ->
-                        %% Models opted into the EOS-bounded end-marker
-                        %% sentinel (`tool_call_markers => #{'end' =>
-                        %% <<"$eos">>}', e.g. Granite-3.x, Phi-4-mini)
-                        %% have no per-call byte-string end marker the
-                        %% scanner can match; the span CLOSES at EOS.
-                        %% Flush the accumulated tool_call_bytes via
-                        %% the existing `req_tool_call_end/2' path
-                        %% before marking the request finishing so the
-                        %% caller receives one `barrel_inference_tool_call_end'
-                        %% per turn (otherwise the buffer would silently
-                        %% drop, matching the byte-string-end behaviour
-                        %% where the model failed to emit its end
-                        %% marker).
-                        Req1F =
-                            case backend_tool_call_end_is_eos(Data) of
-                                true ->
-                                    (req_tool_call_end(Req1, Data))#req{
-                                        active_sampler = normal
-                                    };
-                                false ->
-                                    Req1
-                            end,
-                        Req1F#req{finishing = true};
+                        Req1 = (req_tool_call_end(Req, Data))#req{
+                            active_sampler = normal
+                        },
+                        Req1#req{finishing = true};
                     false ->
-                        Req1
+                        Req1 = req_tool_call_emit(Req, Tok, Data),
+                        case EogFlag =:= 1 of
+                            true -> Req1#req{finishing = true};
+                            false -> Req1
+                        end
                 end,
             apply_step_results(T, put_req(Data, Req2));
         false ->
