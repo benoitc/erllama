@@ -6,6 +6,16 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `llama_model_params.prefetch' (bool). When `false', the NIF asks the
+  kernel to use `POSIX_MADV_RANDOM' on the model's mmap region instead
+  of the default `POSIX_MADV_WILLNEED', so weights page in on first
+  touch instead of being eagerly read. Local patch to vendored
+  llama.cpp threads the new field through `llama_model_loader::init_mappings'.
+  Defaults to `true' (existing behaviour). Drives the server's
+  `weight_residency = lazy' mode.
+
 ### Changed
 
 - Bump vendored llama.cpp from b9334 to b9585. No API-breaking changes

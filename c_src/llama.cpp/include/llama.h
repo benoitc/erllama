@@ -320,6 +320,7 @@ extern "C" {
         bool use_mmap;        // use mmap if possible
         bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
         bool use_mlock;       // force system to keep model in RAM
+        bool prefetch;        // POSIX_MADV_WILLNEED (true) vs POSIX_MADV_RANDOM (false)
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used

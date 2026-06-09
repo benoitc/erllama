@@ -979,6 +979,7 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     int b;
     if (get_map_bool(env, argv[1], "use_mmap", &b)) params.use_mmap = b ? true : false;
     if (get_map_bool(env, argv[1], "use_mlock", &b)) params.use_mlock = b ? true : false;
+    if (get_map_bool(env, argv[1], "prefetch", &b)) params.prefetch = b ? true : false;
     if (get_map_bool(env, argv[1], "vocab_only", &b)) params.vocab_only = b ? true : false;
 
     int enum_v;
