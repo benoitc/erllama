@@ -55,6 +55,7 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     reset_context/1,
     abort_handle/1,
     pin_resident_pages/1,
+    resident_bytes/1,
     get_model_ref/1
 ]).
 
@@ -168,6 +169,11 @@ abort_handle(#s{ctx = Ctx}) ->
 %% which walks each mmap region via mincore(2) + mlock(2).
 pin_resident_pages(#s{model = M}) ->
     barrel_inference_nif:pin_resident_pages(M).
+
+%% Bytes of the model's mmap regions currently resident. mincore-only;
+%% does not pin. Sampled by the metrics gauge per Prometheus scrape.
+resident_bytes(#s{model = M}) ->
+    barrel_inference_nif:resident_bytes(M).
 
 tokenize(#s{model = M}, Text) ->
     barrel_inference_nif:tokenize(M, Text, #{add_special => true, parse_special => false}).

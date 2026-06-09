@@ -852,6 +852,54 @@ static ERL_NIF_TERM nif_model_size(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     return enif_make_uint64(env, sz);
 }
 
+/* nif_resident_bytes(model_ref) -> non_neg_integer()
+ *
+ * Walks every mmap region of the model, runs mincore(2) per region, and
+ * counts the resident pages times the system page size. Diagnostic only:
+ * does not pin or modify the resident set. Used by the Prometheus
+ * `barrel_inference_resident_bytes{model=...}' gauge so operators can
+ * see how the working set evolves under `weight_residency = lazy' or
+ * `lazy_then_pin_resident'. Returns 0 on any mincore failure for a
+ * region (other regions still counted).
+ */
+static ERL_NIF_TERM nif_resident_bytes(ErlNifEnv *env, int argc,
+                                        const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    barrel_inference_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&m->mu);
+    if (!m->model) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_uint64(env, 0);
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { page_size = 4096; }
+    size_t total_resident = 0;
+    size_t nm = llama_model_n_mappings(m->model);
+    for (size_t i = 0; i < nm; i++) {
+        void *addr = NULL;
+        size_t sz = 0;
+        llama_model_get_mapping(m->model, i, &addr, &sz);
+        if (addr == NULL || sz == 0) { continue; }
+        size_t npages = (sz + (size_t)page_size - 1) / (size_t)page_size;
+        unsigned char *vec = (unsigned char *) malloc(npages);
+        if (vec == NULL) { continue; }
+#if defined(__APPLE__)
+        if (mincore(addr, sz, (char *) vec) != 0) { free(vec); continue; }
+#else
+        if (mincore(addr, sz, vec) != 0) { free(vec); continue; }
+#endif
+        for (size_t p = 0; p < npages; p++) {
+            if (vec[p] & 1) { total_resident += (size_t) page_size; }
+        }
+        free(vec);
+    }
+    pthread_mutex_unlock(&m->mu);
+    return enif_make_uint64(env, total_resident);
+}
+
 /* nif_pin_resident_pages(model_ref) -> {ok, ResidentBytes} | {error, atom()}
  *
  * Walks every mmap region the model holds, runs mincore(2) per region to
@@ -3651,6 +3699,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_vram_info",    0, nif_vram_info,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_size",   1, nif_model_size,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_n_layer",1, nif_model_n_layer,ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_resident_bytes", 1, nif_resident_bytes,
+        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_pin_resident_pages", 1, nif_pin_resident_pages,
         ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_grammar_cache_stats", 1, nif_grammar_cache_stats, ERL_NIF_DIRTY_JOB_CPU_BOUND},

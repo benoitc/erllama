@@ -143,6 +143,7 @@ concurrently through one decode call per tick.
     evict/1,
     shutdown/1,
     model_info/1,
+    resident_bytes/1,
     tokenize/2,
     tokenize/3,
     detokenize/2,
@@ -817,6 +818,12 @@ inference.
 -spec model_info(model()) -> model_info().
 model_info(Model) ->
     gen_statem:call(via(Model), model_info).
+
+%% Bytes of the model's mmap regions currently resident. Delegates to
+%% the backend's optional `resident_bytes/1' callback.
+-spec resident_bytes(model()) -> non_neg_integer().
+resident_bytes(Model) ->
+    gen_statem:call(via(Model), resident_bytes).
 
 -doc """
 Tokenise a string using the model's tokenizer. Returns a list of
@@ -2008,6 +2015,8 @@ handle_common(_State, {call, From}, {tokenize, Text, Opts}, Data) ->
     reply(From, wrap_ok(backend_tokenize_with_opts(Data, Text, Opts)), Data);
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
     reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
+handle_common(_State, {call, From}, resident_bytes, Data) ->
+    reply(From, backend_resident_bytes(Data), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
     reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
 handle_common(_State, {call, From}, {chat_apply, Inputs}, Data) ->
@@ -3654,6 +3663,15 @@ backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) 
     case erlang:function_exported(Mod, tokenize, 3) of
         true -> Mod:tokenize(S, Text, Opts);
         false -> Mod:tokenize(S, Text)
+    end.
+
+%% Diagnostic resident-set size in bytes. Backends without an mmap
+%% representation (the stub) return 0; the metrics module surfaces the
+%% value verbatim.
+backend_resident_bytes(#data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, resident_bytes, 1) of
+        true -> Mod:resident_bytes(S);
+        false -> 0
     end.
 
 %% Resolve a model() reference to a Pid that gen_statem:call/2,3

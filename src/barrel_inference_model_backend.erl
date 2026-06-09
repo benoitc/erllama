@@ -197,6 +197,12 @@ inference, etc.) can plug in via this same surface.
 -callback pin_resident_pages(state()) ->
     {ok, non_neg_integer()} | {error, term()}.
 
+%% Diagnostic resident-set size: bytes of the model's mmap regions
+%% currently faulted in. Optional; backends without an mmap layout
+%% (the stub) omit it. Sampled by the metrics module per Prometheus
+%% scrape to populate `barrel_inference_resident_bytes{model=...}`.
+-callback resident_bytes(state()) -> non_neg_integer().
+
 -optional_callbacks([
     kv_pack/3,
     kv_unpack/3,
@@ -220,7 +226,8 @@ inference, etc.) can plug in via this same surface.
     thinking_signature/3,
     reset_context/1,
     abort_handle/1,
-    pin_resident_pages/1
+    pin_resident_pages/1,
+    resident_bytes/1
 ]).
 
 -type sampler_opts() :: #{

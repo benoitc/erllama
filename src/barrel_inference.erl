@@ -58,6 +58,7 @@ an explicit `model_id` in the config map.
     models/0,
     list_models/0,
     model_info/1,
+    resident_bytes/1,
     tokenize/2,
     tokenize/3,
     detokenize/2,
@@ -480,6 +481,17 @@ loaded.
 -spec model_info(model()) -> model_info().
 model_info(Model) ->
     barrel_inference_model:model_info(Model).
+
+-doc """
+Diagnostic resident-set size in bytes for a loaded model. Walks the
+backend's mmap regions and counts pages currently faulted in via
+`mincore(2)`. Backends without an mmap representation (the stub)
+return `0`. Used to drive the Prometheus
+`barrel_inference_resident_bytes{model=...}` gauge.
+""".
+-spec resident_bytes(model()) -> non_neg_integer().
+resident_bytes(Model) ->
+    barrel_inference_model:resident_bytes(Model).
 
 -doc """
 Tokenise text against a loaded model's tokenizer. Safe to call

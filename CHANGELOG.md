@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- `barrel_inference:resident_bytes/1' + optional backend callback
+  `resident_bytes/1'. mincore-only diagnostic that returns the bytes of
+  the model's mmap regions currently faulted in. Backends without an
+  mmap layout (the stub) return 0. The server's metrics module surfaces
+  the value as the new `barrel_inference_resident_bytes{model=...}'
+  Prometheus gauge.
 - `barrel_inference_nif:pin_resident_pages/1' and the matching optional
   backend callback. Walks every mmap region of a loaded model, runs
   `mincore(2)' per region to find the resident pages, then `mlock(2)'s
