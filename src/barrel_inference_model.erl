@@ -144,9 +144,10 @@ concurrently through one decode call per tick.
     shutdown/1,
     model_info/1,
     tokenize/2,
+    tokenize/3,
     detokenize/2,
     apply_chat_template/2,
-    chat_apply/3,
+    chat_apply/2,
     chat_purge/1,
     embed/2,
     load_adapter/2,
@@ -188,7 +189,7 @@ concurrently through one decode call per tick.
     %% String tag like <<"q4_k_m">> / <<"f16">>. Derived from
     %% quant_type + quant_bits.
     quant_tag := binary(),
-    tier := disk | ram_file,
+    tier := ram | disk | ram_file,
     fingerprint := binary(),
     %% erlang:monotonic_time(nanosecond) at gen_statem init.
     loaded_at_monotonic := integer(),
@@ -465,36 +466,12 @@ concurrently through one decode call per tick.
     %% read side) it powers the `cache_delta` map surfaced on
     %% `completion_result()`, `stats()`, and `prefill_result()`.
     cache_delta_created = 0 :: non_neg_integer(),
-    %% Running concat of detokenised tool-call bytes for the current
-    %% span. Forwarded verbatim to the streaming caller as the
-    %% `Full` payload of `{barrel_inference_tool_call_end, _, Full}` when the
-    %% span closes, then reset for any subsequent span on the same
-    %% request.
-    tool_call_bytes = <<>> :: binary(),
     %% Sticky-seq session identifier. When set, `finish_req` skips
     %% the usual `release_seq` so the seq_id's KV cells stay live
     %% for the next request on the same session. `undefined` means
     %% the request is one-shot; the seq returns to the idle pool
     %% on finish as before.
     session_id = undefined :: term() | undefined,
-    %% Secondary sampler ref configured for greedy decoding
-    %% (temperature = 0). When the model is loaded with
-    %% `tool_call_markers` this is built at admission alongside the
-    %% normal sampler; the scheduler swaps to it for tool-call
-    %% syntax tokens so they stay byte-deterministic.
-    %% `undefined` when no tool-call markers exist or the backend
-    %% doesn't expose `sampler_new`.
-    tool_call_greedy_sampler_ref = undefined :: term() | undefined,
-    %% Tri-state pointing at which sampler the next decode op
-    %% should use:
-    %%   `normal`              -> Req#req.sampler_ref
-    %%   `tool_call_syntax`    -> Req#req.tool_call_greedy_sampler_ref
-    %%                            (falls back to sampler_ref when
-    %%                            the greedy ref couldn't be built)
-    %%   `tool_call_payload`   -> Req#req.sampler_ref (caller's
-    %%                            normal chain, used for string
-    %%                            payload bodies inside a span)
-    active_sampler = normal :: normal | tool_call_syntax | tool_call_payload,
     %% Caller-side thinking-phase cap (`undefined` means no cap).
     %% Counted in delivered `{thinking_delta, _}` payloads, not raw
     %% thinking_token step results, so an empty detokenisation does
@@ -522,7 +499,7 @@ concurrently through one decode call per tick.
 -record(data, {
     model_id :: binary(),
     tier_srv :: atom(),
-    tier :: disk | ram_file,
+    tier :: ram | disk | ram_file,
     %% Base model fingerprint; constant for the life of the model.
     fingerprint :: <<_:256>>,
     fingerprint_mode :: safe | gguf_chunked | fast_unsafe,
@@ -846,6 +823,11 @@ runs against the model's static vocabulary, not the live KV cache.
 tokenize(Model, Text) when is_binary(Text) ->
     gen_statem:call(via(Model), {tokenize, Text}).
 
+-spec tokenize(model(), binary(), map()) ->
+    {ok, [non_neg_integer()]} | {error, term()}.
+tokenize(Model, Text, Opts) when is_binary(Text), is_map(Opts) ->
+    gen_statem:call(via(Model), {tokenize, Text, Opts}).
+
 -doc """
 Detokenise a list of token IDs back to a string. Safe to call
 concurrently with `complete/2,3`.
@@ -874,8 +856,8 @@ apply_chat_template(Model, Request) when is_map(Request) ->
 %% binary identifier for the (canonicalised) tools array - same hash
 %% => same cached params_ref + prompt. `Inputs' is the map fed
 %% verbatim to `barrel_inference_chat:apply/2'.
-chat_apply(Model, ToolsHash, Inputs) when is_binary(ToolsHash), is_map(Inputs) ->
-    gen_statem:call(via(Model), {chat_apply, ToolsHash, Inputs}).
+chat_apply(Model, Inputs) when is_map(Inputs) ->
+    gen_statem:call(via(Model), {chat_apply, Inputs}).
 
 %% Drop every chat-cache entry for this model. Called on model
 %% terminate so the cache does not extend templates_ref / params_ref
@@ -1593,7 +1575,6 @@ start_request({complete, From, Prompt, Opts}, SeqId, Mode, Data) ->
         {ok, SamplerRef, SamplerCfg, Data0} ->
             PromptTokens = backend_call(Data0, tokenize, [Prompt]),
             {Stops, StopPat, StopMax} = stop_sequences_from(Opts),
-            GreedyRef = greedy_sampler_for(Data0, SamplerCfg),
             Req = #req{
                 seq_id = SeqId,
                 mode = standard,
@@ -1612,8 +1593,7 @@ start_request({complete, From, Prompt, Opts}, SeqId, Mode, Data) ->
                 stop_max_len = StopMax,
                 thinking = thinking_from(Opts),
                 thinking_budget = thinking_budget_from(Opts),
-                session_id = maps:get(session_id, Opts, undefined),
-                tool_call_greedy_sampler_ref = GreedyRef
+                session_id = maps:get(session_id, Opts, undefined)
             },
             Req1 = setup_admission_path(Req, Mode, PromptTokens, Opts, Data0),
             Data1 = put_req(Data0, Req1),
@@ -1649,7 +1629,6 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
             Ref = make_ref(),
             ok = barrel_inference_inflight:register(Ref, self()),
             {Stops, StopPat, StopMax} = stop_sequences_from(Params),
-            GreedyRef = greedy_sampler_for(Data0, SamplerCfg),
             Req = #req{
                 seq_id = SeqId,
                 mode = streaming,
@@ -1669,8 +1648,7 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
                 stop_max_len = StopMax,
                 thinking = thinking_from(Params),
                 thinking_budget = thinking_budget_from(Params),
-                session_id = maps:get(session_id, Params, undefined),
-                tool_call_greedy_sampler_ref = GreedyRef
+                session_id = maps:get(session_id, Params, undefined)
             },
             Req1 = setup_admission_path(Req, Mode, Tokens, Params, Data0),
             Data1 = put_req(Data0, Req1),
@@ -1691,7 +1669,6 @@ start_request({continue, From, Suffix, Opts}, SeqId, {continue, StoredTokens} = 
             %% (set in `setup_admission_path/5`), not `prompt_tokens`.
             FullPrompt = StoredTokens ++ Suffix,
             {Stops, StopPat, StopMax} = stop_sequences_from(Opts),
-            GreedyRef = greedy_sampler_for(Data0, SamplerCfg),
             Req = #req{
                 seq_id = SeqId,
                 mode = streaming,
@@ -1711,8 +1688,7 @@ start_request({continue, From, Suffix, Opts}, SeqId, {continue, StoredTokens} = 
                 stop_max_len = StopMax,
                 thinking = thinking_from(Opts),
                 thinking_budget = thinking_budget_from(Opts),
-                session_id = maps:get(session_id, Opts),
-                tool_call_greedy_sampler_ref = GreedyRef
+                session_id = maps:get(session_id, Opts)
             },
             Req1 = setup_admission_path(Req, Mode, Suffix, Opts, Data0),
             Data1 = put_req(Data0, Req1),
@@ -1997,12 +1973,14 @@ handle_common(_State, {call, From}, {reset_session, SessionId}, Data) ->
     reply(From, {ok, Outcome}, NewData);
 handle_common(_State, {call, From}, {tokenize, Text}, Data) ->
     reply(From, wrap_ok(backend_call(Data, tokenize, [Text])), Data);
+handle_common(_State, {call, From}, {tokenize, Text, Opts}, Data) ->
+    reply(From, wrap_ok(backend_tokenize_with_opts(Data, Text, Opts)), Data);
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
     reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
     reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
-handle_common(_State, {call, From}, {chat_apply, ToolsHash, Inputs}, Data) ->
-    reply(From, do_chat_apply(Data, ToolsHash, Inputs), Data);
+handle_common(_State, {call, From}, {chat_apply, Inputs}, Data) ->
+    reply(From, do_chat_apply(Data, Inputs), Data);
 handle_common(_State, {call, From}, chat_purge, Data) ->
     barrel_inference_chat_cache:purge(Data#data.model_id),
     reply(From, ok, Data);
@@ -2197,14 +2175,16 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
     end.
 
 %% Resolve a chat templates_ref via the cache (init-once per model id)
-%% and apply the inputs to get a params_ref + rendered prompt
-%% (cached per (model_id, tools-hash)). Reaches the underlying NIF
-%% model resource via the backend module's `get_model_ref/1' getter;
-%% backends without that callback (the stub) return
-%% `{error, chat_not_supported}'.
+%% then call the autoparser fresh to get a params_ref + rendered
+%% prompt. NOTHING is cached at the params/prompt level: llama.cpp
+%% bakes `tool_choice' + `parallel_tool_calls' + message content
+%% into the synthesized `common_chat_params', so sharing across
+%% requests would be incorrect. Each call pays one
+%% `templates_apply' synthesis. The model resource is reached via
+%% the backend module's `get_model_ref/1' getter; backends without
+%% that callback (the stub) return `{error, chat_not_supported}'.
 do_chat_apply(
     #data{backend = Mod, backend_state = S, model_id = ModelId},
-    ToolsHash,
     Inputs
 ) ->
     case erlang:function_exported(Mod, get_model_ref, 1) of
@@ -2218,9 +2198,7 @@ do_chat_apply(
                 )
             of
                 {ok, Templates} ->
-                    barrel_inference_chat_cache:get_or_apply(
-                        ModelId, ToolsHash, Templates, Inputs
-                    );
+                    barrel_inference_chat:apply(Templates, Inputs);
                 Err ->
                     Err
             end
@@ -2410,7 +2388,7 @@ build_op_list(Data) ->
         fun(R, {Decodes, Prefills}) ->
             case R#req.prefill_cursor of
                 undefined ->
-                    case active_sampler_ref(R) of
+                    case R#req.sampler_ref of
                         undefined ->
                             %% prefill_only completed prefill — it's a
                             %% finisher this tick.
@@ -2437,7 +2415,7 @@ build_op_list(Data) ->
 apply_batch_budget(Ops, Data) ->
     Budget = Data#data.total_batch_budget,
     ChunkSize = maps:get(prefill_chunk_size, Data#data.policy, infinity),
-    DecCount = length([{S, O} || {S, {decode, _}} = {S, O} <- Ops, _ <- [1]]),
+    DecCount = length([1 || {_, {decode, _}} <- Ops]),
     case DecCount >= Budget of
         true ->
             %% n_batch is smaller than the number of in-flight
@@ -2521,59 +2499,23 @@ apply_step_results([{{SeqId, {prefill, Slice}}, prefilled} | T], Data) ->
     apply_step_results(T, put_req(Data, Req2));
 apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
-    case in_tool_call_span(Req) of
-        true ->
-            %% A non-marker token sampled between the tool-call markers.
-            %% The marker scanner (barrel_inference_model_llama:map_marker/2) is
-            %% stateless: it tags only the start/end marker tokens, so the
-            %% body in between arrives here as a plain token. Accumulate it
-            %% into the tool-call bytes (it is part of the call, not user
-            %% content) instead of streaming it. An EOG inside a span that
-            %% never closes still finalises the request so it cannot hang.
-            %%
-            %% EOS-bounded end-marker families (Granite-3.x, Phi-4-mini)
-            %% close the span on EOS itself. Skip emitting the EOS
-            %% token's bytes into the buffer in that case: under
-            %% `special=false' detok the special-token EOS is empty
-            %% anyway, but if a future opt-in carries a non-special
-            %% EOS its bytes would pollute FullBin. Flush via
-            %% `req_tool_call_end/2' and finish in one step.
-            EosEnd =
-                EogFlag =:= 1 andalso backend_tool_call_end_is_eos(Data),
-            Req2 =
-                case EosEnd of
-                    true ->
-                        Req1 = (req_tool_call_end(Req, Data))#req{
-                            active_sampler = normal
-                        },
-                        Req1#req{finishing = true};
-                    false ->
-                        Req1 = req_tool_call_emit(Req, Tok, Data),
-                        case EogFlag =:= 1 of
-                            true -> Req1#req{finishing = true};
-                            false -> Req1
-                        end
-                end,
-            apply_step_results(T, put_req(Data, Req2));
-        false ->
-            Req1 = req_append_token(Req, Tok),
-            Req2 = req_stream_emit(Req1, Tok, Data),
-            %% Mark terminal if eog, response_target reached, or a stop
-            %% sequence fired. matched_stop is set inside req_stream_emit
-            %% on a hit; check it here so the request is marked finishing
-            %% at the same point the existing EOG/length paths are.
-            GenLen = length(Req2#req.generated),
-            Done =
-                EogFlag =:= 1 orelse
-                    GenLen >= Req2#req.response_target orelse
-                    Req2#req.matched_stop =/= undefined,
-            Req3 =
-                case Done of
-                    true -> Req2#req{finishing = true};
-                    false -> maybe_fire_continued_for_req(Req2, Data)
-                end,
-            apply_step_results(T, put_req(Data, Req3))
-    end;
+    Req1 = req_append_token(Req, Tok),
+    Req2 = req_stream_emit(Req1, Tok, Data),
+    %% Mark terminal if eog, response_target reached, or a stop
+    %% sequence fired. matched_stop is set inside req_stream_emit
+    %% on a hit; check it here so the request is marked finishing
+    %% at the same point the existing EOG/length paths are.
+    GenLen = length(Req2#req.generated),
+    Done =
+        EogFlag =:= 1 orelse
+            GenLen >= Req2#req.response_target orelse
+            Req2#req.matched_stop =/= undefined,
+    Req3 =
+        case Done of
+            true -> Req2#req{finishing = true};
+            false -> maybe_fire_continued_for_req(Req2, Data)
+        end,
+    apply_step_results(T, put_req(Data, Req3));
 apply_step_results([{{SeqId, {decode, S}}, {thinking_token, Tok}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     case Req#req.thinking_capped of
@@ -2597,73 +2539,7 @@ apply_step_results([{{SeqId, {decode, S}}, {thinking_token, Tok}} | T], Data) ->
 apply_step_results([{{SeqId, {decode, _}}, thinking_end} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     Req1 = req_thinking_end(Req, Data),
-    apply_step_results(T, put_req(Data, Req1));
-apply_step_results([{{SeqId, {decode, _}}, {tool_call_token, Tok}} | T], Data) ->
-    Req = maps:get(SeqId, Data#data.req_table),
-    %% Some families delimit parallel calls by repeating the start
-    %% marker with no per-call end marker between them (e.g. Mistral
-    %% tekken: `[TOOL_CALLS]name1[ARGS]args1[TOOL_CALLS]name2...</s>`).
-    %% If the request is already in-span, finalise the current call so
-    %% the per-call accumulation upstream sees one `tool_call_end`
-    %% message per call, before opening the next span. Behaviour-
-    %% preserving for families with explicit per-call end markers - a
-    %% start never fires while in-span because the end fires first.
-    Req0 =
-        case in_tool_call_span(Req) of
-            true -> req_tool_call_end(Req, Data);
-            false -> Req
-        end,
-    Req1 = req_tool_call_emit(Req0#req{active_sampler = tool_call_syntax}, Tok, Data),
-    apply_step_results(T, put_req(Data, Req1));
-apply_step_results([{{SeqId, {decode, _}}, {tool_call_end, Eog}} | T], Data) ->
-    Req = maps:get(SeqId, Data#data.req_table),
-    %% Close the span: emit the carrying close message and revert to
-    %% the request's normal sampler for any post-call tokens. If the
-    %% end marker IS the eos (Mistral tekken uses `</s>` for both the
-    %% per-span end marker and the assistant turn's eos), finalise the
-    %% request so the model does not keep decoding past the close and
-    %% spam repeated calls under the greedy continuation.
-    Req1 = (req_tool_call_end(Req, Data))#req{active_sampler = normal},
-    Req2 =
-        case Eog =:= 1 of
-            true -> Req1#req{finishing = true};
-            false -> Req1
-        end,
-    apply_step_results(T, put_req(Data, Req2));
-apply_step_results([{{SeqId, {decode, _}}, {tool_call_payload_open, Tok}} | T], Data) ->
-    Req = maps:get(SeqId, Data#data.req_table),
-    %% The marker token itself is part of the captured tool-call
-    %% body bytes; emit it as a delta and accumulate. After the
-    %% marker, subsequent decode ops sample through the request's
-    %% normal sampler so caller-supplied string contents stay
-    %% diverse.
-    Req1 = req_tool_call_emit(Req, Tok, Data),
-    apply_step_results(T, put_req(Data, Req1#req{active_sampler = tool_call_payload}));
-apply_step_results([{{SeqId, {decode, _}}, {tool_call_payload_close, Tok}} | T], Data) ->
-    Req = maps:get(SeqId, Data#data.req_table),
-    %% Closing payload marker: capture its bytes and switch back to
-    %% greedy sampling for the rest of the tool-call body.
-    Req1 = req_tool_call_emit(Req, Tok, Data),
-    apply_step_results(T, put_req(Data, Req1#req{active_sampler = tool_call_syntax})).
-
-%% True while a tool-call span is open (the start marker has been seen
-%% and the end marker has not). The active sampler doubles as the span
-%% state: it is set to tool_call_syntax / tool_call_payload on the
-%% marker tokens and back to normal on tool_call_end.
-in_tool_call_span(#req{active_sampler = tool_call_syntax}) -> true;
-in_tool_call_span(#req{active_sampler = tool_call_payload}) -> true;
-in_tool_call_span(_) -> false.
-
-%% Whether the model's tool-call end marker was configured with the
-%% EOS sentinel. Drives the in-span EogFlag = 1 flush in
-%% `apply_step_results/2'. Backends that have not been updated to
-%% export `tool_call_end_is_eos/1' default to `false' (the
-%% byte-string-end behaviour stays byte-exact).
-backend_tool_call_end_is_eos(#data{backend = B, backend_state = S}) ->
-    case erlang:function_exported(B, tool_call_end_is_eos, 1) of
-        true -> B:tool_call_end_is_eos(S);
-        false -> false
-    end.
+    apply_step_results(T, put_req(Data, Req1)).
 
 %% Append the token to both context_tokens and generated.
 req_append_token(Req, Token) ->
@@ -2816,53 +2692,6 @@ req_thinking_end(
     Req#req{thinking_bytes = <<>>};
 req_thinking_end(Req, _Data) ->
     Req#req{thinking_bytes = <<>>}.
-
-%% Tool-call token: detokenise and forward as
-%% {barrel_inference_token, Ref, {tool_call_delta, Bin}} to streaming
-%% callers. Bytes accumulate on the #req so the closing
-%% `tool_call_end` can deliver the full concatenation. Non-streaming
-%% callers see no message but still accumulate, in case the result
-%% map surface ever exposes tool calls.
-req_tool_call_emit(
-    #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
-    Token,
-    Data
-) when
-    is_pid(Pid), is_reference(Ref)
-->
-    Bin =
-        case backend_call(Data, detokenize, [[Token]]) of
-            B when is_binary(B) -> B;
-            _ -> <<>>
-        end,
-    _ =
-        case Bin of
-            <<>> -> ok;
-            _ -> Pid ! {barrel_inference_token, Ref, {tool_call_delta, Bin}}
-        end,
-    Req#req{tool_call_bytes = <<(Req#req.tool_call_bytes)/binary, Bin/binary>>};
-req_tool_call_emit(Req, Token, Data) ->
-    Bin =
-        case backend_call(Data, detokenize, [[Token]]) of
-            B when is_binary(B) -> B;
-            _ -> <<>>
-        end,
-    Req#req{tool_call_bytes = <<(Req#req.tool_call_bytes)/binary, Bin/binary>>}.
-
-%% Close the current tool-call span. The full concatenated bytes go
-%% out in one message so the downstream's exact-replay map can store
-%% them without re-buffering chunks. Then reset the buffer for the
-%% next span on this request.
-req_tool_call_end(
-    #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
-    _Data
-) when
-    is_pid(Pid), is_reference(Ref)
-->
-    Pid ! {barrel_inference_tool_call_end, Ref, Req#req.tool_call_bytes},
-    Req#req{tool_call_bytes = <<>>};
-req_tool_call_end(Req, _Data) ->
-    Req#req{tool_call_bytes = <<>>}.
 
 %% Resolve the integrity signature for the just-closed thinking
 %% block. Calls the backend's optional `thinking_signature/3` with
@@ -3145,15 +2974,10 @@ notify_failure(#req{caller = From}, Err) when From =/= undefined ->
 notify_failure(_R, _Err) ->
     ok.
 
-release_sampler(#req{sampler_ref = SRef, tool_call_greedy_sampler_ref = GRef}, #data{
-    backend = Mod
-}) ->
+release_sampler(#req{sampler_ref = SRef}, #data{backend = Mod}) ->
     case erlang:function_exported(Mod, sampler_free, 1) of
-        true ->
-            free_sampler_ref(Mod, SRef),
-            free_sampler_ref(Mod, GRef);
-        false ->
-            ok
+        true -> free_sampler_ref(Mod, SRef);
+        false -> ok
     end.
 
 free_sampler_ref(_Mod, undefined) ->
@@ -3266,50 +3090,6 @@ sampler_for(Opts, Data = #data{backend = Mod, backend_state = S}) ->
             end;
         false ->
             {ok, undefined, Cfg, Data}
-    end.
-
-%% Pick the sampler ref to send with the next decode op for this
-%% request. Default is the request's normal chain; while a tool-call
-%% span is open and the optional payload sub-state isn't active, the
-%% scheduler routes through the request's greedy ref so syntax tokens
-%% sample deterministically. Falls back to the normal ref when the
-%% greedy ref couldn't be built (older backends without sampler_new).
-active_sampler_ref(#req{active_sampler = tool_call_syntax} = R) ->
-    case R#req.tool_call_greedy_sampler_ref of
-        undefined -> R#req.sampler_ref;
-        GreedyRef -> GreedyRef
-    end;
-active_sampler_ref(R) ->
-    R#req.sampler_ref.
-
-%% Pick the per-request greedy syntax sampler. A caller-supplied
-%% binary `grammar` is authoritative: it constrains tool-call syntax
-%% tokens too, so we skip the grammar-less greedy sampler and let the
-%% request's grammar chain govern every token (the `active_sampler_ref/1`
-%% fallback routes syntax through `sampler_ref` when this is
-%% `undefined`). Without a grammar, build the greedy chain as usual.
-greedy_sampler_for(Data, Cfg) when is_map(Cfg) ->
-    case maps:get(grammar, Cfg, undefined) of
-        Grammar when is_binary(Grammar) -> undefined;
-        _ -> greedy_sampler_build(Data)
-    end.
-
-%% Build a second sampler chain configured for greedy decoding
-%% (temperature = 0). The greedy chain is built whenever the backend
-%% exposes `sampler_new/2` (it is NOT gated on `tool_call_markers`);
-%% it is only consulted during a tool-call syntax span, so on a
-%% non-tool-call model it is built but never used. Tool-call syntax
-%% tokens route through it so they're byte-deterministic from a fixed
-%% prefix. Returns `undefined` when the backend has no `sampler_new/2`.
-greedy_sampler_build(#data{backend = Mod, backend_state = S}) ->
-    case erlang:function_exported(Mod, sampler_new, 2) of
-        false ->
-            undefined;
-        true ->
-            case Mod:sampler_new(S, #{temperature => 0.0}) of
-                {ok, Ref} -> Ref;
-                {error, _} -> undefined
-            end
     end.
 
 %% Parse `stop_sequences` from an Opts/Params map. Non-binary or
@@ -3675,6 +3455,12 @@ fire_finish_save_for_req(LiveTokens, Req, Data) ->
 
 fire_save_if(false, _Reason, _Tokens, _Req, _Data) ->
     not_fired;
+fire_save_if(true, _Reason, _Tokens, _Req, #data{tier = Tier}) when
+    Tier =/= disk, Tier =/= ram_file
+->
+    %% RAM-only or unknown tier: no persistent writer. The slab lives
+    %% in the in-memory tier until the request finishes; nothing to save.
+    not_fired;
 fire_save_if(true, Reason, Tokens, Req, Data) ->
     BuildMeta = build_meta_for(Reason, Tokens, Req, Data),
     T0 = erlang:monotonic_time(nanosecond),
@@ -3789,6 +3575,15 @@ backend_kv_unpack(Bin, SeqId, #data{backend = Mod, backend_state = S}) ->
 
 backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
     apply(Mod, Fn, [S | Args]).
+
+%% Tokenize via the backend's optional 3-arity callback (forwards
+%% caller-supplied options like `parse_special'). Falls back to the
+%% 2-arity callback when the backend hasn't been updated.
+backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) ->
+    case erlang:function_exported(Mod, tokenize, 3) of
+        true -> Mod:tokenize(S, Text, Opts);
+        false -> Mod:tokenize(S, Text)
+    end.
 
 %% Resolve a model() reference to a Pid that gen_statem:call/2,3
 %% accepts. Binary IDs go through the registry; pids pass through.

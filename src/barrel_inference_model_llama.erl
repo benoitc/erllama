@@ -26,6 +26,7 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     init/1,
     terminate/1,
     tokenize/2,
+    tokenize/3,
     detokenize/2,
     prefill/2,
     decode_one/2,
@@ -53,18 +54,8 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     thinking_signature/3,
     reset_context/1,
     abort_handle/1,
-    tool_call_end_is_eos/1,
     get_model_ref/1
 ]).
-
-%% Marker value that opts a model into "EOS bounds the tool-call
-%% span". Configured as `tool_call_markers => #{start => Bytes,
-%% 'end' => ?EOS_END_SENTINEL}'. Families whose wire shape ends at
-%% EOS (Granite-3.x, Phi-4-mini) use this; the scheduler flushes
-%% the tool_call_bytes buffer via the existing
-%% `barrel_inference_tool_call_end' message when EogFlag = 1 fires
-%% inside an open span.
--define(EOS_END_SENTINEL, <<"$eos">>).
 
 -record(s, {
     model :: barrel_inference_nif:model_ref(),
@@ -89,26 +80,7 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     %% the backend then behaves identically to a non-thinking
     %% backend regardless of the per-request thinking flag.
     thinking_start_ids = [] :: [barrel_inference_nif:token_id()],
-    thinking_end_ids = [] :: [barrel_inference_nif:token_id()],
-    %% Same shape for tool-call spans. Populated from the optional
-    %% `tool_call_markers` config key. Empty lists disable
-    %% recognition; the backend then behaves identically to a
-    %% non-tool-call backend.
-    tool_call_start_ids = [] :: [barrel_inference_nif:token_id()],
-    %% End-marker storage: either a list of token ids (the model
-    %% emits a byte-string end marker the scanner matches per token
-    %% via `map_marker/2'), or the atom `eos' (the model has no
-    %% per-call byte-string end marker and the span is bounded by
-    %% EOS - `tool_call_end_is_eos/1' surfaces this for the
-    %% scheduler's in-span EogFlag-flush path).
-    tool_call_end_ids = [] :: [barrel_inference_nif:token_id()] | eos,
-    %% Inner payload markers inside a tool-call span. When set the
-    %% scheduler switches the request's sampler off the greedy
-    %% variant for tokens between them, so caller-supplied string
-    %% arguments stay diverse while syntax stays byte-deterministic.
-    %% Empty lists leave the whole span on the greedy sampler.
-    tool_call_payload_start_ids = [] :: [barrel_inference_nif:token_id()],
-    tool_call_payload_end_ids = [] :: [barrel_inference_nif:token_id()]
+    thinking_end_ids = [] :: [barrel_inference_nif:token_id()]
 }).
 
 init(Config) ->
@@ -131,10 +103,7 @@ open_context(Model, Config, MOpts) ->
 
 build_state(Model, Ctx, Config, MOpts) ->
     ThinkingMarkers = maps:get(thinking_markers, Config, #{}),
-    ToolCallMarkers = maps:get(tool_call_markers, Config, #{}),
     {ThinkStart, ThinkEnd} = tokenize_markers(Model, ThinkingMarkers),
-    {ToolStart, ToolEnd} = tokenize_markers(Model, ToolCallMarkers),
-    {PayStart, PayEnd} = tokenize_payload_markers(Model, ToolCallMarkers),
     #s{
         model = Model,
         ctx = Ctx,
@@ -143,11 +112,7 @@ build_state(Model, Ctx, Config, MOpts) ->
         total_layers = safe_uint(barrel_inference_nif:model_n_layer(Model)),
         n_gpu_layers = maps:get(n_gpu_layers, MOpts, 0),
         thinking_start_ids = ThinkStart,
-        thinking_end_ids = ThinkEnd,
-        tool_call_start_ids = ToolStart,
-        tool_call_end_ids = ToolEnd,
-        tool_call_payload_start_ids = PayStart,
-        tool_call_payload_end_ids = PayEnd
+        thinking_end_ids = ThinkEnd
     }.
 
 safe_uint(N) when is_integer(N), N >= 0 -> N;
@@ -162,17 +127,7 @@ tokenize_markers(_Model, Markers) when map_size(Markers) =:= 0 ->
     {[], []};
 tokenize_markers(Model, Markers) when is_map(Markers) ->
     Start = tokenize_marker(Model, maps:get(start, Markers, undefined)),
-    End =
-        case maps:get('end', Markers, undefined) of
-            ?EOS_END_SENTINEL ->
-                %% Special-case: the family has no byte-string per-call
-                %% end marker; the scheduler flushes the open span on
-                %% EOS instead. `map_marker/2' walks ids only, so the
-                %% atom never collides with any sampled token id.
-                eos;
-            Other ->
-                tokenize_marker(Model, Other)
-        end,
+    End = tokenize_marker(Model, maps:get('end', Markers, undefined)),
     {Start, End};
 tokenize_markers(_Model, _Other) ->
     {[], []}.
@@ -188,18 +143,6 @@ tokenize_marker(Model, Bin) when is_binary(Bin) ->
         Tokens when is_list(Tokens) -> Tokens;
         _ -> []
     end.
-
-%% Tool-call payload markers live under the same `tool_call_markers`
-%% map but are optional. When both are absent the whole tool-call
-%% span stays on the greedy sampler.
-tokenize_payload_markers(_Model, Markers) when map_size(Markers) =:= 0 ->
-    {[], []};
-tokenize_payload_markers(Model, Markers) when is_map(Markers) ->
-    Start = tokenize_marker(Model, maps:get(payload_start, Markers, undefined)),
-    End = tokenize_marker(Model, maps:get(payload_end, Markers, undefined)),
-    {Start, End};
-tokenize_payload_markers(_Model, _Other) ->
-    {[], []}.
 
 terminate(#s{ctx = Ctx, model = Model}) ->
     barrel_inference_nif:free_context(Ctx),
@@ -222,6 +165,9 @@ abort_handle(#s{ctx = Ctx}) ->
 
 tokenize(#s{model = M}, Text) ->
     barrel_inference_nif:tokenize(M, Text, #{add_special => true, parse_special => false}).
+
+tokenize(#s{model = M}, Text, Opts) when is_map(Opts) ->
+    barrel_inference_nif:tokenize(M, Text, Opts).
 
 detokenize(#s{model = M}, Tokens) ->
     barrel_inference_nif:detokenize(M, Tokens).
@@ -287,69 +233,22 @@ step(#s{ctx = C} = S, Ops) ->
             Other
     end.
 
-all_markers_empty(#s{
-    thinking_start_ids = [],
-    thinking_end_ids = [],
-    tool_call_start_ids = [],
-    tool_call_end_ids = [],
-    tool_call_payload_start_ids = [],
-    tool_call_payload_end_ids = []
-}) ->
+all_markers_empty(#s{thinking_start_ids = [], thinking_end_ids = []}) ->
     true;
 all_markers_empty(_) ->
     false.
 
-map_marker({SeqId, {token, Tok, Eog}} = R, #s{
+map_marker({SeqId, {token, Tok, _Eog}} = R, #s{
     thinking_start_ids = TSI,
-    thinking_end_ids = TEI,
-    tool_call_start_ids = USI,
-    tool_call_end_ids = UEI,
-    tool_call_payload_start_ids = PSI,
-    tool_call_payload_end_ids = PEI
+    thinking_end_ids = TEI
 }) ->
-    Membership = {
-        lists:member(Tok, TSI),
-        lists:member(Tok, TEI),
-        lists:member(Tok, USI),
-        %% `tool_call_end_ids' may be the atom `eos' when the
-        %% family is configured with the EOS-bounded end-marker
-        %% sentinel. `lists:member/2' would crash on a non-list,
-        %% and there is nothing to match against per-token in
-        %% that mode (the scheduler's in-span EogFlag-flush path
-        %% drives the close); short-circuit to `false'.
-        end_id_member(Tok, UEI),
-        lists:member(Tok, PSI),
-        lists:member(Tok, PEI)
-    },
-    case Membership of
-        {true, _, _, _, _, _} -> {SeqId, {thinking_token, Tok}};
-        {_, true, _, _, _, _} -> {SeqId, thinking_end};
-        {_, _, true, _, _, _} -> {SeqId, {tool_call_token, Tok}};
-        %% Carry Eog so the scheduler can finalise the request when
-        %% the end marker IS the eos token (e.g. Mistral tekken uses
-        %% `</s>` as both the per-span end marker AND the assistant
-        %% turn's eos; without this the request keeps decoding past
-        %% the close and the model spams repeated calls under greedy).
-        {_, _, _, true, _, _} -> {SeqId, {tool_call_end, Eog}};
-        {_, _, _, _, true, _} -> {SeqId, {tool_call_payload_open, Tok}};
-        {_, _, _, _, _, true} -> {SeqId, {tool_call_payload_close, Tok}};
+    case {lists:member(Tok, TSI), lists:member(Tok, TEI)} of
+        {true, _} -> {SeqId, {thinking_token, Tok}};
+        {_, true} -> {SeqId, thinking_end};
         _ -> R
     end;
 map_marker(R, _S) ->
     R.
-
-end_id_member(_Tok, eos) -> false;
-end_id_member(Tok, Ids) when is_list(Ids) -> lists:member(Tok, Ids).
-
-%% Whether the model's tool-call end marker is the EOS sentinel
-%% (`tool_call_markers => #{'end' => <<"$eos">>}'). Read by
-%% `barrel_inference_model:apply_step_results/2' to decide
-%% whether an in-span EogFlag = 1 should flush the buffered
-%% tool_call_bytes via `barrel_inference_tool_call_end' instead
-%% of silently dropping them as the byte-string-end case does.
--spec tool_call_end_is_eos(#s{}) -> boolean().
-tool_call_end_is_eos(#s{tool_call_end_ids = eos}) -> true;
-tool_call_end_is_eos(#s{}) -> false.
 
 %% Surface the underlying NIF model resource for callers that need to
 %% hand it to `barrel_inference_chat:init/2' (the autoparser

@@ -2,9 +2,8 @@
 %% See the LICENSE file at the project root.
 %%
 %% Cache-level eunit. ETS-observable semantics only (put/lookup,
-%% LRU eviction, purge). The `get_or_init/3' + `get_or_apply/4'
-%% paths need a real model resource and are covered in
-%% `barrel_inference_chat_SUITE'.
+%% LRU eviction, purge). The `get_or_init/3' path needs a real
+%% model resource and is covered in `barrel_inference_chat_SUITE'.
 -module(barrel_inference_chat_cache_tests).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -69,18 +68,8 @@ lru_evicts_oldest(_Pid) ->
 
 purge_drops_model_entries(_Pid) ->
     ?M:put(?TAB, {templates, <<"model-a">>}, make_ref()),
-    ?M:put(?TAB, {params, <<"model-a">>, <<"hash1">>}, {make_ref(), <<"prompt">>}),
-    ?M:put(?TAB, {params, <<"model-a">>, <<"hash2">>}, {make_ref(), <<"prompt">>}),
     ok = ?M:purge(<<"model-a">>),
-    [
-        ?_assertEqual(not_found, ?M:lookup(?TAB, {templates, <<"model-a">>})),
-        ?_assertEqual(
-            not_found, ?M:lookup(?TAB, {params, <<"model-a">>, <<"hash1">>})
-        ),
-        ?_assertEqual(
-            not_found, ?M:lookup(?TAB, {params, <<"model-a">>, <<"hash2">>})
-        )
-    ].
+    ?_assertEqual(not_found, ?M:lookup(?TAB, {templates, <<"model-a">>})).
 
 purge_leaves_other_models(_Pid) ->
     ?M:put(?TAB, {templates, <<"keep">>}, keep_ref),

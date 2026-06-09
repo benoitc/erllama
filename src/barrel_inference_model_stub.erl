@@ -39,7 +39,6 @@
     thinking_signature/3,
     reset_context/1,
     abort_handle/1,
-    tool_call_end_is_eos/1,
     %% Test helpers: read back what the most recent configure_sampler
     %% / clear_sampler / apply_adapters call saw.
     last_sampler_cfg/1,
@@ -80,25 +79,6 @@
     %% phase is tracked via the process dictionary because step/2 takes
     %% no mutable state argument.
     thinking_capable = false :: boolean(),
-    %% Opt-in: when true, two `{tool_call_token, _}` decodes followed
-    %% by a `tool_call_end` are emitted after the thinking phase (or
-    %% from the start when `thinking_capable = false`). Same per-sampler
-    %% state machine as the thinking phase.
-    tool_call_capable = false :: boolean(),
-    %% Opt-in: extends the tool-call phase with payload markers,
-    %% letting tests exercise the scheduler's sampler-swap on
-    %% payload_open / payload_close. Only meaningful when
-    %% tool_call_capable is also true.
-    tool_call_payload_capable = false :: boolean(),
-    %% Opt-in: drive an exact decode-step script for the tool-call
-    %% phase. When set, each decode step consumes the head: `start`
-    %% emits a `{tool_call_token, T}`, `body` emits a plain
-    %% `{token, T, 0}`, `end_tok` emits a bare `tool_call_end`. After
-    %% the script is exhausted the stub returns to ordinary
-    %% `decode_token/2`. Lets tests exercise the engine's span
-    %% boundaries (e.g. repeated start with one final end for the
-    %% Mistral-tekken parallel-call shape) from one harness.
-    tool_call_script = undefined :: undefined | [start | body | end_tok],
     %% Opt-in: hold each `step/2' call for N ms via timer:sleep/1
     %% before returning results. Lets server-side concurrency tests
     %% deterministically keep a holder request in-flight while other
@@ -112,17 +92,8 @@
 init(Config) ->
     {ok, #stub{
         thinking_capable = bool_opt(thinking_capable, Config),
-        tool_call_capable = bool_opt(tool_call_capable, Config),
-        tool_call_payload_capable = bool_opt(tool_call_payload_capable, Config),
-        tool_call_script = script_opt(tool_call_script, Config),
         step_delay_ms = step_delay_opt(step_delay_ms, Config)
     }}.
-
-script_opt(Key, Config) ->
-    case maps:get(Key, Config, undefined) of
-        L when is_list(L) -> L;
-        _ -> undefined
-    end.
 
 bool_opt(Key, Config) ->
     case maps:get(Key, Config, false) of
@@ -175,7 +146,6 @@ kv_unpack(_S, _Bin, _SeqId) ->
 %% seq_id would inherit the prior request's state.
 seq_rm(_S, SeqId) ->
     erlang:erase({stub_phase, SeqId}),
-    erlang:erase({stub_script_pos, SeqId}),
     ok.
 
 %% Optional callback: warm_restore_primer/3 calls this to trim a seq's KV
@@ -220,153 +190,35 @@ step(S, Ops) ->
 
 stub_step_op({SeqId, {prefill, _Tokens}}, _S) ->
     {SeqId, prefilled};
-stub_step_op({SeqId, {decode, Sampler}}, #stub{tool_call_script = Script}) when
-    is_list(Script)
-->
-    drive_tool_call_script(SeqId, Sampler, Script);
-stub_step_op({SeqId, {decode, Sampler}}, #stub{
-    thinking_capable = false,
-    tool_call_capable = false
-}) ->
-    %% The token is bound to the sampler ref AND the seq_id so a
-    %% scheduler bug that swaps samplers between seqs would change
-    %% one seq's output stream and be visible in tests. The mock
-    %% never produces eog.
+stub_step_op({SeqId, {decode, Sampler}}, #stub{thinking_capable = false}) ->
     decode_token(SeqId, Sampler);
-stub_step_op(
-    {SeqId, {decode, Sampler}},
-    #stub{
-        thinking_capable = TC,
-        tool_call_capable = UC,
-        tool_call_payload_capable = PC
-    }
-) ->
-    Phase = next_phase(SeqId, TC, UC),
-    advance_phase(SeqId, Sampler, Phase, PC).
+stub_step_op({SeqId, {decode, Sampler}}, #stub{thinking_capable = true}) ->
+    Phase = next_phase(SeqId),
+    advance_phase(SeqId, Sampler, Phase).
 
-%% Phases (per-seq_id, via process dict) walk in order:
-%%   thinking_emit_0, thinking_emit_1, thinking_done,
-%%   tool_call_emit_0, [payload_open, payload_emit, payload_close,]
-%%   tool_call_emit_1 (when no payload markers), tool_call_end_due,
-%%   normal
-%% Phases for disabled features are skipped, so a stub with only
-%% thinking_capable goes thinking_emit_0 -> thinking_emit_1 ->
-%% thinking_done -> normal. The key is seq_id (not sampler ref)
-%% so mid-request sampler swaps (the greedy-on-syntax path) don't
-%% reset the state machine.
-next_phase(SeqId, TC, UC) ->
+next_phase(SeqId) ->
     case erlang:get({stub_phase, SeqId}) of
-        undefined when TC -> thinking_emit_0;
-        undefined when UC -> tool_call_emit_0;
-        undefined -> normal;
-        thinking_done when UC -> tool_call_emit_0;
-        thinking_done -> normal;
+        undefined -> thinking_emit_0;
         Other -> Other
     end.
 
-%% Phase transitions: each clause picks the next phase, then either
-%% emits a token (via with_phase_token/4) or a bare marker (via
-%% with_phase/3).
-advance_phase(SeqId, Sampler, thinking_emit_0, _PC) ->
-    with_phase_token(SeqId, Sampler, thinking_emit_1, {thinking, 0});
-advance_phase(SeqId, Sampler, thinking_emit_1, _PC) ->
-    with_phase_token(SeqId, Sampler, thinking_end_due, {thinking, 1});
-advance_phase(SeqId, _Sampler, thinking_end_due, _PC) ->
-    with_phase(SeqId, thinking_done, thinking_end);
-advance_phase(SeqId, Sampler, tool_call_emit_0, true) ->
-    with_phase_token(SeqId, Sampler, tool_call_payload_open_due, {tool_call, 0});
-advance_phase(SeqId, Sampler, tool_call_emit_0, false) ->
-    with_phase_token(SeqId, Sampler, tool_call_emit_1, {tool_call, 0});
-advance_phase(SeqId, Sampler, tool_call_emit_1, _PC) ->
-    %% Tool-call BODY token. Real backends tag only the start/end marker
-    %% tokens (barrel_inference_model_llama:map_marker/2 is stateless); the body
-    %% in between arrives as an ordinary `{token, _}`. Emit it as such so
-    %% the stub exercises the engine's in-span body capture rather than
-    %% pre-tagging it as a tool_call_token.
-    erlang:put({stub_phase, SeqId}, tool_call_end_due),
-    decode_token(SeqId, Sampler);
-advance_phase(SeqId, Sampler, tool_call_payload_open_due, _PC) ->
-    with_phase_marker(SeqId, Sampler, tool_call_payload_emit, payload_open);
-advance_phase(SeqId, Sampler, tool_call_payload_emit, _PC) ->
-    %% Payload body token: ordinary `{token, _}`, mirroring real backends
-    %% (only the markers are tagged). Previously this used
-    %% `with_phase_token(.., {tool_call, payload_body})`, which routed via
-    %% `tag_for_seed({tool_call, _}) -> tool_call_token` and pre-tagged the
-    %% body as a marker - latent stub bug, harmless to the original
-    %% in-span capture but the span-split clause in `apply_step_results/2`
-    %% now treats a second `tool_call_token` as a per-call delimiter and
-    %% would prematurely close the open span.
-    erlang:put({stub_phase, SeqId}, tool_call_payload_close_due),
-    decode_token(SeqId, Sampler);
-advance_phase(SeqId, Sampler, tool_call_payload_close_due, _PC) ->
-    with_phase_marker(SeqId, Sampler, tool_call_end_due, payload_close);
-advance_phase(SeqId, _Sampler, tool_call_end_due, _PC) ->
-    with_phase(SeqId, normal, {tool_call_end, 0});
-advance_phase(SeqId, Sampler, normal, _PC) ->
+advance_phase(SeqId, Sampler, thinking_emit_0) ->
+    erlang:put({stub_phase, SeqId}, thinking_emit_1),
+    T = erlang:phash2({thinking_stub, SeqId, Sampler, 0}) rem (1 bsl 32),
+    {SeqId, {thinking_token, T}};
+advance_phase(SeqId, Sampler, thinking_emit_1) ->
+    erlang:put({stub_phase, SeqId}, thinking_end_due),
+    T = erlang:phash2({thinking_stub, SeqId, Sampler, 1}) rem (1 bsl 32),
+    {SeqId, {thinking_token, T}};
+advance_phase(SeqId, _Sampler, thinking_end_due) ->
+    erlang:put({stub_phase, SeqId}, thinking_done),
+    {SeqId, thinking_end};
+advance_phase(SeqId, Sampler, _) ->
     decode_token(SeqId, Sampler).
-
-%% Advance the per-seq phase and return a step_result with a token
-%% derived from the (seq, sampler, seed) tuple. The seed
-%% disambiguates ticks within the same phase so two consecutive
-%% thinking_tokens get distinct ids.
-with_phase_token(SeqId, Sampler, NextPhase, Seed) ->
-    with_phase_tagged(SeqId, Sampler, NextPhase, Seed, tag_for_seed(Seed)).
-
-with_phase_marker(SeqId, Sampler, NextPhase, Marker) ->
-    with_phase_tagged(SeqId, Sampler, NextPhase, Marker, tag_for_marker(Marker)).
-
-with_phase_tagged(SeqId, Sampler, NextPhase, Seed, Tag) ->
-    erlang:put({stub_phase, SeqId}, NextPhase),
-    T = erlang:phash2({tool_call_step_stub, SeqId, Sampler, Seed}) rem (1 bsl 32),
-    {SeqId, {Tag, T}}.
-
-tag_for_seed({thinking, _}) -> thinking_token;
-tag_for_seed({tool_call, _}) -> tool_call_token.
-
-tag_for_marker(payload_open) -> tool_call_payload_open;
-tag_for_marker(payload_close) -> tool_call_payload_close.
-
-with_phase(SeqId, NextPhase, MarkerResult) ->
-    erlang:put({stub_phase, SeqId}, NextPhase),
-    {SeqId, MarkerResult}.
 
 decode_token(SeqId, Sampler) ->
     T = erlang:phash2({decode_step_stub, SeqId, Sampler}) rem (1 bsl 32),
     {SeqId, {token, T, 0}}.
-
-%% Drive the tool_call_script step by step (one element per decode op).
-%% Per-seq position is tracked in the process dict (same pattern as
-%% next_phase/3) so a wedged seq does not bleed into another.
-drive_tool_call_script(SeqId, Sampler, Script) ->
-    Pos =
-        case erlang:get({stub_script_pos, SeqId}) of
-            undefined -> 0;
-            N -> N
-        end,
-    case nth_or_undef(Pos + 1, Script) of
-        undefined ->
-            decode_token(SeqId, Sampler);
-        Element ->
-            erlang:put({stub_script_pos, SeqId}, Pos + 1),
-            emit_script_element(SeqId, Sampler, Element, Pos)
-    end.
-
-emit_script_element(SeqId, Sampler, start, Pos) ->
-    T =
-        erlang:phash2({tool_call_script_stub, SeqId, Sampler, start, Pos}) rem
-            (1 bsl 32),
-    {SeqId, {tool_call_token, T}};
-emit_script_element(SeqId, Sampler, body, Pos) ->
-    T =
-        erlang:phash2({tool_call_script_stub, SeqId, Sampler, body, Pos}) rem
-            (1 bsl 32),
-    {SeqId, {token, T, 0}};
-emit_script_element(SeqId, _Sampler, end_tok, _Pos) ->
-    {SeqId, {tool_call_end, 0}}.
-
-nth_or_undef(_, []) -> undefined;
-nth_or_undef(1, [H | _]) -> H;
-nth_or_undef(N, [_ | T]) when N > 1 -> nth_or_undef(N - 1, T).
 
 %% Deterministic per-seq stub signature. The stub ignores `Bytes`
 %% and hashes the seq_id; real backends derive their signature from
@@ -381,11 +233,6 @@ reset_context(S) ->
 %% No interruptible context; the engine relies on the per-step budget.
 abort_handle(_S) ->
     undefined.
-
-%% Stub backend has no marker configuration plumbing; report false so
-%% the scheduler's in-span EogFlag-flush path is a no-op when tests
-%% swap in the stub.
-tool_call_end_is_eos(_S) -> false.
 
 %% Test knob: arm the next step/2 to return {error, Reason} once.
 wedge_next_step(Reason) ->

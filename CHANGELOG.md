@@ -6,14 +6,33 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Removed (BREAKING)
+
+- Streaming API: `{barrel_inference_token, _, {tool_call_delta, _}}'
+  and `barrel_inference_tool_call_end' messages, plus the matching
+  step result variants. The engine no longer classifies tool-call
+  bytes mid-stream. Callers using `barrel_inference:infer/4'
+  directly buffer tokens and call `barrel_inference:chat_parse/3'
+  at done for structured extraction. HTTP wire format on the
+  server is unchanged.
+- Backend `tool_call_end_is_eos/1' callback.
+
+### Changed
+
+- `barrel_inference:chat_apply/3' becomes `chat_apply/2' (drops the
+  `ToolsHash' parameter). `barrel_inference_chat_cache' shrinks to
+  caching only the heavy `common_chat_templates_init' ref per model;
+  each request invokes `common_chat_templates_apply' fresh because
+  the synthesized parser is sensitive to `tool_choice' and
+  `parallel_tool_calls' (now folded into the NIF Inputs map).
+
 ### Added
 
-- Public `barrel_inference:chat_apply/3` + `chat_parse/3` that delegate
+- Public `barrel_inference:chat_apply/2` + `chat_parse/3` that delegate
   to `barrel_inference_chat` via the model gen_statem so callers can
-  build a `chat_params_ref' (cached per (`ModelId`, `ToolsHash`)) and
-  parse model output without touching the underlying NIF model
-  resource. Backend gains an optional `get_model_ref/1' callback;
-  the stub backend (no NIF resource) returns
+  build a `chat_params_ref' and parse model output without touching
+  the underlying NIF model resource. Backend gains an optional
+  `get_model_ref/1' callback; the stub backend returns
   `{error, chat_not_supported}'. `chat_purge/1' drops cached entries
   on demand for a given model id.
 

@@ -59,9 +59,10 @@ an explicit `model_id` in the config map.
     list_models/0,
     model_info/1,
     tokenize/2,
+    tokenize/3,
     detokenize/2,
     apply_chat_template/2,
-    chat_apply/3,
+    chat_apply/2,
     chat_parse/3,
     embed/2,
     load_adapter/2,
@@ -224,14 +225,6 @@ async messages:
   exactly once per closed block before any subsequent
   `{barrel_inference_token, _, _}` message. `Sig` is `<<>>` when no
   signature is available
-- `{barrel_inference_token, Ref, {tool_call_delta, Bin :: binary()}}` —
-  fragment of a tool-call body; emitted between a `tool_call`
-  start marker and an end marker when the model is loaded with
-  `tool_call_markers`
-- `{barrel_inference_tool_call_end, Ref, Full :: binary()}` — close marker
-  for a tool-call span; carries the full concatenated bytes of
-  every `{tool_call_delta, _}` sent for the span so the downstream
-  can store them verbatim for byte-exact replay on later turns
 - `{barrel_inference_done, Ref, Stats}` — normal completion
 - `{barrel_inference_error, Ref, Reason}` — failure
 
@@ -497,6 +490,18 @@ concurrently with `complete/2,3`.
 tokenize(Model, Text) ->
     barrel_inference_model:tokenize(Model, Text).
 
+-doc """
+Tokenise text with explicit options. `parse_special => true' lets
+chat-template markers (e.g. `[INST]', `[AVAILABLE_TOOLS]') decode to
+single special-token ids; the 2-arity form keeps them as raw bytes
+to match user-typed input. The pipeline uses the 3-arity form for
+prompt rendered through `chat_apply/2'.
+""".
+-spec tokenize(model(), binary(), map()) ->
+    {ok, [barrel_inference_nif:token_id()]} | {error, term()}.
+tokenize(Model, Text, Opts) when is_map(Opts) ->
+    barrel_inference_model:tokenize(Model, Text, Opts).
+
 -doc "Detokenise a list of token ids back to text.".
 -spec detokenize(model(), [barrel_inference_nif:token_id()]) ->
     {ok, binary()} | {error, term()}.
@@ -514,14 +519,15 @@ apply_chat_template(Model, Request) ->
 
 -doc """
 Build a chat_params_ref + rendered prompt for `Model' via llama.cpp's
-autoparser. `ToolsHash' is a stable identifier for the tools set
-(same hash <=> same cached params_ref + prompt). `Inputs' is the
-map fed to `barrel_inference_chat:apply/2'.
+autoparser. `Inputs' is the map fed to `barrel_inference_chat:apply/2'
+(`messages', `tools', `tool_choice', `parallel_tool_calls').
+Each call synthesizes fresh params + prompt; only the model-level
+`templates_ref' is cached.
 """.
--spec chat_apply(model(), binary(), map()) ->
+-spec chat_apply(model(), map()) ->
     {ok, barrel_inference_nif:chat_params_ref(), binary()} | {error, term()}.
-chat_apply(Model, ToolsHash, Inputs) ->
-    barrel_inference_model:chat_apply(Model, ToolsHash, Inputs).
+chat_apply(Model, Inputs) ->
+    barrel_inference_model:chat_apply(Model, Inputs).
 
 -doc """
 Parse a model output string into a structured assistant message via

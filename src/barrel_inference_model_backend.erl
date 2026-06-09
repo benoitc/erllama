@@ -188,16 +188,6 @@ inference, etc.) can plug in via this same surface.
 %% alone.
 -callback abort_handle(state()) -> {ok, term()} | undefined.
 
-%% Optional. Whether the model's tool-call end marker was configured
-%% with the EOS sentinel (`tool_call_markers => #{'end' => <<"$eos">>}`).
-%% When true, `barrel_inference_model:apply_step_results/2' flushes
-%% the in-span tool_call_bytes buffer via `barrel_inference_tool_call_end'
-%% on the first EogFlag = 1 token instead of dropping it as it does
-%% for byte-string-end families. Backends that have not been
-%% updated return `false' (or omit the callback; the scheduler
-%% checks `function_exported/3' and defaults to false).
--callback tool_call_end_is_eos(state()) -> boolean().
-
 -optional_callbacks([
     kv_pack/3,
     kv_unpack/3,
@@ -220,8 +210,7 @@ inference, etc.) can plug in via this same surface.
     verify/4,
     thinking_signature/3,
     reset_context/1,
-    abort_handle/1,
-    tool_call_end_is_eos/1
+    abort_handle/1
 ]).
 
 -type sampler_opts() :: #{
@@ -251,32 +240,7 @@ inference, etc.) can plug in via this same surface.
     %% The scheduler resolves a signature via thinking_signature/1
     %% (or `<<>>` when the callback is not exported) and sends
     %% {barrel_inference_thinking_end, Ref, Sig} before any subsequent token.
-    | thinking_end
-    %% Tool-call token: scheduler detokenises and emits
-    %% {barrel_inference_token, Ref, {tool_call_delta, Bin}} so the downstream
-    %% can capture the exact bytes the model produced for the call.
-    %% Backends without tool-call markers never emit this variant.
-    | {tool_call_token, barrel_inference_nif:token_id()}
-    %% Marker that the current tool-call span has closed. The
-    %% scheduler emits {barrel_inference_tool_call_end, Ref, Full :: binary()}
-    %% carrying the concatenated bytes of every {tool_call_delta, _}
-    %% it sent for this span, so the downstream does not have to
-    %% buffer chunks itself. The Eog field carries the source token's
-    %% eog flag so the scheduler can finalise the request when the
-    %% end marker IS the eos token (Mistral tekken uses `</s>` for both).
-    | {tool_call_end, Eog :: 0 | 1}
-    %% Optional inner markers within a tool-call span. When the
-    %% backend has `tool_call_markers.payload_start` / `payload_end`
-    %% configured these mark the boundaries of string-payload
-    %% regions: the scheduler switches the request's sampler from
-    %% the greedy variant (used for tool-call syntax) back to the
-    %% request's normal sampler for payload bytes, then back to
-    %% greedy on payload_close. The token id is included so the
-    %% marker's bytes still land in the captured tool_call_delta
-    %% stream (the downstream's exact-replay map needs them).
-    %% Backends without payload markers never emit these variants.
-    | {tool_call_payload_open, barrel_inference_nif:token_id()}
-    | {tool_call_payload_close, barrel_inference_nif:token_id()}.
+    | thinking_end.
 
 -export_type([sampler_opts/0, seq_id/0, sampler_ref/0, step_op/0, step_result/0]).
 

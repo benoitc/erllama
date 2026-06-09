@@ -3,28 +3,35 @@
 %%
 -module(barrel_inference_chat_cache).
 -moduledoc """
-LRU cache for `barrel_inference_chat' templates_ref + params_ref.
+LRU cache for `barrel_inference_chat' templates_ref.
 
-The autoparser's templates_apply path is heavy (re-renders the jinja
-template several times to diff with/without tools). Parse-only is
-cheap. The cache amortises template apply by `{ModelIdBin, ToolsHash}'.
+The autoparser's `templates_init' is heavy (jinja parse + setup);
+amortise by caching the resulting `templates_ref' per `ModelIdBin'.
+Params synthesis (`templates_apply') is NOT cached: it depends on
+`tool_choice' + `parallel_tool_calls' + the prompt-message
+content, and llama.cpp bakes those into the synthesized
+`common_chat_params'; sharing the params across requests with
+different tool_choice / parallel_tool_calls / messages would be
+incorrect. Each request pays one `templates_apply' synthesis. A
+future render-only NIF will let us split synthesis from prompt
+render and cache params per `(ModelId, ToolsHash, tool_choice,
+parallel_tool_calls)'.
 
-The cache is keyed on the stable `ModelIdBin' binary (NOT on a model
-resource ref) so cached entries never extend a model's lifetime past
-unload. The model layer calls `purge/1' on its `terminate/1' to drop
-every entry for the model.
+The cache is keyed on the stable `ModelIdBin' binary so cached
+entries never extend a model's lifetime past unload. The model
+layer calls `purge/1' on its `terminate/1' to drop every entry
+for the model.
 
-Eviction (LRU + `purge/1') removes the resource term from ETS; the
-underlying NIF resource destructor runs on the next BEAM GC. Tests
-do NOT assert destructor timing; the cache contract is "no reachable
-Erlang reference after eviction."
+Eviction (LRU + `purge/1') removes the resource term from ETS;
+the underlying NIF resource destructor runs on the next BEAM GC.
+Tests do NOT assert destructor timing; the cache contract is
+"no reachable Erlang reference after eviction."
 
-`get_or_init/3' and `get_or_apply/4' invoke NIFs that need a real
-model resource; the unit tests in
-`barrel_inference_chat_cache_tests' exercise `put/3' + `lookup/2'
-directly on synthetic terms. The "double-init returns same ref"
-high-level guarantee is covered in the real-model
-`barrel_inference_chat_SUITE'.
+`get_or_init/3' invokes a NIF that needs a real model resource;
+the unit tests in `barrel_inference_chat_cache_tests' exercise
+`put/3' + `lookup/2' directly on synthetic terms. The
+"double-init returns same ref" high-level guarantee is covered in
+the real-model `barrel_inference_chat_SUITE'.
 """.
 
 -behaviour(gen_server).
@@ -33,7 +40,6 @@ high-level guarantee is covered in the real-model
 -export([
     start_link/0,
     get_or_init/3,
-    get_or_apply/4,
     purge/1
 ]).
 
@@ -84,33 +90,6 @@ get_or_init(ModelIdBin, ModelRef, TemplateOverride) when
                 {ok, Ref} ->
                     ok = put(?TAB, Key, Ref),
                     {ok, Ref};
-                Err ->
-                    Err
-            end
-    end.
-
-%% Apply a tools-set to a templates_ref and cache the result. Caches
-%% by {ModelIdBin, ToolsHash}; same key returns the same params_ref
-%% and the same rendered prompt bytes.
--spec get_or_apply(
-    ModelIdBin :: binary(),
-    ToolsHash :: binary(),
-    TemplatesRef :: barrel_inference_chat:templates_ref(),
-    Inputs :: map()
-) ->
-    {ok, barrel_inference_chat:params_ref(), binary()} | {error, term()}.
-get_or_apply(ModelIdBin, ToolsHash, TemplatesRef, Inputs) when
-    is_binary(ModelIdBin), is_binary(ToolsHash), is_map(Inputs)
-->
-    Key = {params, ModelIdBin, ToolsHash},
-    case lookup(?TAB, Key) of
-        {ok, {Params, PromptBin}} ->
-            {ok, Params, PromptBin};
-        not_found ->
-            case barrel_inference_chat:apply(TemplatesRef, Inputs) of
-                {ok, Params, PromptBin} ->
-                    ok = put(?TAB, Key, {Params, PromptBin}),
-                    {ok, Params, PromptBin};
                 Err ->
                     Err
             end
@@ -175,8 +154,6 @@ handle_call({purge, ModelIdBin}, _From, S) ->
         fun({Key, _V, _Seq}, _Acc) ->
             case Key of
                 {templates, MId} when MId =:= ModelIdBin ->
-                    ets:delete(?TAB, Key);
-                {params, MId, _Hash} when MId =:= ModelIdBin ->
                     ets:delete(?TAB, Key);
                 _ ->
                     ok

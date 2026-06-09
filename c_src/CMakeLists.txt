@@ -166,8 +166,6 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 target_link_libraries(barrel_inference_nif PRIVATE
-    llama
-    ggml
     llama-common
     Threads::Threads
 )

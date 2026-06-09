@@ -231,6 +231,21 @@ common_chat_tool_choice map_tool_choice(ErlNifEnv *env, ERL_NIF_TERM map) {
     return COMMON_CHAT_TOOL_CHOICE_AUTO;
 }
 
+/* Map boolean key `parallel_tool_calls' -> bool.
+ * Defaults to false when absent / wrong type. */
+bool map_parallel_tool_calls(ErlNifEnv *env, ERL_NIF_TERM map) {
+    ERL_NIF_TERM kterm = enif_make_atom(env, "parallel_tool_calls");
+    ERL_NIF_TERM v;
+    if (!enif_get_map_value(env, map, kterm, &v)) {
+        return false;
+    }
+    char buf[8];
+    if (enif_get_atom(env, v, buf, sizeof(buf), ERL_NIF_LATIN1) == 0) {
+        return false;
+    }
+    return std::string(buf) == "true";
+}
+
 ERL_NIF_TERM mk_string_bin(ErlNifEnv *env, const std::string &s) {
     ERL_NIF_TERM bin;
     unsigned char *buf = enif_make_new_binary(env, s.size(), &bin);
@@ -340,6 +355,7 @@ extern "C" ERL_NIF_TERM nif_chat_templates_apply(
                 common_chat_tools_parse_oaicompat(nlohmann::json::parse(tools_json));
         }
         inputs.tool_choice = map_tool_choice(env, argv[1]);
+        inputs.parallel_tool_calls = map_parallel_tool_calls(env, argv[1]);
 
         common_chat_params params =
             common_chat_templates_apply(th->ptr.get(), inputs);
