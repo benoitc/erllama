@@ -6,6 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- Bump vendored llama.cpp from b9334 to b9585. No API-breaking changes
+  on our touchpoints; brings `common/chat*` bug fixes (LFM2 reasoning,
+  tool-parser unification). UPDATE_LLAMA.md refreshed to document
+  the `common/` + `vendor/` sync the prior procedure left implicit.
+
 ### Removed (BREAKING)
 
 - Streaming API: `{barrel_inference_token, _, {tool_call_delta, _}}'

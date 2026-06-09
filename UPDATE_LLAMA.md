@@ -1,7 +1,7 @@
 # Updating the vendored llama.cpp
 
 Barrel Inference vendors a pinned copy of llama.cpp under `c_src/llama.cpp/`.
-The current pin is **b9222**.
+The current pin is **b9585**.
 
 This file documents the bump procedure.
 
@@ -25,6 +25,11 @@ c_src/llama.cpp/
   cmake/                    CMake helpers (toolchain files, etc)
   include/                  public headers (llama.h, etc)
   src/                      llama core (model.cpp, context.cpp, etc)
+  common/                   common_chat_* + jinja (autoparser path)
+  vendor/                   header-only deps common/ links against
+    cpp-httplib             pulled in by common's hf-cache / download
+    nlohmann                nlohmann::json used by common chat code
+    miniaudio, sheredom, stb other small header-only deps
   ggml/
     CMakeLists.txt
     cmake/                  ggml CMake helpers (common.cmake, GitVars.cmake)
@@ -42,8 +47,8 @@ c_src/llama.cpp/
 Excluded (unused or out-of-scope for v1):
 
 - `tools/`, `examples/`, `tests/`, `docs/`, `models/`, `gguf-py/`,
-  `benches/`, `ci/`, `scripts/`, `grammars/`, `vendor/`, `.git/`,
-  `.github/`, `AUTHORS`, `.devops/`
+  `benches/`, `ci/`, `scripts/`, `grammars/`, `.git/`,
+  `.github/`, `AUTHORS`, `.devops/`, `app/`
 - ggml backends we do not link: Vulkan, SYCL, OpenCL, CANN, Hexagon,
   HIP, MUSA, RPC, ZDNN, ZenDNN, Virtgpu, Webgpu, OpenVINO
 
@@ -67,7 +72,7 @@ cd /Users/benoitc/Projects/barrel_inference
 rm -rf c_src/llama.cpp
 mkdir -p c_src/llama.cpp/ggml/src
 
-cp -r /tmp/llama.cpp.new/{src,include,cmake,CMakeLists.txt,LICENSE} \
+cp -r /tmp/llama.cpp.new/{src,include,cmake,common,vendor,CMakeLists.txt,LICENSE} \
       c_src/llama.cpp/
 cp -r /tmp/llama.cpp.new/ggml/{include,cmake,CMakeLists.txt} \
       c_src/llama.cpp/ggml/
@@ -107,9 +112,14 @@ BARREL_INFERENCE_OPTS="-DCMAKE_BUILD_TYPE=Debug" # debug build
 
 The build step honours `BARREL_INFERENCE_BUILDOPTS` (passed to `cmake --build`).
 
-## Why we drop `common/`
+## Why we ship `common/`
 
-llama.cpp's `common/` carries HTTP / Hugging Face download helpers
-that pull in cpp-httplib (5 MB). Barrel Inference uses the public `llama.h` API
-directly and provides its own thin sampling / tokenization helpers in
-the NIF; nothing in `common/` is on our critical path.
+llama.cpp's `common/` carries the chat-template pipeline (`common_chat_*`,
+the PEG autoparser, jinja runtime) that the autoparser path in barrel
+depends on (`apps/barrel_inference/c_src/barrel_inference_chat_nif.cpp`).
+It also pulls in HTTP / Hugging Face download helpers we do not use,
+which is why `common/` indirectly depends on `vendor/cpp-httplib` and
+`vendor/nlohmann` — those have to ship too even though we never call
+the HTTP code path. We could prune `hf-cache.cpp` + `download.cpp` and
+drop the http vendor cost, but the diff drifts on each bump; carrying
+~5 MB extra source is cheaper than maintaining the patch.
