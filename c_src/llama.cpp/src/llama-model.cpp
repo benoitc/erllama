@@ -2285,6 +2285,40 @@ void llama_model_free(llama_model * model) {
     delete model;
 }
 
+// barrel_inference local addition: expose the model's mmap regions so a
+// caller can run mincore(2)/mlock(2) against just the resident working
+// set after the first prefill (the `lazy_then_pin_resident' mode).
+size_t llama_model::n_mappings() const {
+    if (pimpl == nullptr) {
+        return 0;
+    }
+    return pimpl->mappings.size();
+}
+
+void llama_model::get_mapping(size_t idx, void ** addr, size_t * size) const {
+    if (addr != nullptr) { *addr = nullptr; }
+    if (size != nullptr) { *size = 0; }
+    if (pimpl == nullptr) { return; }
+    if (idx >= pimpl->mappings.size()) { return; }
+    const auto & m = pimpl->mappings[idx];
+    if (m == nullptr) { return; }
+    if (addr != nullptr) { *addr = m->addr(); }
+    if (size != nullptr) { *size = m->size(); }
+}
+
+size_t llama_model_n_mappings(const llama_model * model) {
+    if (model == nullptr) { return 0; }
+    return model->n_mappings();
+}
+
+void llama_model_get_mapping(
+        const llama_model * model, size_t idx, void ** addr, size_t * size) {
+    if (addr != nullptr) { *addr = nullptr; }
+    if (size != nullptr) { *size = 0; }
+    if (model == nullptr) { return; }
+    model->get_mapping(idx, addr, size);
+}
+
 int32_t llama_model_n_ctx_train(const llama_model * model) {
     return model->hparams.n_ctx_train;
 }

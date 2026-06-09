@@ -8,6 +8,22 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- `barrel_inference_nif:pin_resident_pages/1' and the matching optional
+  backend callback. Walks every mmap region of a loaded model, runs
+  `mincore(2)' per region to find the resident pages, then `mlock(2)'s
+  each contiguous run. Returns the total bytes pinned. Used by the
+  server's `weight_residency = lazy_then_pin_resident' mode: after the
+  first request completes, the working set selected by the prompt is
+  pinned so it cannot be paged out under memory pressure. Partial
+  mlock failures (RLIMIT_MEMLOCK exhausted, EPERM) are logged but not
+  fatal. The scheduler triggers the call once per model load in
+  `finish_req' when the `pin_resident_after_first_request' flag is on,
+  then clears the flag.
+- llama.cpp local accessors: `llama_model_n_mappings(model)' and
+  `llama_model_get_mapping(model, idx, &addr, &size)'. Expose the
+  model's mmap regions without breaking the pimpl encapsulation,
+  so the NIF can run `mincore'/`mlock' against just the weight bytes.
+
 - `llama_model_params.prefetch' (bool). When `false', the NIF asks the
   kernel to use `POSIX_MADV_RANDOM' on the model's mmap region instead
   of the default `POSIX_MADV_WILLNEED', so weights page in on first

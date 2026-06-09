@@ -647,6 +647,12 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // barrel_inference local addition: surface the model's mmap regions
+    // so the C API (llama_model_n_mappings / llama_model_get_mapping)
+    // can read them without breaking the pimpl encapsulation.
+    size_t n_mappings() const;
+    void get_mapping(size_t idx, void ** addr, size_t * size) const;
+
 protected:
     llama_model_params params;
 

@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 /* Sentinel returned by barrel_inference_safe_decode when llama_decode threw a
  * C++ exception. Distinct from any documented llama_decode return
@@ -849,6 +850,72 @@ static ERL_NIF_TERM nif_model_size(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     uint64_t sz = barrel_inference_safe_model_size(m->model);
     pthread_mutex_unlock(&m->mu);
     return enif_make_uint64(env, sz);
+}
+
+/* nif_pin_resident_pages(model_ref) -> {ok, ResidentBytes} | {error, atom()}
+ *
+ * Walks every mmap region the model holds, runs mincore(2) per region to
+ * find which pages have been faulted in so far, then mlock(2)'s each
+ * contiguous run of resident pages. Returns the total bytes pinned.
+ *
+ * Used by `weight_residency = lazy_then_pin_resident'. After the model
+ * loads with prefetch=false and the first inference runs, the kernel has
+ * paged in just the FFN rows / attention blocks the prompt needed; this
+ * NIF call freezes that working set so it cannot be paged out under
+ * pressure. Subsequent prompts that hit the same regions stay warm; new
+ * regions still page in lazily but are NOT pinned.
+ *
+ * mlock failures (RLIMIT_MEMLOCK exhausted, EPERM, ENOMEM) are not fatal:
+ * the call returns whatever it managed to pin and the caller logs.
+ */
+static ERL_NIF_TERM nif_pin_resident_pages(ErlNifEnv *env, int argc,
+                                            const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    barrel_inference_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&m->mu);
+    if (!m->model) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { page_size = 4096; }
+    size_t total_pinned = 0;
+    size_t nm = llama_model_n_mappings(m->model);
+    for (size_t i = 0; i < nm; i++) {
+        void *addr = NULL;
+        size_t sz = 0;
+        llama_model_get_mapping(m->model, i, &addr, &sz);
+        if (addr == NULL || sz == 0) { continue; }
+        size_t npages = (sz + (size_t)page_size - 1) / (size_t)page_size;
+        /* macOS mincore takes char*, Linux/FreeBSD take unsigned char*.
+         * unsigned char* is implicitly convertible on macOS, so use the
+         * portable type that fits both signatures. */
+        unsigned char *vec = (unsigned char *) malloc(npages);
+        if (vec == NULL) { continue; }
+#if defined(__APPLE__)
+        if (mincore(addr, sz, (char *) vec) != 0) { free(vec); continue; }
+#else
+        if (mincore(addr, sz, vec) != 0) { free(vec); continue; }
+#endif
+        size_t run_start = (size_t) -1;
+        for (size_t p = 0; p <= npages; p++) {
+            int in_core = (p < npages) && (vec[p] & 1);
+            if (in_core && run_start == (size_t) -1) {
+                run_start = p;
+            } else if (!in_core && run_start != (size_t) -1) {
+                void *r_addr = (char *) addr + run_start * (size_t) page_size;
+                size_t r_len = (p - run_start) * (size_t) page_size;
+                if (mlock(r_addr, r_len) == 0) { total_pinned += r_len; }
+                run_start = (size_t) -1;
+            }
+        }
+        free(vec);
+    }
+    pthread_mutex_unlock(&m->mu);
+    return enif_make_tuple2(env, atom_ok, enif_make_uint64(env, total_pinned));
 }
 
 static ERL_NIF_TERM nif_model_n_layer(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
@@ -3584,6 +3651,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_vram_info",    0, nif_vram_info,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_size",   1, nif_model_size,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_n_layer",1, nif_model_n_layer,ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_pin_resident_pages", 1, nif_pin_resident_pages,
+        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_grammar_cache_stats", 1, nif_grammar_cache_stats, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_forward_with_argmax", 2, nif_forward_with_argmax,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
