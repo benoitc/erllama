@@ -23,6 +23,23 @@ responses paths.
 
 -export_type([templates_ref/0, params_ref/0, parsed_msg/0]).
 
+%% Observer callbacks. Modules registered via set_observer/1 must
+%% export both functions; the dispatch is dynamic but explicitly
+%% declared as a callback so static analysis (Elvis,
+%% no_invalid_dynamic_calls) recognises the pattern as intentional.
+-callback observe_chat_apply_duration(
+    Variant :: apply | render_only | make_params,
+    ElapsedMicros :: non_neg_integer()
+) -> any().
+-callback observe_chat_parse_duration(
+    IsPartial :: boolean(),
+    ElapsedMicros :: non_neg_integer()
+) -> any().
+-optional_callbacks([
+    observe_chat_apply_duration/2,
+    observe_chat_parse_duration/2
+]).
+
 -type templates_ref() :: barrel_inference_nif:chat_templates_ref().
 -type params_ref() :: barrel_inference_nif:chat_params_ref().
 
