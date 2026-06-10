@@ -1,5 +1,9 @@
 # Weight residency: real-model bench
 
+The operator-facing description of these modes and how to pick one
+lives in the server guide `Weight residency`. This page is the
+maintainer-facing numbers behind it.
+
 Measures the four `weight_residency` modes against a real GGUF so the
 manifest knob's behaviour matches the spec the loader documents.
 
