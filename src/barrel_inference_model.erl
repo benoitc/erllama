@@ -2238,10 +2238,33 @@ do_chat_apply(
                 )
             of
                 {ok, Templates} ->
-                    barrel_inference_chat:apply(Templates, Inputs);
+                    do_chat_apply_with_cache(ModelId, Templates, Inputs);
                 Err ->
                     Err
             end
+    end.
+
+%% Two-step path: look up (or build + cache) the synthesised PEG
+%% parser arena keyed by (ModelId, ToolsHash, ToolChoice, Parallel),
+%% then render the prompt via the cheap render-only call. Falls back
+%% to a single full `chat:apply' when the params cache lookup fails
+%% (e.g. NIF error during make_params) so callers always see a
+%% sensible {ok, ParamsRef, Prompt} or a propagated error.
+do_chat_apply_with_cache(ModelId, Templates, Inputs) ->
+    case
+        barrel_inference_chat_cache:get_or_make_params(
+            ModelId, Templates, Inputs
+        )
+    of
+        {ok, Params} ->
+            case barrel_inference_chat:render_only(Templates, Inputs) of
+                {ok, Prompt} -> {ok, Params, Prompt};
+                Err -> Err
+            end;
+        {error, _} ->
+            %% make_params failed; try the one-shot path so a transient
+            %% NIF hiccup still produces a result for this request.
+            barrel_inference_chat:apply(Templates, Inputs)
     end.
 
 build_model_info(State, Data) ->

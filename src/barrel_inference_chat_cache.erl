@@ -3,35 +3,32 @@
 %%
 -module(barrel_inference_chat_cache).
 -moduledoc """
-LRU cache for `barrel_inference_chat' templates_ref.
+LRU cache for `barrel_inference_chat' templates_ref AND params_ref.
 
-The autoparser's `templates_init' is heavy (jinja parse + setup);
-amortise by caching the resulting `templates_ref' per `ModelIdBin'.
-Params synthesis (`templates_apply') is NOT cached: it depends on
-`tool_choice' + `parallel_tool_calls' + the prompt-message
-content, and llama.cpp bakes those into the synthesized
-`common_chat_params'; sharing the params across requests with
-different tool_choice / parallel_tool_calls / messages would be
-incorrect. Each request pays one `templates_apply' synthesis. A
-future render-only NIF will let us split synthesis from prompt
-render and cache params per `(ModelId, ToolsHash, tool_choice,
-parallel_tool_calls)'.
+Two slots share one ETS table and one LRU budget:
+
+- `{templates, ModelIdBin}` → `templates_ref'.
+  The autoparser's `templates_init' is heavy (jinja parse + setup);
+  amortise by caching the resulting `templates_ref' per `ModelIdBin'.
+- `{params, ModelIdBin, ToolsHash, ToolChoice, Parallel}` → `params_ref'.
+  The autoparser's PEG arena synthesis (formerly inside
+  `templates_apply') is even heavier; with the render-only NIF split
+  we cache the parser per `(tools-hash, tool_choice,
+  parallel_tool_calls)' on the model. Per-request work is the cheap
+  jinja render via `barrel_inference_chat:render_only/2'.
 
 The cache is keyed on the stable `ModelIdBin' binary so cached
 entries never extend a model's lifetime past unload. The model
 layer calls `purge/1' on its `terminate/1' to drop every entry
-for the model.
+for the model (both slots).
 
 Eviction (LRU + `purge/1') removes the resource term from ETS;
 the underlying NIF resource destructor runs on the next BEAM GC.
-Tests do NOT assert destructor timing; the cache contract is
-"no reachable Erlang reference after eviction."
 
-`get_or_init/3' invokes a NIF that needs a real model resource;
-the unit tests in `barrel_inference_chat_cache_tests' exercise
-`put/3' + `lookup/2' directly on synthetic terms. The
-"double-init returns same ref" high-level guarantee is covered in
-the real-model `barrel_inference_chat_SUITE'.
+`get_or_init/3' and `get_or_make_params/4' invoke NIFs that need
+real model + templates resources; the unit tests exercise `put/3' +
+`lookup/2' directly on synthetic terms. End-to-end "double-call
+returns same ref" guarantees live in `barrel_inference_chat_SUITE'.
 """.
 
 -behaviour(gen_server).
@@ -40,6 +37,7 @@ the real-model `barrel_inference_chat_SUITE'.
 -export([
     start_link/0,
     get_or_init/3,
+    get_or_make_params/3,
     purge/1
 ]).
 
@@ -81,12 +79,40 @@ start_link() ->
 get_or_init(ModelIdBin, ModelRef, TemplateOverride) when
     is_binary(ModelIdBin)
 ->
-    Key = {templates, ModelIdBin},
+    cached_or_build(
+        {templates, ModelIdBin},
+        fun() -> barrel_inference_chat:init(ModelRef, TemplateOverride) end
+    ).
+
+%% Get (or build + cache) a params_ref for the given templates +
+%% (tools, tool_choice, parallel_tool_calls). The cache key is
+%% derived from a SHA-256 of the JSON-encoded tools list, so two
+%% requests with the same tools schema (the common case across turns
+%% of one conversation) share one parser. Inputs is the SAME map
+%% `barrel_inference_chat:make_params/2' expects (messages, tools,
+%% tool_choice, parallel_tool_calls).
+-spec get_or_make_params(
+    ModelIdBin :: binary(),
+    Templates :: barrel_inference_chat:templates_ref(),
+    Inputs :: map()
+) ->
+    {ok, barrel_inference_chat:params_ref()} | {error, term()}.
+get_or_make_params(ModelIdBin, Templates, Inputs) when
+    is_binary(ModelIdBin), is_map(Inputs)
+->
+    cached_or_build(
+        params_key(ModelIdBin, Inputs),
+        fun() -> barrel_inference_chat:make_params(Templates, Inputs) end
+    ).
+
+%% Shared cache fast path: return the cached ref on hit, or run the
+%% builder fun and insert its result on miss.
+cached_or_build(Key, BuildFn) ->
     case lookup(?TAB, Key) of
         {ok, Ref} ->
             {ok, Ref};
         not_found ->
-            case barrel_inference_chat:init(ModelRef, TemplateOverride) of
+            case BuildFn() of
                 {ok, Ref} ->
                     ok = put(?TAB, Key, Ref),
                     {ok, Ref};
@@ -95,9 +121,20 @@ get_or_init(ModelIdBin, ModelRef, TemplateOverride) when
             end
     end.
 
-%% Drop every entry whose key references the given ModelIdBin.
-%% Called by the model layer's terminate/1 on unload so cached refs
-%% do not extend templates_ref / params_ref lifetimes past unload.
+%% Build the params-cache key. SHA-256 over the tools JSON keeps it
+%% bounded regardless of how big the tools array gets; the atoms
+%% (`tool_choice', `parallel_tool_calls') hash by value verbatim.
+params_key(ModelIdBin, Inputs) ->
+    Tools = maps:get(tools, Inputs, <<"[]">>),
+    ToolChoice = maps:get(tool_choice, Inputs, auto),
+    Parallel = maps:get(parallel_tool_calls, Inputs, false),
+    ToolsHash = crypto:hash(sha256, iolist_to_binary(Tools)),
+    {params, ModelIdBin, ToolsHash, ToolChoice, Parallel}.
+
+%% Drop every entry whose key references the given ModelIdBin (both
+%% the templates slot and any params slots). Called by the model
+%% layer's terminate/1 on unload so cached refs do not extend
+%% templates_ref / params_ref lifetimes past unload.
 -spec purge(binary()) -> ok.
 purge(ModelIdBin) when is_binary(ModelIdBin) ->
     gen_server:call(?SERVER, {purge, ModelIdBin}).
@@ -154,6 +191,8 @@ handle_call({purge, ModelIdBin}, _From, S) ->
         fun({Key, _V, _Seq}, _Acc) ->
             case Key of
                 {templates, MId} when MId =:= ModelIdBin ->
+                    ets:delete(?TAB, Key);
+                {params, MId, _ToolsH, _TC, _Par} when MId =:= ModelIdBin ->
                     ets:delete(?TAB, Key);
                 _ ->
                     ok

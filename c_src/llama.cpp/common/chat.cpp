@@ -2358,6 +2358,15 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         return data;
     }
 
+    if (inputs.skip_parser_synthesis) {
+        // barrel_inference local addition: short-circuit to a render-only
+        // path so callers caching the synthesised parser separately do
+        // not pay the autoparser cost on every request.
+        common_chat_params data;
+        data.prompt = common_chat_template_direct_apply_impl(tmpl, params);
+        return data;
+    }
+
     if (auto result = common_chat_try_specialized_template(tmpl, src, params)) {
         return *result;
     }

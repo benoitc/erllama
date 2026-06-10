@@ -6,7 +6,28 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- `chat_apply' splits per-request work into a render-only call plus a
+  cached PEG parser arena. The cache is keyed by
+  `(ModelId, ToolsHash, ToolChoice, ParallelToolCalls)' and lives in
+  `barrel_inference_chat_cache' alongside the existing templates
+  slot. First request per (model, tools schema) still pays the full
+  synthesis cost; subsequent turns reuse the parser and only do the
+  cheap jinja render. Behaviour-preserving (same return shape, same
+  `chat_parse/3' results); pure perf win for chat-heavy workloads.
+
 ### Added
+
+- `barrel_inference_chat:render_only/2' and `make_params/2' wrappers
+  around two new NIF entries `nif_chat_render_only' and
+  `nif_chat_make_params'. Render-only sets
+  `common_chat_templates_inputs.skip_parser_synthesis = true' inside
+  the vendored llama.cpp (small local patch in
+  `common/chat.cpp:common_chat_templates_apply_jinja') so the
+  expensive PEG arena is NOT built when the caller has it cached.
+- `barrel_inference_chat_cache:get_or_make_params/3' for the params
+  slot; `purge/1' drops both slots for the given model id.
 
 - `barrel_inference:resident_bytes/1' + optional backend callback
   `resident_bytes/1'. mincore-only diagnostic that returns the bytes of

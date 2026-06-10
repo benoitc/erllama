@@ -23,6 +23,8 @@ int chat_nif_load(ErlNifEnv *env);
  * {error, {chat_parse_failed, Reason}} tuples. */
 ERL_NIF_TERM nif_chat_templates_init(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_chat_templates_apply(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_chat_render_only(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_chat_make_params(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_chat_parse(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 
 #ifdef __cplusplus

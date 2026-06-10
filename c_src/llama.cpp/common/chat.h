@@ -204,6 +204,13 @@ struct common_chat_templates_inputs {
     bool                                  add_bos = false;
     bool                                  add_eos = false;
     bool                                  force_pure_content = false;
+    // barrel_inference local addition: skip the PEG parser synthesis
+    // step inside common_chat_templates_apply_jinja and return a
+    // common_chat_params with only `.prompt' set. Used by the runtime
+    // to split per-request prompt render from the cacheable params
+    // build, so repeat turns with the same (tools, tool_choice,
+    // parallel_tool_calls) reuse a single synthesised parser.
+    bool                                  skip_parser_synthesis = false;
 };
 
 struct common_chat_params {

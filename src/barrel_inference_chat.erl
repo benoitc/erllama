@@ -14,7 +14,7 @@ do not consume it yet. Phase 3.C wires it into the chat / messages /
 responses paths.
 """.
 
--export([init/2, apply/2, parse/3]).
+-export([init/2, apply/2, render_only/2, make_params/2, parse/3]).
 
 -export_type([templates_ref/0, params_ref/0, parsed_msg/0]).
 
@@ -43,6 +43,21 @@ init(Model, TemplateOverride) ->
     {ok, params_ref(), binary()} | {error, term()}.
 apply(Templates, Inputs) when is_map(Inputs) ->
     barrel_inference_nif:chat_templates_apply(Templates, Inputs).
+
+%% Render-only: skip PEG parser synthesis inside the llama.cpp call.
+%% Used per request when the caller has the parser cached separately.
+-spec render_only(templates_ref(), map()) ->
+    {ok, binary()} | {error, term()}.
+render_only(Templates, Inputs) when is_map(Inputs) ->
+    barrel_inference_nif:chat_render_only(Templates, Inputs).
+
+%% Build the params arena only (no prompt). Cached per
+%% (templates, tools, tool_choice, parallel_tool_calls) by
+%% barrel_inference_chat_cache.
+-spec make_params(templates_ref(), map()) ->
+    {ok, params_ref()} | {error, term()}.
+make_params(Templates, Inputs) when is_map(Inputs) ->
+    barrel_inference_nif:chat_make_params(Templates, Inputs).
 
 -spec parse(params_ref(), binary(), boolean()) ->
     {ok, parsed_msg()} | {error, term()}.

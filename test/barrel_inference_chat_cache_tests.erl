@@ -37,7 +37,9 @@ cache_test_() ->
         fun lookup_miss_returns_not_found/1,
         fun lru_evicts_oldest/1,
         fun purge_drops_model_entries/1,
-        fun purge_leaves_other_models/1
+        fun purge_leaves_other_models/1,
+        fun params_key_round_trip/1,
+        fun purge_drops_params_entries/1
     ]}.
 
 put_get_round_trip(_Pid) ->
@@ -78,4 +80,32 @@ purge_leaves_other_models(_Pid) ->
     [
         ?_assertEqual({ok, keep_ref}, ?M:lookup(?TAB, {templates, <<"keep">>})),
         ?_assertEqual(not_found, ?M:lookup(?TAB, {templates, <<"drop">>}))
+    ].
+
+%% Params slot: same shape as templates, but the key carries the
+%% tools-hash + tool_choice + parallel_tool_calls. The cache module's
+%% test-only put/lookup seam handles any tuple key, so we synthesise
+%% the key shape here without going through the real NIF.
+params_key_round_trip(_Pid) ->
+    ToolsHash = crypto:hash(sha256, <<"[{\"name\":\"x\"}]">>),
+    Key = {params, <<"model-a">>, ToolsHash, auto, false},
+    Ref = make_ref(),
+    ok = ?M:put(?TAB, Key, Ref),
+    ?_assertEqual({ok, Ref}, ?M:lookup(?TAB, Key)).
+
+%% Purge drops BOTH the templates slot and any params slots that
+%% reference the model id, in one sweep.
+purge_drops_params_entries(_Pid) ->
+    Hash = crypto:hash(sha256, <<"[]">>),
+    ?M:put(?TAB, {templates, <<"model-a">>}, templates_ref),
+    ?M:put(?TAB, {params, <<"model-a">>, Hash, auto, false}, params_ref),
+    ?M:put(?TAB, {templates, <<"model-b">>}, templates_b),
+    ok = ?M:purge(<<"model-a">>),
+    [
+        ?_assertEqual(not_found, ?M:lookup(?TAB, {templates, <<"model-a">>})),
+        ?_assertEqual(
+            not_found,
+            ?M:lookup(?TAB, {params, <<"model-a">>, Hash, auto, false})
+        ),
+        ?_assertEqual({ok, templates_b}, ?M:lookup(?TAB, {templates, <<"model-b">>}))
     ].

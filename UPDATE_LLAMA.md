@@ -98,6 +98,25 @@ rebar3 fmt --check && rebar3 lint && rebar3 xref \
 # 5. Commit with a message naming the new tag.
 ```
 
+## Known local patches
+
+The vendored tree carries a handful of additive patches the bumper has
+to re-apply when upstream churns the affected lines. Grep for
+`barrel_inference local addition` to find them.
+
+| File | What it adds | Why |
+|---|---|---|
+| `include/llama.h` :: `llama_model_params` | `bool prefetch` | Threads `POSIX_MADV_WILLNEED` vs `POSIX_MADV_RANDOM` through to the mmap, used by the server's `weight_residency = lazy / lazy_then_pin_resident` modes. |
+| `src/llama-model.cpp` :: `llama_model_default_params`, `init_mappings` call | initialises `prefetch = true` (back-compat); plumbs it through to `init_mappings`. | Same. |
+| `src/llama-model.h` :: `llama_model` | `n_mappings()` + `get_mapping()` member fns. | So the NIF can `mincore` / `mlock` the model's mmap regions without breaking pimpl encapsulation. |
+| `src/llama-model.cpp` :: same impls + `llama_model_n_mappings` / `llama_model_get_mapping` C API. | Same. |
+| `common/chat.h` :: `common_chat_templates_inputs` | `bool skip_parser_synthesis` | Lets the NIF render the prompt without paying the per-request PEG synthesis cost; pairs with the cached params arena. |
+| `common/chat.cpp` :: `common_chat_templates_apply_jinja` | Branches to `common_chat_template_direct_apply_impl` when `skip_parser_synthesis` is true. | Same. |
+
+When upstream rewrites any of these chunks, the bump procedure has to
+re-apply the diff. None are intrusive — each is a few lines added next
+to existing functionality.
+
 ## Configuration knobs
 
 The CMake configure step honours these env vars (passed via

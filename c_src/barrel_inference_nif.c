@@ -3736,6 +3736,10 @@ static ErlNifFunc nif_funcs[] = {
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_chat_templates_apply", 2, nif_chat_templates_apply,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_chat_render_only",     2, nif_chat_render_only,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_chat_make_params",     2, nif_chat_make_params,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_chat_parse",           3, nif_chat_parse,
         ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
