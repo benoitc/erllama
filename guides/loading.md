@@ -78,7 +78,7 @@ matter day-to-day:
 | `tensor_split` | `[]` | Per-device proportions when splitting. Up to 16 floats (the vendored llama.cpp's `llama_max_devices()`); shorter lists zero-fill. |
 | `use_mmap` | true | mmap the GGUF instead of copying into anon RAM. Leave on. |
 | `use_mlock` | false | `mlock(2)` the model pages. Useful on workloads where `vm.swappiness` is non-zero and you can't afford to page out weights. |
-| `prefetch` | true | `POSIX_MADV_WILLNEED` (kernel reads ahead) when true, `POSIX_MADV_RANDOM` (only page in on first touch) when false. The server's named `weight_residency` modes map down to this triple; you can pass it directly here for runtime callers that skip the manifest layer. See [Weight residency](weight_residency.md). |
+| `prefetch` | true | `POSIX_MADV_WILLNEED` (kernel reads ahead) when true, `POSIX_MADV_RANDOM` (only page in on first touch) when false. The server's named `weight_residency` modes map down to this triple; you can pass it directly here for runtime callers that skip the manifest layer. See [Weight residency](../../server/guides/weight_residency.md). |
 | `pin_resident_after_first_request` | false | Engine-side flag (read by `barrel_inference_model`, not the NIF). When true, the scheduler calls the backend's `pin_resident_pages/1` once after the first request completes, `mlock`ing the working set. Used by the server's `lazy_then_pin_resident` mode. |
 | `vocab_only` | false | Open the file but skip weight loading. Tokenizer-only mode. |
 
