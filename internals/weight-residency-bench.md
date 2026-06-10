@@ -16,8 +16,8 @@ manifest knob's behaviour matches the spec the loader documents.
   exposed via `weight_residency`.
 - Method: a single BEAM process loads the model in each mode in
   sequence, runs one 64-token generation against a tiny user prompt,
-  idles for 30 s, then unloads. The bench script is at
-  `/tmp/weight_residency_bench.escript` in the maintainer's notes.
+  idles for 30 s, then unloads. The bench script is checked in at
+  `apps/barrel_inference/scripts/weight_residency_bench.escript`.
 
 The page cache stays warm between runs (the GGUF bytes are still in
 the kernel cache when mode N+1 loads), so load wall-time for modes
@@ -92,11 +92,11 @@ matters: peak RSS, resident_bytes, and tok/s.
 
 ```sh
 rebar3 compile
-escript /tmp/weight_residency_bench.escript
+BARREL_BENCH_GGUF=/path/to/model.gguf \
+  escript apps/barrel_inference/scripts/weight_residency_bench.escript
 ```
 
-The escript reads the GGUF path from a `?GGUF` macro at the top; change
-it to point at any local GGUF that the autoparser path can render
-(any model with a chat template will do). For a true cold-cache
-comparison, restart the host between modes — back-to-back in one BEAM
-artificially benefits modes 2-4.
+Any local GGUF with a chat template (Mistral, Qwen, Llama instruct,
+etc.) will do. For a true cold-cache comparison, restart the host
+between modes — back-to-back in one BEAM artificially benefits modes
+2-4.
