@@ -6,6 +6,21 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `barrel_inference_chat:set_observer/1' / `clear_observer/0' hook.
+  Lets a separate module (typically the server's metrics module)
+  observe wall-time of every chat-NIF call (apply / render_only /
+  make_params / parse) without the runtime taking a compile-time
+  dependency on the metrics module. Registered via persistent_term;
+  unset = no-op. Drives the new
+  `barrel_inference_chat_*_duration_seconds' Prometheus histograms
+  on the server side.
+- `barrel_inference_app:start/2' enables
+  `erlang:system_flag(scheduler_wall_time, true)' at boot so callers
+  (the server's metrics module among them) can read per-scheduler
+  busy ratios for the autoparser dirty-pool monitoring.
+
 ### Changed
 
 - `chat_apply' splits per-request work into a render-only call plus a

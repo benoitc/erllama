@@ -15,6 +15,11 @@ responses paths.
 """.
 
 -export([init/2, apply/2, render_only/2, make_params/2, parse/3]).
+%% Optional observer hook set via application env. Module must export
+%% observe_chat_apply_duration/2 and observe_chat_parse_duration/3.
+%% Unset = no-op; the runtime stays decoupled from the server's
+%% metrics module.
+-export([set_observer/1, clear_observer/0]).
 
 -export_type([templates_ref/0, params_ref/0, parsed_msg/0]).
 
@@ -42,14 +47,20 @@ init(Model, TemplateOverride) ->
 -spec apply(templates_ref(), map()) ->
     {ok, params_ref(), binary()} | {error, term()}.
 apply(Templates, Inputs) when is_map(Inputs) ->
-    barrel_inference_nif:chat_templates_apply(Templates, Inputs).
+    timed_observe(
+        apply,
+        fun() -> barrel_inference_nif:chat_templates_apply(Templates, Inputs) end
+    ).
 
 %% Render-only: skip PEG parser synthesis inside the llama.cpp call.
 %% Used per request when the caller has the parser cached separately.
 -spec render_only(templates_ref(), map()) ->
     {ok, binary()} | {error, term()}.
 render_only(Templates, Inputs) when is_map(Inputs) ->
-    barrel_inference_nif:chat_render_only(Templates, Inputs).
+    timed_observe(
+        render_only,
+        fun() -> barrel_inference_nif:chat_render_only(Templates, Inputs) end
+    ).
 
 %% Build the params arena only (no prompt). Cached per
 %% (templates, tools, tool_choice, parallel_tool_calls) by
@@ -57,16 +68,71 @@ render_only(Templates, Inputs) when is_map(Inputs) ->
 -spec make_params(templates_ref(), map()) ->
     {ok, params_ref()} | {error, term()}.
 make_params(Templates, Inputs) when is_map(Inputs) ->
-    barrel_inference_nif:chat_make_params(Templates, Inputs).
+    timed_observe(
+        make_params,
+        fun() -> barrel_inference_nif:chat_make_params(Templates, Inputs) end
+    ).
 
 -spec parse(params_ref(), binary(), boolean()) ->
     {ok, parsed_msg()} | {error, term()}.
 parse(Params, Input, IsPartial) when
     is_binary(Input), is_boolean(IsPartial)
 ->
-    case barrel_inference_nif:chat_parse(Params, Input, IsPartial) of
-        {ok, Msg} -> {ok, decode_tool_calls(Msg)};
-        Err -> Err
+    Start = erlang:monotonic_time(microsecond),
+    Result =
+        case barrel_inference_nif:chat_parse(Params, Input, IsPartial) of
+            {ok, Msg} -> {ok, decode_tool_calls(Msg)};
+            Err -> Err
+        end,
+    Elapsed = erlang:monotonic_time(microsecond) - Start,
+    notify_parse_observer(IsPartial, Elapsed),
+    Result.
+
+%% Observer plumbing. The server's metrics module calls set_observer
+%% once at boot; the chat module then notifies it on every NIF call.
+%% Kept opt-in via persistent_term so the runtime carries no
+%% dependency on the server app.
+-define(OBSERVER_KEY, {?MODULE, observer}).
+
+-spec set_observer(module()) -> ok.
+set_observer(Module) when is_atom(Module) ->
+    persistent_term:put(?OBSERVER_KEY, Module),
+    ok.
+
+-spec clear_observer() -> ok.
+clear_observer() ->
+    _ = persistent_term:erase(?OBSERVER_KEY),
+    ok.
+
+timed_observe(Variant, Fn) ->
+    Start = erlang:monotonic_time(microsecond),
+    Result = Fn(),
+    Elapsed = erlang:monotonic_time(microsecond) - Start,
+    notify_apply_observer(Variant, Elapsed),
+    Result.
+
+notify_apply_observer(Variant, ElapsedMicros) ->
+    case persistent_term:get(?OBSERVER_KEY, undefined) of
+        undefined ->
+            ok;
+        Module ->
+            try
+                Module:observe_chat_apply_duration(Variant, ElapsedMicros)
+            catch
+                _:_ -> ok
+            end
+    end.
+
+notify_parse_observer(IsPartial, ElapsedMicros) ->
+    case persistent_term:get(?OBSERVER_KEY, undefined) of
+        undefined ->
+            ok;
+        Module ->
+            try
+                Module:observe_chat_parse_duration(IsPartial, ElapsedMicros)
+            catch
+                _:_ -> ok
+            end
     end.
 
 %% The NIF returns each tool call's arguments as a raw JSON binary
