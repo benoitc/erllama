@@ -139,9 +139,7 @@ tokenize_marker(_Model, undefined) ->
 tokenize_marker(_Model, <<>>) ->
     [];
 tokenize_marker(Model, Bin) when is_binary(Bin) ->
-    case
-        erllama_nif:tokenize(Model, Bin, #{add_special => false, parse_special => true})
-    of
+    case erllama_nif:tokenize(Model, Bin, #{add_special => false, parse_special => true}) of
         Tokens when is_list(Tokens) -> Tokens;
         _ -> []
     end.
