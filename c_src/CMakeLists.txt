@@ -63,16 +63,27 @@ set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 # not installed on the build host (FreeBSD CI VMs, fresh dev boxes).
 set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
 
-# Backends we never ship in the vendored tree (sources are not present).
-set(GGML_VULKAN  OFF CACHE BOOL "" FORCE)
-set(GGML_SYCL    OFF CACHE BOOL "" FORCE)
-set(GGML_OPENCL  OFF CACHE BOOL "" FORCE)
-set(GGML_CANN    OFF CACHE BOOL "" FORCE)
-set(GGML_HEXAGON OFF CACHE BOOL "" FORCE)
-set(GGML_HIP     OFF CACHE BOOL "" FORCE)
-set(GGML_MUSA    OFF CACHE BOOL "" FORCE)
-set(GGML_RPC     OFF CACHE BOOL "" FORCE)
-set(GGML_ZDNN    OFF CACHE BOOL "" FORCE)
+# Backends we never ship in the vendored tree (scripts/vendor_llama.sh
+# prunes their sources).
+set(GGML_VULKAN   OFF CACHE BOOL "" FORCE)
+set(GGML_SYCL     OFF CACHE BOOL "" FORCE)
+set(GGML_OPENCL   OFF CACHE BOOL "" FORCE)
+set(GGML_CANN     OFF CACHE BOOL "" FORCE)
+set(GGML_HEXAGON  OFF CACHE BOOL "" FORCE)
+set(GGML_HIP      OFF CACHE BOOL "" FORCE)
+set(GGML_MUSA     OFF CACHE BOOL "" FORCE)
+set(GGML_RPC      OFF CACHE BOOL "" FORCE)
+set(GGML_ZDNN     OFF CACHE BOOL "" FORCE)
+set(GGML_ZENDNN   OFF CACHE BOOL "" FORCE)
+set(GGML_OPENVINO OFF CACHE BOOL "" FORCE)
+set(GGML_VIRTGPU  OFF CACHE BOOL "" FORCE)
+set(GGML_WEBGPU   OFF CACHE BOOL "" FORCE)
+set(GGML_ET       OFF CACHE BOOL "" FORCE)
+
+# llama-common links cpp-httplib for its HF download helpers, which the
+# NIF never calls. Keep TLS off so the build does not probe for or link
+# OpenSSL.
+set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 
 # Backends that ship; defaults can be flipped via -DGGML_*=OFF on the
 # CMake command line (see do_cmake.sh).

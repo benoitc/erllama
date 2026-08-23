@@ -188,21 +188,6 @@ inference, etc.) can plug in via this same surface.
 %% alone.
 -callback abort_handle(state()) -> {ok, term()} | undefined.
 
-%% Pin the model's currently-resident weight pages (via mincore/mlock).
-%% Called by `erllama_model:finish_req' on the FIRST request that
-%% completes after admission, when the model was loaded with
-%% `weight_residency = lazy_then_pin_resident'. Returns the byte count
-%% pinned. Optional; backends without an mmap representation (the stub)
-%% may omit this callback or return `{ok, 0}'.
--callback pin_resident_pages(state()) ->
-    {ok, non_neg_integer()} | {error, term()}.
-
-%% Diagnostic resident-set size: bytes of the model's mmap regions
-%% currently faulted in. Optional; backends without an mmap layout
-%% (the stub) omit it. Sampled by the metrics module per Prometheus
-%% scrape to populate `erllama_resident_bytes{model=...}`.
--callback resident_bytes(state()) -> non_neg_integer().
-
 -optional_callbacks([
     kv_pack/3,
     kv_unpack/3,
@@ -225,9 +210,7 @@ inference, etc.) can plug in via this same surface.
     verify/4,
     thinking_signature/3,
     reset_context/1,
-    abort_handle/1,
-    pin_resident_pages/1,
-    resident_bytes/1
+    abort_handle/1
 ]).
 
 -type sampler_opts() :: #{

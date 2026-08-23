@@ -12,14 +12,16 @@
 -export([
     templates_init_returns_ref/1,
     apply_then_parse_round_trip/1,
-    parse_partial_then_full/1
+    parse_partial_then_full/1,
+    facade_chat_apply_then_parse/1
 ]).
 
 all() ->
     [
         templates_init_returns_ref,
         apply_then_parse_round_trip,
-        parse_partial_then_full
+        parse_partial_then_full,
+        facade_chat_apply_then_parse
     ].
 
 init_per_suite(Config) ->
@@ -82,3 +84,35 @@ parse_partial_then_full(Config) ->
     #{content := PartialContent} = Partial,
     #{content := FullContent} = Full,
     ?assert(byte_size(FullContent) >= byte_size(PartialContent)).
+
+%% Public façade path: erllama:chat_apply/2 runs one upstream
+%% common_chat_templates_apply per request (prompt + parser), and the
+%% returned params ref drives erllama:chat_parse/3 for that request.
+%% Two calls with the same inputs yield distinct params refs; only the
+%% per-model templates ref is cached.
+facade_chat_apply_then_parse(_Config) ->
+    Path = os:getenv("LLAMA_TEST_MODEL"),
+    {ok, ModelId} = erllama:load_model(#{
+        backend => erllama_model_llama,
+        model_path => Path
+    }),
+    Inputs = #{
+        messages => iolist_to_binary(
+            json:encode([
+                #{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}
+            ])
+        ),
+        tools => <<"[]">>
+    },
+    try
+        {ok, Params1, Prompt} = erllama:chat_apply(ModelId, Inputs),
+        ?assert(is_reference(Params1)),
+        ?assert(is_binary(Prompt) andalso byte_size(Prompt) > 0),
+        {ok, Params2, Prompt} = erllama:chat_apply(ModelId, Inputs),
+        ?assertNotEqual(Params1, Params2),
+        {ok, Msg} = erllama:chat_parse(Params2, <<"hello there">>, false),
+        ?assertEqual(<<"assistant">>, maps:get(role, Msg)),
+        ?assertEqual(<<"hello there">>, maps:get(content, Msg))
+    after
+        ok = erllama:unload(ModelId)
+    end.

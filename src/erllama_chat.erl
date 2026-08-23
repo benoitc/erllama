@@ -5,16 +5,15 @@
 -moduledoc """
 Thin Erlang facade over llama.cpp's `common_chat_*` autoparser NIF entries.
 
-Three call-once-per-thing functions wrapping the NIFs one-to-one with
-no caching. Callers that want per-(model x tools) caching go through
-`erllama_chat_cache' instead.
-
-This is the DORMANT layer shipped in Phase 3.B; the server handlers
-do not consume it yet. Phase 3.C wires it into the chat / messages /
-responses paths.
+`init/2` builds the templates for a model, `apply/2` renders the prompt
+and synthesises the parser for one request (upstream's
+`common_chat_templates_apply`), `parse/3` turns model output back into a
+structured message with that request's parser. No caching here; the
+per-model templates ref is cached by `erllama_chat_cache`, and
+`erllama_model:chat_apply/2` is the entry point used by the façade.
 """.
 
--export([init/2, apply/2, render_only/2, make_params/2, parse/3]).
+-export([init/2, apply/2, parse/3]).
 %% Optional observer hook set via application env. Module must export
 %% observe_chat_apply_duration/2 and observe_chat_parse_duration/3.
 %% Unset = no-op; the runtime stays decoupled from the server's
@@ -28,7 +27,7 @@ responses paths.
 %% declared as a callback so static analysis (Elvis,
 %% no_invalid_dynamic_calls) recognises the pattern as intentional.
 -callback observe_chat_apply_duration(
-    Variant :: apply | render_only | make_params,
+    Variant :: apply,
     ElapsedMicros :: non_neg_integer()
 ) -> any().
 -callback observe_chat_parse_duration(
@@ -67,27 +66,6 @@ apply(Templates, Inputs) when is_map(Inputs) ->
     timed_observe(
         apply,
         fun() -> erllama_nif:chat_templates_apply(Templates, Inputs) end
-    ).
-
-%% Render-only: skip PEG parser synthesis inside the llama.cpp call.
-%% Used per request when the caller has the parser cached separately.
--spec render_only(templates_ref(), map()) ->
-    {ok, binary()} | {error, term()}.
-render_only(Templates, Inputs) when is_map(Inputs) ->
-    timed_observe(
-        render_only,
-        fun() -> erllama_nif:chat_render_only(Templates, Inputs) end
-    ).
-
-%% Build the params arena only (no prompt). Cached per
-%% (templates, tools, tool_choice, parallel_tool_calls) by
-%% erllama_chat_cache.
--spec make_params(templates_ref(), map()) ->
-    {ok, params_ref()} | {error, term()}.
-make_params(Templates, Inputs) when is_map(Inputs) ->
-    timed_observe(
-        make_params,
-        fun() -> erllama_nif:chat_make_params(Templates, Inputs) end
     ).
 
 -spec parse(params_ref(), binary(), boolean()) ->

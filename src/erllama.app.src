@@ -41,10 +41,8 @@
     {modules, []},
     {licenses, ["MIT"]},
     {links, [{<<"GitHub">>, <<"https://github.com/benoitc/erllama">>}]},
-    %% Hex package manifest. Whitelist what to include; exclude the
-    %% parts of vendored llama.cpp that are not needed at build time
-    %% (unused backends already pruned at vendor time, dotfiles,
-    %% packaging scripts).
+    %% Hex package manifest. Whitelist what to include. The vendored
+    %% llama.cpp is already trimmed by scripts/vendor_llama.sh.
     {files, [
         "rebar.config",
         "do_cmake.sh",
@@ -60,23 +58,16 @@
         "include",
         "guides",
         "internals",
+        "scripts",
         "c_src/CMakeLists.txt",
         "c_src/CMake",
         "c_src/erllama_nif.c",
         "c_src/erllama_safe.cpp",
+        "c_src/erllama_chat_nif.cpp",
+        "c_src/erllama_chat_nif.h",
+        "c_src/erllama_resources.h",
         "c_src/crc32c.c",
         "c_src/crc32c.h",
         "c_src/llama.cpp"
-    ]},
-    {exclude_files, [
-        "c_src/llama.cpp/.git",
-        "c_src/llama.cpp/.github",
-        "c_src/llama.cpp/.devops",
-        "c_src/llama.cpp/.gemini",
-        "c_src/llama.cpp/.pi",
-        "c_src/llama.cpp/.pre-commit-config.yaml",
-        "c_src/llama.cpp/.dockerignore",
-        "c_src/llama.cpp/AUTHORS",
-        "c_src/llama.cpp/build-xcframework.sh"
     ]}
 ]}.

@@ -58,7 +58,6 @@ an explicit `model_id` in the config map.
     models/0,
     list_models/0,
     model_info/1,
-    resident_bytes/1,
     tokenize/2,
     tokenize/3,
     detokenize/2,
@@ -483,17 +482,6 @@ model_info(Model) ->
     erllama_model:model_info(Model).
 
 -doc """
-Diagnostic resident-set size in bytes for a loaded model. Walks the
-backend's mmap regions and counts pages currently faulted in via
-`mincore(2)`. Backends without an mmap representation (the stub)
-return `0`. Used to drive the Prometheus
-`erllama_resident_bytes{model=...}` gauge.
-""".
--spec resident_bytes(model()) -> non_neg_integer().
-resident_bytes(Model) ->
-    erllama_model:resident_bytes(Model).
-
--doc """
 Tokenise text against a loaded model's tokenizer. Safe to call
 concurrently with `complete/2,3`.
 """.
@@ -530,11 +518,12 @@ apply_chat_template(Model, Request) ->
     erllama_model:apply_chat_template(Model, Request).
 
 -doc """
-Build a chat_params_ref + rendered prompt for `Model' via llama.cpp's
-autoparser. `Inputs' is the map fed to `erllama_chat:apply/2'
-(`messages', `tools', `tool_choice', `parallel_tool_calls').
-Each call synthesizes fresh params + prompt; only the model-level
-`templates_ref' is cached.
+Render the chat prompt and build the parser for one request via
+llama.cpp's `common_chat_templates_apply`. `Inputs` is the map fed to
+`erllama_chat:apply/2` (`messages`, `tools`, `tool_choice`,
+`parallel_tool_calls`). Returns the prompt bytes plus a params ref to
+hand to `chat_parse/3` for this request's output. Only the per-model
+templates ref is cached; each call pays one upstream apply.
 """.
 -spec chat_apply(model(), map()) ->
     {ok, erllama_nif:chat_params_ref(), binary()} | {error, term()}.

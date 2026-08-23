@@ -10,8 +10,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 - `erllama_chat:set_observer/1' / `clear_observer/0' hook.
   Lets a separate module (typically the server's metrics module)
-  observe wall-time of every chat-NIF call (apply / render_only /
-  make_params / parse) without the runtime taking a compile-time
+  observe wall-time of every chat-NIF call (apply / parse) without the runtime taking a compile-time
   dependency on the metrics module. Registered via persistent_term;
   unset = no-op. Drives the new
   `erllama_chat_*_duration_seconds' Prometheus histograms
@@ -23,59 +22,16 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
-- `chat_apply' splits per-request work into a render-only call plus a
-  cached PEG parser arena. The cache is keyed by
-  `(ModelId, ToolsHash, ToolChoice, ParallelToolCalls)' and lives in
-  `erllama_chat_cache' alongside the existing templates
-  slot. First request per (model, tools schema) still pays the full
-  synthesis cost; subsequent turns reuse the parser and only do the
-  cheap jinja render. Behaviour-preserving (same return shape, same
-  `chat_parse/3' results); pure perf win for chat-heavy workloads.
-
-### Added
-
-- `erllama_chat:render_only/2' and `make_params/2' wrappers
-  around two new NIF entries `nif_chat_render_only' and
-  `nif_chat_make_params'. Render-only sets
-  `common_chat_templates_inputs.skip_parser_synthesis = true' inside
-  the vendored llama.cpp (small local patch in
-  `common/chat.cpp:common_chat_templates_apply_jinja') so the
-  expensive PEG arena is NOT built when the caller has it cached.
-- `erllama_chat_cache:get_or_make_params/3' for the params
-  slot; `purge/1' drops both slots for the given model id.
-
-- `erllama:resident_bytes/1' + optional backend callback
-  `resident_bytes/1'. mincore-only diagnostic that returns the bytes of
-  the model's mmap regions currently faulted in. Backends without an
-  mmap layout (the stub) return 0. The server's metrics module surfaces
-  the value as the new `erllama_resident_bytes{model=...}'
-  Prometheus gauge.
-- `erllama_nif:pin_resident_pages/1' and the matching optional
-  backend callback. Walks every mmap region of a loaded model, runs
-  `mincore(2)' per region to find the resident pages, then `mlock(2)'s
-  each contiguous run. Returns the total bytes pinned. Used by the
-  server's `weight_residency = lazy_then_pin_resident' mode: after the
-  first request completes, the working set selected by the prompt is
-  pinned so it cannot be paged out under memory pressure. Partial
-  mlock failures (RLIMIT_MEMLOCK exhausted, EPERM) are logged but not
-  fatal. The scheduler triggers the call once per model load in
-  `finish_req' when the `pin_resident_after_first_request' flag is on,
-  then clears the flag.
-- llama.cpp local accessors: `llama_model_n_mappings(model)' and
-  `llama_model_get_mapping(model, idx, &addr, &size)'. Expose the
-  model's mmap regions without breaking the pimpl encapsulation,
-  so the NIF can run `mincore'/`mlock' against just the weight bytes.
-
-- `llama_model_params.prefetch' (bool). When `false', the NIF asks the
-  kernel to use `POSIX_MADV_RANDOM' on the model's mmap region instead
-  of the default `POSIX_MADV_WILLNEED', so weights page in on first
-  touch instead of being eagerly read. Local patch to vendored
-  llama.cpp threads the new field through `llama_model_loader::init_mappings'.
-  Defaults to `true' (existing behaviour). Drives the server's
-  `weight_residency = lazy' mode.
-
-### Changed
-
+- `chat_apply/2' runs upstream's `common_chat_templates_apply' once per
+  request (prompt + parser). The per-tools params cache and the
+  render-only NIF are gone; only the per-model templates ref is
+  cached.
+- Vendored llama.cpp is b10068, upstream and unmodified (no local
+  patches). `scripts/vendor_llama.sh <tag>` performs bumps and fails
+  if any vendored file differs from the tarball. Unused `vendor/`
+  libraries are pruned and `LLAMA_OPENSSL` is off (no OpenSSL link).
+- Hex package manifest now includes `c_src/erllama_chat_nif.{cpp,h}`
+  and `c_src/erllama_resources.h` (previous tarballs could not build).
 - Bump vendored llama.cpp from b9334 to b9585. No API-breaking changes
   on our touchpoints; brings `common/chat*` bug fixes (LFM2 reasoning,
   tool-parser unification). UPDATE_LLAMA.md refreshed to document

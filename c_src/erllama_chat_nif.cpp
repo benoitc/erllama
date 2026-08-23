@@ -319,68 +319,8 @@ ERL_NIF_TERM marshal_msg(ErlNifEnv *env, const common_chat_msg &msg) {
 
 } /* anonymous namespace */
 
-/* ============================================================== */
-/* nif_chat_templates_apply                                       */
-/* ============================================================== */
-
-extern "C" ERL_NIF_TERM nif_chat_templates_apply(
-    ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    if (argc != 2) {
-        return enif_make_badarg(env);
-    }
-    chat_templates_holder *th = nullptr;
-    if (!enif_get_resource(env, argv[0], CHAT_TEMPLATES_RT, (void **) &th)) {
-        return mk_error(env, "invalid_templates");
-    }
-    if (!enif_is_map(env, argv[1])) {
-        return enif_make_badarg(env);
-    }
-
-    /* Required keys: `messages' (JSON array binary). Optional:
-     * `tools', `tool_choice', `add_generation_prompt'. */
-    std::string messages_json;
-    if (!map_get_string(env, argv[1], "messages", messages_json)) {
-        return mk_error(env, "missing_messages");
-    }
-    std::string tools_json;
-    bool have_tools = map_get_string(env, argv[1], "tools", tools_json);
-
-    try {
-        common_chat_templates_inputs inputs;
-        inputs.use_jinja = true;
-        inputs.messages =
-            common_chat_msgs_parse_oaicompat(nlohmann::json::parse(messages_json));
-        if (have_tools && !tools_json.empty()) {
-            inputs.tools =
-                common_chat_tools_parse_oaicompat(nlohmann::json::parse(tools_json));
-        }
-        inputs.tool_choice = map_tool_choice(env, argv[1]);
-        inputs.parallel_tool_calls = map_parallel_tool_calls(env, argv[1]);
-
-        common_chat_params params =
-            common_chat_templates_apply(th->ptr.get(), inputs);
-
-        void *res = enif_alloc_resource(
-            CHAT_PARAMS_RT, sizeof(chat_params_holder));
-        if (!res) {
-            return mk_error(env, "alloc_failed");
-        }
-        new (res) chat_params_holder{std::move(params)};
-
-        auto *holder = static_cast<chat_params_holder *>(res);
-        ERL_NIF_TERM ref = enif_make_resource(env, res);
-        ERL_NIF_TERM prompt = mk_string_bin(env, holder->params.prompt);
-        enif_release_resource(res);
-        return enif_make_tuple3(env, mk_atom(env, "ok"), ref, prompt);
-    } catch (const std::exception &e) {
-        return mk_error_str(env, e.what());
-    } catch (...) {
-        return mk_error(env, "unknown_exception");
-    }
-}
-
 /* Shared inputs-map -> common_chat_templates_inputs conversion used by
- * nif_chat_templates_apply, nif_chat_render_only, nif_chat_make_params.
+ * nif_chat_templates_apply.
  * Returns false (caller should return mk_error) on missing required
  * keys; true on success. */
 static bool build_chat_inputs_from_map(ErlNifEnv *env, ERL_NIF_TERM map,
@@ -406,15 +346,10 @@ static bool build_chat_inputs_from_map(ErlNifEnv *env, ERL_NIF_TERM map,
 }
 
 /* ============================================================== */
-/* nif_chat_render_only                                           */
+/* nif_chat_templates_apply                                       */
 /* ============================================================== */
 
-/* Like nif_chat_templates_apply but sets `skip_parser_synthesis = true'
- * so common_chat_templates_apply returns only the rendered prompt;
- * the heavy PEG parser arena is NOT built. Returns {ok, Prompt}.
- * Used per request when the caller has already cached the parser
- * arena (typically via nif_chat_make_params, keyed by tools hash). */
-extern "C" ERL_NIF_TERM nif_chat_render_only(
+extern "C" ERL_NIF_TERM nif_chat_templates_apply(
     ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     if (argc != 2) {
         return enif_make_badarg(env);
@@ -426,62 +361,28 @@ extern "C" ERL_NIF_TERM nif_chat_render_only(
     if (!enif_is_map(env, argv[1])) {
         return enif_make_badarg(env);
     }
+
     try {
         common_chat_templates_inputs inputs;
         const char *err = nullptr;
         if (!build_chat_inputs_from_map(env, argv[1], inputs, &err)) {
             return mk_error(env, err);
         }
-        inputs.skip_parser_synthesis = true;
         common_chat_params params =
             common_chat_templates_apply(th->ptr.get(), inputs);
-        ERL_NIF_TERM prompt = mk_string_bin(env, params.prompt);
-        return enif_make_tuple2(env, mk_atom(env, "ok"), prompt);
-    } catch (const std::exception &e) {
-        return mk_error_str(env, e.what());
-    } catch (...) {
-        return mk_error(env, "unknown_exception");
-    }
-}
 
-/* ============================================================== */
-/* nif_chat_make_params                                           */
-/* ============================================================== */
-
-/* Build the synthesised PEG parser arena for the given templates +
- * (tools, tool_choice, parallel_tool_calls). Returns {ok, ParamsRef}
- * without exposing the prompt. The caller caches the ref keyed by
- * tools-hash and reuses it for many turns via nif_chat_parse. */
-extern "C" ERL_NIF_TERM nif_chat_make_params(
-    ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    if (argc != 2) {
-        return enif_make_badarg(env);
-    }
-    chat_templates_holder *th = nullptr;
-    if (!enif_get_resource(env, argv[0], CHAT_TEMPLATES_RT, (void **) &th)) {
-        return mk_error(env, "invalid_templates");
-    }
-    if (!enif_is_map(env, argv[1])) {
-        return enif_make_badarg(env);
-    }
-    try {
-        common_chat_templates_inputs inputs;
-        const char *err = nullptr;
-        if (!build_chat_inputs_from_map(env, argv[1], inputs, &err)) {
-            return mk_error(env, err);
-        }
-        /* skip_parser_synthesis stays false; full apply runs. */
-        common_chat_params params =
-            common_chat_templates_apply(th->ptr.get(), inputs);
         void *res = enif_alloc_resource(
             CHAT_PARAMS_RT, sizeof(chat_params_holder));
         if (!res) {
             return mk_error(env, "alloc_failed");
         }
         new (res) chat_params_holder{std::move(params)};
+
+        auto *holder = static_cast<chat_params_holder *>(res);
         ERL_NIF_TERM ref = enif_make_resource(env, res);
+        ERL_NIF_TERM prompt = mk_string_bin(env, holder->params.prompt);
         enif_release_resource(res);
-        return enif_make_tuple2(env, mk_atom(env, "ok"), ref);
+        return enif_make_tuple3(env, mk_atom(env, "ok"), ref, prompt);
     } catch (const std::exception &e) {
         return mk_error_str(env, e.what());
     } catch (...) {
