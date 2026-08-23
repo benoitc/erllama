@@ -17,7 +17,7 @@ Two harnesses live here:
 bench/collect.sh /path/to/model.gguf
 
 # one-shot (clone, build, run):
-curl -fsSL https://raw.githubusercontent.com/benoitc/erllama/main/apps/erllama/bench/bootstrap.sh \
+curl -fsSL https://raw.githubusercontent.com/benoitc/erllama/main/bench/bootstrap.sh \
   | bash -s -- /path/to/model.gguf
 ```
 

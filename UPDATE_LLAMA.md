@@ -135,7 +135,7 @@ The build step honours `ERLLAMA_BUILDOPTS` (passed to `cmake --build`).
 
 llama.cpp's `common/` carries the chat-template pipeline (`common_chat_*`,
 the PEG autoparser, jinja runtime) that the autoparser path in erllama
-depends on (`apps/erllama/c_src/erllama_chat_nif.cpp`).
+depends on (`c_src/erllama_chat_nif.cpp`).
 It also pulls in HTTP / Hugging Face download helpers we do not use,
 which is why `common/` indirectly depends on `vendor/cpp-httplib` and
 `vendor/nlohmann` — those have to ship too even though we never call

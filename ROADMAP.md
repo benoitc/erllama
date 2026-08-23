@@ -5,7 +5,7 @@ item. Issues / PRs welcome.
 
 ## Recently shipped: engine robustness
 
-The `erllama_server` hardening brief (cold-admit decode wedges and
+The server hardening brief (cold-admit decode wedges and
 agentic tool-continue loops under real 30B/Metal load) is fully
 shipped. For reference so these are not re-filed:
 
@@ -119,7 +119,7 @@ application (`erllama_whisper`) sharing the cache subsystem.
 
 ONNX, safetensors, raw PyTorch checkpoints. llama.cpp doesn't load
 these natively, so the path is either a converter step at
-`fetch`-time (the `erllama_server` repo handles fetch) or a second
+`fetch`-time (the server handles fetch) or a second
 backend that targets a different runtime.
 
 ### Stateful streaming with bit-exact KV resume

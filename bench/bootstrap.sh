@@ -5,7 +5,7 @@
 #
 # Usage (either form works):
 #
-#   curl -fsSL https://raw.githubusercontent.com/benoitc/erllama/main/apps/erllama/bench/bootstrap.sh | bash -s -- /path/to/model.gguf
+#   curl -fsSL https://raw.githubusercontent.com/benoitc/erllama/main/bench/bootstrap.sh | bash -s -- /path/to/model.gguf
 #
 #   bench/bootstrap.sh /path/to/model.gguf [out-json-path]
 #

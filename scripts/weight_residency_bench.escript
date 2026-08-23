@@ -7,7 +7,7 @@
 %%
 %% Run from the repo root after `rebar3 compile':
 %%   ERLLAMA_BENCH_GGUF=/path/to/model.gguf \
-%%     escript apps/erllama/scripts/weight_residency_bench.escript
+%%     escript scripts/weight_residency_bench.escript
 %%
 %% Note on OS page cache: modes run back-to-back in the same BEAM, so
 %% by mode 2 the GGUF bytes are warm in the kernel cache. The bench
@@ -120,7 +120,7 @@ setup_paths() ->
     [{ok, _} = file:copy(B, filename:join(Ebin, filename:basename(B)))
         || B <- filelib:wildcard("/tmp/bench_ebin/*.beam")],
     {ok, _} = file:copy(
-        "apps/erllama/priv/erllama_nif.so",
+        "priv/erllama_nif.so",
         filename:join(Priv, "erllama_nif.so")
     ),
     %% Synthesize a minimal .app file. Modules are derived from the

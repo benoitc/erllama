@@ -47,7 +47,7 @@ rebar3 xref         # Cross-reference analysis
 
 ```bash
 rebar3 compile                                    # Build
-rebar3 shell                                      # Boot the umbrella
+rebar3 shell                                      # Boot the app
 rebar3 eunit                                      # All EUnit tests
 rebar3 eunit --module=erllama_cache_kvc_tests     # Specific test module
 rebar3 proper                                     # All PropEr property-based tests
