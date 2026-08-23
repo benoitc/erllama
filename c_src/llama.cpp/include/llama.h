@@ -324,7 +324,6 @@ extern "C" {
         bool use_mmap;        // use mmap if possible
         bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
         bool use_mlock;       // force system to keep model in RAM
-        bool prefetch;        // POSIX_MADV_WILLNEED (true) vs POSIX_MADV_RANDOM (false)
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
@@ -515,17 +514,6 @@ extern "C" {
             "use llama_model_free instead");
 
     LLAMA_API void llama_model_free(struct llama_model * model);
-
-    // erllama local addition. Expose the model's mmap regions so a
-    // caller can run mincore(2)/mlock(2) directly against the resident
-    // working set after the first prefill. Used by the runtime's
-    // `weight_residency = lazy_then_pin_resident' mode.
-    LLAMA_API size_t llama_model_n_mappings(const struct llama_model * model);
-    LLAMA_API void llama_model_get_mapping(
-            const struct llama_model * model,
-            size_t                     idx,
-            void **                    addr,
-            size_t *                   size);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,

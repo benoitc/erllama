@@ -25,7 +25,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 - `chat_apply/2' runs upstream's `common_chat_templates_apply' once per
   request (prompt + parser). The per-tools params cache and the
   render-only NIF are gone; only the per-model templates ref is
-  cached. The vendored llama.cpp carries no local patches.
+  cached.
+- Vendored llama.cpp is b10068, upstream and unmodified (no local
+  patches). `scripts/vendor_llama.sh <tag>` performs bumps and fails
+  if any vendored file differs from the tarball. Unused `vendor/`
+  libraries are pruned and `LLAMA_OPENSSL` is off (no OpenSSL link).
+- Hex package manifest now includes `c_src/erllama_chat_nif.{cpp,h}`
+  and `c_src/erllama_resources.h` (previous tarballs could not build).
 - Bump vendored llama.cpp from b9334 to b9585. No API-breaking changes
   on our touchpoints; brings `common/chat*` bug fixes (LFM2 reasoning,
   tool-parser unification). UPDATE_LLAMA.md refreshed to document

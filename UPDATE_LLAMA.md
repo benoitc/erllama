@@ -1,144 +1,71 @@
 # Updating the vendored llama.cpp
 
-erllama vendors a pinned copy of llama.cpp under `c_src/llama.cpp/`.
-The current pin is **b9585**.
+erllama vendors a pinned, unmodified copy of llama.cpp under
+`c_src/llama.cpp/`. The pinned tag is in `c_src/llama.cpp/.version`
+(currently **b10068**). You need this page when you bump that pin.
 
-This file documents the bump procedure.
+Why pin: reproducible builds, no network access at install time (the hex
+package ships the source), and control over when new model
+architectures are adopted.
 
-## Why pin
+## What is vendored
 
-- Reproducible builds: every developer and CI run compiles the same
-  source.
-- Hex.pm-friendly: published packages contain the full source so no
-  network access is needed at install time.
-- Backend stability: llama.cpp moves fast, especially in the model
-  zoo. We control when we adopt new architectures.
-
-## What we ship
-
-We vendor only the parts we need. Currently:
+`scripts/vendor_llama.sh` copies these upstream paths wholesale:
 
 ```
-c_src/llama.cpp/
-  CMakeLists.txt            llama.cpp's top-level CMake
-  LICENSE                   MIT (dual MIT/Apache, llama.cpp pick MIT)
-  cmake/                    CMake helpers (toolchain files, etc)
-  include/                  public headers (llama.h, etc)
-  src/                      llama core (model.cpp, context.cpp, etc)
-  common/                   common_chat_* + jinja (autoparser path)
-  vendor/                   header-only deps common/ links against
-    cpp-httplib             pulled in by common's hf-cache / download
-    nlohmann                nlohmann::json used by common chat code
-    miniaudio, sheredom, stb other small header-only deps
-  ggml/
-    CMakeLists.txt
-    cmake/                  ggml CMake helpers (common.cmake, GitVars.cmake)
-    include/                public ggml headers
-    src/
-      CMakeLists.txt
-      ggml*.c, ggml*.cpp, ggml*.h  core ggml + frontends
-      gguf.cpp                     GGUF file format
-      ggml-cpu/                    CPU SIMD kernels (mandatory)
-      ggml-metal/                  Apple GPU backend (Apple Silicon)
-      ggml-cuda/                   NVIDIA GPU backend (Linux x86-64)
-      ggml-blas/                   BLAS backend (OpenBLAS / Accelerate)
+cmake/ CMakeLists.txt common/ ggml/ include/ src/ LICENSE vendor/
 ```
 
-Excluded (unused or out-of-scope for v1):
+and then removes whole directories we never build:
 
-- `tools/`, `examples/`, `tests/`, `docs/`, `models/`, `gguf-py/`,
-  `benches/`, `ci/`, `scripts/`, `grammars/`, `.git/`,
-  `.github/`, `AUTHORS`, `.devops/`, `app/`
-- ggml backends we do not link: Vulkan, SYCL, OpenCL, CANN, Hexagon,
-  HIP, MUSA, RPC, ZDNN, ZenDNN, Virtgpu, Webgpu, OpenVINO
+- ggml backends other than CPU, Metal, CUDA and BLAS
+  (`ggml/src/ggml-{cann,et,hexagon,hip,musa,opencl,openvino,rpc,sycl,virtgpu,vulkan,webgpu,zdnn,zendnn}`)
+- `vendor/{miniaudio,stb,sheredom}` (nothing in `common/` uses them)
+- `.gitignore` files
 
-If a user needs one of the excluded backends they can build erllama
-against an unvendored llama.cpp via `git+` rebar dep instead of the
-hex package; that path is supported but unsupported in this scaffold.
+No file is edited. `common/` is needed for the chat template pipeline
+(`common_chat_*`, the PEG autoparser, the jinja runtime). It links
+`vendor/cpp-httplib` for its Hugging Face download helpers, which the
+NIF never calls; `c_src/CMakeLists.txt` sets `LLAMA_OPENSSL=OFF` so that
+code is compiled without TLS and no OpenSSL dependency is pulled in.
 
-## Bumping
+## Bump the pin
 
-Pick a tag from <https://github.com/ggml-org/llama.cpp/tags>. Newer
-tags are usually fine; check the changelog for breaking C-API changes
-to `llama_state_seq_*` (the cache layer depends on those).
+Pick a tag from <https://github.com/ggml-org/llama.cpp/tags>. Check the
+release notes for changes to the C API the NIF wraps
+(`c_src/erllama_safe.cpp` lists every `llama_*` / `ggml_*` symbol) and to
+`common/chat.h`.
 
 ```sh
-# 1. Clone the new tag into a scratch directory.
-cd /tmp
-git clone --depth=1 --branch=<TAG> https://github.com/ggml-org/llama.cpp llama.cpp.new
-
-# 2. Sync the parts we vendor.
-cd /Users/benoitc/Projects/erllama
-rm -rf c_src/llama.cpp
-mkdir -p c_src/llama.cpp/ggml/src
-
-cp -r /tmp/llama.cpp.new/{src,include,cmake,common,vendor,CMakeLists.txt,LICENSE} \
-      c_src/llama.cpp/
-cp -r /tmp/llama.cpp.new/ggml/{include,cmake,CMakeLists.txt} \
-      c_src/llama.cpp/ggml/
-cp /tmp/llama.cpp.new/ggml/src/CMakeLists.txt \
-   c_src/llama.cpp/ggml/src/
-cp /tmp/llama.cpp.new/ggml/src/ggml*.c \
-   /tmp/llama.cpp.new/ggml/src/ggml*.cpp \
-   /tmp/llama.cpp.new/ggml/src/ggml*.h \
-   /tmp/llama.cpp.new/ggml/src/gguf.cpp \
-   c_src/llama.cpp/ggml/src/
-cp -r /tmp/llama.cpp.new/ggml/src/{ggml-cpu,ggml-metal,ggml-cuda,ggml-blas} \
-      c_src/llama.cpp/ggml/src/
-
-# 3. Rebuild and run the full test gauntlet.
+scripts/vendor_llama.sh b10068          # replace with the new tag
 rm -rf _build
 rebar3 compile
-rebar3 fmt --check && rebar3 lint && rebar3 xref \
-    && rebar3 eunit && rebar3 proper && rebar3 ct
-
-# 4. Update the pin reference in this file and in
-#    c_src/llama.cpp/.version (if present).
-
-# 5. Commit with a message naming the new tag.
+rebar3 xref && rebar3 dialyzer && rebar3 fmt --check && rebar3 lint
+rebar3 eunit && rebar3 proper
+LLAMA_TEST_MODEL=/path/to/small.gguf rebar3 ct
 ```
 
-## Known local patches
+The script fails if any vendored file differs from the tarball, so a
+clean run proves the tree is upstream. Update the tag in this page and
+add a CHANGELOG line, then commit with a message naming the new tag.
 
-The vendored tree carries a handful of additive patches the bumper has
-to re-apply when upstream churns the affected lines. Grep for
-`erllama local addition` to find them.
+## Build knobs
 
-| File | What it adds | Why |
-|---|---|---|
-| `include/llama.h` :: `llama_model_params` | `bool prefetch` | Threads `POSIX_MADV_WILLNEED` vs `POSIX_MADV_RANDOM` through to the mmap, used by the server's `weight_residency = lazy / lazy_then_pin_resident` modes. |
-| `src/llama-model.cpp` :: `llama_model_default_params`, `init_mappings` call | initialises `prefetch = true` (back-compat); plumbs it through to `init_mappings`. | Same. |
-| `src/llama-model.h` :: `llama_model` | `n_mappings()` + `get_mapping()` member fns. | So the NIF can `mincore` / `mlock` the model's mmap regions without breaking pimpl encapsulation. |
-| `src/llama-model.cpp` :: same impls + `llama_model_n_mappings` / `llama_model_get_mapping` C API. | Same. |
-| `common/chat.h` :: `common_chat_templates_inputs` | `bool skip_parser_synthesis` | Lets the NIF render the prompt without paying the per-request PEG synthesis cost; pairs with the cached params arena. |
-| `common/chat.cpp` :: `common_chat_templates_apply_jinja` | Branches to `common_chat_template_direct_apply_impl` when `skip_parser_synthesis` is true. | Same. |
+`do_cmake.sh` passes `ERLLAMA_OPTS` to the CMake configure step and
+`do_llama.sh` passes `ERLLAMA_BUILDOPTS` to `cmake --build`:
 
-When upstream rewrites any of these chunks, the bump procedure has to
-re-apply the diff. None are intrusive — each is a few lines added next
-to existing functionality.
-
-## Configuration knobs
-
-The CMake configure step honours these env vars (passed via
-`ERLLAMA_OPTS` to `do_cmake.sh`):
-
-```
+```sh
 ERLLAMA_OPTS="-DGGML_CUDA=ON"           # enable CUDA on Linux x86-64
 ERLLAMA_OPTS="-DGGML_METAL=OFF"         # disable Metal on Darwin
 ERLLAMA_OPTS="-DGGML_BLAS=OFF"          # disable BLAS
 ERLLAMA_OPTS="-DCMAKE_BUILD_TYPE=Debug" # debug build
+ERLLAMA_BUILDOPTS="-j 4"                # limit build parallelism
 ```
 
-The build step honours `ERLLAMA_BUILDOPTS` (passed to `cmake --build`).
+## Notes
 
-## Why we ship `common/`
-
-llama.cpp's `common/` carries the chat-template pipeline (`common_chat_*`,
-the PEG autoparser, jinja runtime) that the autoparser path in erllama
-depends on (`c_src/erllama_chat_nif.cpp`).
-It also pulls in HTTP / Hugging Face download helpers we do not use,
-which is why `common/` indirectly depends on `vendor/cpp-httplib` and
-`vendor/nlohmann` — those have to ship too even though we never call
-the HTTP code path. We could prune `hf-cache.cpp` + `download.cpp` and
-drop the http vendor cost, but the diff drifts on each bump; carrying
-~5 MB extra source is cheaper than maintaining the patch.
+- If you need a backend that is pruned (Vulkan, SYCL, ...), drop it from
+  `PRUNE_GGML` in `scripts/vendor_llama.sh` and remove the matching
+  `GGML_*=OFF` line in `c_src/CMakeLists.txt`.
+- The cache layer depends on `llama_state_seq_*`; bumps that change those
+  signatures show up as NIF compile errors in `erllama_safe.cpp`.
