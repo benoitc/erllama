@@ -15,30 +15,8 @@ per-model templates ref is cached by `erllama_chat_cache`, and
 
 -export([init/2, apply/2, parse/3]).
 -export([chat/3, inputs/2]).
-%% Optional observer hook set via application env. Module must export
-%% observe_chat_apply_duration/2 and observe_chat_parse_duration/3.
-%% Unset = no-op; the runtime stays decoupled from the server's
-%% metrics module.
--export([set_observer/1, clear_observer/0]).
 
 -export_type([templates_ref/0, params_ref/0, parsed_msg/0, message/0, tool/0]).
-
-%% Observer callbacks. Modules registered via set_observer/1 must
-%% export both functions; the dispatch is dynamic but explicitly
-%% declared as a callback so static analysis (Elvis,
-%% no_invalid_dynamic_calls) recognises the pattern as intentional.
--callback observe_chat_apply_duration(
-    Variant :: apply,
-    ElapsedMicros :: non_neg_integer()
-) -> any().
--callback observe_chat_parse_duration(
-    IsPartial :: boolean(),
-    ElapsedMicros :: non_neg_integer()
-) -> any().
--optional_callbacks([
-    observe_chat_apply_duration/2,
-    observe_chat_parse_duration/2
-]).
 
 -type templates_ref() :: erllama_nif:chat_templates_ref().
 -type params_ref() :: erllama_nif:chat_params_ref().
@@ -119,7 +97,9 @@ chat_generate(Model, Params, Prompt, RequestOpts) ->
     TokOpts = #{add_special => false, parse_special => true},
     case erllama_model:tokenize(Model, Prompt, TokOpts) of
         {ok, Tokens} ->
-            case erllama:stream(Model, Tokens, RequestOpts#{to => self()}) of
+            %% Straight to the model process: the façade's `chat' op is the
+            %% one the middleware chain sees, not a nested `stream'.
+            case erllama_model:infer(Model, Tokens, maps:remove(to, RequestOpts), self()) of
                 {ok, Ref} ->
                     chat_collect(Ref, Params, Prompt);
                 {error, _} = E ->
@@ -150,71 +130,16 @@ init(Model, TemplateOverride) ->
 -spec apply(templates_ref(), map()) ->
     {ok, params_ref(), binary()} | {error, term()}.
 apply(Templates, Inputs) when is_map(Inputs) ->
-    timed_observe(
-        apply,
-        fun() -> erllama_nif:chat_templates_apply(Templates, Inputs) end
-    ).
+    erllama_nif:chat_templates_apply(Templates, Inputs).
 
 -spec parse(params_ref(), binary(), boolean()) ->
     {ok, parsed_msg()} | {error, term()}.
 parse(Params, Input, IsPartial) when
     is_binary(Input), is_boolean(IsPartial)
 ->
-    Start = erlang:monotonic_time(microsecond),
-    Result =
-        case erllama_nif:chat_parse(Params, Input, IsPartial) of
-            {ok, Msg} -> {ok, decode_tool_calls(Msg)};
-            Err -> Err
-        end,
-    Elapsed = erlang:monotonic_time(microsecond) - Start,
-    notify_parse_observer(IsPartial, Elapsed),
-    Result.
-
-%% Observer plumbing. The server's metrics module calls set_observer
-%% once at boot; the chat module then notifies it on every NIF call.
-%% Kept opt-in via persistent_term so the runtime carries no
-%% dependency on the server app.
--define(OBSERVER_KEY, {?MODULE, observer}).
-
--spec set_observer(module()) -> ok.
-set_observer(Module) when is_atom(Module) ->
-    persistent_term:put(?OBSERVER_KEY, Module),
-    ok.
-
--spec clear_observer() -> ok.
-clear_observer() ->
-    _ = persistent_term:erase(?OBSERVER_KEY),
-    ok.
-
-timed_observe(Variant, Fn) ->
-    Start = erlang:monotonic_time(microsecond),
-    Result = Fn(),
-    Elapsed = erlang:monotonic_time(microsecond) - Start,
-    notify_apply_observer(Variant, Elapsed),
-    Result.
-
-notify_apply_observer(Variant, ElapsedMicros) ->
-    case persistent_term:get(?OBSERVER_KEY, undefined) of
-        undefined ->
-            ok;
-        Module ->
-            try
-                Module:observe_chat_apply_duration(Variant, ElapsedMicros)
-            catch
-                _:_ -> ok
-            end
-    end.
-
-notify_parse_observer(IsPartial, ElapsedMicros) ->
-    case persistent_term:get(?OBSERVER_KEY, undefined) of
-        undefined ->
-            ok;
-        Module ->
-            try
-                Module:observe_chat_parse_duration(IsPartial, ElapsedMicros)
-            catch
-                _:_ -> ok
-            end
+    case erllama_nif:chat_parse(Params, Input, IsPartial) of
+        {ok, Msg} -> {ok, decode_tool_calls(Msg)};
+        Err -> Err
     end.
 
 %% The NIF returns each tool call's arguments as a raw JSON binary

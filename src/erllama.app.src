@@ -6,28 +6,53 @@
         "Native Erlang/OTP wrapper around llama.cpp with token-exact tiered KV cache; cache more warm state than fits in RAM"},
     {vsn, "0.9.0"},
     {registered, [
-        erllama_sup, erllama_cache_sup, erllama_cache_meta_srv
+        erllama_sup,
+        erllama_registry,
+        erllama_inflight,
+        erllama_chat_cache,
+        erllama_model_sup,
+        erllama_scheduler,
+        erllama_cache_sup,
+        erllama_cache_meta_srv,
+        erllama_cache_ram,
+        erllama_cache_writer,
+        erllama_cache_tier_sup
     ]},
     {mod, {erllama_app, []}},
     {applications, [
         kernel,
         stdlib,
         sasl,
-        crypto
+        crypto,
+        os_mon
     ]},
     {env, [
-        {tiers, [
-            #{backend => ram, quota_mb => 4096}
-        ]},
+        %% Extra cache tiers started with the application; each entry
+        %% is #{name, backend => disk | ram_file, root}. The RAM tier
+        %% is always on.
+        {tiers, []},
+        %% Cache policy defaults; every key can be overridden per model
+        %% in the `policy' load config map.
         {min_tokens, 512},
         {cold_min_tokens, 512},
         {cold_max_tokens, 30000},
         {continued_interval, 2048},
         {boundary_trim_tokens, 32},
         {boundary_align_tokens, 2048},
-        {evict_save_timeout_ms, 30000},
         {session_resume_wait_ms, 500},
+        %% Bound for the synchronous evict / shutdown saves.
+        {evict_save_timeout_ms, 30000},
+        %% Default model fingerprint mode: safe | gguf_chunked | fast_unsafe.
         {fingerprint_mode, safe},
+        %% Concurrent cache writers (default: 2 * schedulers + 1).
+        %% {writer_max_concurrent, 9},
+        %% LRU size of the per-model chat template cache.
+        {chat_cache_size, 64},
+        %% Key used to sign thinking-block signatures (binary); unset
+        %% or <<>> disables signing.
+        %% {thinking_signing_key, <<>>},
+        %% Global middleware chain; see erllama_middleware.
+        {middleware, []},
         {scheduler, #{
             enabled => false,
             pressure_source => noop,

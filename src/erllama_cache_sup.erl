@@ -17,7 +17,23 @@ init([]) ->
     Children = [
         erllama_cache_meta_srv, erllama_cache_ram, erllama_cache_writer
     ],
-    {ok, {SupFlags, [worker(M) || M <- Children]}}.
+    TierSup = #{
+        id => erllama_cache_tier_sup,
+        start => {erllama_cache_tier_sup, start_link, []},
+        restart => permanent,
+        shutdown => infinity,
+        type => supervisor,
+        modules => [erllama_cache_tier_sup]
+    },
+    Configured = #{
+        id => erllama_cache_tiers_boot,
+        start => {erllama_cache, start_configured_tiers, []},
+        restart => transient,
+        shutdown => brutal_kill,
+        type => worker,
+        modules => [erllama_cache]
+    },
+    {ok, {SupFlags, [worker(M) || M <- Children] ++ [TierSup, Configured]}}.
 
 worker(Mod) ->
     #{

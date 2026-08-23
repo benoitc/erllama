@@ -1032,7 +1032,9 @@ build_init_data(ModelId, Config, Backend, BState) ->
         tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
         tier = maps:get(tier, Config, ram),
         fingerprint = Fp,
-        fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
+        fingerprint_mode = maps:get(
+            fingerprint_mode, Config, application:get_env(erllama, fingerprint_mode, safe)
+        ),
         quant_type = maps:get(quant_type, Config, f16),
         quant_bits = maps:get(quant_bits, Config, 16),
         ctx_params_hash = maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
