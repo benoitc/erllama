@@ -36,8 +36,9 @@ PRUNE_GGML="ggml-cann ggml-et ggml-hexagon ggml-hip ggml-musa ggml-opencl \
 ggml-openvino ggml-rpc ggml-sycl ggml-virtgpu ggml-vulkan ggml-webgpu \
 ggml-zdnn ggml-zendnn"
 
-# vendor/ entries nothing in common/ links against.
-PRUNE_VENDOR="miniaudio stb sheredom"
+# vendor/ is kept whole: since b10593 upstream builds it as CMake targets
+# (vendor/CMakeLists.txt) that common/ links against.
+PRUNE_VENDOR=""
 
 rm -rf "$DEST"
 mkdir -p "$DEST"

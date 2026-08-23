@@ -87,11 +87,17 @@ load_sub_type_checks_test_() ->
             model_opts => #{split_mode => diagonal}
         }},
         {{error, {invalid_config, use_mmap, 1}}, Base#{model_opts => #{use_mmap => 1}}},
+        {{error, {invalid_config, load_mode, lazy}}, Base#{model_opts => #{load_mode => lazy}}},
         {{error, {invalid_config, min_tokens, -1}}, Base#{policy => #{min_tokens => -1}}}
     ],
     Good = Base#{
         context_opts => #{n_ctx => 4096, kv_unified => true, type_k => q8_0},
-        model_opts => #{n_gpu_layers => -1, split_mode => layer, tensor_split => [0.5, 0.5]},
+        model_opts => #{
+            n_gpu_layers => -1,
+            split_mode => layer,
+            tensor_split => [0.5, 0.5],
+            load_mode => mmap_mlock
+        },
         policy => #{min_tokens => 4, prefill_chunk_size => infinity}
     },
     [?_assertEqual(Expected, ?M:load_config(Config)) || {Expected, Config} <- Cases] ++
