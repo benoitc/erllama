@@ -6,6 +6,43 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Removed (BREAKING)
+
+- `erllama:unload_model/1` (use `unload/1`), `erllama:models/0` (use
+  `list_models/0`), `erllama:list_cached_prefixes/2` (renamed
+  `cached_prefix_len/2`).
+
+### Changed (BREAKING)
+
+- Every per-model call returns `{ok, Result}` or `{error, not_loaded}`
+  for an unknown or stopped model instead of exiting with `noproc`:
+  `model_info/1`, `status/1`, `phase/1`, `pending_len/1`,
+  `queue_depth/1`, `last_cache_hit/1`, `list_adapters/1` now wrap
+  their result in `{ok, _}`; `unload/1`, `evict/1`, `shutdown/1`,
+  `end_session/2` return `{error, not_loaded}`.
+- `load_model/1,2` validates the config (`erllama_opts`): `backend`
+  defaults to `erllama_model_llama`; a missing `model_path` is
+  `{error, {missing_config, model_path}}`, a missing file is
+  `{error, {invalid_config, model_path, Path}}`, an unknown key is
+  `{error, {unknown_option, Key}}`. `model_id` in the config map is
+  honoured by `load_model/1`.
+- `complete/3`, `prefill_only/3` and `infer/4` validate their option
+  maps: unknown keys are `{error, {unknown_option, Key}}`, wrong types
+  `{error, {invalid_option, Key, Value}}`.
+- `response_tokens` defaults to 64 on every path (`complete/3` used 4).
+- `evict/1` and `shutdown/1` honour the `evict_save_timeout_ms`
+  application environment key (default 30 s); it was documented but
+  unread.
+- `list_adapters/1` entries use the key `adapter` (was `handle`).
+
+### Added
+
+- `erllama:whereis/1` returns the model pid for monitoring.
+- `erllama` exports the types its specs use (`token_id/0`,
+  `cache_key/0`, `completion_result/0`, `stats/0`, `request_opts/0`,
+  `load_config/0`, `error_reason/0`, ...) and documents every error
+  reason in `error_reason/0`.
+
 ## [0.9.0] - 2026-08-23
 
 ### Added

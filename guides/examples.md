@@ -648,13 +648,13 @@ read a public ETS row, never cross the model gen_statem:
 
 ```erlang
 1> erllama:phase(<<"chat">>).
-generating
+{ok, generating}
 2> erllama:pending_len(<<"chat">>).
-3
+{ok, 3}
 3> erllama:queue_depth(<<"chat">>).
-1
+{ok, 1}
 4> erllama:last_cache_hit(<<"chat">>).
-#{kind => partial, prefix_len => 1024}
+{ok, #{kind => partial, prefix_len => 1024}}
 5> erllama:queue_depth().
 %% global: total admitted streaming infer/4 rows across all loaded models.
 4

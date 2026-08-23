@@ -139,11 +139,11 @@ ok = erllama:unload(<<"tiny">>).
   misses => 12, saves_cold => 12, saves_finish => 31, ...}
 
 2> erllama:phase(<<"big">>).
-generating
+{ok, generating}
 3> erllama:pending_len(<<"big">>).
-3
+{ok, 3}
 4> erllama:last_cache_hit(<<"big">>).
-#{kind => partial, prefix_len => 1024}
+{ok, #{kind => partial, prefix_len => 1024}}
 ```
 
 ## Documentation

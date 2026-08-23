@@ -162,12 +162,10 @@ tokenize_concurrent_with_idle_test() ->
         ?assertEqual(idle, erllama_model:status(<<"test_model">>))
     end).
 
-via_unknown_model_crashes_test() ->
+unknown_model_is_not_loaded_test() ->
     with_model(#{}, fun(_) ->
-        ?assertExit(
-            {noproc, {erllama_model, not_found, <<"unknown">>}},
-            erllama_model:status(<<"unknown">>)
-        )
+        ?assertEqual({error, not_loaded}, erllama_model:status(<<"unknown">>)),
+        ?assertEqual({error, not_loaded}, erllama_model:model_info(<<"unknown">>))
     end).
 
 complete_returns_response_test() ->
@@ -1603,20 +1601,20 @@ drain_done(Ref, TimeoutMs) ->
 
 phase_starts_idle_and_reflects_state_test() ->
     with_model(#{}, fun(_Cfg) ->
-        ?assertEqual(idle, erllama:phase(<<"test_model">>)),
+        ?assertEqual({ok, idle}, erllama:phase(<<"test_model">>)),
         {ok, _} = erllama_model:complete(<<"test_model">>, short_prompt()),
         %% Back to idle after the synchronous complete returns.
-        ?assertEqual(idle, erllama:phase(<<"test_model">>))
+        ?assertEqual({ok, idle}, erllama:phase(<<"test_model">>))
     end).
 
-phase_unknown_model_returns_idle_test() ->
+phase_unknown_model_returns_not_loaded_test() ->
     with_model(#{}, fun(_Cfg) ->
-        ?assertEqual(idle, erllama:phase(<<"never_loaded">>))
+        ?assertEqual({error, not_loaded}, erllama:phase(<<"never_loaded">>))
     end).
 
 pending_len_zero_when_idle_test() ->
     with_model(#{}, fun(_Cfg) ->
-        ?assertEqual(0, erllama:pending_len(<<"test_model">>))
+        ?assertEqual({ok, 0}, erllama:pending_len(<<"test_model">>))
     end).
 
 pending_len_increments_when_queued_test() ->
@@ -1668,7 +1666,7 @@ pending_len_increments_when_queued_test() ->
             {erllama_done, Ref2, _} -> ok
         after 5000 -> erlang:error(timeout_second)
         end,
-        ?assertEqual(0, erllama:pending_len(<<"test_model">>))
+        ?assertEqual({ok, 0}, erllama:pending_len(<<"test_model">>))
     end).
 
 %% Poll pending_len until it reaches Expected or Timeout expires.
@@ -1682,7 +1680,7 @@ wait_for_pending_len(ModelId, Expected, TimeoutMs) ->
 
 wait_for_pending_len_loop(ModelId, Expected, Deadline) ->
     case erllama:pending_len(ModelId) of
-        Expected ->
+        {ok, Expected} ->
             ok;
         _ ->
             case erlang:monotonic_time(millisecond) > Deadline of
@@ -1696,7 +1694,7 @@ wait_for_pending_len_loop(ModelId, Expected, Deadline) ->
 
 last_cache_hit_undefined_before_any_request_test() ->
     with_model(#{}, fun(_Cfg) ->
-        ?assertEqual(undefined, erllama:last_cache_hit(<<"test_model">>))
+        ?assertEqual({ok, undefined}, erllama:last_cache_hit(<<"test_model">>))
     end).
 
 last_cache_hit_after_cold_admission_reports_cold_test() ->
@@ -1708,7 +1706,7 @@ last_cache_hit_after_cold_admission_reports_cold_test() ->
             response_tokens => 2
         }),
         ?assertEqual(
-            #{kind => cold, prefix_len => 0},
+            {ok, #{kind => cold, prefix_len => 0}},
             erllama:last_cache_hit(<<"test_model">>)
         )
     end).
@@ -1728,7 +1726,7 @@ last_cache_hit_after_warm_resume_test() ->
                 response_tokens => 2
             }
         ),
-        Hit = erllama:last_cache_hit(<<"test_model">>),
+        {ok, Hit} = erllama:last_cache_hit(<<"test_model">>),
         ?assertMatch(#{kind := exact, prefix_len := _}, Hit),
         #{prefix_len := PrefixLen} = Hit,
         ?assertEqual(length(Tokens), PrefixLen)

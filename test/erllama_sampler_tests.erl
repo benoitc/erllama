@@ -90,7 +90,7 @@ full_sampler_set_lands_on_backend_test() ->
         {ok, _} = erllama:load_model(Id, minimal_config()),
         Opts = #{
             response_tokens => 4,
-            parent_key => <<"ignored">>,
+            parent_key => undefined,
             temperature => 0.7,
             top_k => 40,
             top_p => 0.9,

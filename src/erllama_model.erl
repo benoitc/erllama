@@ -129,6 +129,8 @@ concurrently through one decode call per tick.
 
 -export([
     start_link/2,
+    call/2,
+    call/3,
     stop/1,
     complete/2,
     complete/3,
@@ -373,6 +375,9 @@ concurrently through one decode call per tick.
 %% `n_seq_max => 1` exactly one request runs at a time; with
 %% n_seq_max > 1 the scheduler co-batches multiple in-flight reqs
 %% into one llama_decode tick.
+%% Default cap on generated tokens for complete/infer/continue.
+-define(DEFAULT_RESPONSE_TOKENS, 64).
+
 -record(req, {
     seq_id :: non_neg_integer(),
     mode :: standard | streaming | prefill_only,
@@ -590,6 +595,28 @@ start_link(ModelId, Config) when is_binary(ModelId) ->
 stop(Model) ->
     gen_statem:stop(via(Model)).
 
+-doc """
+Call the model gen_statem. Maps a dead or unknown model to
+`{error, not_loaded}` and an expired timeout to `{error, timeout}`
+instead of exiting, so every façade function has one error shape for
+"this model is not there".
+""".
+-spec call(model(), term()) -> term() | {error, not_loaded | timeout}.
+call(Model, Request) ->
+    call(Model, Request, 5000).
+
+-spec call(model(), term(), timeout()) -> term() | {error, not_loaded | timeout}.
+call(Model, Request, Timeout) ->
+    try
+        gen_statem:call(via(Model), Request, Timeout)
+    catch
+        exit:{noproc, _} -> {error, not_loaded};
+        exit:{normal, _} -> {error, not_loaded};
+        exit:{shutdown, _} -> {error, not_loaded};
+        exit:{{shutdown, _}, _} -> {error, not_loaded};
+        exit:{timeout, _} -> {error, timeout}
+    end.
+
 -spec complete(model(), binary()) ->
     {ok, completion_result()} | {error, term()}.
 complete(Model, Prompt) ->
@@ -598,7 +625,7 @@ complete(Model, Prompt) ->
 -spec complete(model(), binary(), map()) ->
     {ok, completion_result()} | {error, term()}.
 complete(Model, Prompt, Opts) ->
-    gen_statem:call(via(Model), {complete, Prompt, Opts}, infinity).
+    call(Model, {complete, Prompt, Opts}, infinity).
 
 -doc """
 Decode a prompt into KV state and fire a finish save, without
@@ -623,7 +650,7 @@ prefill_only(Model, PromptTokens) when is_list(PromptTokens) ->
 -spec prefill_only(model(), [non_neg_integer()], map()) ->
     {ok, prefill_result()} | {error, term()}.
 prefill_only(Model, PromptTokens, Opts) when is_list(PromptTokens), is_map(Opts) ->
-    gen_statem:call(via(Model), {prefill_only, PromptTokens, Opts}, infinity).
+    call(Model, {prefill_only, PromptTokens, Opts}, infinity).
 
 -doc """
 Streaming inference. Admits a request and immediately returns a
@@ -652,7 +679,7 @@ request.
 infer(Model, Tokens, Params, CallerPid) when
     is_list(Tokens), is_map(Params), is_pid(CallerPid)
 ->
-    gen_statem:call(via(Model), {infer, Tokens, Params, CallerPid}, infinity).
+    call(Model, {infer, Tokens, Params, CallerPid}, infinity).
 
 -doc """
 Streaming inference that extends a pinned sticky session by prefilling
@@ -719,7 +746,7 @@ continue(Model, SuffixTokens, Opts) when is_list(SuffixTokens), is_map(Opts) ->
                 error ->
                     {error, {missing_opt, caller_pid}};
                 {ok, Pid} when is_pid(Pid) ->
-                    gen_statem:call(via(Model), {continue, SuffixTokens, Opts}, infinity);
+                    call(Model, {continue, SuffixTokens, Opts}, infinity);
                 {ok, _} ->
                     {error, {missing_opt, caller_pid}}
             end
@@ -761,7 +788,7 @@ cancel(Ref) when is_reference(Ref) ->
 
 -spec end_session(model(), term()) -> ok.
 end_session(Model, SessionId) ->
-    gen_statem:call(via(Model), {end_session, SessionId}, infinity).
+    call(Model, {end_session, SessionId}, infinity).
 
 %% Recovery primitive. Uses a 5 s timeout so it stays reachable when
 %% the engine's hot path is wedged. Force-fails any in-flight req on
@@ -771,15 +798,11 @@ end_session(Model, SessionId) ->
 -spec reset_session(model(), term()) ->
     {ok, recovered | not_found} | {error, timeout}.
 reset_session(Model, SessionId) ->
-    try gen_statem:call(via(Model), {reset_session, SessionId}, 5000) of
-        Reply -> Reply
-    catch
-        exit:{timeout, _} -> {error, timeout}
-    end.
+    call(Model, {reset_session, SessionId}, 5000).
 
--spec status(model()) -> idle | prefilling | generating.
+-spec status(model()) -> idle | prefilling | generating | {error, not_loaded | timeout}.
 status(Model) ->
-    gen_statem:call(via(Model), status).
+    call(Model, status).
 
 -doc """
 Request that the model evict its current state. Fires an `evict`
@@ -788,18 +811,18 @@ save synchronously if there is anything in the context. Called by
 model to release its context handle. No-op when the model is idle
 with no live context.
 """.
--spec evict(model()) -> ok.
+-spec evict(model()) -> ok | {error, not_loaded | timeout}.
 evict(Model) ->
-    gen_statem:call(via(Model), evict).
+    call(Model, evict, save_timeout()).
 
 -doc """
 Fire a `shutdown` save synchronously and return. Called from the
 application's `prep_stop` hook so live state survives a graceful
 restart.
 """.
--spec shutdown(model()) -> ok.
+-spec shutdown(model()) -> ok | {error, not_loaded | timeout}.
 shutdown(Model) ->
-    gen_statem:call(via(Model), shutdown).
+    call(Model, shutdown, save_timeout()).
 
 -doc """
 Snapshot of the model's metadata.
@@ -809,9 +832,9 @@ backend, fingerprint, and tier. Safe to call from any state - the
 gen_statem handles it as a common event without disrupting in-flight
 inference.
 """.
--spec model_info(model()) -> model_info().
+-spec model_info(model()) -> model_info() | {error, not_loaded | timeout}.
 model_info(Model) ->
-    gen_statem:call(via(Model), model_info).
+    call(Model, model_info).
 
 -doc """
 Tokenise a string using the model's tokenizer. Returns a list of
@@ -821,12 +844,12 @@ runs against the model's static vocabulary, not the live KV cache.
 -spec tokenize(model(), binary()) ->
     {ok, [non_neg_integer()]} | {error, term()}.
 tokenize(Model, Text) when is_binary(Text) ->
-    gen_statem:call(via(Model), {tokenize, Text}).
+    call(Model, {tokenize, Text}, infinity).
 
 -spec tokenize(model(), binary(), map()) ->
     {ok, [non_neg_integer()]} | {error, term()}.
 tokenize(Model, Text, Opts) when is_binary(Text), is_map(Opts) ->
-    gen_statem:call(via(Model), {tokenize, Text, Opts}).
+    call(Model, {tokenize, Text, Opts}, infinity).
 
 -doc """
 Detokenise a list of token IDs back to a string. Safe to call
@@ -835,7 +858,7 @@ concurrently with `complete/2,3`.
 -spec detokenize(model(), [non_neg_integer()]) ->
     {ok, binary()} | {error, term()}.
 detokenize(Model, Tokens) when is_list(Tokens) ->
-    gen_statem:call(via(Model), {detokenize, Tokens}).
+    call(Model, {detokenize, Tokens}, infinity).
 
 -doc """
 Render a normalised chat request through the model's chat template
@@ -849,7 +872,7 @@ chat templating.
 -spec apply_chat_template(model(), erllama_model_backend:chat_request()) ->
     {ok, [non_neg_integer()]} | {error, term()}.
 apply_chat_template(Model, Request) when is_map(Request) ->
-    gen_statem:call(via(Model), {apply_chat_template, Request}).
+    call(Model, {apply_chat_template, Request}, infinity).
 
 %% Build (or fetch from cache) a chat_params_ref + rendered prompt for
 %% this model and the given tools-set. `ToolsHash' is a stable
@@ -857,13 +880,13 @@ apply_chat_template(Model, Request) when is_map(Request) ->
 %% => same cached params_ref + prompt. `Inputs' is the map fed
 %% verbatim to `erllama_chat:apply/2'.
 chat_apply(Model, Inputs) when is_map(Inputs) ->
-    gen_statem:call(via(Model), {chat_apply, Inputs}).
+    call(Model, {chat_apply, Inputs}, infinity).
 
 %% Drop every chat-cache entry for this model. Called on model
 %% terminate so the cache does not extend templates_ref / params_ref
 %% lifetimes past unload.
 chat_purge(Model) ->
-    gen_statem:call(via(Model), chat_purge).
+    call(Model, chat_purge).
 
 -doc """
 Compute an embedding vector for the given prompt tokens.
@@ -871,7 +894,7 @@ Compute an embedding vector for the given prompt tokens.
 -spec embed(model(), [non_neg_integer()]) ->
     {ok, [float()]} | {error, term()}.
 embed(Model, Tokens) when is_list(Tokens) ->
-    gen_statem:call(via(Model), {embed, Tokens}).
+    call(Model, {embed, Tokens}, infinity).
 
 -doc """
 Load a LoRA adapter from a GGUF file and attach it to the model
@@ -883,7 +906,7 @@ this adapter never collide with rows from a different adapter set.
 -spec load_adapter(model(), file:filename_all()) ->
     {ok, term()} | {error, term()}.
 load_adapter(Model, Path) ->
-    gen_statem:call(via(Model), {load_adapter, Path}).
+    call(Model, {load_adapter, Path}, infinity).
 
 -doc """
 Detach + free a previously loaded adapter. Idempotent: a second call
@@ -891,7 +914,7 @@ on the same handle returns `ok`.
 """.
 -spec unload_adapter(model(), term()) -> ok | {error, term()}.
 unload_adapter(Model, Handle) ->
-    gen_statem:call(via(Model), {unload_adapter, Handle}).
+    call(Model, {unload_adapter, Handle}).
 
 -doc """
 Change an attached adapter's scale. Re-applies the full set on the
@@ -899,15 +922,16 @@ underlying context.
 """.
 -spec set_adapter_scale(model(), term(), float()) -> ok | {error, term()}.
 set_adapter_scale(Model, Handle, Scale) when is_number(Scale) ->
-    gen_statem:call(via(Model), {set_adapter_scale, Handle, float(Scale)}).
+    call(Model, {set_adapter_scale, Handle, float(Scale)}).
 
 -doc """
 List currently attached adapters as `[#{handle => H, scale => F}]`.
 The handle is the same opaque value `load_adapter/2` returned.
 """.
--spec list_adapters(model()) -> [#{handle := term(), scale := float()}].
+-spec list_adapters(model()) ->
+    [#{handle := term(), scale := float()}] | {error, not_loaded | timeout}.
 list_adapters(Model) ->
-    gen_statem:call(via(Model), list_adapters).
+    call(Model, list_adapters).
 
 %% =============================================================================
 %% gen_statem callbacks
@@ -954,9 +978,10 @@ get_policy(Model) ->
 %% (with attached LoRA composition) so the lookup matches what
 %% runtime requests would hit.
 -spec cache_key_meta(model()) ->
-    #{fingerprint := binary(), quant_type := atom(), ctx_params_hash := binary()}.
+    #{fingerprint := binary(), quant_type := atom(), ctx_params_hash := binary()}
+    | {error, not_loaded | timeout}.
 cache_key_meta(Model) ->
-    gen_statem:call(via(Model), cache_key_meta).
+    call(Model, cache_key_meta).
 
 %% Speculative-decoding verifier. Synchronous; runs the verifier
 %% pass against the model's context and returns
@@ -972,7 +997,7 @@ cache_key_meta(Model) ->
 ) ->
     {ok, non_neg_integer(), erllama_nif:token_id() | eos} | {error, term()}.
 verify(Model, PrefixTokens, Candidates, K) ->
-    gen_statem:call(via(Model), {verify, PrefixTokens, Candidates, K}).
+    call(Model, {verify, PrefixTokens, Candidates, K}, infinity).
 
 init([ModelId, Config]) ->
     Backend = maps:get(backend, Config, erllama_model_stub),
@@ -1580,7 +1605,7 @@ start_request({complete, From, Prompt, Opts}, SeqId, Mode, Data) ->
                 mode = standard,
                 caller = From,
                 prompt_tokens = PromptTokens,
-                response_target = maps:get(response_tokens, Opts, 4),
+                response_target = maps:get(response_tokens, Opts, ?DEFAULT_RESPONSE_TOKENS),
                 generated = [],
                 last_save_at = 0,
                 context_tokens = [],
@@ -1635,7 +1660,7 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
                 caller_pid = CallerPid,
                 request_ref = Ref,
                 prompt_tokens = Tokens,
-                response_target = maps:get(response_tokens, Params, 64),
+                response_target = maps:get(response_tokens, Params, ?DEFAULT_RESPONSE_TOKENS),
                 generated = [],
                 last_save_at = 0,
                 context_tokens = [],
@@ -1675,7 +1700,7 @@ start_request({continue, From, Suffix, Opts}, SeqId, {continue, StoredTokens} = 
                 caller_pid = CallerPid,
                 request_ref = Ref,
                 prompt_tokens = FullPrompt,
-                response_target = maps:get(response_tokens, Opts, 64),
+                response_target = maps:get(response_tokens, Opts, ?DEFAULT_RESPONSE_TOKENS),
                 generated = [],
                 last_save_at = 0,
                 context_tokens = [],
@@ -3584,6 +3609,11 @@ backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) 
         true -> Mod:tokenize(S, Text, Opts);
         false -> Mod:tokenize(S, Text)
     end.
+
+%% Bound for the synchronous evict / shutdown saves; app env
+%% `evict_save_timeout_ms' (default 30 s).
+save_timeout() ->
+    application:get_env(erllama, evict_save_timeout_ms, 30000).
 
 %% Resolve a model() reference to a Pid that gen_statem:call/2,3
 %% accepts. Binary IDs go through the registry; pids pass through.
