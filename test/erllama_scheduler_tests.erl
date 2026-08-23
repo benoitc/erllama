@@ -348,10 +348,18 @@ invalid_model_evictor_at_init_test() ->
     ).
 
 valid_model_unload_config_test() ->
+    %% Any loadable module exporting evict_one/0 is accepted (this
+    %% test module is one); an unknown module is not.
     ?assertEqual(
         ok,
         erllama_scheduler:validate_config(#{
-            unload_models_under_pressure => true, model_evictor => some_module
+            unload_models_under_pressure => true, model_evictor => ?MODULE
+        })
+    ),
+    ?assertMatch(
+        {error, {invalid_config, {model_evictor, _}}},
+        erllama_scheduler:validate_config(#{
+            unload_models_under_pressure => true, model_evictor => no_such_module
         })
     ).
 

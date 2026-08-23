@@ -66,6 +66,10 @@ handle for every other call; a pid works too. The cache subsystem is
     list_adapters/1,
     counters/0,
     vram_info/0,
+    pressure/0,
+    pressure_sources/0,
+    requests/0,
+    request_info/1,
     cached_prefix_len/2,
     draft_tokens/3,
     verify/4
@@ -192,7 +196,7 @@ as `{erllama, Ref, Event}`.
     stop_sequence => binary()
 }.
 -doc "A middleware: `fun(Request, Next) -> Response`; see `erllama_middleware`.".
--type middleware() :: fun((map(), fun((map()) -> term())) -> term()).
+-type middleware() :: erllama_middleware:middleware().
 
 -doc """
 Config map for `load_model/1,2`.
@@ -355,18 +359,29 @@ load_model(Config) when is_map(Config) ->
 load_model(ModelId, Config) when is_binary(ModelId), is_map(Config) ->
     case erllama_opts:load_config(Config) of
         {ok, Config1} ->
-            case erllama_model_sup:start_model(ModelId, maps:remove(model_id, Config1)) of
-                {ok, _Pid} -> {ok, ModelId};
-                {error, {already_started, _}} -> {error, already_loaded};
-                {error, _} = E -> E
-            end;
+            Req = #{
+                op => load_model,
+                model => ModelId,
+                args => #{config => maps:remove(model_id, Config1)}
+            },
+            erllama_middleware:run(Req, fun do_load_model/1);
         {error, _} = E ->
             E
+    end.
+
+do_load_model(#{model := ModelId, args := #{config := Config}}) ->
+    case erllama_model_sup:start_model(ModelId, Config) of
+        {ok, _Pid} -> {ok, ModelId};
+        {error, {already_started, _}} -> {error, already_loaded};
+        {error, _} = E -> E
     end.
 
 -doc "Unload a model and free its context. `{error, not_loaded}` if it is not running.".
 -spec unload(model()) -> ok | {error, not_loaded}.
 unload(Model) ->
+    erllama_middleware:run(#{op => unload, model => Model, args => #{}}, fun do_unload/1).
+
+do_unload(#{model := Model}) ->
     case erllama_model_sup:stop_model(Model) of
         ok -> ok;
         {error, _} -> {error, not_loaded}
@@ -483,10 +498,11 @@ cached row instead of walking the longest cached prefix. See
 -spec complete(model(), binary(), request_opts()) ->
     {ok, completion_result()} | {error, error_reason()}.
 complete(Model, Prompt, Opts) when is_binary(Prompt), is_map(Opts) ->
-    case erllama_opts:request_opts(Opts) of
-        {ok, Opts1} -> erllama_model:complete(Model, Prompt, Opts1);
-        {error, _} = E -> E
-    end.
+    with_opts(complete, Model, Opts, fun erllama_opts:request_opts/1, #{prompt => Prompt}, fun(
+        #{model := M, args := #{prompt := P, opts := O}}
+    ) ->
+        erllama_model:complete(M, P, O)
+    end).
 
 -doc "`prefill_only/3` with default options.".
 -spec prefill_only(model(), [token_id()]) -> {ok, prefill_result()} | {error, error_reason()}.
@@ -503,10 +519,13 @@ the new suffix is prefilled.
 -spec prefill_only(model(), [token_id()], prefill_opts()) ->
     {ok, prefill_result()} | {error, error_reason()}.
 prefill_only(Model, PromptTokens, Opts) when is_list(PromptTokens), is_map(Opts) ->
-    case erllama_opts:prefill_opts(Opts) of
-        {ok, Opts1} -> erllama_model:prefill_only(Model, PromptTokens, Opts1);
-        {error, _} = E -> E
-    end.
+    with_opts(
+        prefill_only, Model, Opts, fun erllama_opts:prefill_opts/1, #{tokens => PromptTokens}, fun(
+            #{model := M, args := #{tokens := T, opts := O}}
+        ) ->
+            erllama_model:prefill_only(M, T, O)
+        end
+    ).
 
 -doc """
 Streaming inference. Returns `{ok, Ref}` at once; events arrive at the
@@ -524,19 +543,22 @@ loop.
 """.
 -spec stream(model(), binary() | [token_id()], request_opts()) ->
     {ok, reference()} | {error, error_reason()}.
-stream(Model, Prompt, Opts) when is_binary(Prompt), is_map(Opts) ->
-    case tokenize(Model, Prompt) of
-        {ok, Tokens} -> stream(Model, Tokens, Opts);
+stream(Model, Prompt, Opts) when is_binary(Prompt), is_map(Opts); is_list(Prompt), is_map(Opts) ->
+    with_opts(
+        stream, Model, Opts, fun erllama_opts:request_opts/1, #{prompt => Prompt}, fun do_stream/1
+    ).
+
+do_stream(#{model := Model, args := #{prompt := Prompt, opts := Opts}}) when is_binary(Prompt) ->
+    case erllama_model:tokenize(Model, Prompt) of
+        {ok, Tokens} -> do_stream_tokens(Model, Tokens, Opts);
         {error, _} = E -> E
     end;
-stream(Model, Tokens, Opts) when is_list(Tokens), is_map(Opts) ->
-    case erllama_opts:request_opts(Opts) of
-        {ok, Opts1} ->
-            {To, Params} = take_to(Opts1),
-            erllama_model:infer(Model, Tokens, Params, To);
-        {error, _} = E ->
-            E
-    end.
+do_stream(#{model := Model, args := #{prompt := Tokens, opts := Opts}}) when is_list(Tokens) ->
+    do_stream_tokens(Model, Tokens, Opts).
+
+do_stream_tokens(Model, Tokens, Opts) ->
+    {To, Params} = take_to(Opts),
+    erllama_model:infer(Model, Tokens, Params, To).
 
 -doc """
 Wait for a streaming request started with `stream/3` or `continue/3`
@@ -565,17 +587,23 @@ ignored. Events are those of `stream/3`; `Stats.cache_hit_kind` is
 -spec continue(model(), [token_id()], request_opts()) ->
     {ok, reference()} | {error, error_reason()}.
 continue(Model, SuffixTokens, Opts) when is_list(SuffixTokens), is_map(Opts) ->
-    case erllama_opts:request_opts(Opts) of
-        {ok, Opts1} ->
-            case maps:is_key(session_id, Opts1) of
-                false ->
-                    {error, {missing_option, session_id}};
-                true ->
-                    {To, Params} = take_to(Opts1),
-                    erllama_model:continue(Model, SuffixTokens, Params#{caller_pid => To})
-            end;
-        {error, _} = E ->
-            E
+    case maps:is_key(session_id, Opts) of
+        false ->
+            {error, {missing_option, session_id}};
+        true ->
+            with_opts(
+                continue,
+                Model,
+                Opts,
+                fun erllama_opts:request_opts/1,
+                #{tokens => SuffixTokens},
+                fun(
+                    #{model := M, args := #{tokens := T, opts := O}}
+                ) ->
+                    {To, Params} = take_to(O),
+                    erllama_model:continue(M, T, Params#{caller_pid => To})
+                end
+            )
     end.
 
 -doc """
@@ -632,7 +660,7 @@ shutdown(Model) ->
 -doc "Tokenise text (`add_special => true`, `parse_special => false`). Safe during inference.".
 -spec tokenize(model(), binary()) -> {ok, [token_id()]} | {error, error_reason()}.
 tokenize(Model, Text) when is_binary(Text) ->
-    erllama_model:tokenize(Model, Text).
+    tokenize(Model, Text, #{}).
 
 -doc """
 Tokenise with explicit options. `parse_special => true` turns
@@ -643,12 +671,21 @@ the BOS token.
 -spec tokenize(model(), binary(), #{add_special => boolean(), parse_special => boolean()}) ->
     {ok, [token_id()]} | {error, error_reason()}.
 tokenize(Model, Text, Opts) when is_binary(Text), is_map(Opts) ->
+    Req = #{op => tokenize, model => Model, args => #{text => Text, opts => Opts}},
+    erllama_middleware:run(Req, fun do_tokenize/1).
+
+do_tokenize(#{model := Model, args := #{text := Text, opts := Opts}}) when map_size(Opts) =:= 0 ->
+    erllama_model:tokenize(Model, Text);
+do_tokenize(#{model := Model, args := #{text := Text, opts := Opts}}) ->
     erllama_model:tokenize(Model, Text, Opts).
 
 -doc "Detokenise token ids back to text.".
 -spec detokenize(model(), [token_id()]) -> {ok, binary()} | {error, error_reason()}.
 detokenize(Model, Tokens) when is_list(Tokens) ->
-    erllama_model:detokenize(Model, Tokens).
+    Req = #{op => detokenize, model => Model, args => #{tokens => Tokens}},
+    erllama_middleware:run(Req, fun(#{model := M, args := #{tokens := T}}) ->
+        erllama_model:detokenize(M, T)
+    end).
 
 %% =============================================================================
 %% Chat
@@ -684,8 +721,16 @@ Streaming callers use `chat_apply/2` + `stream/3` + `chat_parse/3`.
     {ok, chat_result()} | {error, error_reason()}.
 chat(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
     case erllama_opts:request_opts(maps:without([tools, tool_choice, parallel_tool_calls], Opts)) of
-        {ok, _} -> erllama_chat:chat(Model, Messages, Opts);
-        {error, _} = E -> E
+        {ok, _} ->
+            {Chain, Opts1} = erllama_middleware:take(Opts),
+            Req = #{op => chat, model => Model, args => #{messages => Messages, opts => Opts1}},
+            erllama_middleware:run(Req, Chain, fun(
+                #{model := M, args := #{messages := Ms, opts := O}}
+            ) ->
+                erllama_chat:chat(M, Ms, O)
+            end);
+        {error, _} = E ->
+            E
     end.
 
 -doc """
@@ -700,6 +745,11 @@ reusable across requests.
 -spec chat_apply(model(), [chat_message()], chat_opts()) ->
     {ok, #{prompt := binary(), params := chat_params()}} | {error, error_reason()}.
 chat_apply(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
+    {Chain, Opts1} = erllama_middleware:take(Opts),
+    Req = #{op => chat_apply, model => Model, args => #{messages => Messages, opts => Opts1}},
+    erllama_middleware:run(Req, Chain, fun do_chat_apply/1).
+
+do_chat_apply(#{model := Model, args := #{messages := Messages, opts := Opts}}) ->
     case erllama_model:chat_apply(Model, erllama_chat:inputs(Messages, Opts)) of
         {ok, Params, Prompt} -> {ok, #{prompt => Prompt, params => Params}};
         {error, _} = E -> E
@@ -713,7 +763,14 @@ reasoning, tool calls) with the parser from `chat_apply/3`.
 -spec chat_parse(chat_params(), binary(), boolean()) ->
     {ok, parsed_message()} | {error, error_reason()}.
 chat_parse(Params, Input, IsPartial) when is_binary(Input), is_boolean(IsPartial) ->
-    erllama_chat:parse(Params, Input, IsPartial).
+    Req = #{
+        op => chat_parse,
+        model => undefined,
+        args => #{params => Params, input => Input, partial => IsPartial}
+    },
+    erllama_middleware:run(Req, fun(#{args := #{params := P, input := I, partial := Partial}}) ->
+        erllama_chat:parse(P, I, Partial)
+    end).
 
 %% =============================================================================
 %% Embeddings
@@ -724,12 +781,16 @@ Embedding vector for a text or a token list. The model must be loaded
 with `context_opts => #{embeddings => true}`.
 """.
 -spec embed(model(), binary() | [token_id()]) -> {ok, [float()]} | {error, error_reason()}.
-embed(Model, Text) when is_binary(Text) ->
-    case tokenize(Model, Text) of
-        {ok, Tokens} -> embed(Model, Tokens);
+embed(Model, Input) when is_binary(Input); is_list(Input) ->
+    Req = #{op => embed, model => Model, args => #{input => Input}},
+    erllama_middleware:run(Req, fun do_embed/1).
+
+do_embed(#{model := Model, args := #{input := Text}}) when is_binary(Text) ->
+    case erllama_model:tokenize(Model, Text) of
+        {ok, Tokens} -> erllama_model:embed(Model, Tokens);
         {error, _} = E -> E
     end;
-embed(Model, Tokens) when is_list(Tokens) ->
+do_embed(#{model := Model, args := #{input := Tokens}}) when is_list(Tokens) ->
     erllama_model:embed(Model, Tokens).
 
 -doc """
@@ -739,15 +800,18 @@ round-trip to the model process. Stops at the first error.
 -spec embed_batch(model(), [binary() | [token_id()]]) ->
     {ok, [[float()]]} | {error, error_reason()}.
 embed_batch(Model, Inputs) when is_list(Inputs) ->
-    case tokenize_all(Model, Inputs, []) of
-        {ok, TokenLists} -> erllama_model:embed_batch(Model, TokenLists);
-        {error, _} = E -> E
-    end.
+    Req = #{op => embed_batch, model => Model, args => #{input => Inputs}},
+    erllama_middleware:run(Req, fun(#{model := M, args := #{input := In}}) ->
+        case tokenize_all(M, In, []) of
+            {ok, TokenLists} -> erllama_model:embed_batch(M, TokenLists);
+            {error, _} = E -> E
+        end
+    end).
 
 tokenize_all(_Model, [], Acc) ->
     {ok, lists:reverse(Acc)};
 tokenize_all(Model, [Text | Rest], Acc) when is_binary(Text) ->
-    case tokenize(Model, Text) of
+    case erllama_model:tokenize(Model, Text) of
         {ok, Tokens} -> tokenize_all(Model, Rest, [Tokens | Acc]);
         {error, _} = E -> E
     end;
@@ -806,6 +870,61 @@ probe in that case.
     | {error, no_gpu | error_reason()}.
 vram_info() ->
     erllama_nif:vram_info().
+
+-doc """
+Host or accelerator memory pressure from the scheduler's configured
+`pressure_source` (`system` when the scheduler is off or on `noop`):
+used and total bytes plus the source that produced them.
+""".
+-spec pressure() ->
+    {ok, #{
+        source := erllama_pressure:source(),
+        used_b := non_neg_integer(),
+        total_b := non_neg_integer()
+    }}
+    | {error, term()}.
+pressure() ->
+    Source =
+        case erllama_scheduler:status() of
+            #{pressure_source := noop} -> system;
+            #{pressure_source := S} -> S;
+            _ -> system
+        end,
+    try erllama_pressure:sample(Source) of
+        {Used, Total} -> {ok, #{source => Source, used_b => Used, total_b => Total}}
+    catch
+        Class:Reason -> {error, {Class, Reason}}
+    end.
+
+-doc "Pressure sources the scheduler accepts (`noop`, `system`, `nvidia_smi`, ...).".
+-spec pressure_sources() -> [erllama_pressure:source()].
+pressure_sources() ->
+    erllama_pressure:available_sources().
+
+-doc "Admitted streaming requests across all models: the ref and the model pid and id.".
+-spec requests() -> [#{ref := reference(), pid := pid(), model := model_id() | undefined}].
+requests() ->
+    Ids = maps:from_list([{Pid, Id} || {Id, Pid} <- erllama_registry:all()]),
+    [
+        #{ref => Ref, pid => Pid, model => maps:get(Pid, Ids, undefined)}
+     || {Ref, Pid} <- erllama_inflight:all()
+    ].
+
+-doc "The model serving a streaming request, or `{error, not_found}` once it has finished.".
+-spec request_info(reference()) ->
+    {ok, #{ref := reference(), pid := pid(), model := model_id() | undefined}} | {error, not_found}.
+request_info(Ref) when is_reference(Ref) ->
+    case erllama_inflight:lookup(Ref) of
+        {ok, Pid} ->
+            Model =
+                case [Id || {Id, P} <- erllama_registry:all(), P =:= Pid] of
+                    [Id] -> Id;
+                    [] -> undefined
+                end,
+            {ok, #{ref => Ref, pid => Pid, model => Model}};
+        {error, not_found} ->
+            {error, not_found}
+    end.
 
 -doc """
 How many bytes of the detokenised `PromptTokens` are already cached
@@ -879,6 +998,18 @@ verify(Model, PrefixTokens, Candidates, K) when
 %% =============================================================================
 %% Internal
 %% =============================================================================
+
+%% Validate an option map, split the per-call middleware chain out of
+%% it, and run `Fun' on the request through that chain.
+with_opts(Op, Model, Opts, Validate, Args, Fun) ->
+    case Validate(Opts) of
+        {ok, Opts1} ->
+            {Chain, Opts2} = erllama_middleware:take(Opts1),
+            Req = #{op => Op, model => Model, args => Args#{opts => Opts2}},
+            erllama_middleware:run(Req, Chain, Fun);
+        {error, _} = E ->
+            E
+    end.
 
 %% Split the `to` option (default: the caller) from the request params.
 take_to(Opts) ->

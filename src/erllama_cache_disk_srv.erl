@@ -53,6 +53,8 @@ that fail to parse are deleted.
     load/2,
     delete/2,
     dir/1,
+    tier_of/1,
+    root_of/1,
     scan/1,
     touch_hits/2
 ]).
@@ -189,6 +191,16 @@ delete(SrvName, Key) ->
 dir(SrvName) ->
     gen_server:call(SrvName, dir).
 
+%% Backend (`disk' | `ram_file') of a running tier server.
+-spec tier_of(atom()) -> disk | ram_file.
+tier_of(SrvName) ->
+    gen_server:call(SrvName, tier).
+
+%% Root directory of a running tier server (same as `dir/1').
+-spec root_of(atom()) -> file:name().
+root_of(SrvName) ->
+    dir(SrvName).
+
 %% Scan the directory and return a list of `{Key, Header, Size}` for
 %% every parseable `<hex>.kvc`. Side effect: deletes `*.tmp` files
 %% and any unreadable `<hex>.kvc` files.
@@ -241,6 +253,8 @@ handle_call({delete, Key}, _From, S) ->
     {reply, do_delete(Key, S#state.root), S};
 handle_call(dir, _From, S) ->
     {reply, S#state.root, S};
+handle_call(tier, _From, S) ->
+    {reply, S#state.tier, S};
 handle_call(scan, _From, S) ->
     sweep_tmps(S#state.root),
     {reply, scan_dir(S#state.root), S};

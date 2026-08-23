@@ -11,12 +11,12 @@
 -define(TAB, erllama_chat_cache).
 
 setup() ->
-    application:set_env(erllama, chat_params_cache_size, 4),
+    application:set_env(erllama, chat_cache_size, 4),
     {ok, Pid} = ?M:start_link(),
     Pid.
 
 cleanup(Pid) ->
-    application:unset_env(erllama, chat_params_cache_size),
+    application:unset_env(erllama, chat_cache_size),
     case is_process_alive(Pid) of
         true ->
             MRef = monitor(process, Pid),

@@ -258,13 +258,25 @@ validate_model_unload(Cfg) ->
         false ->
             {error, {invalid_config, {unload_models_under_pressure, "must be a boolean"}}};
         true ->
-            case is_atom(E) of
+            evictor_ok(E)
+    end.
+
+evictor_ok(undefined) ->
+    ok;
+evictor_ok(Mod) when is_atom(Mod) ->
+    case code:ensure_loaded(Mod) of
+        {module, Mod} ->
+            case erlang:function_exported(Mod, evict_one, 0) of
                 true ->
                     ok;
                 false ->
-                    {error, {invalid_config, {model_evictor, "must be a module atom or undefined"}}}
-            end
-    end.
+                    {error, {invalid_config, {model_evictor, "module must export evict_one/0"}}}
+            end;
+        {error, _} ->
+            {error, {invalid_config, {model_evictor, "module cannot be loaded"}}}
+    end;
+evictor_ok(_) ->
+    {error, {invalid_config, {model_evictor, "must be a module atom or undefined"}}}.
 
 watermarks_ok(H, L) when is_number(H), is_number(L), H > L, H =< 1.0, L >= 0.0 ->
     true;

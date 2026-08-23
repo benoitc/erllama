@@ -106,7 +106,8 @@ load_config(Config) when is_map(Config) ->
         fun(C) -> sub_keys(C, model_opts, ?MODEL_OPT_KEYS) end,
         fun(C) -> sub_keys(C, context_opts, ?CONTEXT_OPT_KEYS) end,
         fun(C) -> sub_keys(C, policy, ?POLICY_KEYS) end,
-        fun check_load_types/1
+        fun check_load_types/1,
+        fun check_tier/1
     ]);
 load_config(Other) ->
     {error, {invalid_config, config, Other}}.
@@ -204,6 +205,38 @@ context_opt_checks() ->
 
 policy_checks() ->
     [{K, fun(V) -> non_neg_int(V) orelse V =:= infinity end} || K <- ?POLICY_KEYS].
+
+%% `tier_srv' must name a running tier server and `tier' must match
+%% its backend, so a mismatch fails at load time instead of at the
+%% first save.
+check_tier(C) ->
+    Tier = maps:get(tier, C, ram),
+    Srv = maps:get(tier_srv, C, erllama_cache_ram),
+    case {Tier, Srv} of
+        {ram, erllama_cache_ram} ->
+            {ok, C};
+        {ram, Other} ->
+            {error, {invalid_config, tier_srv, Other}};
+        {_, erllama_cache_ram} ->
+            {error, {invalid_config, tier, Tier}};
+        _ ->
+            case whereis(Srv) of
+                undefined ->
+                    {error, {invalid_config, tier_srv, Srv}};
+                _Pid ->
+                    case tier_backend(Srv) of
+                        Tier -> {ok, C};
+                        _ -> {error, {invalid_config, tier, Tier}}
+                    end
+            end
+    end.
+
+tier_backend(Srv) ->
+    try
+        erllama_cache_disk_srv:tier_of(Srv)
+    catch
+        exit:_ -> undefined
+    end.
 
 %% -----------------------------------------------------------------------------
 %% per-request options (complete/3, stream/3, continue/3)

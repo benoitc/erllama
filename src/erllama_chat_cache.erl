@@ -131,7 +131,7 @@ lookup(Tab, Key) when Tab =:= ?TAB ->
 init([]) ->
     _ = ets:new(?TAB, [set, named_table, protected, {read_concurrency, true}]),
     MaxSize = application:get_env(
-        erllama, chat_params_cache_size, ?DEFAULT_SIZE
+        erllama, chat_cache_size, ?DEFAULT_SIZE
     ),
     {ok, #state{max_size = MaxSize}}.
 

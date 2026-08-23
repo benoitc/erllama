@@ -26,6 +26,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
   returns `{ok, #{prompt, params}}`; messages and tools are Erlang
   maps, JSON encoding happens at the NIF boundary.
 - `erllama:verify/4` returns `{ok, #{accepted, next}}`.
+- `erllama_chat:set_observer/1` and `clear_observer/0`: use a
+  middleware (`erllama_middleware`, `guides/middleware.md`).
+- Application environment: `chat_params_cache_size` renamed
+  `chat_cache_size`; `quota_mb` dropped from the `tiers` entries.
 
 ### Changed (BREAKING)
 
@@ -61,6 +65,23 @@ this project adheres to [Semantic Versioning](https://semver.org).
 - `erllama:embed/2` accepts text; `erllama:embed_batch/2` embeds a
   list of inputs in one round-trip to the model process.
 - `erllama:whereis/1` returns the model pid for monitoring.
+- Supervised cache tiers: `erllama_cache:add_tier/1`, `remove_tier/1`,
+  `list_tiers/0`, `info/0`, and the `tiers` application environment
+  key (`[#{name, backend => disk | ram_file, root}]`) started with
+  the application. `load_model` checks that `tier_srv` is running and
+  matches `tier`.
+- `erllama_middleware`: hackney-style middleware chain around every
+  API call (global via the `middleware` environment key, or per call
+  with the `middleware` option).
+- `erllama:pressure/0`, `pressure_sources/0`, `requests/0`,
+  `request_info/1`.
+- Application environment keys `fingerprint_mode` (now the default
+  for models that do not set it), `writer_max_concurrent`,
+  `chat_cache_size`, `thinking_signing_key`, `middleware` and `tiers`
+  are declared in the app file and documented; `os_mon` is a
+  declared dependency (the `system` pressure source needs memsup).
+- `erllama_scheduler:validate_config/1` checks that `model_evictor`
+  names a loadable module exporting `evict_one/0`.
 - `erllama` exports the types its specs use (`token_id/0`,
   `cache_key/0`, `completion_result/0`, `stats/0`, `request_opts/0`,
   `load_config/0`, `error_reason/0`, ...) and documents every error
