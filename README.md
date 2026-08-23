@@ -141,6 +141,12 @@ Tools = [#{name => <<"weather">>,
 %% Calls = [#{name => <<"weather">>, arguments => #{<<"city">> => <<"Paris">>}, id => _}]
 ```
 
+### Agent loop
+
+`examples/agent_loop` is a complete tool-calling agent on `chat/3`: tools
+as Erlang maps, results fed back as `tool` messages, one session pinned
+across rounds so each round only prefills the new suffix.
+
 ### Test without a model
 
 `erllama_model_stub` is a deterministic backend with no NIF and no

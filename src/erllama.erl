@@ -351,6 +351,9 @@ Config map for `load_model/1,2`.
 - `tier`, `tier_srv`: cache tier for this model's saves (default RAM).
 - `policy`: cache policy overrides (`min_tokens`, `cold_min_tokens`, ...).
 - `thinking_markers`: `#{start := binary(), 'end' := binary()}`.
+- `chat_template`: Jinja source that replaces the template stored in
+  the GGUF for `chat/3` and `chat_apply/3` (for files that ship a broken
+  or outdated template).
 """.
 -type load_config() :: #{
     model_path => file:name_all(),
@@ -368,6 +371,7 @@ Config map for `load_model/1,2`.
     tier_srv => atom(),
     policy => map(),
     thinking_markers => #{start := binary(), 'end' := binary()},
+    chat_template => binary(),
     %% erllama_model_stub only
     step_delay_ms => non_neg_integer(),
     thinking_capable => boolean()

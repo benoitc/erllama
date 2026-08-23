@@ -414,6 +414,9 @@
     %% 0 when no GPU layers are offloaded or when the backend does
     %% not report enough metadata to derive it.
     vram_estimate_b = 0 :: non_neg_integer(),
+    %% Optional chat template source overriding the one in the GGUF
+    %% (load config `chat_template'); `undefined' uses the model's own.
+    chat_template = undefined :: binary() | undefined,
     %% Attached LoRA adapters. Each entry holds the backend's opaque
     %% handle, the file sha256 (for cache-key derivation), and the
     %% current scale. effective_fp = sha256(fingerprint || sorted
@@ -933,6 +936,7 @@ build_init_data(ModelId, Config, Backend, BState) ->
         policy = resolve_policy(Config, NBatch),
         backend = Backend,
         backend_state = BState,
+        chat_template = maps:get(chat_template, Config, undefined),
         adapters = [],
         effective_fp = Fp,
         loaded_at_monotonic = erlang:monotonic_time(nanosecond),
@@ -2123,7 +2127,7 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
 %% the backend module's `get_model_ref/1' getter; backends without
 %% that callback (the stub) return `{error, chat_not_supported}'.
 do_chat_apply(
-    #data{backend = Mod, backend_state = S, model_id = ModelId},
+    #data{backend = Mod, backend_state = S, model_id = ModelId, chat_template = Tmpl},
     Inputs
 ) ->
     case erlang:function_exported(Mod, get_model_ref, 1) of
@@ -2133,7 +2137,7 @@ do_chat_apply(
             ModelRef = Mod:get_model_ref(S),
             case
                 erllama_chat_cache:get_or_init(
-                    ModelId, ModelRef, undefined
+                    ModelId, ModelRef, Tmpl
                 )
             of
                 {ok, Templates} ->

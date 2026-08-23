@@ -35,13 +35,31 @@ tools are JSON-encoded, `tool_choice` (`auto | required | none`) and
 """.
 -spec inputs([message()], map()) -> map().
 inputs(Messages, Opts) when is_list(Messages), is_map(Opts) ->
-    Tools = maps:get(tools, Opts, []),
+    Tools = [oaicompat_tool(T) || T <- maps:get(tools, Opts, [])],
     #{
         messages => iolist_to_binary(json:encode(Messages)),
         tools => iolist_to_binary(json:encode(Tools)),
         tool_choice => maps:get(tool_choice, Opts, auto),
         parallel_tool_calls => maps:get(parallel_tool_calls, Opts, false)
     }.
+
+%% llama.cpp parses tools in the OpenAI shape
+%% `{"type": "function", "function": {name, description, parameters}}';
+%% `erllama:chat_tool()' is the flat inner map. Already wrapped tools
+%% (e.g. forwarded from an OpenAI-style client) pass through.
+oaicompat_tool(#{type := _, function := _} = Tool) ->
+    Tool;
+oaicompat_tool(#{<<"type">> := _, <<"function">> := _} = Tool) ->
+    Tool;
+oaicompat_tool(Tool) when is_map(Tool) ->
+    Params = maps:get(parameters, Tool, #{type => object, properties => #{}}),
+    Function0 = #{name => maps:get(name, Tool), parameters => Params},
+    Function =
+        case maps:find(description, Tool) of
+            {ok, D} -> Function0#{description => D};
+            error -> Function0
+        end,
+    #{type => function, function => Function}.
 
 -doc """
 One synchronous chat turn: render the prompt and parser for

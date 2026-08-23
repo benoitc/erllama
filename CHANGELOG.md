@@ -6,6 +6,20 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- `chat/3` and `chat_apply/3` hand tools to llama.cpp in the OpenAI
+  shape (`{"type": "function", "function": {...}}`); the flat
+  `chat_tool()` maps were rejected with `chat_parse_failed`.
+- `erllama_chat_SUITE` starts the application with its dependencies when
+  run on its own.
+
+### Added
+
+- Load option `chat_template`: Jinja source replacing the template
+  stored in the GGUF for `chat/3` / `chat_apply/3`.
+- `examples/agent_loop`: a tool-calling agent loop on `chat/3`.
+
 ## [0.10.0] - 2026-08-23
 
 ### Changed

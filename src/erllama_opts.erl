@@ -27,6 +27,7 @@
     tier_srv,
     policy,
     thinking_markers,
+    chat_template,
     model_id,
     %% erllama_model_stub only (test backend)
     step_delay_ms,
@@ -145,6 +146,7 @@ check_load_types(C) ->
         {tier, fun(V) -> lists:member(V, [ram, ram_file, disk]) end},
         {tier_srv, fun is_atom/1},
         {thinking_markers, fun is_map/1},
+        {chat_template, fun is_binary/1},
         {model_id, fun is_binary/1},
         {step_delay_ms, fun non_neg_int/1},
         {thinking_capable, fun is_boolean/1},

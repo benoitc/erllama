@@ -1,0 +1,8 @@
+{"1.2.0",
+[{<<"erllama">>,{pkg,<<"erllama">>,<<"0.10.0">>},0}]}.
+[
+{pkg_hash,[
+ {<<"erllama">>, <<"6BA578B59383DF879DDC6BBCE23F5B53C799D015265ACD44A1E6EDA7261AC542">>}]},
+{pkg_hash_ext,[
+ {<<"erllama">>, <<"E35334A8576EF1DD831A39F50F95712F9946C5391D3D7D603A296C31D5CABFAE">>}]}
+].

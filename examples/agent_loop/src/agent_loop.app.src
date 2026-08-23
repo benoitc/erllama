@@ -1,0 +1,9 @@
+{application, agent_loop, [
+    {description, "erllama example: a tool-calling agent loop"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib, erllama]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]}
+]}.
