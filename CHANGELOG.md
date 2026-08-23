@@ -11,6 +11,21 @@ this project adheres to [Semantic Versioning](https://semver.org).
 - `erllama:unload_model/1` (use `unload/1`), `erllama:models/0` (use
   `list_models/0`), `erllama:list_cached_prefixes/2` (renamed
   `cached_prefix_len/2`).
+- `erllama:infer/4`: use `stream/3` (text or tokens; the receiving
+  process is the `to` option, default the caller). `continue/3` takes
+  `to` instead of `caller_pid`; a missing `session_id` is
+  `{error, {missing_option, session_id}}`.
+- Stream messages `{erllama_token, Ref, _}`, `{erllama_token_id, Ref,
+  _}`, `{erllama_thinking_end, Ref, _}`, `{erllama_done, Ref, _}`,
+  `{erllama_error, Ref, _}`: every event is now `{erllama, Ref,
+  Event}` with `Event :: {token, Bin} | {token_id, Id} | {thinking,
+  Bin} | {thinking_end, Sig} | {done, Stats} | {error, Reason}`
+  (`erllama:stream_event()`).
+- `erllama:apply_chat_template/2` renamed `render_chat_template/2`.
+- `erllama:chat_apply/2` is `chat_apply/3` (model, messages, opts) and
+  returns `{ok, #{prompt, params}}`; messages and tools are Erlang
+  maps, JSON encoding happens at the NIF boundary.
+- `erllama:verify/4` returns `{ok, #{accepted, next}}`.
 
 ### Changed (BREAKING)
 
@@ -37,6 +52,14 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- `erllama:stream/3` and `erllama:collect/2`: streaming inference
+  with a typed event envelope and a collector that folds the events
+  into a `stream_result()`.
+- `erllama:chat/3`: one chat turn (render, generate, parse) with
+  Erlang-term messages and tools; returns the parsed assistant
+  message with content, reasoning and tool calls.
+- `erllama:embed/2` accepts text; `erllama:embed_batch/2` embeds a
+  list of inputs in one round-trip to the model process.
 - `erllama:whereis/1` returns the model pid for monitoring.
 - `erllama` exports the types its specs use (`token_id/0`,
   `cache_key/0`, `completion_result/0`, `stats/0`, `request_opts/0`,

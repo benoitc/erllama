@@ -149,7 +149,7 @@ not_loaded_shapes_test() ->
         ?assertEqual({error, not_loaded}, erllama:detokenize(Id, [1])),
         ?assertEqual({error, not_loaded}, erllama:complete(Id, <<"x">>)),
         ?assertEqual({error, not_loaded}, erllama:prefill_only(Id, [1])),
-        ?assertEqual({error, not_loaded}, erllama:infer(Id, [1], #{}, self())),
+        ?assertEqual({error, not_loaded}, erllama:stream(Id, [1], #{})),
         ?assertEqual({error, not_loaded}, erllama:end_session(Id, s)),
         ?assertEqual({error, not_loaded}, erllama:reset_session(Id, s)),
         ?assertEqual({error, not_loaded}, erllama:evict(Id)),
@@ -219,7 +219,7 @@ request_validation_test() ->
             ),
             ?assertEqual(
                 {error, {unknown_option, nope}},
-                erllama:infer(Id, [1, 2], #{nope => 1}, self())
+                erllama:stream(Id, [1, 2], #{nope => 1})
             )
         after
             erllama:unload(Id)

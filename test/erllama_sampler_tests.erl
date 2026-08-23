@@ -137,12 +137,9 @@ infer_path_also_configures_sampler_test() ->
         {ok, _} = erllama:load_model(Id, minimal_config()),
         try
             {ok, Tokens} = erllama:tokenize(Id, <<"a b c">>),
-            {ok, Ref} = erllama:infer(
-                Id,
-                Tokens,
-                #{response_tokens => 2, temperature => 0.5, seed => 7},
-                self()
-            ),
+            {ok, Ref} = erllama:stream(Id, Tokens, #{
+                response_tokens => 2, temperature => 0.5, seed => 7
+            }),
             drain(Ref),
             Cfg = get_stub_cfg(Id),
             ?assertEqual(0.5, maps:get(temperature, Cfg)),
@@ -154,9 +151,9 @@ infer_path_also_configures_sampler_test() ->
 
 drain(Ref) ->
     receive
-        {erllama_token, Ref, _} -> drain(Ref);
-        {erllama_done, Ref, _} -> ok;
-        {erllama_error, Ref, R} -> ?assert({unexpected_error, R} =:= ok)
+        {erllama, Ref, {token, _}} -> drain(Ref);
+        {erllama, Ref, {done, _}} -> ok;
+        {erllama, Ref, {error, R}} -> ?assert({unexpected_error, R} =:= ok)
     after 5000 ->
         ?assert({timeout, drain} =:= ok)
     end.

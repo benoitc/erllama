@@ -93,7 +93,7 @@ apply_chat_template_simple_test() ->
         Request = #{
             messages => [#{role => <<"user">>, content => <<"hello">>}]
         },
-        {ok, Tokens} = erllama:apply_chat_template(Id, Request),
+        {ok, Tokens} = erllama:render_chat_template(Id, Request),
         ?assert(is_list(Tokens)),
         ?assert(lists:all(fun is_integer/1, Tokens))
     end).
@@ -104,8 +104,8 @@ apply_chat_template_with_system_test() ->
             messages => [#{role => <<"user">>, content => <<"hi">>}]
         },
         With = Without#{system => <<"you are a helper">>},
-        {ok, A} = erllama:apply_chat_template(Id, Without),
-        {ok, B} = erllama:apply_chat_template(Id, With),
+        {ok, A} = erllama:render_chat_template(Id, Without),
+        {ok, B} = erllama:render_chat_template(Id, With),
         %% System content lands in the rendered prompt, so token list
         %% length must differ.
         ?assertNotEqual(A, B),
@@ -125,7 +125,7 @@ apply_chat_template_with_tools_test() ->
             messages => [#{role => <<"user">>, content => <<"hi">>}],
             tools => Tools
         },
-        {ok, Tokens} = erllama:apply_chat_template(Id, Request),
+        {ok, Tokens} = erllama:render_chat_template(Id, Request),
         ?assert(is_list(Tokens))
     end).
 
@@ -138,7 +138,7 @@ apply_chat_template_multi_turn_test() ->
                 #{role => <<"user">>, content => <<"who are you">>}
             ]
         },
-        {ok, Tokens} = erllama:apply_chat_template(Id, Request),
+        {ok, Tokens} = erllama:render_chat_template(Id, Request),
         ?assert(length(Tokens) >= 3)
     end).
 
@@ -147,8 +147,8 @@ apply_chat_template_deterministic_test() ->
         Request = #{
             messages => [#{role => <<"user">>, content => <<"hi">>}]
         },
-        {ok, A} = erllama:apply_chat_template(Id, Request),
-        {ok, B} = erllama:apply_chat_template(Id, Request),
+        {ok, A} = erllama:render_chat_template(Id, Request),
+        {ok, B} = erllama:render_chat_template(Id, Request),
         ?assertEqual(A, B)
     end).
 
@@ -182,6 +182,23 @@ embed_different_input_different_vector_test() ->
         ?assertNotEqual(A, B)
     end).
 
+embed_accepts_text_test() ->
+    with_model(fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, A} = erllama:embed(Id, Tokens),
+        {ok, B} = erllama:embed(Id, <<"hello">>),
+        ?assertEqual(A, B)
+    end).
+
+embed_batch_matches_single_calls_test() ->
+    with_model(fun(Id) ->
+        {ok, T1} = erllama:tokenize(Id, <<"alpha">>),
+        {ok, A} = erllama:embed(Id, T1),
+        {ok, B} = erllama:embed(Id, <<"omega">>),
+        ?assertEqual({ok, [A, B]}, erllama:embed_batch(Id, [T1, <<"omega">>])),
+        ?assertEqual({ok, []}, erllama:embed_batch(Id, []))
+    end).
+
 %% =============================================================================
 %% Grammar plumbing
 %% =============================================================================
@@ -196,7 +213,7 @@ grammar_in_params_does_not_break_streaming_test() ->
             response_tokens => 4,
             grammar => <<"root ::= \"a\" | \"b\"">>
         },
-        {ok, Ref} = erllama:infer(Id, Tokens, Params, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, Params),
         ?assert(is_reference(Ref)),
         Result = drain(Ref, 5000),
         ?assertMatch({_TokensList, #{}}, Result)
@@ -207,9 +224,9 @@ grammar_undefined_is_no_op_test() ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
         %% no grammar key
         Params = #{response_tokens => 2},
-        {ok, _Ref} = erllama:infer(Id, Tokens, Params, self()),
+        {ok, _Ref} = erllama:stream(Id, Tokens, Params),
         receive
-            {erllama_done, _, _} -> ok
+            {erllama, _, {done, _}} -> ok
         after 5000 -> ?assert(false)
         end
     end).
@@ -232,7 +249,7 @@ unsupported_apply_chat_template_returns_error_test() ->
     with_model(fun(Id) ->
         ?assertMatch(
             {ok, _},
-            erllama:apply_chat_template(
+            erllama:render_chat_template(
                 Id,
                 #{messages => [#{role => <<"u">>, content => <<"x">>}]}
             )
@@ -248,9 +265,9 @@ drain(Ref, TimeoutMs) ->
 
 drain(Ref, TimeoutMs, Acc) ->
     receive
-        {erllama_token, Ref, B} -> drain(Ref, TimeoutMs, [B | Acc]);
-        {erllama_done, Ref, S} -> {lists:reverse(Acc), S};
-        {erllama_error, Ref, R} -> {error, R}
+        {erllama, Ref, {token, B}} -> drain(Ref, TimeoutMs, [B | Acc]);
+        {erllama, Ref, {done, S}} -> {lists:reverse(Acc), S};
+        {erllama, Ref, {error, R}} -> {error, R}
     after TimeoutMs ->
         timeout
     end.

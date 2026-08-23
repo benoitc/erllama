@@ -172,7 +172,7 @@ measure_continue_3turn(Model, ShortPrompt, RespTokens) ->
         Suffix2,
         #{
             session_id => SessionId,
-            caller_pid => self(),
+            to => self(),
             response_tokens => RespTokens
         }
     ),
@@ -185,7 +185,7 @@ measure_continue_3turn(Model, ShortPrompt, RespTokens) ->
         Suffix3,
         #{
             session_id => SessionId,
-            caller_pid => self(),
+            to => self(),
             response_tokens => RespTokens
         }
     ),
@@ -216,12 +216,12 @@ turn_record(N, Method, Stats) ->
 
 drain_done(Ref, TimeoutMs) ->
     receive
-        {erllama_done, Ref, Stats} -> Stats;
-        {erllama_token, Ref, _} -> drain_done(Ref, TimeoutMs);
-        {erllama_token_id, Ref, _} -> drain_done(Ref, TimeoutMs);
-        {erllama_thinking_end, Ref, _} -> drain_done(Ref, TimeoutMs);
+        {erllama, Ref, {done, Stats}} -> Stats;
+        {erllama, Ref, {token, _}} -> drain_done(Ref, TimeoutMs);
+        {erllama, Ref, {token_id, _}} -> drain_done(Ref, TimeoutMs);
+        {erllama, Ref, {thinking_end, _}} -> drain_done(Ref, TimeoutMs);
         {erllama_tool_call_end, Ref, _} -> drain_done(Ref, TimeoutMs);
-        {erllama_error, Ref, R} -> erlang:error({stream_error, R})
+        {erllama, Ref, {error, R}} -> erlang:error({stream_error, R})
     after TimeoutMs ->
         erlang:error({timeout, drain_done})
     end.

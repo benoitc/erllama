@@ -875,15 +875,15 @@ model_info_available_seqs_decrements_with_inflight_test_() ->
             %% Wait for first token so we know the seq has been taken
             %% off the idle list and is in req_table.
             receive
-                {erllama_token, Ref, _} -> ok;
-                {erllama_token_id, Ref, _} -> ok
+                {erllama, Ref, {token, _}} -> ok;
+                {erllama, Ref, {token_id, _}} -> ok
             after 2000 -> erlang:error(no_first_token)
             end,
             Info1 = erllama_model:model_info(<<"test_model">>),
             ?assertEqual(0, maps:get(available_seqs, Info1)),
             ok = erllama_model:cancel(Ref),
             receive
-                {erllama_done, Ref, _} -> ok
+                {erllama, Ref, {done, _}} -> ok
             after 5000 -> erlang:error(timeout_drain)
             end,
             Info2 = erllama_model:model_info(<<"test_model">>),
@@ -924,7 +924,7 @@ reset_session_idle_session_returns_recovered_test() ->
 reset_session_in_flight_signals_caller_and_recovers_test() ->
     %% Mirror the wedge: a streaming infer is in req_table when the
     %% recovery call arrives. The caller must be signalled with
-    %% {erllama_error, Ref, engine_reset}, the seq must return to
+    %% {erllama, Ref, {error, engine_reset}}, the seq must return to
     %% idle, and a fresh infer on the same session_id must admit.
     SessionId = make_ref(),
     with_model(#{}, fun(_Cfg) ->
@@ -944,8 +944,8 @@ reset_session_in_flight_signals_caller_and_recovers_test() ->
         ),
         %% Wait for the first token so we know the seq is in req_table.
         receive
-            {erllama_token, Ref1, _} -> ok;
-            {erllama_token_id, Ref1, _} -> ok
+            {erllama, Ref1, {token, _}} -> ok;
+            {erllama, Ref1, {token_id, _}} -> ok
         after 2000 -> erlang:error(no_first_token)
         end,
         ?assertEqual(
@@ -953,7 +953,7 @@ reset_session_in_flight_signals_caller_and_recovers_test() ->
             erllama:reset_session(<<"test_model">>, SessionId)
         ),
         receive
-            {erllama_error, Ref1, engine_reset} -> ok
+            {erllama, Ref1, {error, engine_reset}} -> ok
         after 2000 -> erlang:error(no_engine_reset)
         end,
         %% Drain any tokens emitted between the reset call and the
@@ -973,29 +973,29 @@ reset_session_in_flight_signals_caller_and_recovers_test() ->
 
 drain_stream_messages(Ref) ->
     receive
-        {erllama_token, Ref, _} -> drain_stream_messages(Ref);
-        {erllama_token_id, Ref, _} -> drain_stream_messages(Ref);
-        {erllama_thinking_end, Ref, _} -> drain_stream_messages(Ref);
+        {erllama, Ref, {token, _}} -> drain_stream_messages(Ref);
+        {erllama, Ref, {token_id, _}} -> drain_stream_messages(Ref);
+        {erllama, Ref, {thinking_end, _}} -> drain_stream_messages(Ref);
         {erllama_tool_call_end, Ref, _} -> drain_stream_messages(Ref);
-        {erllama_done, Ref, _} -> drain_stream_messages(Ref);
-        {erllama_error, Ref, _} -> drain_stream_messages(Ref)
+        {erllama, Ref, {done, _}} -> drain_stream_messages(Ref);
+        {erllama, Ref, {error, _}} -> drain_stream_messages(Ref)
     after 50 -> ok
     end.
 
-%% Drain a stream collecting the {erllama_token_id, _, _} ids in
+%% Drain a stream collecting the {erllama, _, {token_id, _}} ids in
 %% order; returns {Stats, CollectedIds} at the done message.
 drain_done_collecting_ids(Ref, TimeoutMs) ->
     drain_done_collecting_ids(Ref, TimeoutMs, []).
 
 drain_done_collecting_ids(Ref, TimeoutMs, Acc) ->
     receive
-        {erllama_done, Ref, Stats} ->
+        {erllama, Ref, {done, Stats}} ->
             {Stats, lists:reverse(Acc)};
-        {erllama_token_id, Ref, Id} ->
+        {erllama, Ref, {token_id, Id}} ->
             drain_done_collecting_ids(Ref, TimeoutMs, [Id | Acc]);
-        {erllama_token, Ref, _} ->
+        {erllama, Ref, {token, _}} ->
             drain_done_collecting_ids(Ref, TimeoutMs, Acc);
-        {erllama_thinking_end, Ref, _} ->
+        {erllama, Ref, {thinking_end, _}} ->
             drain_done_collecting_ids(Ref, TimeoutMs, Acc);
         {erllama_tool_call_end, Ref, _} ->
             drain_done_collecting_ids(Ref, TimeoutMs, Acc)
@@ -1004,7 +1004,7 @@ drain_done_collecting_ids(Ref, TimeoutMs, Acc) ->
     end.
 
 %% #3: the erllama_done Stats map carries the exact generated token
-%% ids, in order, matching the {erllama_token_id, _, _} stream.
+%% ids, in order, matching the {erllama, _, {token_id, _}} stream.
 infer_stats_carries_generated_token_ids_test() ->
     with_model(#{}, fun(_Cfg) ->
         {ok, Ref} = erllama_model:infer(
@@ -1034,8 +1034,8 @@ admit_on_full_error_returns_seq_capacity_test_() ->
                 self()
             ),
             receive
-                {erllama_token, Ref1, _} -> ok;
-                {erllama_token_id, Ref1, _} -> ok
+                {erllama, Ref1, {token, _}} -> ok;
+                {erllama, Ref1, {token_id, _}} -> ok
             after 2000 -> erlang:error(no_first_token)
             end,
             %% Second admit with on_full => error must fail fast.
@@ -1049,7 +1049,7 @@ admit_on_full_error_returns_seq_capacity_test_() ->
             ),
             ok = erllama_model:cancel(Ref1),
             receive
-                {erllama_done, Ref1, _} -> ok
+                {erllama, Ref1, {done, _}} -> ok
             after 5000 -> erlang:error(timeout_drain)
             end,
             drain_stream_messages(Ref1)
@@ -1068,8 +1068,8 @@ admit_default_blocks_and_queues_test_() ->
                 self()
             ),
             receive
-                {erllama_token, Ref1, _} -> ok;
-                {erllama_token_id, Ref1, _} -> ok
+                {erllama, Ref1, {token, _}} -> ok;
+                {erllama, Ref1, {token_id, _}} -> ok
             after 2000 -> erlang:error(no_first_token)
             end,
             %% Queue a second infer (default block) from a helper proc
@@ -1104,8 +1104,8 @@ admit_default_blocks_and_queues_test_() ->
 
 wait_first_token(Ref) ->
     receive
-        {erllama_token, Ref, _} -> ok;
-        {erllama_token_id, Ref, _} -> ok
+        {erllama, Ref, {token, _}} -> ok;
+        {erllama, Ref, {token_id, _}} -> ok
     after 2000 -> erlang:error(no_first_token)
     end.
 
@@ -1228,7 +1228,7 @@ decode_timeout_recovers_in_place_test_() ->
                 self()
             ),
             receive
-                {erllama_error, Ref1, _Reason} -> ok
+                {erllama, Ref1, {error, _Reason}} -> ok
             after 5000 -> erlang:error(no_error_on_wedge)
             end,
             %% Same gen_statem pid: recovered in place, not restarted.
@@ -1261,7 +1261,7 @@ decode_failed_recovers_in_place_test_() ->
                 self()
             ),
             receive
-                {erllama_error, Ref1, _Reason} -> ok
+                {erllama, Ref1, {error, _Reason}} -> ok
             after 5000 -> erlang:error(no_error_on_decode_failed)
             end,
             %% Same pid: recovered in place, not restarted.
@@ -1316,7 +1316,7 @@ recover_in_place_clears_sessions_test_() ->
                 self()
             ),
             receive
-                {erllama_error, Ref, _} -> ok
+                {erllama, Ref, {error, _}} -> ok
             after 5000 -> erlang:error(no_error_on_wedge)
             end,
             Info1 = erllama_model:model_info(<<"test_model">>),
@@ -1342,14 +1342,14 @@ cancel_bounded_test_() ->
                 self()
             ),
             receive
-                {erllama_token, Ref, _} -> ok;
-                {erllama_token_id, Ref, _} -> ok
+                {erllama, Ref, {token, _}} -> ok;
+                {erllama, Ref, {token_id, _}} -> ok
             after 2000 -> erlang:error(no_first_token)
             end,
             ok = erllama_model:cancel(Ref),
             receive
-                {erllama_done, Ref, _} -> ok;
-                {erllama_error, Ref, _} -> ok
+                {erllama, Ref, {done, _}} -> ok;
+                {erllama, Ref, {error, _}} -> ok
             after 5000 -> erlang:error(cancel_did_not_land)
             end,
             drain_stream_messages(Ref)
@@ -1383,7 +1383,7 @@ continue_extends_session_without_prefix_check_test() ->
             Suffix,
             #{
                 session_id => SessionId,
-                caller_pid => self(),
+                to => self(),
                 response_tokens => 2
             }
         ),
@@ -1418,7 +1418,7 @@ continue_with_matching_committed_admits_test() ->
             [12345, 67890],
             #{
                 session_id => SessionId,
-                caller_pid => self(),
+                to => self(),
                 response_tokens => 2,
                 expect_committed => Turn1Tokens
             }
@@ -1445,7 +1445,7 @@ continue_with_wrong_committed_rejects_test() ->
             [12345],
             #{
                 session_id => SessionId,
-                caller_pid => self(),
+                to => self(),
                 response_tokens => 2,
                 expect_committed => Wrong
             }
@@ -1460,7 +1460,7 @@ continue_with_wrong_committed_rejects_test() ->
         {ok, Ref} = erllama:continue(
             <<"test_model">>,
             [12345],
-            #{session_id => SessionId, caller_pid => self(), response_tokens => 2}
+            #{session_id => SessionId, to => self(), response_tokens => 2}
         ),
         _ = drain_done(Ref, 5000),
         ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
@@ -1479,7 +1479,7 @@ continue_without_committed_unchanged_test() ->
         {ok, Ref} = erllama:continue(
             <<"test_model">>,
             [12345, 67890],
-            #{session_id => SessionId, caller_pid => self(), response_tokens => 2}
+            #{session_id => SessionId, to => self(), response_tokens => 2}
         ),
         Stats = drain_done(Ref, 5000),
         ?assertEqual(continuation, maps:get(cache_hit_kind, Stats)),
@@ -1493,22 +1493,22 @@ continue_returns_no_session_for_unknown_session_test() ->
             erllama:continue(
                 <<"test_model">>,
                 [1, 2, 3],
-                #{session_id => make_ref(), caller_pid => self()}
+                #{session_id => make_ref(), to => self()}
             )
         )
     end).
 
-continue_returns_no_session_when_session_id_missing_test() ->
+continue_returns_missing_option_when_session_id_missing_test() ->
     %% Opts must carry session_id explicitly. An Opts map without it
-    %% is a malformed call; reject with no_session before reaching
-    %% the gen_statem so a stray caller can't bounce off the model.
+    %% is a malformed call; reject before reaching the gen_statem so
+    %% a stray caller can't bounce off the model.
     with_model(#{}, fun(_Cfg) ->
         ?assertEqual(
-            {error, no_session},
+            {error, {missing_option, session_id}},
             erllama:continue(
                 <<"test_model">>,
                 [1, 2, 3],
-                #{caller_pid => self()}
+                #{to => self()}
             )
         )
     end).
@@ -1537,8 +1537,8 @@ continue_returns_sticky_busy_when_seq_in_flight_test() ->
             self()
         ),
         receive
-            {erllama_token, Ref1, _} -> ok;
-            {erllama_token_id, Ref1, _} -> ok
+            {erllama, Ref1, {token, _}} -> ok;
+            {erllama, Ref1, {token_id, _}} -> ok
         after 2000 -> erlang:error(no_first_token)
         end,
         ?assertEqual(
@@ -1546,12 +1546,12 @@ continue_returns_sticky_busy_when_seq_in_flight_test() ->
             erllama:continue(
                 <<"test_model">>,
                 [99],
-                #{session_id => SessionId, caller_pid => self()}
+                #{session_id => SessionId, to => self()}
             )
         ),
         ok = erllama_model:cancel(Ref1),
         receive
-            {erllama_done, Ref1, _} -> ok
+            {erllama, Ref1, {done, _}} -> ok
         after 5000 -> erlang:error(timeout_drain)
         end,
         ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
@@ -1573,7 +1573,7 @@ continue_with_empty_suffix_generates_from_current_kv_test() ->
             [],
             #{
                 session_id => SessionId,
-                caller_pid => self(),
+                to => self(),
                 response_tokens => 1
             }
         ),
@@ -1585,10 +1585,10 @@ continue_with_empty_suffix_generates_from_current_kv_test() ->
 %% Drain streaming until the done message and return its Stats map.
 drain_done(Ref, TimeoutMs) ->
     receive
-        {erllama_done, Ref, Stats} -> Stats;
-        {erllama_token, Ref, _} -> drain_done(Ref, TimeoutMs);
-        {erllama_token_id, Ref, _} -> drain_done(Ref, TimeoutMs);
-        {erllama_thinking_end, Ref, _} -> drain_done(Ref, TimeoutMs);
+        {erllama, Ref, {done, Stats}} -> Stats;
+        {erllama, Ref, {token, _}} -> drain_done(Ref, TimeoutMs);
+        {erllama, Ref, {token_id, _}} -> drain_done(Ref, TimeoutMs);
+        {erllama, Ref, {thinking_end, _}} -> drain_done(Ref, TimeoutMs);
         {erllama_tool_call_end, Ref, _} -> drain_done(Ref, TimeoutMs)
     after TimeoutMs ->
         erlang:error({timeout, drain_done})
@@ -1631,8 +1631,8 @@ pending_len_increments_when_queued_test() ->
         %% Wait for the first token so we know the model is past
         %% prefill and actively decoding.
         receive
-            {erllama_token, Ref1, _} -> ok;
-            {erllama_token_id, Ref1, _} -> ok
+            {erllama, Ref1, {token, _}} -> ok;
+            {erllama, Ref1, {token_id, _}} -> ok
         after 2000 -> erlang:error(no_first_token)
         end,
         %% Issue a second infer from a separate process — the
@@ -1654,7 +1654,7 @@ pending_len_increments_when_queued_test() ->
         %% Drain: cancel Ref1, then expect Ref2 to dispatch.
         ok = erllama_model:cancel(Ref1),
         receive
-            {erllama_done, Ref1, _} -> ok
+            {erllama, Ref1, {done, _}} -> ok
         after 5000 -> erlang:error(timeout_first)
         end,
         Ref2 =
@@ -1663,7 +1663,7 @@ pending_len_increments_when_queued_test() ->
             after 5000 -> erlang:error(worker_timeout)
             end,
         receive
-            {erllama_done, Ref2, _} -> ok
+            {erllama, Ref2, {done, _}} -> ok
         after 5000 -> erlang:error(timeout_second)
         end,
         ?assertEqual({ok, 0}, erllama:pending_len(<<"test_model">>))
@@ -1858,7 +1858,7 @@ pending_fifo_fills_when_seq_ids_exhausted_() ->
         lists:foreach(
             fun(Ref) ->
                 receive
-                    {erllama_done, Ref, _} -> ok
+                    {erllama, Ref, {done, _}} -> ok
                 after 5000 -> erlang:error({no_done, Ref})
                 end
             end,

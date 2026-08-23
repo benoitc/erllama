@@ -43,7 +43,8 @@ handle for every other call; a pid works too. The cache subsystem is
     complete/3,
     prefill_only/2,
     prefill_only/3,
-    infer/4,
+    stream/3,
+    collect/2,
     continue/3,
     cancel/1,
     end_session/2,
@@ -53,10 +54,12 @@ handle for every other call; a pid works too. The cache subsystem is
     tokenize/2,
     tokenize/3,
     detokenize/2,
-    apply_chat_template/2,
-    chat_apply/2,
+    render_chat_template/2,
+    chat/3,
+    chat_apply/3,
     chat_parse/3,
     embed/2,
+    embed_batch/2,
     load_adapter/2,
     unload_adapter/2,
     set_adapter_scale/3,
@@ -88,6 +91,12 @@ handle for every other call; a pid works too. The cache subsystem is
     chat_params/0,
     chat_request/0,
     parsed_message/0,
+    chat_message/0,
+    chat_tool/0,
+    chat_opts/0,
+    chat_result/0,
+    stream_event/0,
+    stream_result/0,
     error_reason/0,
     middleware/0
 ]).
@@ -116,6 +125,72 @@ handle for every other call; a pid works too. The cache subsystem is
 -type chat_params() :: erllama_nif:chat_params_ref().
 -type chat_request() :: erllama_model_backend:chat_request().
 -type parsed_message() :: erllama_chat:parsed_msg().
+-type chat_message() :: erllama_chat:message().
+-type chat_tool() :: erllama_chat:tool().
+-doc """
+Options for `chat/3`: `tools`, `tool_choice` (`auto | required | none`),
+`parallel_tool_calls`, plus any `request_opts()` key.
+""".
+-type chat_opts() :: #{
+    tools => [chat_tool()],
+    tool_choice => auto | required | none,
+    parallel_tool_calls => boolean(),
+    response_tokens => pos_integer(),
+    parent_key => cache_key() | undefined,
+    session_id => term(),
+    on_full => block | error,
+    stop_sequences => [binary()],
+    thinking => enabled | disabled,
+    thinking_budget_tokens => pos_integer(),
+    temperature => number(),
+    top_p => number(),
+    top_k => integer(),
+    min_p => number(),
+    repetition_penalty => number(),
+    seed => non_neg_integer(),
+    grammar => binary(),
+    prefix_checkpoint_len => non_neg_integer(),
+    middleware => [middleware()]
+}.
+-doc "Result of `chat/3`.".
+-type chat_result() :: #{
+    message := parsed_message(),
+    prompt := binary(),
+    reply := binary(),
+    stats := stats()
+}.
+-doc """
+Events delivered to the `to` process of `stream/3` and `continue/3`
+as `{erllama, Ref, Event}`.
+
+- `{token, Bin}`: text fragment (omitted when empty)
+- `{token_id, Id}`: every generated token id, in order
+- `{thinking, Bin}`: extended-thinking fragment (`thinking => enabled`)
+- `{thinking_end, Sig}`: close of a thinking block with its signature
+- `{done, Stats}`: completion; after `cancel/1` `Stats` carries
+  `finish_reason => cancelled`
+- `{error, Reason}`: failure; no `done` follows
+""".
+-type stream_event() ::
+    {token, binary()}
+    | {token_id, token_id()}
+    | {thinking, binary()}
+    | {thinking_end, binary()}
+    | {done, stats()}
+    | {error, error_reason()}.
+-doc "Result of `collect/2`: the stream folded into a map.".
+-type stream_result() :: #{
+    reply := binary(),
+    thinking := binary(),
+    generated := [token_id()],
+    committed_tokens := non_neg_integer(),
+    finish_key := cache_key() | undefined,
+    cache_hit_kind := cache_hit_kind(),
+    finish_reason := finish_reason(),
+    cache_delta := #{read := non_neg_integer(), created := non_neg_integer()},
+    stats := stats(),
+    stop_sequence => binary()
+}.
 -doc "A middleware: `fun(Request, Next) -> Response`; see `erllama_middleware`.".
 -type middleware() :: fun((map(), fun((map()) -> term())) -> term()).
 
@@ -160,7 +235,7 @@ Config map for `load_model/1,2`.
 }.
 
 -doc """
-Options for `complete/3`, `infer/4` and `continue/3`.
+Options for `complete/3`, `stream/3` and `continue/3`.
 
 - `response_tokens` (default 64): cap on generated tokens.
 - `parent_key`: a previous `finish_key`; resumes from that cached row.
@@ -172,6 +247,7 @@ Options for `complete/3`, `infer/4` and `continue/3`.
   `seed`, `grammar`: sampling.
 - `prefix_checkpoint_len`: pin the first N tokens as a static prefix
   checkpoint.
+- `to`: process receiving the stream events (`stream/3`, `continue/3`).
 - `middleware`: per-call middleware chain (see `erllama_middleware`).
 """.
 -type request_opts() :: #{
@@ -219,7 +295,8 @@ Every `{error, Reason}` the API returns.
 - `oom`, `load_failed`, `malformed_gguf`, `no_gpu`, `too_large`,
   `not_found`: NIF-level failures.
 - `{missing_config, Key}`, `{invalid_config, Key, Value}`,
-  `{unknown_option, Key}`, `{invalid_option, Key, Value}`: validation.
+  `{missing_option, Key}`, `{unknown_option, Key}`,
+  `{invalid_option, Key, Value}`: validation.
 
 Backends may add their own atoms; they are documented on the backend.
 """.
@@ -253,6 +330,7 @@ Backends may add their own atoms; they are documented on the backend.
     | empty_prefix
     | {missing_config, atom()}
     | {invalid_config, atom(), term()}
+    | {missing_option, atom()}
     | {unknown_option, atom() | {atom(), atom()}}
     | {invalid_option, atom(), term()}
     | term().
@@ -347,7 +425,7 @@ phase(ModelId) when is_binary(ModelId) ->
 
 -doc """
 Lock-free count of calls queued behind the model's current request
-(`complete/2,3`, `prefill_only/2,3`, `infer/4`).
+(`complete/2,3`, `prefill_only/2,3`, `stream/3`).
 """.
 -spec pending_len(model_id()) -> {ok, non_neg_integer()} | {error, not_loaded}.
 pending_len(ModelId) when is_binary(ModelId) ->
@@ -431,56 +509,78 @@ prefill_only(Model, PromptTokens, Opts) when is_list(PromptTokens), is_map(Opts)
     end.
 
 -doc """
-Streaming inference. Returns `{ok, Ref}` at once; tokens are delivered
-to `CallerPid` as messages:
+Streaming inference. Returns `{ok, Ref}` at once; events arrive at the
+`to` process (default the caller) as `{erllama, Ref, stream_event()}`.
+`Prompt` is text (tokenised with `tokenize/2`) or a token list.
 
-- `{erllama_token, Ref, Bin :: binary()}`: text fragment
-- `{erllama_token_id, Ref, Id :: token_id()}`: every generated token id
-- `{erllama_token, Ref, {thinking_delta, Bin}}`: extended-thinking
-  fragment (only with `thinking => enabled`)
-- `{erllama_thinking_end, Ref, Sig :: binary()}`: close of a thinking
-  block
-- `{erllama_done, Ref, Stats :: stats()}`: completion; after `cancel/1`
-  `Stats` has `finish_reason => cancelled`
-- `{erllama_error, Ref, Reason :: error_reason()}`: failure
-
-`Tokens` is the tokenised prompt (`tokenize/2`). `session_id` pins the
-KV cells to a session so the next request with the same id extends
-them in place; release it with `end_session/2`. A concurrent request on
-a pinned session returns `{error, sticky_busy}`; `on_full => error`
-returns `{error, seq_capacity}` instead of queueing when no seq is
-free. `Stats.generated` is the exact generated token list, usable as
-the suffix for `continue/3`.
+`session_id` pins the KV cells to a session so the next request with
+the same id extends them in place; release it with `end_session/2`. A
+concurrent request on a pinned session returns `{error, sticky_busy}`;
+`on_full => error` returns `{error, seq_capacity}` instead of queueing
+when no seq is free. `Stats.generated` in the `done` event is the
+exact generated token list, usable as the suffix for `continue/3`.
+Use `collect/2` to wait for the result without writing the receive
+loop.
 """.
--spec infer(model(), [token_id()], request_opts(), pid()) ->
+-spec stream(model(), binary() | [token_id()], request_opts()) ->
     {ok, reference()} | {error, error_reason()}.
-infer(Model, Tokens, Params, CallerPid) when is_list(Tokens), is_map(Params), is_pid(CallerPid) ->
-    case erllama_opts:request_opts(Params) of
-        {ok, Params1} -> erllama_model:infer(Model, Tokens, Params1, CallerPid);
+stream(Model, Prompt, Opts) when is_binary(Prompt), is_map(Opts) ->
+    case tokenize(Model, Prompt) of
+        {ok, Tokens} -> stream(Model, Tokens, Opts);
         {error, _} = E -> E
+    end;
+stream(Model, Tokens, Opts) when is_list(Tokens), is_map(Opts) ->
+    case erllama_opts:request_opts(Opts) of
+        {ok, Opts1} ->
+            {To, Params} = take_to(Opts1),
+            erllama_model:infer(Model, Tokens, Params, To);
+        {error, _} = E ->
+            E
     end.
+
+-doc """
+Wait for a streaming request started with `stream/3` or `continue/3`
+and fold its events into a `stream_result()`. `{error, timeout}` after
+`Timeout` milliseconds without any event (the request is cancelled and
+its remaining events drained).
+""".
+-spec collect(reference(), timeout()) -> {ok, stream_result()} | {error, error_reason()}.
+collect(Ref, Timeout) when is_reference(Ref) ->
+    erllama_stream:collect(Ref, Timeout).
 
 -doc """
 Extend a pinned session by prefilling `SuffixTokens` on top of its live
 KV cells, skipping the prefix-equality check and any cache lookup. Use
 it when the chat template renders history-dependent prefixes that would
-defeat `infer/4`'s sticky path.
+defeat `stream/3`'s sticky path.
 
-`Opts` must carry `session_id` and `caller_pid`. `expect_committed =>
-[token_id()]` makes the engine verify the session's stored tokens first
-and fail with `{error, {transcript_mismatch, #{stored_len, expected_len,
-diverge_at}}}` on divergence, leaving the session pinned for a retry.
-`parent_key` is ignored. Streaming messages are those of `infer/4`;
-`Stats.cache_hit_kind` is `continuation`.
+`Opts` must carry `session_id`; events go to `to` (default the caller).
+`expect_committed => [token_id()]` makes the engine verify the
+session's stored tokens first and fail with `{error,
+{transcript_mismatch, #{stored_len, expected_len, diverge_at}}}` on
+divergence, leaving the session pinned for a retry. `parent_key` is
+ignored. Events are those of `stream/3`; `Stats.cache_hit_kind` is
+`continuation`.
 """.
 -spec continue(model(), [token_id()], request_opts()) ->
     {ok, reference()} | {error, error_reason()}.
 continue(Model, SuffixTokens, Opts) when is_list(SuffixTokens), is_map(Opts) ->
-    erllama_model:continue(Model, SuffixTokens, Opts).
+    case erllama_opts:request_opts(Opts) of
+        {ok, Opts1} ->
+            case maps:is_key(session_id, Opts1) of
+                false ->
+                    {error, {missing_option, session_id}};
+                true ->
+                    {To, Params} = take_to(Opts1),
+                    erllama_model:continue(Model, SuffixTokens, Params#{caller_pid => To})
+            end;
+        {error, _} = E ->
+            E
+    end.
 
 -doc """
 Cancel an in-flight streaming request. Idempotent. The caller still
-receives the terminal `{erllama_done, Ref, Stats}` with
+receives the terminal `{erllama, Ref, {done, Stats}}` with
 `finish_reason => cancelled`. The running decode is interrupted through
 the backend's abort callback; an interrupt that fires recreates the
 context in place, which also resets co-batched requests on other seqs.
@@ -500,7 +600,7 @@ end_session(Model, SessionId) ->
 
 -doc """
 Forcibly drop a session's live KV cells and fail any in-flight request
-on its seq (the caller gets `{erllama_error, Ref, engine_reset}`).
+on its seq (the caller gets `{erllama, Ref, {error, engine_reset}}`).
 Bounded by a 5 s timeout so it stays usable when the engine is wedged:
 `{error, timeout}` means the model process itself is unreachable.
 Returns `{ok, recovered}` or `{ok, not_found}`. Prefer `end_session/2`
@@ -555,31 +655,59 @@ detokenize(Model, Tokens) when is_list(Tokens) ->
 %% =============================================================================
 
 -doc """
-Render a chat request through the model's built-in template and
-tokenise it. `Request` carries `messages`, `system` and `tools`.
-`{error, no_template}` when the GGUF ships none.
+Render a chat request through the model's built-in template with the
+legacy renderer and tokenise it. `Request` carries `messages`, `system`
+and `tools`. Fallback for models whose template the autoparser
+(`chat_apply/2`) cannot handle; `{error, no_template}` when the GGUF
+ships none.
 """.
--spec apply_chat_template(model(), chat_request()) ->
+-spec render_chat_template(model(), chat_request()) ->
     {ok, [token_id()]} | {error, error_reason()}.
-apply_chat_template(Model, Request) when is_map(Request) ->
+render_chat_template(Model, Request) when is_map(Request) ->
     erllama_model:apply_chat_template(Model, Request).
 
 -doc """
+One chat turn: render `Messages` (and the `tools` in `Opts`) through
+the model's template, generate, and parse the output into a structured
+assistant message with content, reasoning and tool calls. Messages and
+tools are Erlang maps; see `chat_message()` and `chat_tool()`.
+
+```erlang
+{ok, #{message := #{content := Text, tool_calls := Calls}}} =
+    erllama:chat(Model, [#{role => user, content => <<"hi">>}],
+                 #{tools => [#{name => <<"weather">>, parameters => Schema}]}).
+```
+
+Streaming callers use `chat_apply/2` + `stream/3` + `chat_parse/3`.
+""".
+-spec chat(model(), [chat_message()], chat_opts()) ->
+    {ok, chat_result()} | {error, error_reason()}.
+chat(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
+    case erllama_opts:request_opts(maps:without([tools, tool_choice, parallel_tool_calls], Opts)) of
+        {ok, _} -> erllama_chat:chat(Model, Messages, Opts);
+        {error, _} = E -> E
+    end.
+
+-doc """
 Render the prompt and build the output parser for one request with
-llama.cpp's `common_chat_templates_apply`. `Inputs` carries `messages`
-and `tools` as JSON binaries plus `tool_choice` and
-`parallel_tool_calls`. Returns the prompt bytes and the `chat_params()`
-to hand to `chat_parse/3` for this request's output; the parser is not
+llama.cpp's `common_chat_templates_apply`. `Messages` and `Opts` are
+those of `chat/3` (only the chat keys of `Opts` are used). Returns the
+prompt bytes and the `chat_params()` to hand to `chat_parse/3` for this
+request's output; tokenise the prompt with `tokenize/3` and
+`#{add_special => false, parse_special => true}`. The parser is not
 reusable across requests.
 """.
--spec chat_apply(model(), map()) ->
-    {ok, chat_params(), binary()} | {error, error_reason()}.
-chat_apply(Model, Inputs) when is_map(Inputs) ->
-    erllama_model:chat_apply(Model, Inputs).
+-spec chat_apply(model(), [chat_message()], chat_opts()) ->
+    {ok, #{prompt := binary(), params := chat_params()}} | {error, error_reason()}.
+chat_apply(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
+    case erllama_model:chat_apply(Model, erllama_chat:inputs(Messages, Opts)) of
+        {ok, Params, Prompt} -> {ok, #{prompt => Prompt, params => Params}};
+        {error, _} = E -> E
+    end.
 
 -doc """
 Parse model output into a structured assistant message (content,
-reasoning, tool calls) with the parser from `chat_apply/2`.
+reasoning, tool calls) with the parser from `chat_apply/3`.
 `IsPartial = true` accepts a streaming prefix.
 """.
 -spec chat_parse(chat_params(), binary(), boolean()) ->
@@ -591,10 +719,40 @@ chat_parse(Params, Input, IsPartial) when is_binary(Input), is_boolean(IsPartial
 %% Embeddings
 %% =============================================================================
 
--doc "Embedding vector for the given tokens. Needs `context_opts => #{embeddings => true}`.".
--spec embed(model(), [token_id()]) -> {ok, [float()]} | {error, error_reason()}.
+-doc """
+Embedding vector for a text or a token list. The model must be loaded
+with `context_opts => #{embeddings => true}`.
+""".
+-spec embed(model(), binary() | [token_id()]) -> {ok, [float()]} | {error, error_reason()}.
+embed(Model, Text) when is_binary(Text) ->
+    case tokenize(Model, Text) of
+        {ok, Tokens} -> embed(Model, Tokens);
+        {error, _} = E -> E
+    end;
 embed(Model, Tokens) when is_list(Tokens) ->
     erllama_model:embed(Model, Tokens).
+
+-doc """
+Embedding vectors for several inputs (texts or token lists) in one
+round-trip to the model process. Stops at the first error.
+""".
+-spec embed_batch(model(), [binary() | [token_id()]]) ->
+    {ok, [[float()]]} | {error, error_reason()}.
+embed_batch(Model, Inputs) when is_list(Inputs) ->
+    case tokenize_all(Model, Inputs, []) of
+        {ok, TokenLists} -> erllama_model:embed_batch(Model, TokenLists);
+        {error, _} = E -> E
+    end.
+
+tokenize_all(_Model, [], Acc) ->
+    {ok, lists:reverse(Acc)};
+tokenize_all(Model, [Text | Rest], Acc) when is_binary(Text) ->
+    case tokenize(Model, Text) of
+        {ok, Tokens} -> tokenize_all(Model, Rest, [Tokens | Acc]);
+        {error, _} = E -> E
+    end;
+tokenize_all(Model, [Tokens | Rest], Acc) when is_list(Tokens) ->
+    tokenize_all(Model, Rest, [Tokens | Acc]).
 
 %% =============================================================================
 %% Adapters
@@ -681,7 +839,7 @@ cached_prefix_len(Model, PromptTokens) when is_list(PromptTokens) ->
 -doc """
 Draft up to `max` next tokens after `PrefixTokens` and return their
 ids. Shorter lists (EOS, `response_tokens`) are valid. Built on
-`infer/4`; a 30 s silence cancels the request and returns
+`stream/3`; a 30 s silence cancels the request and returns
 `{error, timeout}`.
 """.
 -spec draft_tokens(model(), [token_id()], #{max => pos_integer()}) ->
@@ -690,8 +848,8 @@ draft_tokens(_Model, [], _Opts) ->
     {error, empty_prefix};
 draft_tokens(Model, PrefixTokens, Opts) when is_list(PrefixTokens), is_map(Opts) ->
     Params = draft_params(Opts),
-    case infer(Model, PrefixTokens, Params, self()) of
-        {ok, Ref} -> collect_draft_tokens(Ref, [], 30_000);
+    case stream(Model, PrefixTokens, Params) of
+        {ok, Ref} -> erllama_stream:collect_token_ids(Ref, 30_000);
         {error, _} = E -> E
     end.
 
@@ -699,31 +857,6 @@ draft_params(Opts) ->
     case maps:find(max, Opts) of
         {ok, Max} when is_integer(Max), Max > 0 -> #{response_tokens => Max};
         _ -> #{}
-    end.
-
-collect_draft_tokens(Ref, Acc, Timeout) ->
-    receive
-        {erllama_token_id, Ref, Id} ->
-            collect_draft_tokens(Ref, [Id | Acc], Timeout);
-        {erllama_token, Ref, _Bin} ->
-            collect_draft_tokens(Ref, Acc, Timeout);
-        {erllama_done, Ref, _Stats} ->
-            {ok, lists:reverse(Acc)};
-        {erllama_error, Ref, Reason} ->
-            {error, Reason}
-    after Timeout ->
-        ok = cancel(Ref),
-        ok = drain_draft(Ref),
-        {error, timeout}
-    end.
-
-drain_draft(Ref) ->
-    receive
-        {erllama_token, Ref, _} -> drain_draft(Ref);
-        {erllama_token_id, Ref, _} -> drain_draft(Ref);
-        {erllama_done, Ref, _} -> ok;
-        {erllama_error, Ref, _} -> ok
-    after 100 -> ok
     end.
 
 -doc """
@@ -734,15 +867,23 @@ concurrent requests get `{error, busy}`. KV state is restored before
 returning.
 """.
 -spec verify(model(), [token_id()], [token_id()], pos_integer()) ->
-    {ok, non_neg_integer(), token_id() | eos} | {error, error_reason()}.
+    {ok, #{accepted := non_neg_integer(), next := token_id() | eos}} | {error, error_reason()}.
 verify(Model, PrefixTokens, Candidates, K) when
     is_list(PrefixTokens), is_list(Candidates), is_integer(K), K > 0
 ->
-    erllama_model:verify(Model, PrefixTokens, Candidates, K).
+    case erllama_model:verify(Model, PrefixTokens, Candidates, K) of
+        {ok, Accepted, Next} -> {ok, #{accepted => Accepted, next => Next}};
+        {error, _} = E -> E
+    end.
 
 %% =============================================================================
 %% Internal
 %% =============================================================================
+
+%% Split the `to` option (default: the caller) from the request params.
+take_to(Opts) ->
+    To = maps:get(to, Opts, self()),
+    {To, maps:remove(to, Opts)}.
 
 %% Read the model's lock-free observability row and project it.
 obs(ModelId, Project) ->

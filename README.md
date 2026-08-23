@@ -64,7 +64,7 @@ exact tokens, exact cache keys, and OTP supervision around the whole path.
 ```
 
 `load_model/1` returns a binary model id. Pass it to `complete/2,3`,
-`infer/4`, `tokenize/2`, `unload/1`, and the rest of the public API.
+`stream/3`, `tokenize/2`, `unload/1`, and the rest of the public API.
 
 ## Install
 

@@ -140,7 +140,7 @@ co-batched scheduling.
 
 When `n_seq_max` is too low for the concurrent-session count, an
 admission with no free seq blocks by default. Pass
-`on_full => error` on `complete/3` / `infer/4` to fail fast with
+`on_full => error` on `complete/3` / `stream/3` to fail fast with
 `{error, seq_capacity}` instead, and size capacity up front with
 `available_seqs` / `n_seq_max` from `model_info/1`.
 

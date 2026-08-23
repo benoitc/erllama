@@ -14,13 +14,14 @@ per-model templates ref is cached by `erllama_chat_cache`, and
 """.
 
 -export([init/2, apply/2, parse/3]).
+-export([chat/3, inputs/2]).
 %% Optional observer hook set via application env. Module must export
 %% observe_chat_apply_duration/2 and observe_chat_parse_duration/3.
 %% Unset = no-op; the runtime stays decoupled from the server's
 %% metrics module.
 -export([set_observer/1, clear_observer/0]).
 
--export_type([templates_ref/0, params_ref/0, parsed_msg/0]).
+-export_type([templates_ref/0, params_ref/0, parsed_msg/0, message/0, tool/0]).
 
 %% Observer callbacks. Modules registered via set_observer/1 must
 %% export both functions; the dispatch is dynamic but explicitly
@@ -54,6 +55,92 @@ per-model templates ref is cached by `erllama_chat_cache`, and
         }
     ]
 }.
+
+-doc """
+A chat message as an Erlang map. `role` is `system | user | assistant
+| tool`; `content` is a binary or a list of content-part maps in the
+OpenAI shape; assistant messages may carry `tool_calls`, tool results
+carry `tool_call_id`. Encoded to JSON at the NIF boundary.
+""".
+-type message() :: #{
+    role := system | user | assistant | tool | binary(),
+    content := binary() | [map()] | null,
+    tool_calls => [map()],
+    tool_call_id => binary(),
+    name => binary()
+}.
+
+-doc "A tool definition: `#{name, description, parameters}` (JSON-schema map).".
+-type tool() :: #{
+    name := binary(),
+    description => binary(),
+    parameters => map()
+}.
+
+-define(CHAT_KEYS, [tools, tool_choice, parallel_tool_calls]).
+
+-doc """
+Build the NIF inputs map for `apply/2` from Erlang terms: messages and
+tools are JSON-encoded, `tool_choice` (`auto | required | none`) and
+`parallel_tool_calls` are passed through.
+""".
+-spec inputs([message()], map()) -> map().
+inputs(Messages, Opts) when is_list(Messages), is_map(Opts) ->
+    Tools = maps:get(tools, Opts, []),
+    #{
+        messages => iolist_to_binary(json:encode(Messages)),
+        tools => iolist_to_binary(json:encode(Tools)),
+        tool_choice => maps:get(tool_choice, Opts, auto),
+        parallel_tool_calls => maps:get(parallel_tool_calls, Opts, false)
+    }.
+
+-doc """
+One synchronous chat turn: render the prompt and parser for
+`Messages`, tokenise, stream the completion to this process, collect
+it, and parse the output into a structured message. `Opts` carries
+the chat keys (`tools`, `tool_choice`, `parallel_tool_calls`) plus any
+`erllama:request_opts()` key.
+""".
+-spec chat(erllama:model(), [message()], map()) ->
+    {ok, #{
+        message := parsed_msg(), prompt := binary(), reply := binary(), stats := erllama:stats()
+    }}
+    | {error, term()}.
+chat(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
+    RequestOpts = maps:without(?CHAT_KEYS, Opts),
+    case erllama_model:chat_apply(Model, inputs(Messages, Opts)) of
+        {ok, Params, Prompt} ->
+            chat_generate(Model, Params, Prompt, RequestOpts);
+        {error, _} = E ->
+            E
+    end.
+
+chat_generate(Model, Params, Prompt, RequestOpts) ->
+    TokOpts = #{add_special => false, parse_special => true},
+    case erllama_model:tokenize(Model, Prompt, TokOpts) of
+        {ok, Tokens} ->
+            case erllama:stream(Model, Tokens, RequestOpts#{to => self()}) of
+                {ok, Ref} ->
+                    chat_collect(Ref, Params, Prompt);
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+chat_collect(Ref, Params, Prompt) ->
+    case erllama_stream:collect(Ref, infinity) of
+        {ok, #{reply := Reply, stats := Stats}} ->
+            case parse(Params, Reply, false) of
+                {ok, Msg} ->
+                    {ok, #{message => Msg, prompt => Prompt, reply => Reply, stats => Stats}};
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
 
 -spec init(erllama_nif:model_ref(), binary() | undefined) ->
     {ok, templates_ref()} | {error, term()}.
