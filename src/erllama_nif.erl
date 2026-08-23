@@ -53,8 +53,6 @@
     vram_info/0,
     model_size/1,
     model_n_layer/1,
-    resident_bytes/1,
-    pin_resident_pages/1,
     grammar_cache_stats/1,
     forward_with_argmax/2,
     chat_templates_init/2,
@@ -369,29 +367,6 @@ model_size(Model) ->
 model_n_layer(Model) ->
     nif_model_n_layer(Model).
 
-%% Diagnostic resident-set size. Walks the model's mmap regions and runs
-%% `mincore(2)' to count pages currently faulted in; returns
-%% `resident_pages * page_size'. Does NOT pin or modify anything.
-%% Drives the Prometheus `erllama_resident_bytes' gauge so
-%% operators can watch the working set evolve under `lazy' and
-%% `lazy_then_pin_resident'. Returns 0 on backends without an mmap
-%% representation (the stub).
--spec resident_bytes(model_ref()) -> non_neg_integer().
-resident_bytes(Model) ->
-    nif_resident_bytes(Model).
-
-%% Walks the model's mmap regions, runs `mincore(2)' to find which pages
-%% are currently resident (faulted in), and `mlock(2)' s each contiguous
-%% run. Returns the total bytes pinned. Used to implement the
-%% `weight_residency = lazy_then_pin_resident' mode: after the first
-%% inference, the working set of pages selected by the prompt is frozen
-%% so it cannot be paged out under memory pressure. Partial mlock
-%% failures are not fatal; the call returns whatever it managed to pin.
--spec pin_resident_pages(model_ref()) ->
-    {ok, non_neg_integer()} | {error, atom()}.
-pin_resident_pages(Model) ->
-    nif_pin_resident_pages(Model).
-
 %% Per-context grammar-cache stats. Advisory metric to confirm the
 %% compiled-grammar cache is taking effect: a client that resends the same
 %% tool grammar each turn should accrue hits after the first request.
@@ -496,8 +471,6 @@ nif_sampler_free(_Sampler) -> erlang:nif_error(nif_not_loaded).
 nif_vram_info() -> erlang:nif_error(nif_not_loaded).
 nif_model_size(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_model_n_layer(_Model) -> erlang:nif_error(nif_not_loaded).
-nif_pin_resident_pages(_Model) -> erlang:nif_error(nif_not_loaded).
-nif_resident_bytes(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_grammar_cache_stats(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_forward_with_argmax(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_init(_Model, _Override) -> erlang:nif_error(nif_not_loaded).

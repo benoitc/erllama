@@ -44,36 +44,6 @@ this project adheres to [Semantic Versioning](https://semver.org).
 - `erllama_chat_cache:get_or_make_params/3' for the params
   slot; `purge/1' drops both slots for the given model id.
 
-- `erllama:resident_bytes/1' + optional backend callback
-  `resident_bytes/1'. mincore-only diagnostic that returns the bytes of
-  the model's mmap regions currently faulted in. Backends without an
-  mmap layout (the stub) return 0. The server's metrics module surfaces
-  the value as the new `erllama_resident_bytes{model=...}'
-  Prometheus gauge.
-- `erllama_nif:pin_resident_pages/1' and the matching optional
-  backend callback. Walks every mmap region of a loaded model, runs
-  `mincore(2)' per region to find the resident pages, then `mlock(2)'s
-  each contiguous run. Returns the total bytes pinned. Used by the
-  server's `weight_residency = lazy_then_pin_resident' mode: after the
-  first request completes, the working set selected by the prompt is
-  pinned so it cannot be paged out under memory pressure. Partial
-  mlock failures (RLIMIT_MEMLOCK exhausted, EPERM) are logged but not
-  fatal. The scheduler triggers the call once per model load in
-  `finish_req' when the `pin_resident_after_first_request' flag is on,
-  then clears the flag.
-- llama.cpp local accessors: `llama_model_n_mappings(model)' and
-  `llama_model_get_mapping(model, idx, &addr, &size)'. Expose the
-  model's mmap regions without breaking the pimpl encapsulation,
-  so the NIF can run `mincore'/`mlock' against just the weight bytes.
-
-- `llama_model_params.prefetch' (bool). When `false', the NIF asks the
-  kernel to use `POSIX_MADV_RANDOM' on the model's mmap region instead
-  of the default `POSIX_MADV_WILLNEED', so weights page in on first
-  touch instead of being eagerly read. Local patch to vendored
-  llama.cpp threads the new field through `llama_model_loader::init_mappings'.
-  Defaults to `true' (existing behaviour). Drives the server's
-  `weight_residency = lazy' mode.
-
 ### Changed
 
 - Bump vendored llama.cpp from b9334 to b9585. No API-breaking changes

@@ -143,7 +143,6 @@ concurrently through one decode call per tick.
     evict/1,
     shutdown/1,
     model_info/1,
-    resident_bytes/1,
     tokenize/2,
     tokenize/3,
     detokenize/2,
@@ -518,11 +517,6 @@ concurrently through one decode call per tick.
     %% 0 when no GPU layers are offloaded or when the backend does
     %% not report enough metadata to derive it.
     vram_estimate_b = 0 :: non_neg_integer(),
-    %% `weight_residency = lazy_then_pin_resident' deferred pinning flag.
-    %% Set to true at load time when the operator picked the mode; the
-    %% scheduler calls the backend's `pin_resident_pages/1' on the
-    %% first `finish_req' and clears the flag.
-    pin_resident_pending = false :: boolean(),
     %% Attached LoRA adapters. Each entry holds the backend's opaque
     %% handle, the file sha256 (for cache-key derivation), and the
     %% current scale. effective_fp = sha256(fingerprint || sorted
@@ -819,12 +813,6 @@ inference.
 model_info(Model) ->
     gen_statem:call(via(Model), model_info).
 
-%% Bytes of the model's mmap regions currently resident. Delegates to
-%% the backend's optional `resident_bytes/1' callback.
--spec resident_bytes(model()) -> non_neg_integer().
-resident_bytes(Model) ->
-    gen_statem:call(via(Model), resident_bytes).
-
 -doc """
 Tokenise a string using the model's tokenizer. Returns a list of
 token IDs. Safe to call concurrently with `complete/2,3`; tokenisation
@@ -1016,7 +1004,6 @@ build_init_data(ModelId, Config, Backend, BState) ->
         policy = resolve_policy(Config, NBatch),
         backend = Backend,
         backend_state = BState,
-        pin_resident_pending = pin_resident_pending_from_config(Config, Backend),
         adapters = [],
         effective_fp = Fp,
         loaded_at_monotonic = erlang:monotonic_time(nanosecond),
@@ -1098,31 +1085,6 @@ default_fingerprint() ->
 %% production.
 default_ctx_params_hash() ->
     binary:copy(<<0>>, 32).
-
-%% Decide whether the loaded model should pin its resident weight pages
-%% after the first request completes. Activated by either:
-%%   * Config-level shorthand: `pin_resident_after_first_request => true'
-%%     (the loader translates `weight_residency = lazy_then_pin_resident'
-%%     into this flag), or
-%%   * The model_opts forwarded to the backend's load already carrying
-%%     the same key.
-%% Backends that do not export `pin_resident_pages/1' (the stub) cannot
-%% honour the request, so the flag is gated on the export check.
-pin_resident_pending_from_config(Config, Backend) ->
-    Want =
-        case maps:get(pin_resident_after_first_request, Config, undefined) of
-            true -> true;
-            _ -> from_model_opts(maps:get(model_opts, Config, #{}))
-        end,
-    Want andalso erlang:function_exported(Backend, pin_resident_pages, 1).
-
-from_model_opts(MOpts) when is_map(MOpts) ->
-    case maps:get(pin_resident_after_first_request, MOpts, false) of
-        true -> true;
-        _ -> false
-    end;
-from_model_opts(_) ->
-    false.
 
 %% =============================================================================
 %% State: idle
@@ -2015,8 +1977,6 @@ handle_common(_State, {call, From}, {tokenize, Text, Opts}, Data) ->
     reply(From, wrap_ok(backend_tokenize_with_opts(Data, Text, Opts)), Data);
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
     reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
-handle_common(_State, {call, From}, resident_bytes, Data) ->
-    reply(From, backend_resident_bytes(Data), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
     reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
 handle_common(_State, {call, From}, {chat_apply, Inputs}, Data) ->
@@ -2941,47 +2901,7 @@ finish_req(Req, FinishReason, Data, Actions) ->
     _ = release_sampler(Req1, Data),
     Data1 = remove_req(Data, Req1#req.seq_id),
     Data2 = release_or_pin_seq(Req1, Data1),
-    Data3 = maybe_pin_resident_pages(Data2),
-    {Data3, Actions ++ Action}.
-
-%% First-request hook for `weight_residency = lazy_then_pin_resident'.
-%% Once a request completes the kernel has paged in whichever weight
-%% rows the prompt touched; mlock that working set so it survives
-%% memory pressure. Clears the flag whether the call succeeds or fails
-%% so a backend hiccup never retries forever. Pinning is a one-shot
-%% operation per model load.
-maybe_pin_resident_pages(#data{pin_resident_pending = false} = Data) ->
-    Data;
-maybe_pin_resident_pages(
-    #data{pin_resident_pending = true, backend = Mod, model_id = ModelId} = Data
-) ->
-    case backend_call(Data, pin_resident_pages, []) of
-        {ok, Bytes} when is_integer(Bytes), Bytes > 0 ->
-            logger:info(
-                "erllama: pinned ~B bytes of weights for ~ts "
-                "(weight_residency = lazy_then_pin_resident)",
-                [Bytes, ModelId]
-            );
-        {ok, 0} ->
-            logger:notice(
-                "erllama: pin_resident_pages returned 0 bytes "
-                "for ~ts (backend=~p); no pages pinned",
-                [ModelId, Mod]
-            );
-        {error, Reason} ->
-            logger:warning(
-                "erllama: pin_resident_pages failed for ~ts: ~p; "
-                "model continues unpinned",
-                [ModelId, Reason]
-            );
-        Other ->
-            logger:warning(
-                "erllama: pin_resident_pages returned ~p for ~ts; "
-                "treating as failure",
-                [Other, ModelId]
-            )
-    end,
-    Data#data{pin_resident_pending = false}.
+    {Data2, Actions ++ Action}.
 
 release_or_pin_seq(#req{session_id = undefined, seq_id = SeqId}, Data) ->
     _ = release_seq(SeqId, Data),
@@ -3686,15 +3606,6 @@ backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) 
     case erlang:function_exported(Mod, tokenize, 3) of
         true -> Mod:tokenize(S, Text, Opts);
         false -> Mod:tokenize(S, Text)
-    end.
-
-%% Diagnostic resident-set size in bytes. Backends without an mmap
-%% representation (the stub) return 0; the metrics module surfaces the
-%% value verbatim.
-backend_resident_bytes(#data{backend = Mod, backend_state = S}) ->
-    case erlang:function_exported(Mod, resident_bytes, 1) of
-        true -> Mod:resident_bytes(S);
-        false -> 0
     end.
 
 %% Resolve a model() reference to a Pid that gen_statem:call/2,3
