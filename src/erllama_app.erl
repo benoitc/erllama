@@ -2,6 +2,7 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_app).
+-moduledoc false.
 -behaviour(application).
 
 -export([start/2, stop/1]).

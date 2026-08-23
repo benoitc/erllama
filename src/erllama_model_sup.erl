@@ -2,11 +2,10 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_model_sup).
--moduledoc """
-Dynamic supervisor for `erllama_model` gen_statems. Each loaded
-model is one child started via `start_model/2`. simple_one_for_one
-strategy: children are spawned on demand from a single child spec.
-""".
+-moduledoc false.
+%% Dynamic supervisor for `erllama_model` gen_statems. Each loaded
+%% model is one child started via `start_model/2`. simple_one_for_one
+%% strategy: children are spawned on demand from a single child spec.
 -behaviour(supervisor).
 
 -export([start_link/0, start_model/2, stop_model/1, models/0]).

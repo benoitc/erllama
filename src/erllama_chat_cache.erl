@@ -2,27 +2,26 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_chat_cache).
--moduledoc """
-LRU cache for `erllama_chat' templates refs.
-
-One slot per model: `{templates, ModelIdBin}` → `templates_ref'.
-The autoparser's `templates_init' is heavy (jinja parse + setup);
-amortise by caching the resulting `templates_ref' per `ModelIdBin'.
-Per-request work (`erllama_chat:apply/2`) is not cached.
-
-The cache is keyed on the stable `ModelIdBin' binary so cached
-entries never extend a model's lifetime past unload. The model
-layer calls `purge/1' on its `terminate/1' to drop every entry
-for the model.
-
-Eviction (LRU + `purge/1') removes the resource term from ETS;
-the underlying NIF resource destructor runs on the next BEAM GC.
-
-`get_or_init/3' invokes NIFs that need real model + templates
-resources; the unit tests exercise `put/3' +
-`lookup/2' directly on synthetic terms. End-to-end "double-call
-returns same ref" guarantees live in `erllama_chat_SUITE'.
-""".
+-moduledoc false.
+%% LRU cache for `erllama_chat' templates refs.
+%%
+%% One slot per model: `{templates, ModelIdBin}` → `templates_ref'.
+%% The autoparser's `templates_init' is heavy (jinja parse + setup);
+%% amortise by caching the resulting `templates_ref' per `ModelIdBin'.
+%% Per-request work (`erllama_chat:apply/2`) is not cached.
+%%
+%% The cache is keyed on the stable `ModelIdBin' binary so cached
+%% entries never extend a model's lifetime past unload. The model
+%% layer calls `purge/1' on its `terminate/1' to drop every entry
+%% for the model.
+%%
+%% Eviction (LRU + `purge/1') removes the resource term from ETS;
+%% the underlying NIF resource destructor runs on the next BEAM GC.
+%%
+%% `get_or_init/3' invokes NIFs that need real model + templates
+%% resources; the unit tests exercise `put/3' +
+%% `lookup/2' directly on synthetic terms. End-to-end "double-call
+%% returns same ref" guarantees live in `erllama_chat_SUITE'.
 
 -behaviour(gen_server).
 

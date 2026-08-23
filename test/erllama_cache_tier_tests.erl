@@ -7,15 +7,6 @@
 -module(erllama_cache_tier_tests).
 -include_lib("eunit/include/eunit.hrl").
 
-with_app(Body) ->
-    {ok, Started} = application:ensure_all_started(erllama),
-    try
-        Body()
-    after
-        [application:stop(A) || A <- lists:reverse(Started)],
-        ok
-    end.
-
 tmp_dir(Tag) ->
     Dir = filename:join(
         os:getenv("TMPDIR", "/tmp"),
@@ -25,7 +16,7 @@ tmp_dir(Tag) ->
     Dir.
 
 add_list_remove_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         Root = tmp_dir("disk"),
         ?assertMatch([#{name := erllama_cache_ram, backend := ram}], erllama_cache:list_tiers()),
         ok = erllama_cache:add_tier(#{name => tier_t1, backend => disk, root => Root}),
@@ -42,7 +33,7 @@ add_list_remove_test() ->
     end).
 
 ram_file_tier_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         Root = tmp_dir("ramfile"),
         ok = erllama_cache:add_tier(#{name => tier_rf, backend => ram_file, root => Root}),
         ?assertMatch(
@@ -53,7 +44,7 @@ ram_file_tier_test() ->
     end).
 
 invalid_tier_spec_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         ?assertMatch({error, {invalid_tier, _}}, erllama_cache:add_tier(#{name => x})),
         ?assertMatch(
             {error, {invalid_tier, _}},
@@ -65,7 +56,7 @@ env_tiers_start_with_app_test() ->
     Root = tmp_dir("env"),
     application:set_env(erllama, tiers, [#{name => tier_env, backend => disk, root => Root}]),
     try
-        with_app(fun() ->
+        erllama_test_helpers:with_app(fun() ->
             ?assertMatch([_, #{name := tier_env, backend := disk}], erllama_cache:list_tiers())
         end)
     after
@@ -73,7 +64,7 @@ env_tiers_start_with_app_test() ->
     end.
 
 model_saves_to_added_tier_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         Root = tmp_dir("model"),
         ok = erllama_cache:add_tier(#{name => tier_m, backend => disk, root => Root}),
         {ok, Id} = erllama:load_model(#{
@@ -122,7 +113,7 @@ wait_for_disk_row_loop(Root, Deadline) ->
     end.
 
 load_validates_tier_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         Base = #{backend => erllama_model_stub},
         ?assertEqual(
             {error, {invalid_config, tier_srv, nope}},

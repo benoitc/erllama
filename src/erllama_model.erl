@@ -2,127 +2,126 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_model).
--moduledoc """
-Per-model gen_statem that drives the request flow and wires the
-cache subsystem into the model lifecycle.
-
-## State machine
-
-```
-  ┌──── admit (idle_seq_ids non-empty)
-  │     ┌──── admit (queues in pending when idle_seq_ids empty)
-  │     │     ┌──── cast tick (self)
-  ▼     ▼     │
- idle ──────▶ running ─────┐
-  ▲                        │
-  └────── all reqs finished (req_table = #{} AND pending = [])
-```
-
-Two states only:
-
-- `idle/3` — `req_table` is empty AND `pending` is empty. Accepts
-  admit events (complete, prefill_only, infer) and transitions to
-  `running`. Verifies and other read-only ops are allowed.
-- `running/3` — one or more `#req{}` are in flight. Accepts further
-  admit events (allocate seq_id from `idle_seq_ids` or enqueue in
-  `pending`), cancel casts, and the internal `tick` cast. Verify
-  is refused with `{error, busy}` because it mutates the context.
-
-## Per-request lifecycle
-
-```
-  admit                  step_tick                step_tick               finish_req
-  ─────▶ req_table       ──────▶ prefilling       ──────▶ decoding        ────────▶
-         (new #req,              (prefill_cursor          (prefill_cursor
-          seq_id popped           non-empty,              undefined,
-          from                    backend:step             backend:step
-          idle_seq_ids,           pushes slice             samples one
-          sampler built,          to KV)                   token + decodes)
-          warm/cold path
-          chosen)
-```
-
-Each `#req` records its own `seq_id`, sampler_ref, prompt_tokens,
-context_tokens, prefill_cursor, generated, response_target,
-cache_hit_kind, and finishing flag. The `req_table` map is keyed
-by seq_id.
-
-## step_tick driver
-
-Every tick (one llama_decode call) builds a co-batched op list:
-
-  - For each `#req` with `prefill_cursor =/= undefined`, append
-    `{seq_id, {prefill, Slice}}`.
-  - For each `#req` with `prefill_cursor =:= undefined` and a
-    sampler_ref, append `{seq_id, {decode, sampler_ref}}`.
-
-The op list is bounded by `total_batch_budget` (`context_opts.n_batch`):
-decode rows are kept whole, prefill rows are sliced head-first
-until the sum fits. The NIF returns `{seq_id, prefilled}` or
-`{seq_id, {token, T, EogFlag}}` per row; results land back in the
-respective `#req`. Reqs that reach `response_target` tokens, an
-eog flag, or a cancel get `finishing = true` and finalise in the
-post-step finisher walk (`finish_marked_reqs/2`).
-
-## Per-tick batch budget
-
-`step_tick/1` enforces total tokens ≤ `total_batch_budget` (mirrors
-`context_opts.n_batch`, default 512). If `total_batch_budget` is
-smaller than the number of in-flight decoders, the gen_statem
-crashes deliberately so the supervisor restarts and the operator
-fixes `n_batch` / `n_seq_max`. Otherwise prefill rows are sliced
-head-first to fit; truncated tails resume next tick.
-
-## Chunked prefill
-
-Each prefill row is additionally capped by the `prefill_chunk_size`
-policy knob (default `max(64, n_batch div 4)`, or `infinity` to
-disable). The effective slice per prefill row is
-`min(length(remaining), prefill_chunk_size, available_budget)`. A
-long prompt is therefore sliced across several ticks even when the
-batch budget alone would have accommodated it in one, leaving room
-for concurrent decoders to make progress between chunks.
-
-## Cache save reasons
-
-- **cold**: fired right after a fresh prompt's prefill completes,
-  before any decoding. Saves the trimmed prefix the policy
-  produces from `cold_save_split/2`. Per-#req — each new admit
-  fires its own cold save at most once.
-- **continued**: fired every `continued_interval` tokens during
-  decode. Per-#req, gated on the request's `last_save_at`.
-- **finish**: fired when the request finishes (success, length
-  limit, eog, or cancel). Saves the full context_tokens.
-- **evict** / **shutdown**: fired by external triggers and walks
-  every in-flight #req, firing one save per non-empty
-  context_tokens.
-
-All saves go through `fire_save_if/5` which calls
-`backend:kv_pack/3` against the request's seq_id and hands the
-binary off to `erllama_cache_writer`.
-
-## Concurrency contract
-
-The gen_statem is the sole writer of the context's KV cells: every
-`backend:step/2` and `kv_pack` / `kv_unpack` / `seq_rm` call runs
-inside a state callback, so the AGENTS.md paused-context invariant
-holds — `kv_pack` only runs between ticks when no `llama_decode`
-is in flight. Default `n_seq_max => 1` collapses this to the v0.2
-single-tenant flow bit-identically; opting in via
-`context_opts.n_seq_max > 1` lets up to N requests run
-concurrently through one decode call per tick.
-
-## Backwards compatibility
-
-- Public API (`complete/2,3`, `prefill_only/2`, `infer/4`,
-  `cancel/1`, `status/1`, `model_info/1`, `verify/4`, etc.) is
-  unchanged.
-- Default `n_seq_max => 1` keeps single-tenant behaviour
-  bit-identical to v0.2; multi-tenancy is opt-in.
-- `phase` on the obs row and in `model_info/1` is still
-  `idle | prefilling | generating`, computed from the dominant
-  phase across in-flight reqs (`dominant_phase/1`).
-""".
+-moduledoc false.
+%% Per-model gen_statem that drives the request flow and wires the
+%% cache subsystem into the model lifecycle.
+%%
+%% ## State machine
+%%
+%% ```
+%%   ┌──── admit (idle_seq_ids non-empty)
+%%   │     ┌──── admit (queues in pending when idle_seq_ids empty)
+%%   │     │     ┌──── cast tick (self)
+%%   ▼     ▼     │
+%%  idle ──────▶ running ─────┐
+%%   ▲                        │
+%%   └────── all reqs finished (req_table = #{} AND pending = [])
+%% ```
+%%
+%% Two states only:
+%%
+%% - `idle/3` — `req_table` is empty AND `pending` is empty. Accepts
+%%   admit events (complete, prefill_only, infer) and transitions to
+%%   `running`. Verifies and other read-only ops are allowed.
+%% - `running/3` — one or more `#req{}` are in flight. Accepts further
+%%   admit events (allocate seq_id from `idle_seq_ids` or enqueue in
+%%   `pending`), cancel casts, and the internal `tick` cast. Verify
+%%   is refused with `{error, busy}` because it mutates the context.
+%%
+%% ## Per-request lifecycle
+%%
+%% ```
+%%   admit                  step_tick                step_tick               finish_req
+%%   ─────▶ req_table       ──────▶ prefilling       ──────▶ decoding        ────────▶
+%%          (new #req,              (prefill_cursor          (prefill_cursor
+%%           seq_id popped           non-empty,              undefined,
+%%           from                    backend:step             backend:step
+%%           idle_seq_ids,           pushes slice             samples one
+%%           sampler built,          to KV)                   token + decodes)
+%%           warm/cold path
+%%           chosen)
+%% ```
+%%
+%% Each `#req` records its own `seq_id`, sampler_ref, prompt_tokens,
+%% context_tokens, prefill_cursor, generated, response_target,
+%% cache_hit_kind, and finishing flag. The `req_table` map is keyed
+%% by seq_id.
+%%
+%% ## step_tick driver
+%%
+%% Every tick (one llama_decode call) builds a co-batched op list:
+%%
+%%   - For each `#req` with `prefill_cursor =/= undefined`, append
+%%     `{seq_id, {prefill, Slice}}`.
+%%   - For each `#req` with `prefill_cursor =:= undefined` and a
+%%     sampler_ref, append `{seq_id, {decode, sampler_ref}}`.
+%%
+%% The op list is bounded by `total_batch_budget` (`context_opts.n_batch`):
+%% decode rows are kept whole, prefill rows are sliced head-first
+%% until the sum fits. The NIF returns `{seq_id, prefilled}` or
+%% `{seq_id, {token, T, EogFlag}}` per row; results land back in the
+%% respective `#req`. Reqs that reach `response_target` tokens, an
+%% eog flag, or a cancel get `finishing = true` and finalise in the
+%% post-step finisher walk (`finish_marked_reqs/2`).
+%%
+%% ## Per-tick batch budget
+%%
+%% `step_tick/1` enforces total tokens ≤ `total_batch_budget` (mirrors
+%% `context_opts.n_batch`, default 512). If `total_batch_budget` is
+%% smaller than the number of in-flight decoders, the gen_statem
+%% crashes deliberately so the supervisor restarts and the operator
+%% fixes `n_batch` / `n_seq_max`. Otherwise prefill rows are sliced
+%% head-first to fit; truncated tails resume next tick.
+%%
+%% ## Chunked prefill
+%%
+%% Each prefill row is additionally capped by the `prefill_chunk_size`
+%% policy knob (default `max(64, n_batch div 4)`, or `infinity` to
+%% disable). The effective slice per prefill row is
+%% `min(length(remaining), prefill_chunk_size, available_budget)`. A
+%% long prompt is therefore sliced across several ticks even when the
+%% batch budget alone would have accommodated it in one, leaving room
+%% for concurrent decoders to make progress between chunks.
+%%
+%% ## Cache save reasons
+%%
+%% - **cold**: fired right after a fresh prompt's prefill completes,
+%%   before any decoding. Saves the trimmed prefix the policy
+%%   produces from `cold_save_split/2`. Per-#req — each new admit
+%%   fires its own cold save at most once.
+%% - **continued**: fired every `continued_interval` tokens during
+%%   decode. Per-#req, gated on the request's `last_save_at`.
+%% - **finish**: fired when the request finishes (success, length
+%%   limit, eog, or cancel). Saves the full context_tokens.
+%% - **evict** / **shutdown**: fired by external triggers and walks
+%%   every in-flight #req, firing one save per non-empty
+%%   context_tokens.
+%%
+%% All saves go through `fire_save_if/5` which calls
+%% `backend:kv_pack/3` against the request's seq_id and hands the
+%% binary off to `erllama_cache_writer`.
+%%
+%% ## Concurrency contract
+%%
+%% The gen_statem is the sole writer of the context's KV cells: every
+%% `backend:step/2` and `kv_pack` / `kv_unpack` / `seq_rm` call runs
+%% inside a state callback, so the AGENTS.md paused-context invariant
+%% holds — `kv_pack` only runs between ticks when no `llama_decode`
+%% is in flight. Default `n_seq_max => 1` collapses this to the v0.2
+%% single-tenant flow bit-identically; opting in via
+%% `context_opts.n_seq_max > 1` lets up to N requests run
+%% concurrently through one decode call per tick.
+%%
+%% ## Backwards compatibility
+%%
+%% - Public API (`complete/2,3`, `prefill_only/2`, `infer/4`,
+%%   `cancel/1`, `status/1`, `model_info/1`, `verify/4`, etc.) is
+%%   unchanged.
+%% - Default `n_seq_max => 1` keeps single-tenant behaviour
+%%   bit-identical to v0.2; multi-tenancy is opt-in.
+%% - `phase` on the obs row and in `model_info/1` is still
+%%   `idle | prefilling | generating`, computed from the dominant
+%%   phase across in-flight reqs (`dominant_phase/1`).
 -behaviour(gen_statem).
 
 -include("erllama_cache.hrl").
@@ -177,131 +176,23 @@ concurrently through one decode call per tick.
 ]).
 
 -type model() :: erllama_registry:model_id() | pid().
--type model_info() :: #{
-    id := binary(),
-    %% Alias for `id`. Added for cluster registry rows so callers
-    %% match on a name that does not collide with their own
-    %% process-id-typed `id` fields.
-    model_id := binary(),
-    pid := pid(),
-    status := idle | prefilling | generating,
-    backend := module(),
-    context_size := non_neg_integer(),
-    quant_type := atom(),
-    quant_bits := non_neg_integer(),
-    %% String tag like <<"q4_k_m">> / <<"f16">>. Derived from
-    %% quant_type + quant_bits.
-    quant_tag := binary(),
-    tier := ram | disk | ram_file,
-    fingerprint := binary(),
-    %% erlang:monotonic_time(nanosecond) at gen_statem init.
-    loaded_at_monotonic := integer(),
-    %% Best-effort estimate of VRAM footprint for the model when
-    %% the gpu offload is configured. 0 if no GPU layers are
-    %% offloaded or if the backend cannot report the underlying
-    %% sizes (stub backend, etc.).
-    vram_estimate_b := non_neg_integer(),
-    %% Total seq capacity of the live context (`context_opts.n_seq_max`).
-    n_seq_max := pos_integer(),
-    %% Number of seq slots currently free for a new admission. A
-    %% sticky session with no in-flight req still holds its slot
-    %% off the free list, so this counts only seqs the engine could
-    %% admit a brand-new request onto right now.
-    available_seqs := non_neg_integer(),
-    %% Sticky-session seqs that are pinned but idle (no in-flight
-    %% request) - reclaimable under seq-pool pressure. `available_seqs`
-    %% stays ~0 since an admitted request immediately re-pins, so this is
-    %% the meaningful "headroom" signal.
-    pinned_idle_seqs := non_neg_integer()
-}.
+-type model_info() :: erllama:model_info().
 
--type cache_hit_kind() :: exact | partial | cold | sticky | continuation.
+-type cache_hit_kind() :: erllama:cache_hit_kind().
 
 -type pending_request() ::
     {complete, gen_statem:from(), binary(), map()}
     | {prefill_only, gen_statem:from(), [non_neg_integer()], map()}
     | {infer, gen_statem:from(), [non_neg_integer()], map(), pid()}
     | {continue, gen_statem:from(), [non_neg_integer()], map()}.
--type finish_reason() :: stop | length | cancelled.
--type stats() :: #{
-    prompt_tokens := non_neg_integer(),
-    completion_tokens := non_neg_integer(),
-    %% Exact generated token ids for this turn, in order. Lets a
-    %% caller reconstruct a byte-exact suffix for `continue/3`
-    %% without re-tokenising detokenised text. Mirrors the
-    %% `generated` key in the standard-mode (`complete`) result map.
-    generated := [non_neg_integer()],
-    prefill_ms := non_neg_integer(),
-    generation_ms := non_neg_integer(),
-    cache_hit_kind := cache_hit_kind(),
-    finish_reason := finish_reason(),
-    cancelled := boolean(),
-    %% Token-exact cache key for the full context (prompt ++ generated).
-    %% `undefined` when the finish save was suppressed (e.g. live token
-    %% count below `min_tokens`).
-    finish_key := binary() | undefined,
-    %% Length of `context_tokens` at finish (prompt + generated). Equal
-    %% to `prompt_tokens + completion_tokens` unless the cache pruned
-    %% the live context (not currently possible).
-    committed_tokens := non_neg_integer(),
-    %% Anthropic-style per-request cache breakdown. `read` is the
-    %% warm prefix length restored from cache at admission;
-    %% `created` is the largest contribution this request added to
-    %% the cache beyond that prefix (saves below `min_tokens` and
-    %% writer back-pressure leave `created` unchanged). Both
-    %% default to 0.
-    cache_delta := #{
-        read := non_neg_integer(),
-        created := non_neg_integer()
-    },
-    %% Only present when a caller-supplied `stop_sequences` entry
-    %% fired. The value is the binary of the matched stop string.
-    %% Absent on `length`, `cancelled`, or natural end-of-generation
-    %% without a stop-string match.
-    stop_sequence => binary()
-}.
+-type finish_reason() :: erllama:finish_reason().
+-type stats() :: erllama:stats().
 
 %% Reply shape for `complete/2,3`.
--type completion_result() :: #{
-    %% Detokenised reply text. Trimmed at the first occurrence of a
-    %% matched `stop_sequences` entry when one fired.
-    reply := binary(),
-    %% Tokens produced by this request (not including the prompt).
-    generated := [non_neg_integer()],
-    %% Full context as a token list (prompt ++ generated).
-    context_tokens := [non_neg_integer()],
-    %% Convenience: length(context_tokens).
-    committed_tokens := non_neg_integer(),
-    %% Token-exact cache key for the full context. Pass as
-    %% `parent_key` on the next request to resume from the warm row.
-    %% `undefined` if the finish save was suppressed.
-    finish_key := binary() | undefined,
-    %% How this request resolved against the cache on admission.
-    cache_hit_kind := cache_hit_kind(),
-    finish_reason := finish_reason(),
-    %% Per-request Anthropic cache breakdown. See `stats()`.
-    cache_delta := #{
-        read := non_neg_integer(),
-        created := non_neg_integer()
-    },
-    stats := stats(),
-    %% Only present when a caller-supplied `stop_sequences` entry
-    %% fired. The value is the binary of the matched stop string.
-    stop_sequence => binary()
-}.
+-type completion_result() :: erllama:completion_result().
 
 %% Reply shape for `prefill_only/2`.
--type prefill_result() :: #{
-    context_tokens := [non_neg_integer()],
-    committed_tokens := non_neg_integer(),
-    finish_key := binary() | undefined,
-    cache_hit_kind := cache_hit_kind(),
-    %% Per-request Anthropic cache breakdown. See `stats()`.
-    cache_delta := #{
-        read := non_neg_integer(),
-        created := non_neg_integer()
-    }
-}.
+-type prefill_result() :: erllama:prefill_result().
 
 %% Optional fields the caller may set on `infer/4`. The same fields
 %% are honoured by `complete/3` Opts and `continue/3`. The sampler

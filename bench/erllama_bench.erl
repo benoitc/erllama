@@ -56,9 +56,9 @@ cold_vs_warm(ModelPath, PromptTokenTargets) ->
                   "prefill or kv_unpack → 1 generated token. Warm includes "
                   "the seq_rm + 1-token re-prefill primer.)_~n")
     after
-        catch erllama_model:stop(Model),
-        catch gen_server:stop(DiskSrv),
-        rm_rf(Dir)
+        erllama_test_helpers:stop_model_quiet(Model),
+        erllama_test_helpers:stop_quiet(DiskSrv),
+        erllama_test_helpers:rm_rf(Dir)
     end,
     ok.
 
@@ -130,7 +130,7 @@ multi_agent(ModelPath, NAgents, SharedTokens) ->
     try
         %% Pre-warm: cold completion that publishes the cache row.
         {_, _, _} = call_complete(PrewarmModel, SharedPrompt, 1),
-        catch erllama_model:stop(PrewarmModel),
+        erllama_test_helpers:stop_model_quiet(PrewarmModel),
         timer:sleep(300),
         erllama_cache:reset_counters(),
         Tasks = [
@@ -164,9 +164,9 @@ multi_agent(ModelPath, NAgents, SharedTokens) ->
         io:format("| longest_prefix_ns | ~p |~n", [maps:get(longest_prefix_ns, Snap)]),
         io:format("| load_total_ns | ~p |~n", [maps:get(load_total_ns, Snap)])
     after
-        catch erllama_model:stop(PrewarmModel),
-        catch gen_server:stop(DiskSrv),
-        rm_rf(Dir)
+        erllama_test_helpers:stop_model_quiet(PrewarmModel),
+        erllama_test_helpers:stop_quiet(DiskSrv),
+        erllama_test_helpers:rm_rf(Dir)
     end,
     ok.
 
@@ -191,7 +191,7 @@ run_one_agent(ModelPath, DiskSrv, I, Task, Parent, Tag) ->
         {Lat, _} = timer:tc(erllama_model, complete, [ModelName, Task, #{response_tokens => 1}]),
         Parent ! {agent_done, self(), Lat}
     after
-        catch erllama_model:stop(ModelName)
+        erllama_test_helpers:stop_model_quiet(ModelName)
     end.
 
 %% =============================================================================
@@ -300,12 +300,6 @@ make_tmp_dir(Tag) ->
     ok = filelib:ensure_path(Dir),
     Dir.
 
-rm_rf(Dir) ->
-    case file:list_dir(Dir) of
-        {ok, Entries} -> [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ -> ok
-    end,
-    file:del_dir(Dir).
 
 enumerate(L) ->
     lists:zip(lists:seq(1, length(L)), L).

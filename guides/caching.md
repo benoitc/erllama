@@ -35,10 +35,23 @@ ram_file  Files on /dev/shm. Fast, capped only by tmpfs size.
 disk      Files on persistent storage. Survives restarts.
 ```
 
-Each tier is an independently-supervised gen_server with its own
-byte quota and its own LRU. A save is written to the tier you
-configure on the model; reads consult an in-memory index that fans
-out to the right tier.
+The RAM tier is always on. Add `ram_file` and `disk` tiers with
+`erllama_cache:add_tier/1` or the `tiers` application environment key;
+each one is a supervised server rooted at a directory. A save is
+written to the tier the model is configured with (`tier` + `tier_srv`
+in its load config); reads consult an in-memory index that fans out to
+the right tier.
+
+```erlang
+ok = erllama_cache:add_tier(#{name => kv_disk, backend => disk,
+                              root => "/var/lib/erllama/kvc"}),
+ok = erllama_cache:add_tier(#{name => kv_shm, backend => ram_file,
+                              root => "/dev/shm/erllama"}),
+erllama_cache:list_tiers().
+%% [#{name => erllama_cache_ram, backend => ram, ...},
+%%  #{name => kv_disk, backend => disk, root => "/var/lib/erllama/kvc", pid => <0.231.0>},
+%%  #{name => kv_shm, backend => ram_file, ...}]
+```
 
 The disk tier is **a first-class citizen**: large models that
 wouldn't fit alongside a working set of warm KV state in RAM can
@@ -136,10 +149,10 @@ below `low_watermark`, scoped to the configured tiers.
 %% Hit/miss/save counters and per-path latency totals.
 erllama_cache:get_counters().
 
-%% Every row in the index, raw tuples:
-%%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin,
-%%    Location, TokensRef, Hits}
-erllama_cache_meta_srv:dump().
+%% Tiers, number of cached rows and bytes held per tier backend.
+erllama_cache:info().
+%% #{tiers => [...], entries => 42,
+%%   bytes => #{ram => 12582912, ram_file => 0, disk => 805306368}}
 
 %% Synchronous full eviction pass: returns {evicted, N}.
 erllama_cache:gc().
@@ -149,9 +162,7 @@ erllama_cache:evict_bytes(256 * 1024 * 1024).
 erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 ```
 
-The counter map is documented inline on
-`erllama_cache:get_counters/0` — call it from a shell to see the
-keys for your build.
+The counter keys are listed on `erllama_cache:get_counters/0`.
 
 ## Disabling the cache
 

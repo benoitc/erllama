@@ -17,10 +17,10 @@ with_disk(Body) ->
     try
         Body(Dir)
     after
-        catch gen_server:stop(test_disk),
-        catch gen_server:stop(erllama_cache_ram),
-        catch gen_server:stop(erllama_cache_meta_srv),
-        rm_rf(Dir)
+        erllama_test_helpers:stop_quiet(test_disk),
+        erllama_test_helpers:stop_quiet(erllama_cache_ram),
+        erllama_test_helpers:stop_quiet(erllama_cache_meta_srv),
+        erllama_test_helpers:rm_rf(Dir)
     end.
 
 prompt_bytes(Tokens) ->
@@ -67,8 +67,8 @@ agent_prefix_repinned_on_disk_scan_test() ->
         %% the disk scan re-adopts the on-disk .kvc. The scan + insert +
         %% pin run synchronously in disk_srv init, so the row is pinned
         %% by the time start_link returns.
-        catch gen_server:stop(test_disk),
-        catch gen_server:stop(erllama_cache_meta_srv),
+        erllama_test_helpers:stop_quiet(test_disk),
+        erllama_test_helpers:stop_quiet(erllama_cache_meta_srv),
         {ok, _} = erllama_cache_meta_srv:start_link(),
         {ok, _} = erllama_cache_disk_srv:start_link(test_disk, Dir),
         {ok, Row} = erllama_cache_meta_srv:dump(Key),
@@ -163,12 +163,12 @@ init_sweeps_tmp_files_test() ->
             {ok, Entries} = file:list_dir(Dir),
             ?assertEqual([], Entries)
         after
-            catch gen_server:stop(scan_disk),
-            catch gen_server:stop(erllama_cache_ram),
-            catch gen_server:stop(erllama_cache_meta_srv)
+            erllama_test_helpers:stop_quiet(scan_disk),
+            erllama_test_helpers:stop_quiet(erllama_cache_ram),
+            erllama_test_helpers:stop_quiet(erllama_cache_meta_srv)
         end
     after
-        rm_rf(Dir)
+        erllama_test_helpers:rm_rf(Dir)
     end.
 
 init_registers_existing_kvc_files_test() ->
@@ -185,12 +185,12 @@ init_registers_existing_kvc_files_test() ->
         try
             ?assertMatch({ok, _Row}, erllama_cache_meta_srv:lookup_exact(Key))
         after
-            catch gen_server:stop(scan2_disk),
-            catch gen_server:stop(erllama_cache_ram),
-            catch gen_server:stop(erllama_cache_meta_srv)
+            erllama_test_helpers:stop_quiet(scan2_disk),
+            erllama_test_helpers:stop_quiet(erllama_cache_ram),
+            erllama_test_helpers:stop_quiet(erllama_cache_meta_srv)
         end
     after
-        rm_rf(Dir)
+        erllama_test_helpers:rm_rf(Dir)
     end.
 
 init_drops_corrupt_kvc_files_test() ->
@@ -204,12 +204,12 @@ init_drops_corrupt_kvc_files_test() ->
             {ok, Entries} = file:list_dir(Dir),
             ?assertEqual([], Entries)
         after
-            catch gen_server:stop(scan3_disk),
-            catch gen_server:stop(erllama_cache_ram),
-            catch gen_server:stop(erllama_cache_meta_srv)
+            erllama_test_helpers:stop_quiet(scan3_disk),
+            erllama_test_helpers:stop_quiet(erllama_cache_ram),
+            erllama_test_helpers:stop_quiet(erllama_cache_meta_srv)
         end
     after
-        rm_rf(Dir)
+        erllama_test_helpers:rm_rf(Dir)
     end.
 
 %% =============================================================================
@@ -259,13 +259,6 @@ make_tmp_dir() ->
     ),
     ok = file:make_dir(Dir),
     Dir.
-
-rm_rf(Dir) ->
-    case file:list_dir(Dir) of
-        {ok, Entries} -> [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ -> ok
-    end,
-    file:del_dir(Dir).
 
 bin_to_hex(Bin) ->
     binary_to_list(binary:encode_hex(Bin, lowercase)).

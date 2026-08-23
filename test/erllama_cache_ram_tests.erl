@@ -11,8 +11,8 @@ with_cache(Body) ->
     try
         Body()
     after
-        catch gen_server:stop(erllama_cache_ram),
-        catch gen_server:stop(erllama_cache_meta_srv)
+        erllama_test_helpers:stop_quiet(erllama_cache_ram),
+        erllama_test_helpers:stop_quiet(erllama_cache_meta_srv)
     end.
 
 key(N) ->

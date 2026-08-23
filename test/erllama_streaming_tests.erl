@@ -22,8 +22,8 @@ with_app(Body) ->
     try
         Body(DiskSrv)
     after
-        catch gen_server:stop(DiskSrv),
-        rm_rf(Dir),
+        erllama_test_helpers:stop_quiet(DiskSrv),
+        erllama_test_helpers:rm_rf(Dir),
         [application:stop(A) || A <- lists:reverse(Started)],
         ok
     end.
@@ -77,16 +77,6 @@ make_tmp_dir() ->
     ),
     ok = file:make_dir(Dir),
     Dir.
-
-rm_rf(Dir) ->
-    case file:list_dir(Dir) of
-        {ok, Entries} ->
-            [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ ->
-            ok
-    end,
-    file:del_dir(Dir),
-    ok.
 
 %% Drain messages of a given Ref until {erllama, Ref, {done, _}} or timeout.
 %% Returns {Tokens, Stats} or {error, Reason} on erllama_error.

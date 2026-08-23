@@ -23,19 +23,19 @@ inference, etc.) can plug in via this same surface.
 -callback terminate(state()) -> ok.
 
 -callback tokenize(state(), Text :: binary()) ->
-    [erllama_nif:token_id()] | {error, term()}.
+    [erllama:token_id()] | {error, term()}.
 
--callback detokenize(state(), [erllama_nif:token_id()]) ->
+-callback detokenize(state(), [erllama:token_id()]) ->
     binary() | {error, term()}.
 
--callback prefill(state(), [erllama_nif:token_id()]) -> ok | {error, term()}.
+-callback prefill(state(), [erllama:token_id()]) -> ok | {error, term()}.
 
--callback decode_one(state(), ContextTokens :: [erllama_nif:token_id()]) ->
-    {ok, erllama_nif:token_id()}
-    | {eog, erllama_nif:token_id()}
+-callback decode_one(state(), ContextTokens :: [erllama:token_id()]) ->
+    {ok, erllama:token_id()}
+    | {eog, erllama:token_id()}
     | {error, term()}.
 
--callback kv_pack(state(), Tokens :: [erllama_nif:token_id()]) ->
+-callback kv_pack(state(), Tokens :: [erllama:token_id()]) ->
     binary() | {error, term()}.
 
 -callback kv_unpack(state(), Bin :: binary()) -> ok | {error, term()}.
@@ -45,7 +45,7 @@ inference, etc.) can plug in via this same surface.
 %% removal flow the single-seq paths already use. Backends that have
 %% not been ported keep the single-seq callbacks above and `seq_id =
 %% 0` is implied everywhere.
--callback kv_pack(state(), Tokens :: [erllama_nif:token_id()], seq_id()) ->
+-callback kv_pack(state(), Tokens :: [erllama:token_id()], seq_id()) ->
     binary() | {error, term()}.
 
 -callback kv_unpack(state(), Bin :: binary(), seq_id()) -> ok | {error, term()}.
@@ -103,11 +103,11 @@ inference, etc.) can plug in via this same surface.
 %% this; callers will get `{error, not_supported}` from the public
 %% API.
 -callback apply_chat_template(state(), Request :: chat_request()) ->
-    {ok, [erllama_nif:token_id()]} | {error, term()}.
+    {ok, [erllama:token_id()]} | {error, term()}.
 
 %% Optional. Compute an embedding vector for the given prompt tokens.
 %% Backends that don't support embeddings can omit this.
--callback embed(state(), [erllama_nif:token_id()]) ->
+-callback embed(state(), [erllama:token_id()]) ->
     {ok, [float()]} | {error, term()}.
 
 %% Optional. Configure the per-request sampler with a GBNF grammar.
@@ -167,11 +167,11 @@ inference, etc.) can plug in via this same surface.
 %% is preserved.
 -callback verify(
     state(),
-    PrefixTokens :: [erllama_nif:token_id()],
-    Candidates :: [erllama_nif:token_id()],
+    PrefixTokens :: [erllama:token_id()],
+    Candidates :: [erllama:token_id()],
     K :: pos_integer()
 ) ->
-    {ok, AcceptedCount :: non_neg_integer(), NextToken :: erllama_nif:token_id() | eos,
+    {ok, AcceptedCount :: non_neg_integer(), NextToken :: erllama:token_id() | eos,
         NewState :: state()}
     | {error, term()}.
 
@@ -226,16 +226,16 @@ inference, etc.) can plug in via this same surface.
 -type seq_id() :: non_neg_integer().
 -type sampler_ref() :: term().
 -type step_op() ::
-    {prefill, [erllama_nif:token_id()]}
+    {prefill, [erllama:token_id()]}
     | {decode, sampler_ref()}.
 -type step_result() ::
     prefilled
-    | {token, erllama_nif:token_id(), 0 | 1}
+    | {token, erllama:token_id(), 0 | 1}
     %% Thinking-phase token: scheduler detokenises and emits
     %% {erllama, Ref, {thinking, Bin}} instead of a plain
     %% text fragment. Backends without extended-thinking support
     %% never emit this variant.
-    | {thinking_token, erllama_nif:token_id()}
+    | {thinking_token, erllama:token_id()}
     %% Marker that the thinking phase has closed for this decode row.
     %% The scheduler resolves a signature via thinking_signature/1
     %% (or `<<>>` when the callback is not exported) and sends

@@ -22,6 +22,7 @@
 %%   kv_unpack/3         ctx + binary + seq_id -> ok | {error, _}.
 %% @end
 -module(erllama_nif).
+-moduledoc false.
 
 -export([
     crc32c/1,

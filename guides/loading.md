@@ -14,7 +14,6 @@ matters in practice.
 1> {ok, _}  = application:ensure_all_started(erllama).
 2> {ok, Bin} = file:read_file("/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf").
 3> {ok, M} = erllama:load_model(#{
-       backend     => erllama_model_llama,
        model_path  => "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf",
        fingerprint => crypto:hash(sha256, Bin)
    }).
@@ -26,14 +25,27 @@ parameters from the application defaults; with no `tier`/`tier_srv`
 override the model writes to the RAM tier (the only one started by
 default).
 
-`M` is a binary registered name. Use it for every subsequent call:
-`erllama:complete(M, ...)`, `erllama:unload(M)`, etc. You can also
-pass an explicit id via `load_model/2` (also binary).
+`M` is a binary model id. Use it for every subsequent call:
+`erllama:complete(M, ...)`, `erllama:unload(M)`, etc. Pick the id
+yourself with `model_id => <<"chat">>` in the map or with
+`load_model/2`.
+
+The config is validated before the model process starts:
+
+```erlang
+4> erllama:load_model(#{}).
+{error, {missing_config, model_path}}
+5> erllama:load_model(#{model_path => "/no/such.gguf"}).
+{error, {invalid_config, model_path, "/no/such.gguf"}}
+6> erllama:load_model(#{model_path => Path, context_opts => #{n_ctxx => 1}}).
+{error, {unknown_option, {context_opts, n_ctxx}}}
+```
 
 ## The full option map
 
 ```erlang
 #{
+  model_id          => <<"chat">>,
   backend           => erllama_model_llama,
   model_path        => "/srv/models/llama-3.1-8b-instruct.Q4_K_M.gguf",
   model_opts        => #{n_gpu_layers => 99, use_mmap => true},
@@ -46,7 +58,8 @@ pass an explicit id via `load_model/2` (also binary).
   context_size      => 8192,
   tier_srv          => my_disk,
   tier              => disk,
-  policy            => #{ ... }
+  policy            => #{ ... },
+  thinking_markers  => #{start => <<"<think>">>, 'end' => <<"</think>">>}
 }
 ```
 
@@ -55,8 +68,10 @@ pass an explicit id via `load_model/2` (also binary).
 Module implementing the `erllama_model_backend` behaviour. Two
 shipped today:
 
-- `erllama_model_llama` — the real llama.cpp backend.
-- `erllama_model_stub` — a no-op backend used by the unit tests.
+- `erllama_model_llama` (default): the llama.cpp backend.
+- `erllama_model_stub`: a deterministic backend with no NIF and no
+  GGUF, for testing your own code against the API. It needs no
+  `model_path`.
 
 ### `model_path`
 
@@ -95,6 +110,10 @@ Pass-through to `llama_context_default_params()`.
 | `flash_attn` | `auto` | `true` enables, `false` disables, `auto` lets llama.cpp decide based on the build and model. |
 | `type_k` | `f16` | KV cache element type for keys. One of `f16`, `f32`, `bf16`, `q4_0`, `q5_0`, `q5_1`, `q8_0`. Quantised KV trades a bit of quality for roughly 2x cache footprint reduction. |
 | `type_v` | `f16` | KV cache element type for values. Same atom set as `type_k`. |
+| `kv_unified` | false | Share one KV buffer across sequences. erllama sets it for `n_seq_max > 1` so every sequence can use the full context. |
+| `embeddings` | false | Enable embedding output; required for `embed/2` and `embed_batch/2`. |
+| `offload_kqv` | true | Keep the KV cache on the GPU when layers are offloaded. |
+| `decode_budget_ms` | 30000 | Bound on one `llama_decode` call; a stalled decode fails the request with `decode_timeout` instead of hanging the model. |
 
 ### `fingerprint`
 
@@ -141,24 +160,24 @@ Plain integer copy of `n_ctx`. The cache uses it for bounds checks.
 
 ### `tier_srv` and `tier`
 
-Where saves go.
+Where saves go. The RAM tier (`erllama_cache_ram`, `tier => ram`) is
+always on and is the default. For `ram_file` or `disk`, add a tier and
+reference it by name:
 
-- `tier_srv` is the registered name of the tier server. Only the RAM
-  tier (`erllama_cache_ram`) is started automatically by the
-  application. To use `ram_file` or `disk`, start a tier server
-  yourself and pass its name:
+```erlang
+ok = erllama_cache:add_tier(#{name => my_disk, backend => disk,
+                              root => "/var/lib/erllama/kvc"}),
+{ok, M} = erllama:load_model(Config#{tier_srv => my_disk, tier => disk}).
+```
 
-  ```erlang
-  {ok, _} = erllama_cache_disk_srv:start_link(my_disk, "/var/lib/erllama/kvc"),
-  ...
-  tier_srv => my_disk,
-  tier => disk,
-  ```
+Tiers can also be declared once in the application environment
+(`tiers`, see the [configuration guide](configuration.md)) so they
+start with the application. `load_model` checks that `tier_srv` is
+running and that `tier` matches its backend, so a mismatch fails at
+load time (`{error, {invalid_config, tier, disk}}`), not at the first
+save.
 
-- `tier` is the symbolic tier (`ram | ram_file | disk`). It must
-  match the backend the `tier_srv` was started with.
-
-For production deployments use the disk tier — it survives restarts
+For production deployments use the disk tier: it survives restarts
 and is the cheapest place to keep warm state.
 
 ### `policy`
@@ -170,6 +189,19 @@ keys you omit fall back to the application defaults declared in
 `boundary_align_tokens`, `session_resume_wait_ms`). See the
 [caching guide](caching.md) for what each gate means. Pass an empty
 map (or omit the key entirely) to use the defaults.
+
+### `thinking_markers`
+
+`#{start => binary(), 'end' => binary()}`: the byte markers that open
+and close an extended-thinking block for models that emit one (for
+example `<think>` / `</think>`). With markers set and `thinking =>
+enabled` on the request, the text between them arrives as
+`{thinking, Bin}` stream events instead of `{token, Bin}`.
+
+### `model_id`
+
+Explicit id for `load_model/1`; the same as calling `load_model/2`.
+Loading an id that is in use returns `{error, already_loaded}`.
 
 ## Loading multiple models
 
@@ -206,8 +238,3 @@ in-flight cache writes are awaited up to that timeout.
 - **Wrong `n_ctx`.** The cache key includes `ctx_params_hash`. If you
   bump `n_ctx` for a tenant, expect a one-shot cold prefill across
   every cached prefix until the new rows accumulate.
-- **Mismatched `tier` / `tier_srv`.** `tier => disk` against an
-  `erllama_cache_ram` server name fails at first save; verify the
-  pair before deploy. The RAM tier is the only one auto-started; for
-  `ram_file` / `disk`, start the relevant `erllama_cache_disk_srv`
-  yourself and pass its registered name.

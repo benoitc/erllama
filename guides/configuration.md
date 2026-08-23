@@ -6,8 +6,18 @@ passed to `erllama:load_model/1,2`. This page is the full set.
 
 ## Application environment
 
+Every key with its default; all of them are declared in
+`src/erllama.app.src`.
+
 ```erlang
 {erllama, [
+  %% --------------- Cache tiers -----------------------------------
+  %% Extra tiers started with the application (the RAM tier is always on).
+  {tiers, [
+    #{name => kv_disk, backend => disk,     root => "/var/lib/erllama/kvc"},
+    #{name => kv_shm,  backend => ram_file, root => "/dev/shm/erllama"}
+  ]},
+
   %% --------------- Save-policy gates -----------------------------
   {min_tokens,             512},
   {cold_min_tokens,        512},
@@ -20,35 +30,38 @@ passed to `erllama:load_model/1,2`. This page is the full set.
   {evict_save_timeout_ms,  30000},
   {session_resume_wait_ms,   500},
   {fingerprint_mode,         safe},   %% safe | gguf_chunked | fast_unsafe
+  %% {writer_max_concurrent,   9},   %% default: 2 * schedulers + 1
+
+  %% --------------- Chat -------------------------------------------
+  {chat_cache_size, 64},              %% per-model template cache (LRU)
+  %% {thinking_signing_key, <<"...">>},
+
+  %% --------------- Observability ----------------------------------
+  {middleware, []},                   %% see guides/middleware.md
 
   %% --------------- Memory-pressure scheduler ---------------------
   {scheduler, #{
     enabled         => false,
-    pressure_source => noop,
+    pressure_source => noop,          %% noop | system | nvidia_smi | {module, M}
     interval_ms     => 5000,
     high_watermark  => 0.85,
     low_watermark   => 0.75,
     min_evict_bytes => 1048576,
-    evict_tiers     => [ram, ram_file]
+    evict_tiers     => [ram, ram_file],
+    unload_models_under_pressure => false,
+    model_evictor   => undefined     %% module exporting evict_one/0
   }}
 ]}.
 ```
 
-### Tiers
+### `tiers`
 
-The RAM tier (`erllama_cache_ram`) starts automatically with the
-application. For `ram_file` or `disk` tiers, start an
-`erllama_cache_disk_srv` per root in your own supervision tree (or
-from a release start hook) and pass its registered name as `tier_srv`
-on the relevant `load_model/1,2` call:
-
-```erlang
-{ok, _} = erllama_cache_disk_srv:start_link(my_disk,    "/var/lib/erllama/kvc"),
-{ok, _} = erllama_cache_ramfile_srv:start_link(my_shm,  "/dev/shm/erllama").
-```
-
-There is no single `tiers` env key in v0.1: per-process supervision
-gives you crisper restart semantics than a static list.
+Each entry is `#{name := atom(), backend := disk | ram_file, root :=
+string()}`; the directory is created if missing and the tier is
+registered under `name`, supervised by erllama. Models reference it
+with `tier_srv => name` and `tier => backend`. The same can be done at
+runtime with `erllama_cache:add_tier/1`; `erllama_cache:list_tiers/0`
+shows what is running.
 
 ### Save-policy gates
 
@@ -79,9 +92,33 @@ How to verify the model fingerprint at load:
 - `fast_unsafe` — trust the supplied fingerprint blindly. Use only
   when you fingerprint upstream and pass the digest through.
 
+### `writer_max_concurrent`
+
+Upper bound on cache saves written concurrently. Defaults to twice
+the number of schedulers plus one.
+
+### `chat_cache_size`
+
+Number of per-model chat template handles kept in the LRU used by
+`chat/3` and `chat_apply/3`. One entry per loaded model is enough;
+the default 64 only matters with many models.
+
+### `thinking_signing_key`
+
+Binary key used to sign the signature attached to `{thinking_end,
+Sig}` events so a client cannot forge a thinking block on a later
+turn. Unset or `<<>>` disables signing.
+
+### `middleware`
+
+Global middleware chain applied to every API call; see the
+[middleware guide](middleware.md).
+
 ### `scheduler`
 
 See the [caching guide](caching.md#memory-pressure-driven-eviction).
+`model_evictor` must name a loadable module exporting `evict_one/0`
+(the `erllama_model_evictor` behaviour).
 
 ## Per-model options
 
@@ -172,8 +209,12 @@ See [loading a model](loading.md) for the per-field walkthrough.
 2> erllama_scheduler:status().
 #{enabled => true, pressure_source => system, ...}
 
-3> erllama_cache_meta_srv:dump().
-%% List of raw ETS tuples; see include/erllama_cache.hrl for the
-%% position layout.
-[{<<_:256>>, disk, 8388608, _, 0, available, _, _, _, 4}, ...]
+3> erllama_cache:info().
+#{tiers => [#{name => erllama_cache_ram, backend => ram, ...}, ...],
+  entries => 12,
+  bytes => #{ram => 12582912, ram_file => 0, disk => 805306368}}
+
+4> erllama:model_info(<<"chat">>).
+{ok, #{id => <<"chat">>, status => idle, context_size => 8192,
+       quant_type => q4_k_m, tier => disk, n_seq_max => 4, ...}}
 ```

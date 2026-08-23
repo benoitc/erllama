@@ -2,6 +2,7 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_cache_sup).
+-moduledoc false.
 -behaviour(supervisor).
 
 -export([start_link/0]).

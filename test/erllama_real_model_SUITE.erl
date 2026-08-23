@@ -142,8 +142,8 @@ init_per_testcase(TC, Config) ->
     [{disk_srv, DiskSrv}, {model, Model}, {dir, Dir} | Config].
 
 end_per_testcase(_TC, Config) ->
-    catch erllama_model:stop(?config(model, Config)),
-    catch gen_server:stop(?config(disk_srv, Config)),
+    erllama_test_helpers:stop_model_quiet(?config(model, Config)),
+    erllama_test_helpers:stop_quiet(?config(disk_srv, Config)),
     ok.
 
 model_config(Path, DiskSrv) ->
@@ -516,10 +516,10 @@ chunked_prefill_sizes_agree(Config) ->
         {TextB, _} = run_infer(ModelB, Tokens, Params),
         ?assertEqual(TextA, TextB)
     after
-        catch erllama_model:stop(ModelA),
-        catch erllama_model:stop(ModelB),
-        catch gen_server:stop(SrvA),
-        catch gen_server:stop(SrvB)
+        erllama_test_helpers:stop_model_quiet(ModelA),
+        erllama_test_helpers:stop_model_quiet(ModelB),
+        erllama_test_helpers:stop_quiet(SrvA),
+        erllama_test_helpers:stop_quiet(SrvB)
     end,
     ok.
 

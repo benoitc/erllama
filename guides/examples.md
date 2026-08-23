@@ -7,34 +7,29 @@ omitted from the snippets; assume it's there).
 
 ## 10-second smoke test (no model required)
 
-The cache subsystem is independently usable. From `rebar3 shell`:
+The stub backend runs the whole API without a GGUF or a NIF. From
+`rebar3 shell`:
 
 ```erlang
 1> {ok, _} = application:ensure_all_started(erllama).
-2> ok = filelib:ensure_path("/tmp/edemo").
-3> {ok, _} = erllama_cache_disk_srv:start_link(d, "/tmp/edemo").
-4> Meta = #{save_reason => cold, quant_bits => 16,
-           fingerprint => binary:copy(<<170>>, 32),
-           fingerprint_mode => safe, quant_type => f16,
-           ctx_params_hash => binary:copy(<<187>>, 32),
-           tokens => [1,2,3], context_size => 4096,
-           prompt_text => <<>>, hostname => <<"d">>,
-           erllama_version => <<"0.1.0">>}.
-5> {ok, K, _Header, Size} =
-       erllama_cache_disk_srv:save(d, Meta, <<"hi">>).
-6> {ok, _Info, <<"hi">>} = erllama_cache_disk_srv:load(d, K).
-7> erllama_cache:get_counters().
+2> {ok, M} = erllama:load_model(#{backend => erllama_model_stub}).
+3> {ok, #{reply := R, finish_key := K}} =
+       erllama:complete(M, <<"one two three four">>, #{response_tokens => 4}).
+4> {ok, #{cache_hit_kind := exact}} =
+       erllama:complete(M, <<"one two three four">>, #{response_tokens => 4}).
+5> erllama_cache:get_counters().
+6> ok = erllama:unload(M).
 ```
 
-Verified end-to-end: a published .kvc file, the meta-server
-registers it, the load path round-trips the payload, and the
-counters reflect one cold save plus one cache miss followed by one
-exact hit. **No model loaded — `llama_backend_init` doesn't run.**
+The second completion is a byte-exact cache hit on the first one's
+finish save. Nothing touches llama.cpp: `llama_backend_init` never
+runs, so there is no Metal/CUDA discovery cost.
 
 ## 1. Load a model and run a one-shot completion
 
 ```erlang
-{ok, _} = erllama_cache_disk_srv:start_link(my_disk, "/var/lib/erllama/kvc"),
+ok = erllama_cache:add_tier(#{name => my_disk, backend => disk,
+                              root => "/var/lib/erllama/kvc"}),
 {ok, Bin} = file:read_file("/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf"),
 Fp = crypto:hash(sha256, Bin),
 
@@ -177,26 +172,22 @@ loop(Ref) ->
 always emits a final `{erllama, Ref, {done, Stats}}` with
 `#{cancelled => true}`.
 
-## 7. Chat template + embeddings
+## 7. Chat and embeddings
 
 ```erlang
-%% Render a chat request through the model's built-in GGUF template
-%% and tokenise it in one shot. Backed by llama_chat_apply_template.
-{ok, ChatTokens} = erllama:render_chat_template(ModelId, #{
-    messages => [
-        #{role => system,    content => <<"You are concise.">>},
-        #{role => user,      content => <<"What's 2+2?">>}
-    ]
-}),
-{ok, Ref} = erllama:stream(ModelId, ChatTokens, #{response_tokens => 8}).
+%% One chat turn: render through the model's template, generate,
+%% parse. Messages are maps; see guides/tool-calls.md for tools.
+{ok, #{message := #{content := Answer}, stats := Stats}} =
+    erllama:chat(ModelId, [
+        #{role => system, content => <<"You are concise.">>},
+        #{role => user,   content => <<"What's 2+2?">>}
+    ], #{response_tokens => 16, temperature => 0.0}).
 ```
 
 ```erlang
-%% Pooled sentence embedding via llama_get_embeddings_seq.
-%% The model must have been loaded with embedding-friendly settings
-%% (see guides/loading.md). Returns a list of floats.
-{ok, Toks}      = erllama:tokenize(ModelId, <<"The quick brown fox.">>),
-{ok, Embedding} = erllama:embed(ModelId, Toks).
+%% Embeddings need a model loaded with context_opts => #{embeddings => true}.
+{ok, Vec}  = erllama:embed(ModelId, <<"The quick brown fox.">>),
+{ok, Vecs} = erllama:embed_batch(ModelId, [<<"alpha">>, <<"beta">>, <<"gamma">>]).
 ```
 
 ## 8. Grammar-constrained sampling (GBNF)
@@ -309,7 +300,7 @@ node-wide HMAC key once at boot:
 ]}.
 ```
 
-`erllama_model_llama:thinking_signature/3` HMACs the observed
+`erllama_model_llama:thinking_signature` (arity 3) HMACs the observed
 thinking text with this key. Leaving it unset returns `<<>>`, the
 documented "no signature" path — the downstream forwards no
 `signature_delta` event.
@@ -354,59 +345,25 @@ still progresses.
 
 Non-positive values and a missing key both mean "no cap".
 
-## 11. Tool-call streaming (`tool_call_markers`)
-
-Models whose chat template emits structured tool-call markers
-(qwen3 with `<tool_call>...</tool_call>`, DSML, OpenAI-style XML,
-etc.) can surface those boundaries on the streaming wire so an
-HTTP front end can capture the exact bytes the model produced
-under a tool id, and splice them back verbatim on the next turn.
-
-Declare the markers per model:
+## 11. Tool calls
 
 ```erlang
-erllama:load_model(<<"qwen3-tool">>, #{
-    backend => erllama_model_llama,
-    model_path => "/models/qwen3-7b.gguf",
-    tool_call_markers => #{
-        start => <<"<tool_call>">>,
-        end   => <<"</tool_call>">>
-    }
-}).
+Tools = [#{name => <<"get_weather">>,
+           description => <<"Current weather for a city">>,
+           parameters => #{type => object,
+                           properties => #{city => #{type => string}},
+                           required => [city]}}],
+{ok, #{message := #{tool_calls := Calls}}} =
+    erllama:chat(ModelId,
+                 [#{role => user, content => <<"Weather in Paris?">>}],
+                 #{tools => Tools, temperature => 0.0}).
+%% Calls = [#{name => <<"get_weather">>,
+%%            arguments => #{<<"city">> => <<"Paris">>}, id => undefined}]
 ```
 
-A streaming `stream/3` against this model receives:
-
-```erlang
-{erllama, Ref, {token, Bin}}    %% one per chunk of the call body
-{erllama_tool_call_end, Ref, FullBin :: binary()} %% concatenated bytes of every delta
-```
-
-`FullBin` is what to persist under a minted tool id — no need to
-re-buffer the deltas yourself.
-
-When the template also delimits string-typed argument bodies
-(DSML's `string=true ... string=false`, XML's `<arg>...</arg>`),
-declare payload markers too:
-
-```erlang
-tool_call_markers => #{
-    start         => <<"<tool_call>">>,
-    end           => <<"</tool_call>">>,
-    payload_start => <<"<arg>">>,
-    payload_end   => <<"</arg>">>
-}
-```
-
-With payload markers set, erllama swaps to a greedy
-(`temperature=0`) sampler for tool-call syntax tokens so the
-syntax stays byte-deterministic, then back to the request's normal
-sampler for payload bytes so long string arguments stay diverse.
-Without payload markers the entire tool-call span uses the greedy
-sampler.
-
-Models loaded without `tool_call_markers` behave identically to
-v0.4: no tool-call messages, no sampler swap.
+The full loop (run the tool, append a `tool` message, call again) and
+the streaming form (`chat_apply/3` + `stream/3` + `chat_parse/3`) are
+in the [tool-calls guide](tool-calls.md).
 
 ## 12. Warm a session without sampling (`prefill_only/2,3`)
 
@@ -697,13 +654,8 @@ on its result map too.
 Counters = erllama_cache:get_counters(),
 io:format("~p~n", [Counters]).
 
-%% Every row in the index. dump/0 returns raw ETS tuples; the layout
-%% is documented in include/erllama_cache.hrl:
-%%   {Key, Tier, Size, LastUsedNs, Refcount, Status, Header,
-%%    Location, TokensRef, Hits}
-Dump = erllama_cache_meta_srv:dump(),
-[io:format("tier=~p size=~p refs=~p~n", [Tier, Size, Refs])
- || {_Key, Tier, Size, _Lru, Refs, _Status, _Hdr, _Loc, _Tok, _Hits} <- Dump].
+%% Tiers, row count and bytes per tier backend.
+#{tiers := Tiers, entries := N, bytes := Bytes} = erllama_cache:info(),
 
 %% Free at least 256 MiB, oldest LRU first, RAM tiers only.
 erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
@@ -731,48 +683,41 @@ Sources shipped: `noop`, `system`, `nvidia_smi`, `{module, M}`. Roll
 your own with `-behaviour(erllama_pressure)` and pass
 `{module, M}` as the source.
 
-## 20. Cache-only tests (no model required)
+## 20. Tests without a model
 
-The cache subsystem is independently usable. eunit tests that
-exercise save/load round-trips never touch llama.cpp:
+`erllama_model_stub` lets your own test suite exercise loading,
+completion, streaming, sessions and cache tiers with no GGUF:
 
 ```erlang
-%% test/my_cache_test.erl
--module(my_cache_test).
+%% test/my_app_llm_tests.erl
+-module(my_app_llm_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("erllama/include/erllama_cache.hrl").
 
-with_disk(Body) ->
-    {ok, _} = erllama_cache_meta_srv:start_link(),
-    {ok, _} = erllama_cache_ram:start_link(),
-    {ok, Dir} = file:make_dir("/tmp/my_cache_test"), %% ensure exists
-    {ok, _} = erllama_cache_disk_srv:start_link(t, "/tmp/my_cache_test"),
-    try Body() after
-        catch gen_server:stop(t),
-        catch gen_server:stop(erllama_cache_ram),
-        catch gen_server:stop(erllama_cache_meta_srv)
+with_model(Body) ->
+    {ok, Started} = application:ensure_all_started(erllama),
+    {ok, M} = erllama:load_model(#{backend => erllama_model_stub}),
+    try Body(M) after
+        erllama:unload(M),
+        [application:stop(A) || A <- lists:reverse(Started)]
     end.
 
-round_trip_test() ->
-    with_disk(fun() ->
-        Meta = #{
-            save_reason => cold,
-            quant_bits => 16,
-            fingerprint => binary:copy(<<16#AA>>, 32),
-            fingerprint_mode => safe,
-            quant_type => f16,
-            ctx_params_hash => binary:copy(<<16#BB>>, 32),
-            tokens => [1, 2, 3],
-            context_size => 4096
-        },
-        {ok, Key, _, _} = erllama_cache_disk_srv:save(t, Meta, <<"data">>),
-        ?assertMatch({ok, _Info, <<"data">>},
-                     erllama_cache_disk_srv:load(t, Key))
+completion_round_trip_test() ->
+    with_model(fun(M) ->
+        {ok, #{reply := Reply, finish_key := Key}} =
+            erllama:complete(M, <<"hello there">>, #{response_tokens => 4}),
+        ?assert(is_binary(Reply)),
+        ?assert(is_binary(Key))
+    end).
+
+stream_delivers_done_test() ->
+    with_model(fun(M) ->
+        {ok, Ref} = erllama:stream(M, <<"hello there">>, #{response_tokens => 3}),
+        {ok, #{finish_reason := stop, generated := [_, _, _]}} = erllama:collect(Ref, 5000)
     end).
 ```
 
-The lazy `llama_backend_init` means cache-only tests never trigger
-`ggml_backend_load_all` — no Metal/CUDA discovery cost.
+Replies are deterministic for a given prompt, so assertions on cache
+behaviour (`cache_hit_kind`, `cache_delta`) hold across runs.
 
 ## 21. End-to-end against a real GGUF
 

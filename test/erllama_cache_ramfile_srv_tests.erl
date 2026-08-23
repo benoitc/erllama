@@ -18,10 +18,10 @@ with_ramfile(Body) ->
     try
         Body(Dir)
     after
-        catch gen_server:stop(test_ramfile),
-        catch gen_server:stop(erllama_cache_ram),
-        catch gen_server:stop(erllama_cache_meta_srv),
-        rm_rf(Dir)
+        erllama_test_helpers:stop_quiet(test_ramfile),
+        erllama_test_helpers:stop_quiet(erllama_cache_ram),
+        erllama_test_helpers:stop_quiet(erllama_cache_meta_srv),
+        erllama_test_helpers:rm_rf(Dir)
     end.
 
 prompt_bytes(Tokens) ->
@@ -80,12 +80,12 @@ init_registers_with_ram_file_tier_label_test() ->
             ?assertEqual(ram_file, element(?POS_TIER, Row)),
             ?assertMatch({ram_file, _}, element(?POS_LOCATION, Row))
         after
-            catch gen_server:stop(scan_ramfile),
-            catch gen_server:stop(erllama_cache_ram),
-            catch gen_server:stop(erllama_cache_meta_srv)
+            erllama_test_helpers:stop_quiet(scan_ramfile),
+            erllama_test_helpers:stop_quiet(erllama_cache_ram),
+            erllama_test_helpers:stop_quiet(erllama_cache_meta_srv)
         end
     after
-        rm_rf(Dir)
+        erllama_test_helpers:rm_rf(Dir)
     end.
 
 eviction_deletes_ram_file_too_test() ->
@@ -122,13 +122,6 @@ make_tmp_dir() ->
     ),
     ok = file:make_dir(Dir),
     Dir.
-
-rm_rf(Dir) ->
-    case file:list_dir(Dir) of
-        {ok, Entries} -> [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ -> ok
-    end,
-    file:del_dir(Dir).
 
 bin_to_hex(Bin) ->
     binary_to_list(binary:encode_hex(Bin, lowercase)).

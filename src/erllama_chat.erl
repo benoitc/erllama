@@ -2,16 +2,15 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_chat).
--moduledoc """
-Thin Erlang facade over llama.cpp's `common_chat_*` autoparser NIF entries.
-
-`init/2` builds the templates for a model, `apply/2` renders the prompt
-and synthesises the parser for one request (upstream's
-`common_chat_templates_apply`), `parse/3` turns model output back into a
-structured message with that request's parser. No caching here; the
-per-model templates ref is cached by `erllama_chat_cache`, and
-`erllama_model:chat_apply/2` is the entry point used by the façade.
-""".
+-moduledoc false.
+%% Thin Erlang facade over llama.cpp's `common_chat_*` autoparser NIF entries.
+%%
+%% `init/2` builds the templates for a model, `apply/2` renders the prompt
+%% and synthesises the parser for one request (upstream's
+%% `common_chat_templates_apply`), `parse/3` turns model output back into a
+%% structured message with that request's parser. No caching here; the
+%% per-model templates ref is cached by `erllama_chat_cache`, and
+%% `erllama_model:chat_apply/2` is the entry point used by the façade.
 
 -export([init/2, apply/2, parse/3]).
 -export([chat/3, inputs/2]).
@@ -21,39 +20,11 @@ per-model templates ref is cached by `erllama_chat_cache`, and
 -type templates_ref() :: erllama_nif:chat_templates_ref().
 -type params_ref() :: erllama_nif:chat_params_ref().
 
--type parsed_msg() :: #{
-    role := binary(),
-    content := binary(),
-    reasoning_content := binary() | undefined,
-    tool_calls := [
-        #{
-            name := binary(),
-            arguments := map(),
-            id := binary() | undefined
-        }
-    ]
-}.
+-type parsed_msg() :: erllama:parsed_message().
 
--doc """
-A chat message as an Erlang map. `role` is `system | user | assistant
-| tool`; `content` is a binary or a list of content-part maps in the
-OpenAI shape; assistant messages may carry `tool_calls`, tool results
-carry `tool_call_id`. Encoded to JSON at the NIF boundary.
-""".
--type message() :: #{
-    role := system | user | assistant | tool | binary(),
-    content := binary() | [map()] | null,
-    tool_calls => [map()],
-    tool_call_id => binary(),
-    name => binary()
-}.
+-type message() :: erllama:chat_message().
 
--doc "A tool definition: `#{name, description, parameters}` (JSON-schema map).".
--type tool() :: #{
-    name := binary(),
-    description => binary(),
-    parameters => map()
-}.
+-type tool() :: erllama:chat_tool().
 
 -define(CHAT_KEYS, [tools, tool_choice, parallel_tool_calls]).
 

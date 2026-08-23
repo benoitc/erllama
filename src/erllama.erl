@@ -108,29 +108,163 @@ handle for every other call; a pid works too. The cache subsystem is
 -doc "A model id (binary) or the model process pid.".
 -type model() :: model_id() | pid().
 -doc "The registered model id returned by `load_model/1,2`.".
--type model_id() :: erllama_registry:model_id().
+-type model_id() :: binary().
 -doc "Snapshot returned by `model_info/1` and `list_models/0`.".
--type model_info() :: erllama_model:model_info().
+-type model_info() :: #{
+    id := binary(),
+    %% Alias for `id`. Added for cluster registry rows so callers
+    %% match on a name that does not collide with their own
+    %% process-id-typed `id` fields.
+    model_id := binary(),
+    pid := pid(),
+    status := idle | prefilling | generating,
+    backend := module(),
+    context_size := non_neg_integer(),
+    quant_type := atom(),
+    quant_bits := non_neg_integer(),
+    %% String tag like <<"q4_k_m">> / <<"f16">>. Derived from
+    %% quant_type + quant_bits.
+    quant_tag := binary(),
+    tier := ram | disk | ram_file,
+    fingerprint := binary(),
+    %% erlang:monotonic_time(nanosecond) at gen_statem init.
+    loaded_at_monotonic := integer(),
+    %% Best-effort estimate of VRAM footprint for the model when
+    %% the gpu offload is configured. 0 if no GPU layers are
+    %% offloaded or if the backend cannot report the underlying
+    %% sizes (stub backend, etc.).
+    vram_estimate_b := non_neg_integer(),
+    %% Total seq capacity of the live context (`context_opts.n_seq_max`).
+    n_seq_max := pos_integer(),
+    %% Number of seq slots currently free for a new admission. A
+    %% sticky session with no in-flight req still holds its slot
+    %% off the free list, so this counts only seqs the engine could
+    %% admit a brand-new request onto right now.
+    available_seqs := non_neg_integer(),
+    %% Sticky-session seqs that are pinned but idle (no in-flight
+    %% request) - reclaimable under seq-pool pressure. `available_seqs`
+    %% stays ~0 since an admitted request immediately re-pins, so this is
+    %% the meaningful "headroom" signal.
+    pinned_idle_seqs := non_neg_integer()
+}.
 -doc "A token id in the model vocabulary.".
 -type token_id() :: non_neg_integer().
 -doc "SHA-256 cache key of a committed context (`finish_key`, `parent_key`).".
 -type cache_key() :: <<_:256>>.
--type completion_result() :: erllama_model:completion_result().
--type prefill_result() :: erllama_model:prefill_result().
--type stats() :: erllama_model:stats().
--type finish_reason() :: erllama_model:finish_reason().
--type cache_hit_kind() :: erllama_model:cache_hit_kind().
+-doc "Result of `complete/2,3`.".
+-type completion_result() :: #{
+    %% Detokenised reply text. Trimmed at the first occurrence of a
+    %% matched `stop_sequences` entry when one fired.
+    reply := binary(),
+    %% Tokens produced by this request (not including the prompt).
+    generated := [non_neg_integer()],
+    %% Full context as a token list (prompt ++ generated).
+    context_tokens := [non_neg_integer()],
+    %% Convenience: length(context_tokens).
+    committed_tokens := non_neg_integer(),
+    %% Token-exact cache key for the full context. Pass as
+    %% `parent_key` on the next request to resume from the warm row.
+    %% `undefined` if the finish save was suppressed.
+    finish_key := binary() | undefined,
+    %% How this request resolved against the cache on admission.
+    cache_hit_kind := cache_hit_kind(),
+    finish_reason := finish_reason(),
+    %% Per-request Anthropic cache breakdown. See `stats()`.
+    cache_delta := #{
+        read := non_neg_integer(),
+        created := non_neg_integer()
+    },
+    stats := stats(),
+    %% Only present when a caller-supplied `stop_sequences` entry
+    %% fired. The value is the binary of the matched stop string.
+    stop_sequence => binary()
+}.
+-doc "Result of `prefill_only/2,3`.".
+-type prefill_result() :: #{
+    context_tokens := [non_neg_integer()],
+    committed_tokens := non_neg_integer(),
+    finish_key := binary() | undefined,
+    cache_hit_kind := cache_hit_kind(),
+    %% Per-request Anthropic cache breakdown. See `stats()`.
+    cache_delta := #{
+        read := non_neg_integer(),
+        created := non_neg_integer()
+    }
+}.
+-doc "Per-request statistics (`stats` in results, `{done, Stats}` in streams).".
+-type stats() :: #{
+    prompt_tokens := non_neg_integer(),
+    completion_tokens := non_neg_integer(),
+    %% Exact generated token ids for this turn, in order. Lets a
+    %% caller reconstruct a byte-exact suffix for `continue/3`
+    %% without re-tokenising detokenised text. Mirrors the
+    %% `generated` key in the standard-mode (`complete`) result map.
+    generated := [token_id()],
+    prefill_ms := non_neg_integer(),
+    generation_ms := non_neg_integer(),
+    cache_hit_kind := cache_hit_kind(),
+    finish_reason := finish_reason(),
+    cancelled := boolean(),
+    %% Token-exact cache key for the full context (prompt ++ generated).
+    %% `undefined` when the finish save was suppressed (e.g. live token
+    %% count below `min_tokens`).
+    finish_key := binary() | undefined,
+    %% Length of `context_tokens` at finish (prompt + generated). Equal
+    %% to `prompt_tokens + completion_tokens` unless the cache pruned
+    %% the live context (not currently possible).
+    committed_tokens := non_neg_integer(),
+    %% Anthropic-style per-request cache breakdown. `read` is the
+    %% warm prefix length restored from cache at admission;
+    %% `created` is the largest contribution this request added to
+    %% the cache beyond that prefix (saves below `min_tokens` and
+    %% writer back-pressure leave `created` unchanged). Both
+    %% default to 0.
+    cache_delta := #{
+        read := non_neg_integer(),
+        created := non_neg_integer()
+    },
+    %% Only present when a caller-supplied `stop_sequences` entry
+    %% fired. The value is the binary of the matched stop string.
+    %% Absent on `length`, `cancelled`, or natural end-of-generation
+    %% without a stop-string match.
+    stop_sequence => binary()
+}.
+-type finish_reason() :: stop | length | cancelled.
+-doc "How the last admission found its prefix in the cache.".
+-type cache_hit_kind() :: exact | partial | cold | sticky | continuation.
 -doc "Last admission summary from `last_cache_hit/1`.".
 -type cache_hit() :: #{kind := cache_hit_kind(), prefix_len := non_neg_integer()}.
 -type phase() :: idle | prefilling | generating.
 -doc "Handle of an attached LoRA adapter; treat as opaque.".
 -type adapter() :: term().
--doc "Opaque parser handle produced by `chat_apply/2` for `chat_parse/3`.".
--type chat_params() :: erllama_nif:chat_params_ref().
+-doc "Parser handle produced by `chat_apply/3` for `chat_parse/3`; treat as opaque.".
+-type chat_params() :: reference().
 -type chat_request() :: erllama_model_backend:chat_request().
--type parsed_message() :: erllama_chat:parsed_msg().
--type chat_message() :: erllama_chat:message().
--type chat_tool() :: erllama_chat:tool().
+-doc "Assistant message parsed by `chat_parse/3` / returned by `chat/3`.".
+-type parsed_message() :: #{
+    role := binary(),
+    content := binary(),
+    reasoning_content := binary() | undefined,
+    tool_calls := [#{name := binary(), arguments := map(), id := binary() | undefined}]
+}.
+-doc """
+A chat message. `role` is `system | user | assistant | tool`; `content`
+is a binary or a list of content-part maps in the OpenAI shape;
+assistant messages may carry `tool_calls`, tool results `tool_call_id`.
+""".
+-type chat_message() :: #{
+    role := system | user | assistant | tool | binary(),
+    content := binary() | [map()] | null,
+    tool_calls => [map()],
+    tool_call_id => binary(),
+    name => binary()
+}.
+-doc "A tool definition: `name`, `description`, JSON-schema `parameters`.".
+-type chat_tool() :: #{
+    name := binary(),
+    description => binary(),
+    parameters => map()
+}.
 -doc """
 Options for `chat/3`: `tools`, `tool_choice` (`auto | required | none`),
 `parallel_tool_calls`, plus any `request_opts()` key.

@@ -22,6 +22,7 @@
 %% data transformations.
 %% @end
 -module(erllama_cache_policy).
+-moduledoc false.
 
 -export([
     trim_boundary/3,

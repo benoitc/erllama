@@ -162,7 +162,7 @@ The atom naming regex allows `_SUITE` suffix for CT suites:
 ## What to avoid
 
 - No `iolist_to_binary` flattening of multi-GB payloads. Use iolists
-  for `prim_file:write/2`.
+  for `prim_file:write` (arity 2).
 - No `ets:select_replace/2` on the hot path; the meta server is the
   arbitration authority.
 - No silent EEXIST handling on link; always validate-and-adopt or

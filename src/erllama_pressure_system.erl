@@ -2,14 +2,13 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_pressure_system).
--moduledoc """
-System-memory pressure sampler backed by OTP's `memsup` (from
-`os_mon`). Portable across Linux, macOS, BSD, and Windows. Returns
-`{Total - Available, Total}`.
-
-Requires `os_mon` to be started. The scheduler ensures this when
-`system` is selected as the pressure source.
-""".
+-moduledoc false.
+%% System-memory pressure sampler backed by OTP's `memsup` (from
+%% `os_mon`). Portable across Linux, macOS, BSD, and Windows. Returns
+%% `{Total - Available, Total}`.
+%%
+%% Requires `os_mon` to be started. The scheduler ensures this when
+%% `system` is selected as the pressure source.
 -behaviour(erllama_pressure).
 
 -export([sample/0]).
