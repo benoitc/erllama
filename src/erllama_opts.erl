@@ -34,7 +34,7 @@
 ]).
 
 -define(MODEL_OPT_KEYS, [
-    n_gpu_layers, main_gpu, use_mmap, use_mlock, vocab_only, split_mode, tensor_split
+    n_gpu_layers, main_gpu, use_mmap, use_mlock, load_mode, vocab_only, split_mode, tensor_split
 ]).
 
 -define(CONTEXT_OPT_KEYS, [
@@ -181,6 +181,7 @@ model_opt_checks() ->
         {main_gpu, fun non_neg_int/1},
         {use_mmap, fun is_boolean/1},
         {use_mlock, fun is_boolean/1},
+        {load_mode, fun(V) -> lists:member(V, [auto, none, mmap, mlock, mmap_mlock, direct_io]) end},
         {vocab_only, fun is_boolean/1},
         {split_mode, fun(V) -> lists:member(V, [none, layer, row]) end},
         {tensor_split, fun(V) -> is_list(V) andalso lists:all(fun is_number/1, V) end}

@@ -114,7 +114,9 @@ Recognised keys in `Opts` (all optional; defaults come from
 - `tensor_split :: [float()]` — per-device proportions when splitting.
   Up to `llama_max_devices()` entries (16 in the vendored llama.cpp);
   shorter lists zero-fill the tail.
-- `use_mmap, use_mlock, vocab_only :: boolean()`.
+- `use_mmap, use_mlock, vocab_only :: boolean()`,
+  `load_mode :: auto | none | mmap | mlock | mmap_mlock | direct_io`
+  (the two booleans map onto it when it is absent).
 
 A bad atom for `split_mode`, or a non-numeric entry in
 `tensor_split`, raises `badarg`.

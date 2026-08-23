@@ -339,8 +339,9 @@ Config map for `load_model/1,2`.
   path to a GGUF file.
 - `backend`: `erllama_model_llama` (default) or `erllama_model_stub`.
 - `model_id`: explicit id (`load_model/1` only).
-- `model_opts`: `n_gpu_layers`, `main_gpu`, `use_mmap`, `use_mlock`,
-  `vocab_only`, `split_mode`, `tensor_split`.
+- `model_opts`: `n_gpu_layers`, `main_gpu`, `load_mode` (`auto | none |
+  mmap | mlock | mmap_mlock | direct_io`; `use_mmap` / `use_mlock`
+  booleans map onto it), `vocab_only`, `split_mode`, `tensor_split`.
 - `context_opts`: `n_ctx`, `n_batch`, `n_ubatch`, `n_seq_max`,
   `n_threads`, `n_threads_batch`, `embeddings`, `offload_kqv`,
   `kv_unified`, `flash_attn`, `type_k`, `type_v`, `decode_budget_ms`.

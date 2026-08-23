@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [0.10.0] - 2026-08-23
 
+### Changed
+
+- Vendored llama.cpp bumped from b10068 to b10593 (`vendor/` is now kept
+  whole: upstream builds it as CMake targets). `model_opts` gains
+  `load_mode` (upstream's `llama_load_mode`); `use_mmap` / `use_mlock`
+  are mapped onto it.
+
 ### Removed (BREAKING)
 
 - `unload_model/1` (use `unload/1`), `models/0` (use

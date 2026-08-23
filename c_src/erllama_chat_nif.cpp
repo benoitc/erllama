@@ -335,10 +335,10 @@ static bool build_chat_inputs_from_map(ErlNifEnv *env, ERL_NIF_TERM map,
     bool have_tools = map_get_string(env, map, "tools", tools_json);
     inputs.use_jinja = true;
     inputs.messages =
-        common_chat_msgs_parse_oaicompat(nlohmann::json::parse(messages_json));
+        common_chat_msgs_parse_oaicompat(common_json::parse(messages_json));
     if (have_tools && !tools_json.empty()) {
         inputs.tools =
-            common_chat_tools_parse_oaicompat(nlohmann::json::parse(tools_json));
+            common_chat_tools_parse_oaicompat(common_json::parse(tools_json));
     }
     inputs.tool_choice = map_tool_choice(env, map);
     inputs.parallel_tool_calls = map_parallel_tool_calls(env, map);

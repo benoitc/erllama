@@ -92,7 +92,7 @@ extern struct llama_sampler *erllama_safe_sampler_init_min_p(float p,
                                                              size_t min_keep);
 extern struct llama_sampler *erllama_safe_sampler_init_temp(float t);
 extern struct llama_sampler *erllama_safe_sampler_init_penalties(
-    int32_t last_n, float repeat, float freq, float present);
+    int32_t n_vocab, int32_t last_n, float repeat, float freq, float present);
 extern int erllama_safe_sampler_chain_add(struct llama_sampler *chain,
                                           struct llama_sampler *s);
 extern int erllama_safe_sampler_free(struct llama_sampler *s);
@@ -795,6 +795,14 @@ static const erllama_atom_enum_pair_t SPLIT_MODE_TABLE[] = {
     {"layer", LLAMA_SPLIT_MODE_LAYER},
     {"row",   LLAMA_SPLIT_MODE_ROW},
 };
+static const erllama_atom_enum_pair_t LOAD_MODE_TABLE[] = {
+    {"auto",       LLAMA_LOAD_MODE_AUTO},
+    {"none",       LLAMA_LOAD_MODE_NONE},
+    {"mmap",       LLAMA_LOAD_MODE_MMAP},
+    {"mlock",      LLAMA_LOAD_MODE_MLOCK},
+    {"mmap_mlock", LLAMA_LOAD_MODE_MMAP_MLOCK},
+    {"direct_io",  LLAMA_LOAD_MODE_DIRECT_IO},
+};
 
 static const erllama_atom_enum_pair_t FLASH_ATTN_TABLE[] = {
     /* booleans-as-atoms map to the matching enum tristate. `auto`
@@ -977,8 +985,30 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         params.main_gpu = i32;
     }
     int b;
-    if (get_map_bool(env, argv[1], "use_mmap", &b)) params.use_mmap = b ? true : false;
-    if (get_map_bool(env, argv[1], "use_mlock", &b)) params.use_mlock = b ? true : false;
+    /* `load_mode' is the upstream knob (llama_load_mode). `use_mmap' /
+     * `use_mlock' are kept as sugar and mapped onto it when `load_mode'
+     * is absent: mmap+mlock -> MMAP_MLOCK, mmap -> MMAP, mlock -> MLOCK,
+     * neither -> NONE; unspecified -> AUTO. */
+    int lm_v;
+    int lm_rc = get_map_atom_enum(
+        env, argv[1], "load_mode",
+        LOAD_MODE_TABLE, sizeof(LOAD_MODE_TABLE) / sizeof(LOAD_MODE_TABLE[0]),
+        &lm_v
+    );
+    if (lm_rc < 0) return enif_make_badarg(env);
+    if (lm_rc > 0) {
+        params.load_mode = (enum llama_load_mode) lm_v;
+    } else {
+        int has_mmap = get_map_bool(env, argv[1], "use_mmap", &b);
+        int use_mmap = has_mmap ? (b ? 1 : 0) : 1;
+        int has_mlock = get_map_bool(env, argv[1], "use_mlock", &b);
+        int use_mlock = has_mlock ? (b ? 1 : 0) : 0;
+        if (has_mmap || has_mlock) {
+            params.load_mode = use_mmap
+                ? (use_mlock ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MMAP)
+                : (use_mlock ? LLAMA_LOAD_MODE_MLOCK : LLAMA_LOAD_MODE_NONE);
+        }
+    }
     if (get_map_bool(env, argv[1], "vocab_only", &b)) params.vocab_only = b ? true : false;
 
     int enum_v;
@@ -3152,9 +3182,12 @@ build_sampler_chain_from_map(ErlNifEnv *env, ERL_NIF_TERM cfg,
     }
 
     if (has_rep && rep_val != 1.0) {
+        const struct llama_vocab *pen_vocab =
+            erllama_safe_model_get_vocab(c->model_res->model);
+        int32_t pen_n_vocab = pen_vocab ? erllama_safe_vocab_n_tokens(pen_vocab) : 0;
         if (chain_append(chain,
                          erllama_safe_sampler_init_penalties(
-                             64, (float) rep_val, 0.0f, 0.0f)) != 0) {
+                             pen_n_vocab, 64, (float) rep_val, 0.0f, 0.0f)) != 0) {
             (void) erllama_safe_sampler_free(chain);
             *out_err_atom = atom_oom;
             return NULL;

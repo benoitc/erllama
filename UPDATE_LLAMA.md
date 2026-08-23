@@ -2,7 +2,7 @@
 
 erllama vendors a pinned, unmodified copy of llama.cpp under
 `c_src/llama.cpp/`. The pinned tag is in `c_src/llama.cpp/.version`
-(currently **b10068**). You need this page when you bump that pin.
+(currently **b10593**). You need this page when you bump that pin.
 
 Why pin: reproducible builds, no network access at install time (the hex
 package ships the source), and control over when new model
@@ -20,8 +20,10 @@ and then removes whole directories we never build:
 
 - ggml backends other than CPU, Metal, CUDA and BLAS
   (`ggml/src/ggml-{cann,et,hexagon,hip,musa,opencl,openvino,rpc,sycl,virtgpu,vulkan,webgpu,zdnn,zendnn}`)
-- `vendor/{miniaudio,stb,sheredom}` (nothing in `common/` uses them)
 - `.gitignore` files
+
+`vendor/` is kept whole: upstream builds it as CMake targets that
+`common/` links against.
 
 No file is edited. `common/` is needed for the chat template pipeline
 (`common_chat_*`, the PEG autoparser, the jinja runtime). It links

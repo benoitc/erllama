@@ -130,10 +130,10 @@ struct llama_sampler *erllama_safe_sampler_init_temp(float t) noexcept {
 }
 
 struct llama_sampler *
-erllama_safe_sampler_init_penalties(int32_t last_n, float repeat, float freq,
-                                    float present) noexcept {
+erllama_safe_sampler_init_penalties(int32_t n_vocab, int32_t last_n, float repeat,
+                                    float freq, float present) noexcept {
     try {
-        return llama_sampler_init_penalties(last_n, repeat, freq, present);
+        return llama_sampler_init_penalties(n_vocab, last_n, repeat, freq, present);
     } catch (...) {
         return nullptr;
     }

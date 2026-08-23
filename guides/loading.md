@@ -91,8 +91,9 @@ matter day-to-day:
 | `split_mode` | `layer` | Multi-GPU split policy. `none` keeps the model on `main_gpu`, `layer` slices by layer range, `row` slices each tensor row-wise. A bad atom raises `badarg`. |
 | `main_gpu` | 0 | GPU index when `split_mode = none`, or the device that holds non-split tensors otherwise. |
 | `tensor_split` | `[]` | Per-device proportions when splitting. Up to 16 floats (the vendored llama.cpp's `llama_max_devices()`); shorter lists zero-fill. |
-| `use_mmap` | true | mmap the GGUF instead of copying into anon RAM. Leave on. |
-| `use_mlock` | false | `mlock(2)` the model pages. Useful on workloads where `vm.swappiness` is non-zero and you can't afford to page out weights. |
+| `load_mode` | `auto` | How weights are brought in: `auto` (llama.cpp picks), `none` (read into RAM), `mmap`, `mlock`, `mmap_mlock`, `direct_io`. |
+| `use_mmap` | true | Sugar for `load_mode`: with `use_mlock` they map onto `mmap`, `mlock`, `mmap_mlock` or `none`. Ignored when `load_mode` is set. |
+| `use_mlock` | false | `mlock(2)` the model pages so they are never paged out; see `use_mmap`. |
 | `vocab_only` | false | Open the file but skip weight loading. Tokenizer-only mode. |
 
 ### `context_opts`
