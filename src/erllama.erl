@@ -518,11 +518,12 @@ apply_chat_template(Model, Request) ->
     erllama_model:apply_chat_template(Model, Request).
 
 -doc """
-Build a chat_params_ref + rendered prompt for `Model' via llama.cpp's
-autoparser. `Inputs' is the map fed to `erllama_chat:apply/2'
-(`messages', `tools', `tool_choice', `parallel_tool_calls').
-Each call synthesizes fresh params + prompt; only the model-level
-`templates_ref' is cached.
+Render the chat prompt and build the parser for one request via
+llama.cpp's `common_chat_templates_apply`. `Inputs` is the map fed to
+`erllama_chat:apply/2` (`messages`, `tools`, `tool_choice`,
+`parallel_tool_calls`). Returns the prompt bytes plus a params ref to
+hand to `chat_parse/3` for this request's output. Only the per-model
+templates ref is cached; each call pays one upstream apply.
 """.
 -spec chat_apply(model(), map()) ->
     {ok, erllama_nif:chat_params_ref(), binary()} | {error, term()}.

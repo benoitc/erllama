@@ -57,8 +57,6 @@
     forward_with_argmax/2,
     chat_templates_init/2,
     chat_templates_apply/2,
-    chat_render_only/2,
-    chat_make_params/2,
     chat_parse/3
 ]).
 
@@ -408,29 +406,10 @@ chat_templates_init(Model, TemplateOverride) ->
 chat_templates_apply(Templates, Inputs) when is_map(Inputs) ->
     nif_chat_templates_apply(Templates, Inputs).
 
-%% Render only the chat-template prompt; the underlying llama.cpp
-%% call sets `skip_parser_synthesis = true' so the heavy PEG arena
-%% is NOT built. Use together with a cached params_ref from
-%% `chat_make_params/2' to avoid re-synthesising the parser on every
-%% turn when the tools schema has not changed.
--spec chat_render_only(chat_templates_ref(), map()) ->
-    {ok, binary()} | {error, term()}.
-chat_render_only(Templates, Inputs) when is_map(Inputs) ->
-    nif_chat_render_only(Templates, Inputs).
-
-%% Build the synthesised PEG parser arena for the given templates +
-%% (tools, tool_choice, parallel_tool_calls). Returns a params_ref
-%% suitable for `chat_parse/3'. The prompt is not exposed; callers
-%% that need it should use `chat_render_only/2' afterwards.
--spec chat_make_params(chat_templates_ref(), map()) ->
-    {ok, chat_params_ref()} | {error, term()}.
-chat_make_params(Templates, Inputs) when is_map(Inputs) ->
-    nif_chat_make_params(Templates, Inputs).
-
 %% Parse a model output string into a structured assistant message
 %% via llama.cpp's autoparser. `IsPartial' = true accepts streaming
-%% prefixes. Phase 3.B ships this as `{error, not_implemented}'; the
-%% term marshalling lands in the follow-up.
+%% prefixes. `Params' comes from `chat_templates_apply/2' for the same
+%% request.
 -spec chat_parse(chat_params_ref(), binary(), boolean()) ->
     {ok, map()} | {error, term()}.
 chat_parse(Params, Input, IsPartial) when
@@ -475,6 +454,4 @@ nif_grammar_cache_stats(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_forward_with_argmax(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_init(_Model, _Override) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_apply(_Templates, _Inputs) -> erlang:nif_error(nif_not_loaded).
-nif_chat_render_only(_Templates, _Inputs) -> erlang:nif_error(nif_not_loaded).
-nif_chat_make_params(_Templates, _Inputs) -> erlang:nif_error(nif_not_loaded).
 nif_chat_parse(_Params, _Input, _IsPartial) -> erlang:nif_error(nif_not_loaded).

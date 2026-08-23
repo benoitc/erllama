@@ -10,8 +10,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 - `erllama_chat:set_observer/1' / `clear_observer/0' hook.
   Lets a separate module (typically the server's metrics module)
-  observe wall-time of every chat-NIF call (apply / render_only /
-  make_params / parse) without the runtime taking a compile-time
+  observe wall-time of every chat-NIF call (apply / parse) without the runtime taking a compile-time
   dependency on the metrics module. Registered via persistent_term;
   unset = no-op. Drives the new
   `erllama_chat_*_duration_seconds' Prometheus histograms
@@ -23,29 +22,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
-- `chat_apply' splits per-request work into a render-only call plus a
-  cached PEG parser arena. The cache is keyed by
-  `(ModelId, ToolsHash, ToolChoice, ParallelToolCalls)' and lives in
-  `erllama_chat_cache' alongside the existing templates
-  slot. First request per (model, tools schema) still pays the full
-  synthesis cost; subsequent turns reuse the parser and only do the
-  cheap jinja render. Behaviour-preserving (same return shape, same
-  `chat_parse/3' results); pure perf win for chat-heavy workloads.
-
-### Added
-
-- `erllama_chat:render_only/2' and `make_params/2' wrappers
-  around two new NIF entries `nif_chat_render_only' and
-  `nif_chat_make_params'. Render-only sets
-  `common_chat_templates_inputs.skip_parser_synthesis = true' inside
-  the vendored llama.cpp (small local patch in
-  `common/chat.cpp:common_chat_templates_apply_jinja') so the
-  expensive PEG arena is NOT built when the caller has it cached.
-- `erllama_chat_cache:get_or_make_params/3' for the params
-  slot; `purge/1' drops both slots for the given model id.
-
-### Changed
-
+- `chat_apply/2' runs upstream's `common_chat_templates_apply' once per
+  request (prompt + parser). The per-tools params cache and the
+  render-only NIF are gone; only the per-model templates ref is
+  cached. The vendored llama.cpp carries no local patches.
 - Bump vendored llama.cpp from b9334 to b9585. No API-breaking changes
   on our touchpoints; brings `common/chat*` bug fixes (LFM2 reasoning,
   tool-parser unification). UPDATE_LLAMA.md refreshed to document

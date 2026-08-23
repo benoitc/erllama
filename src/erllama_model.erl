@@ -2175,12 +2175,12 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
     end.
 
 %% Resolve a chat templates_ref via the cache (init-once per model id)
-%% then call the autoparser fresh to get a params_ref + rendered
-%% prompt. NOTHING is cached at the params/prompt level: llama.cpp
-%% bakes `tool_choice' + `parallel_tool_calls' + message content
-%% into the synthesized `common_chat_params', so sharing across
-%% requests would be incorrect. Each call pays one
-%% `templates_apply' synthesis. The model resource is reached via
+%% then run upstream's `common_chat_templates_apply' for this request:
+%% one call renders the prompt and synthesises the parser. Nothing is
+%% cached at the params/prompt level; llama.cpp bakes `tool_choice',
+%% `parallel_tool_calls' and message content into the synthesised
+%% `common_chat_params', so the returned params_ref is valid for this
+%% request's `chat_parse/3' only. The model resource is reached via
 %% the backend module's `get_model_ref/1' getter; backends without
 %% that callback (the stub) return `{error, chat_not_supported}'.
 do_chat_apply(
@@ -2198,33 +2198,10 @@ do_chat_apply(
                 )
             of
                 {ok, Templates} ->
-                    do_chat_apply_with_cache(ModelId, Templates, Inputs);
+                    erllama_chat:apply(Templates, Inputs);
                 Err ->
                     Err
             end
-    end.
-
-%% Two-step path: look up (or build + cache) the synthesised PEG
-%% parser arena keyed by (ModelId, ToolsHash, ToolChoice, Parallel),
-%% then render the prompt via the cheap render-only call. Falls back
-%% to a single full `chat:apply' when the params cache lookup fails
-%% (e.g. NIF error during make_params) so callers always see a
-%% sensible {ok, ParamsRef, Prompt} or a propagated error.
-do_chat_apply_with_cache(ModelId, Templates, Inputs) ->
-    case
-        erllama_chat_cache:get_or_make_params(
-            ModelId, Templates, Inputs
-        )
-    of
-        {ok, Params} ->
-            case erllama_chat:render_only(Templates, Inputs) of
-                {ok, Prompt} -> {ok, Params, Prompt};
-                Err -> Err
-            end;
-        {error, _} ->
-            %% make_params failed; try the one-shot path so a transient
-            %% NIF hiccup still produces a result for this request.
-            erllama_chat:apply(Templates, Inputs)
     end.
 
 build_model_info(State, Data) ->
