@@ -38,10 +38,10 @@ tool-call messages and no sampler swap.
 
 ## Streaming shape
 
-A streaming `infer/4` against a tool-aware model receives:
+A streaming `stream/3` against a tool-aware model receives:
 
 ```erlang
-{erllama_token, Ref, {tool_call_delta, Bin}}
+{erllama, Ref, {token, Bin}}
 {erllama_tool_call_end, Ref, FullBin}
 ```
 
@@ -94,7 +94,7 @@ erllama provides adjacent primitives that help compose the full flow:
 
 - `erllama:prefill_only/3` with `parent_key` can warm a prompt prefix
   before generation.
-- `session_id` on `infer/4` and `complete/3` can pin a live sequence
+- `session_id` on `stream/3` and `complete/3` can pin a live sequence
   across turns.
 - `erllama:continue/3` extends a pinned sequence with a
   caller-asserted token tail, for chat templates that render

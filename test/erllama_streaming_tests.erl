@@ -88,18 +88,18 @@ rm_rf(Dir) ->
     file:del_dir(Dir),
     ok.
 
-%% Drain messages of a given Ref until {erllama_done, Ref, _} or timeout.
+%% Drain messages of a given Ref until {erllama, Ref, {done, _}} or timeout.
 %% Returns {Tokens, Stats} or {error, Reason} on erllama_error.
 collect_stream(Ref, TimeoutMs) ->
     collect_stream(Ref, TimeoutMs, []).
 
 collect_stream(Ref, TimeoutMs, Acc) ->
     receive
-        {erllama_token, Ref, Bin} ->
+        {erllama, Ref, {token, Bin}} ->
             collect_stream(Ref, TimeoutMs, [Bin | Acc]);
-        {erllama_done, Ref, Stats} ->
+        {erllama, Ref, {done, Stats}} ->
             {lists:reverse(Acc), Stats};
-        {erllama_error, Ref, Reason} ->
+        {erllama, Ref, {error, Reason}} ->
             {error, Reason}
     after TimeoutMs ->
         {timeout, lists:reverse(Acc)}
@@ -112,7 +112,7 @@ collect_stream(Ref, TimeoutMs, Acc) ->
 infer_returns_ref_and_streams_tokens_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello world">>),
-        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 4}, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 4}),
         ?assert(is_reference(Ref)),
         {Out, Stats} = collect_stream(Ref, 5000),
         ?assert(length(Out) >= 1),
@@ -127,7 +127,7 @@ infer_returns_ref_and_streams_tokens_test() ->
 infer_emits_binary_fragments_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"x y z">>),
-        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 3}, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 3}),
         {Out, _Stats} = collect_stream(Ref, 5000),
         ?assert(lists:all(fun is_binary/1, Out))
     end).
@@ -135,7 +135,7 @@ infer_emits_binary_fragments_test() ->
 infer_finish_reason_length_when_target_reached_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"a b">>),
-        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 2}),
         {_, Stats} = collect_stream(Ref, 5000),
         FR = maps:get(finish_reason, Stats),
         %% Stub backend never produces eog so we should hit the
@@ -146,7 +146,7 @@ infer_finish_reason_length_when_target_reached_test() ->
 stats_carry_token_counts_test() ->
     with_model(fun(Id) ->
         {ok, PromptTokens} = erllama:tokenize(Id, <<"hello big world">>),
-        {ok, Ref} = erllama:infer(Id, PromptTokens, #{response_tokens => 4}, self()),
+        {ok, Ref} = erllama:stream(Id, PromptTokens, #{response_tokens => 4}),
         {Out, Stats} = collect_stream(Ref, 5000),
         ?assertEqual(length(PromptTokens), maps:get(prompt_tokens, Stats)),
         ?assertEqual(length(Out), maps:get(completion_tokens, Stats))
@@ -155,7 +155,7 @@ stats_carry_token_counts_test() ->
 stats_carry_finish_key_and_committed_tokens_test() ->
     with_model(fun(Id) ->
         {ok, PromptTokens} = erllama:tokenize(Id, <<"hello big world">>),
-        {ok, Ref} = erllama:infer(Id, PromptTokens, #{response_tokens => 6}, self()),
+        {ok, Ref} = erllama:stream(Id, PromptTokens, #{response_tokens => 6}),
         {_Out, Stats} = collect_stream(Ref, 5000),
         ?assert(maps:is_key(finish_key, Stats)),
         ?assert(maps:is_key(committed_tokens, Stats)),
@@ -196,7 +196,7 @@ stop_sequence_value_reported_on_match_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
         Params = #{response_tokens => 16, stop_sequences => all_digits()},
-        {ok, Ref} = erllama:infer(Id, Tokens, Params, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, Params),
         {_Out, Stats} = collect_stream(Ref, 5000),
         ?assertEqual(stop, maps:get(finish_reason, Stats)),
         Match = maps:get(stop_sequence, Stats),
@@ -212,7 +212,7 @@ stop_sequence_absent_on_length_test() ->
             response_tokens => 1,
             stop_sequences => [<<"unmatchable-xyz">>]
         },
-        {ok, Ref} = erllama:infer(Id, Tokens, Params, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, Params),
         {_Out, Stats} = collect_stream(Ref, 5000),
         ?assertNot(maps:is_key(stop_sequence, Stats)),
         ?assertEqual(length, maps:get(finish_reason, Stats))
@@ -221,7 +221,7 @@ stop_sequence_absent_on_length_test() ->
 stop_sequence_absent_when_no_param_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
-        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 2}),
         {_Out, Stats} = collect_stream(Ref, 5000),
         ?assertNot(maps:is_key(stop_sequence, Stats))
     end).
@@ -230,7 +230,7 @@ stop_sequence_trimmed_from_stream_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
         Params = #{response_tokens => 16, stop_sequences => all_digits()},
-        {ok, Ref} = erllama:infer(Id, Tokens, Params, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, Params),
         {Out, Stats} = collect_stream(Ref, 5000),
         Match = maps:get(stop_sequence, Stats),
         Streamed = iolist_to_binary(Out),
@@ -248,15 +248,15 @@ collect_all(Ref, TimeoutMs) ->
 
 collect_all(Ref, TimeoutMs, Acc) ->
     receive
-        {erllama_token, Ref, {thinking_delta, Bin}} ->
+        {erllama, Ref, {thinking, Bin}} ->
             collect_all(Ref, TimeoutMs, [{thinking_delta, Bin} | Acc]);
-        {erllama_token, Ref, Bin} when is_binary(Bin) ->
+        {erllama, Ref, {token, Bin}} when is_binary(Bin) ->
             collect_all(Ref, TimeoutMs, [{token, Bin} | Acc]);
-        {erllama_thinking_end, Ref, Sig} ->
+        {erllama, Ref, {thinking_end, Sig}} ->
             collect_all(Ref, TimeoutMs, [{thinking_end, Sig} | Acc]);
-        {erllama_done, Ref, Stats} ->
+        {erllama, Ref, {done, Stats}} ->
             lists:reverse([{done, Stats} | Acc]);
-        {erllama_error, Ref, Reason} ->
+        {erllama, Ref, {error, Reason}} ->
             lists:reverse([{error, Reason} | Acc])
     after TimeoutMs ->
         lists:reverse([{timeout, TimeoutMs} | Acc])
@@ -265,9 +265,7 @@ collect_all(Ref, TimeoutMs, Acc) ->
 thinking_capable_stub_emits_delta_end_then_tokens_test() ->
     with_model(#{thinking_capable => true}, fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
-        {ok, Ref} = erllama:infer(
-            Id, Tokens, #{response_tokens => 3, thinking => enabled}, self()
-        ),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 3, thinking => enabled}),
         Events = collect_all(Ref, 5000),
         Kinds = [K || {K, _} <- Events],
         %% Expect: thinking_delta+, thinking_end, token+, done.
@@ -302,7 +300,7 @@ thinking_capable_stub_with_thinking_disabled_fails_test() ->
     %% clean erllama_error tagged thinking_not_enabled.
     with_model(#{thinking_capable => true}, fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
-        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 3}, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 3}),
         Events = collect_all(Ref, 5000),
         ?assertEqual({error, thinking_not_enabled}, lists:last(Events))
     end).
@@ -312,9 +310,7 @@ non_thinking_stub_with_thinking_enabled_is_normal_stream_test() ->
     %% thinking => enabled; no thinking messages should arrive.
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
-        {ok, Ref} = erllama:infer(
-            Id, Tokens, #{response_tokens => 2, thinking => enabled}, self()
-        ),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 2, thinking => enabled}),
         Events = collect_all(Ref, 5000),
         Kinds = [K || {K, _} <- Events],
         ?assertEqual([], [K || K <- Kinds, K =:= thinking_delta]),
@@ -329,16 +325,11 @@ thinking_budget_clips_after_one_delta_test() ->
     %% subsequent thinking_tokens through the normal token path.
     with_model(#{thinking_capable => true}, fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
-        {ok, Ref} = erllama:infer(
-            Id,
-            Tokens,
-            #{
-                response_tokens => 4,
-                thinking => enabled,
-                thinking_budget_tokens => 1
-            },
-            self()
-        ),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{
+            response_tokens => 4,
+            thinking => enabled,
+            thinking_budget_tokens => 1
+        }),
         Events = collect_all(Ref, 5000),
         Kinds = [K || {K, _} <- Events],
         Deltas = [K || K <- Kinds, K =:= thinking_delta],
@@ -363,9 +354,7 @@ thinking_budget_unset_keeps_existing_shape_test() ->
     %% natural shape (two thinking_deltas) must still come through.
     with_model(#{thinking_capable => true}, fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
-        {ok, Ref} = erllama:infer(
-            Id, Tokens, #{response_tokens => 3, thinking => enabled}, self()
-        ),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 3, thinking => enabled}),
         Events = collect_all(Ref, 5000),
         Kinds = [K || {K, _} <- Events],
         Deltas = [K || K <- Kinds, K =:= thinking_delta],
@@ -397,9 +386,9 @@ second_infer_while_busy_is_queued_test() ->
     %% Cancelling the first request makes room for the second.
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
-        {ok, Ref1} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
+        {ok, Ref1} = erllama:stream(Id, Tokens, #{response_tokens => 10000}),
         receive
-            {erllama_token, Ref1, _} -> ok
+            {erllama, Ref1, {token, _}} -> ok
         after 5000 -> ?assert(false)
         end,
         %% Issue the second infer; it queues because the first is
@@ -407,18 +396,16 @@ second_infer_while_busy_is_queued_test() ->
         %% as the call is admitted (the gen_statem accepts the call
         %% and returns the ref before dispatching prefill, so the
         %% reply lands without waiting for the first to drain).
-        {ok, Ref2} = erllama:infer(
-            Id, Tokens, #{response_tokens => 1}, self()
-        ),
+        {ok, Ref2} = erllama:stream(Id, Tokens, #{response_tokens => 1}),
         %% Cancel the long-running first; the queued second then
         %% starts and finishes naturally.
         ok = erllama:cancel(Ref1),
         receive
-            {erllama_done, Ref1, _} -> ok
+            {erllama, Ref1, {done, _}} -> ok
         after 5000 -> ?assert(false)
         end,
         receive
-            {erllama_done, Ref2, _} -> ok
+            {erllama, Ref2, {done, _}} -> ok
         after 5000 -> ?assert(false)
         end
     end).
@@ -431,9 +418,9 @@ complete_while_streaming_is_queued_test() ->
     %% queue until the cancellation drains the infer.
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
-        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 10000}),
         receive
-            {erllama_token, Ref, _} -> ok
+            {erllama, Ref, {token, _}} -> ok
         after 5000 -> ?assert(false)
         end,
         Parent = self(),
@@ -444,7 +431,7 @@ complete_while_streaming_is_queued_test() ->
         timer:sleep(50),
         ok = erllama:cancel(Ref),
         receive
-            {erllama_done, Ref, _} -> ok
+            {erllama, Ref, {done, _}} -> ok
         after 5000 -> ?assert(false)
         end,
         %% The queued complete now drains; expect a successful reply.
@@ -460,9 +447,9 @@ queued_requests_drain_in_fifo_order_test() ->
     %% must arrive in submission order (FIFO queue semantics).
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
-        {ok, R1} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
-        {ok, R2} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
-        {ok, R3} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
+        {ok, R1} = erllama:stream(Id, Tokens, #{response_tokens => 2}),
+        {ok, R2} = erllama:stream(Id, Tokens, #{response_tokens => 2}),
+        {ok, R3} = erllama:stream(Id, Tokens, #{response_tokens => 2}),
         ?assertNotEqual(R1, R2),
         ?assertNotEqual(R2, R3),
         Order = drain_done_in_order(3, 5000),
@@ -473,9 +460,9 @@ drain_done_in_order(0, _Timeout) ->
     [];
 drain_done_in_order(N, Timeout) ->
     receive
-        {erllama_done, Ref, _} -> [Ref | drain_done_in_order(N - 1, Timeout)];
+        {erllama, Ref, {done, _}} -> [Ref | drain_done_in_order(N - 1, Timeout)];
         %% Tokens emitted while waiting for done are fine; ignore them.
-        {erllama_token, _, _} -> drain_done_in_order(N, Timeout)
+        {erllama, _, {token, _}} -> drain_done_in_order(N, Timeout)
     after Timeout -> ?assert(false)
     end.
 
@@ -501,9 +488,9 @@ cancel_in_flight_marks_done_cancelled_test() ->
         %% Use a large response_tokens so cancellation is observable
         %% before completion. Wait for the first token so we know we
         %% are mid-stream before cancelling.
-        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 10000}),
         receive
-            {erllama_token, Ref, _} -> ok
+            {erllama, Ref, {token, _}} -> ok
         after 5000 -> ?assert(false)
         end,
         ok = erllama:cancel(Ref),
@@ -519,16 +506,16 @@ cancel_in_flight_marks_done_cancelled_test() ->
 cancelled_stream_releases_model_for_next_request_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
-        {ok, Ref1} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
+        {ok, Ref1} = erllama:stream(Id, Tokens, #{response_tokens => 10000}),
         receive
-            {erllama_token, Ref1, _} -> ok
+            {erllama, Ref1, {token, _}} -> ok
         after 5000 -> ?assert(false)
         end,
         ok = erllama:cancel(Ref1),
         _ = collect_stream(Ref1, 5000),
         %% After cancel-flushed-done, the model should be idle and
         %% accept a new infer.
-        {ok, Ref2} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
+        {ok, Ref2} = erllama:stream(Id, Tokens, #{response_tokens => 2}),
         ?assertNotEqual(Ref1, Ref2),
         _ = collect_stream(Ref2, 5000)
     end).
@@ -541,9 +528,9 @@ inflight_registers_and_unregisters_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"x">>),
         Pre = length(erllama_inflight:all()),
-        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
+        {ok, Ref} = erllama:stream(Id, Tokens, #{response_tokens => 10000}),
         receive
-            {erllama_token, Ref, _} -> ok
+            {erllama, Ref, {token, _}} -> ok
         after 5000 -> ?assert(false)
         end,
         ?assertMatch({ok, _Pid}, erllama_inflight:lookup(Ref)),

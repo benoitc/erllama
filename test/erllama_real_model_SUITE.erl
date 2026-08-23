@@ -314,7 +314,7 @@ apply_chat_template_renders(Config) ->
     Request = #{
         messages => [#{role => <<"user">>, content => <<"Hi.">>}]
     },
-    case erllama:apply_chat_template(Model, Request) of
+    case erllama:render_chat_template(Model, Request) of
         {ok, Tokens} ->
             ?assert(is_list(Tokens)),
             ?assert(length(Tokens) > 0),
@@ -331,8 +331,8 @@ apply_chat_template_includes_system(Config) ->
     With = Without#{system => <<"You speak only in haiku.">>},
     case
         {
-            erllama:apply_chat_template(Model, Without),
-            erllama:apply_chat_template(Model, With)
+            erllama:render_chat_template(Model, Without),
+            erllama:render_chat_template(Model, With)
         }
     of
         {{ok, A}, {ok, B}} ->
@@ -357,7 +357,7 @@ set_grammar_constrains_output(Config) ->
     {ok, PromptTokens} = erllama:tokenize(Model, <<"Answer with yes or no:">>),
     Grammar = <<"root ::= \"yes\" | \"no\"">>,
     Params = #{response_tokens => 6, grammar => Grammar},
-    {ok, Ref} = erllama:infer(Model, PromptTokens, Params, self()),
+    {ok, Ref} = erllama:stream(Model, PromptTokens, Params),
     Drained = drain(Ref, 60000),
     case Drained of
         {Texts, _Stats} ->
@@ -400,20 +400,10 @@ clear_sampler_resets_to_greedy(Config) ->
     %% The second run should be free to produce any output, so it
     %% must complete without {error, grammar_failed}.
     Grammar = <<"root ::= \"a\" | \"b\"">>,
-    {ok, R1} = erllama:infer(
-        Model,
-        PromptTokens,
-        #{response_tokens => 2, grammar => Grammar},
-        self()
-    ),
+    {ok, R1} = erllama:stream(Model, PromptTokens, #{response_tokens => 2, grammar => Grammar}),
     _ = drain(R1, 60000),
     %% Second run, no grammar.
-    {ok, R2} = erllama:infer(
-        Model,
-        PromptTokens,
-        #{response_tokens => 2},
-        self()
-    ),
+    {ok, R2} = erllama:stream(Model, PromptTokens, #{response_tokens => 2}),
     case drain(R2, 60000) of
         {Texts, _Stats} ->
             ?assert(iolist_size(Texts) >= 0);
@@ -424,9 +414,9 @@ clear_sampler_resets_to_greedy(Config) ->
 drain(Ref, TimeoutMs) -> drain(Ref, TimeoutMs, []).
 drain(Ref, TimeoutMs, Acc) ->
     receive
-        {erllama_token, Ref, B} -> drain(Ref, TimeoutMs, [B | Acc]);
-        {erllama_done, Ref, S} -> {lists:reverse(Acc), S};
-        {erllama_error, Ref, R} -> {error, R}
+        {erllama, Ref, {token, B}} -> drain(Ref, TimeoutMs, [B | Acc]);
+        {erllama, Ref, {done, S}} -> {lists:reverse(Acc), S};
+        {erllama, Ref, {error, R}} -> {error, R}
     after TimeoutMs ->
         timeout
     end.
@@ -554,7 +544,7 @@ start_chunked_model(Path, BaseDiskSrv, ChunkSize, Suffix, Fp) ->
     {Model, Srv}.
 
 run_infer(Model, Tokens, Params) ->
-    {ok, Ref} = erllama:infer(Model, Tokens, Params, self()),
+    {ok, Ref} = erllama:stream(Model, Tokens, Params),
     case drain(Ref, 60000) of
         {Texts, Stats} -> {iolist_to_binary(Texts), Stats};
         Other -> ct:fail({drain, Other})
@@ -587,7 +577,7 @@ verify_does_not_mutate_caller_visible_state(Config) ->
     %% matters is that the post-call sampling distribution is
     %% restored.
     Candidates = [1, 2, 3, 4],
-    {ok, _Accepted, _Next} = erllama:verify(
+    {ok, #{accepted := _Accepted, next := _Next}} = erllama:verify(
         Model, Prompt, Candidates, length(Candidates)
     ),
     %% Post-call decode_one: T2 must equal T1.
@@ -608,7 +598,7 @@ verify_accepted_count_le_k(Config) ->
         begin
             ok = erllama_nif:kv_seq_rm(Ctx, 0, length(Prompt), -1),
             ok = erllama_nif:prefill(Ctx, Prompt),
-            {ok, Accepted, _Next} = erllama:verify(Model, Prompt, Cands, K),
+            {ok, #{accepted := Accepted}} = erllama:verify(Model, Prompt, Cands, K),
             ?assert(Accepted >= 0 andalso Accepted =< K)
         end
      || {Cands, K} <- [
@@ -652,7 +642,7 @@ continue_multi_turn_cache_delta(Config) ->
         Suffix2,
         #{
             session_id => SessionId,
-            caller_pid => self(),
+            to => self(),
             response_tokens => Resp
         }
     ),
@@ -674,7 +664,7 @@ continue_multi_turn_cache_delta(Config) ->
         Suffix3,
         #{
             session_id => SessionId,
-            caller_pid => self(),
+            to => self(),
             response_tokens => Resp
         }
     ),
@@ -710,7 +700,7 @@ apply_chat_template_large_input(Config) ->
     %% Skip cleanly if the model has no chat template — every size
     %% would otherwise just return the same `{error, no_template}`.
     Probe = #{messages => [#{role => <<"user">>, content => <<"hi">>}]},
-    case erllama:apply_chat_template(Model, Probe) of
+    case erllama:render_chat_template(Model, Probe) of
         {error, no_template} ->
             {skip, "model has no chat template in GGUF metadata"};
         {ok, _} ->
@@ -752,7 +742,7 @@ assert_tokenize_safe(Model, Sz) ->
 assert_apply_chat_template_safe(Model, Sz) ->
     Content = big_text(Sz),
     Request = #{messages => [#{role => <<"user">>, content => Content}]},
-    case erllama:apply_chat_template(Model, Request) of
+    case erllama:render_chat_template(Model, Request) of
         {ok, Tokens} ->
             ?assert(is_list(Tokens)),
             ?assert(length(Tokens) > 0),
@@ -776,7 +766,7 @@ tokenize_over_text_cap(Config) ->
     Over = big_text(?ERLLAMA_MAX_TOKEN_TEXT + 1),
     ?assertEqual({error, too_large}, erllama:tokenize(Model, Over)),
     Request = #{messages => [#{role => <<"user">>, content => Over}]},
-    case erllama:apply_chat_template(Model, Request) of
+    case erllama:render_chat_template(Model, Request) of
         {error, too_large} ->
             ok;
         %% Older models without a template short-circuit before tokenize.

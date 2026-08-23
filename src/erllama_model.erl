@@ -152,6 +152,7 @@ concurrently through one decode call per tick.
     chat_apply/2,
     chat_purge/1,
     embed/2,
+    embed_batch/2,
     load_adapter/2,
     unload_adapter/2,
     set_adapter_scale/3,
@@ -330,9 +331,9 @@ concurrently through one decode call per tick.
     %% Opt-in extended thinking. When `enabled`, a thinking-capable
     %% backend may emit `{thinking_token, _}` step results that the
     %% scheduler forwards to the streaming caller as
-    %% `{erllama_token, Ref, {thinking_delta, Bin}}`. When the
+    %% `{erllama, Ref, {thinking, Bin}}`. When the
     %% thinking phase closes the scheduler emits a single
-    %% `{erllama_thinking_end, Ref, Sig}` before any non-thinking
+    %% `{erllama, Ref, {thinking_end, Sig}}` before any non-thinking
     %% token. Defaults to `disabled`; backends without thinking
     %% support ignore the flag entirely.
     thinking => enabled | disabled,
@@ -657,13 +658,14 @@ Streaming inference. Admits a request and immediately returns a
 unique `reference()`; tokens are delivered to `CallerPid` via
 asynchronous messages:
 
-- `{erllama_token, Ref, binary()}` per generated token (text fragment;
-  suppressed when the detokenized binary is empty)
-- `{erllama_token_id, Ref, integer()}` per generated token (always
-  delivered, including for tokens whose text fragment is empty;
-  used by speculative-decoding collectors)
-- `{erllama_done, Ref, stats()}` on normal completion
-- `{erllama_error, Ref, term()}` on failure
+- `{erllama, Ref, {token, binary()}}` per generated token (text
+  fragment; suppressed when the detokenized binary is empty)
+- `{erllama, Ref, {token_id, integer()}}` per generated token (always
+  delivered, including for tokens whose text fragment is empty)
+- `{erllama, Ref, {thinking, binary()}}` / `{erllama, Ref,
+  {thinking_end, Sig}}` for extended-thinking blocks
+- `{erllama, Ref, {done, stats()}}` on completion
+- `{erllama, Ref, {error, term()}}` on failure
 
 `Tokens` is the prompt as a list of token ids - tokenisation is the
 caller's responsibility (use `tokenize/2` or apply a chat template
@@ -756,8 +758,8 @@ continue(Model, SuffixTokens, Opts) when is_list(SuffixTokens), is_map(Opts) ->
 Cancel an in-flight streaming inference. Idempotent and fire-and-
 forget: returns `ok` even if the ref is unknown (already finished or
 never existed). The cancellation is observed at the next
-inter-token boundary; the model emits a final `{erllama_done, Ref,
-Stats}` with `cancelled => true` after the running decode step
+inter-token boundary; the model emits a final `{erllama, Ref,
+{done, Stats}}` with `cancelled => true` after the running decode step
 completes.
 """.
 -spec cancel(reference()) -> ok.
@@ -895,6 +897,15 @@ Compute an embedding vector for the given prompt tokens.
     {ok, [float()]} | {error, term()}.
 embed(Model, Tokens) when is_list(Tokens) ->
     call(Model, {embed, Tokens}, infinity).
+
+-doc """
+Embedding vectors for several token lists in one call to the model
+process. Stops at the first backend error.
+""".
+-spec embed_batch(model(), [[non_neg_integer()]]) ->
+    {ok, [[float()]]} | {error, term()}.
+embed_batch(Model, TokenLists) when is_list(TokenLists) ->
+    call(Model, {embed_batch, TokenLists}, infinity).
 
 -doc """
 Load a LoRA adapter from a GGUF file and attach it to the model
@@ -1556,7 +1567,7 @@ notify_caller_error(
     #req{mode = streaming, request_ref = Ref, caller_pid = Pid}, Err
 ) when is_pid(Pid), is_reference(Ref) ->
     erllama_inflight:unregister(Ref),
-    Pid ! {erllama_error, Ref, Err},
+    Pid ! {erllama, Ref, {error, Err}},
     ok;
 notify_caller_error(#req{caller = From}, Err) when From =/= undefined ->
     _ = gen_statem:reply(From, {error, Err}),
@@ -2011,6 +2022,8 @@ handle_common(_State, {call, From}, chat_purge, Data) ->
     reply(From, ok, Data);
 handle_common(_State, {call, From}, {embed, Tokens}, Data) ->
     reply(From, optional_backend_call(Data, embed, [Tokens]), Data);
+handle_common(_State, {call, From}, {embed_batch, TokenLists}, Data) ->
+    reply(From, embed_each(Data, TokenLists, []), Data);
 handle_common(State, {call, From}, {load_adapter, Path}, Data) ->
     handle_load_adapter(State, From, Path, Data);
 handle_common(State, {call, From}, {unload_adapter, Handle}, Data) ->
@@ -2188,6 +2201,14 @@ reply(From, Reply, Data) ->
 %% public API surface stays uniform across backends.
 wrap_ok({error, _} = E) -> E;
 wrap_ok(Result) -> {ok, Result}.
+
+embed_each(_Data, [], Acc) ->
+    {ok, lists:reverse(Acc)};
+embed_each(Data, [Tokens | Rest], Acc) ->
+    case optional_backend_call(Data, embed, [Tokens]) of
+        {ok, Vec} -> embed_each(Data, Rest, [Vec | Acc]);
+        {error, _} = E -> E
+    end.
 
 %% Like backend_call/3, but for callbacks declared optional in the
 %% behaviour. If the backend module does not export the function
@@ -2585,11 +2606,11 @@ req_stream_emit(
     _ =
         case backend_call(Data, detokenize, [[Token]]) of
             Bin when is_binary(Bin), Bin =/= <<>> ->
-                Pid ! {erllama_token, Ref, Bin};
+                Pid ! {erllama, Ref, {token, Bin}};
             _ ->
                 ok
         end,
-    Pid ! {erllama_token_id, Ref, Token},
+    Pid ! {erllama, Ref, {token_id, Token}},
     Req;
 req_stream_emit(#req{stop_pattern = undefined} = Req, _Token, _Data) ->
     Req;
@@ -2629,15 +2650,15 @@ maybe_emit_stream(
     _ =
         case Text of
             <<>> -> ok;
-            _ -> Pid ! {erllama_token, Ref, Text}
+            _ -> Pid ! {erllama, Ref, {token, Text}}
         end,
-    Pid ! {erllama_token_id, Ref, Token},
+    Pid ! {erllama, Ref, {token_id, Token}},
     ok;
 maybe_emit_stream(_Req, _Text, _Token) ->
     ok.
 
 %% Thinking-phase token. Detokenises the new id and forwards it as
-%% {erllama_token, Ref, {thinking_delta, Bin}} to streaming callers
+%% {erllama, Ref, {thinking, Bin}} to streaming callers
 %% that opted in via `thinking = enabled`. The bytes are also kept
 %% on the #req so the backend's thinking_signature/2 fallback can
 %% be derived from the accumulated text. A thinking_token arriving
@@ -2667,7 +2688,7 @@ req_thinking_emit(
             %% isn't observed by the caller.
             Req1;
         _ ->
-            Pid ! {erllama_token, Ref, {thinking_delta, Bin}},
+            Pid ! {erllama, Ref, {thinking, Bin}},
             Req2 = Req1#req{thinking_count = Req1#req.thinking_count + 1},
             maybe_cap_thinking(Req2, Data)
     end;
@@ -2696,7 +2717,7 @@ maybe_cap_thinking(
     is_pid(Pid), is_reference(Ref)
 ->
     Sig = thinking_signature(Req, Data),
-    Pid ! {erllama_thinking_end, Ref, Sig},
+    Pid ! {erllama, Ref, {thinking_end, Sig}},
     Req#req{thinking_bytes = <<>>, thinking_capped = true};
 maybe_cap_thinking(Req, _Data) ->
     Req#req{thinking_bytes = <<>>, thinking_capped = true}.
@@ -2713,7 +2734,7 @@ req_thinking_end(
     is_pid(Pid), is_reference(Ref)
 ->
     Sig = thinking_signature(Req, Data),
-    Pid ! {erllama_thinking_end, Ref, Sig},
+    Pid ! {erllama, Ref, {thinking_end, Sig}},
     Req#req{thinking_bytes = <<>>};
 req_thinking_end(Req, _Data) ->
     Req#req{thinking_bytes = <<>>}.
@@ -2747,7 +2768,7 @@ fail_thinking_disabled(#req{
     is_pid(Pid), is_reference(Ref)
 ->
     erllama_inflight:unregister(Ref),
-    Pid ! {erllama_error, Ref, thinking_not_enabled},
+    Pid ! {erllama, Ref, {error, thinking_not_enabled}},
     ok;
 fail_thinking_disabled(_Req) ->
     ok.
@@ -2963,7 +2984,7 @@ send_done_for_req(#req{request_ref = Ref, caller_pid = Pid}, Stats) when
     is_pid(Pid), is_reference(Ref)
 ->
     erllama_inflight:unregister(Ref),
-    Pid ! {erllama_done, Ref, Stats},
+    Pid ! {erllama, Ref, {done, Stats}},
     ok;
 send_done_for_req(_Req, _Stats) ->
     ok.
@@ -2988,7 +3009,7 @@ notify_failure(#req{mode = streaming, request_ref = Ref, caller_pid = Pid}, Err)
     is_pid(Pid), is_reference(Ref)
 ->
     erllama_inflight:unregister(Ref),
-    Pid ! {erllama_error, Ref, Err};
+    Pid ! {erllama, Ref, {error, Err}};
 notify_failure(#req{caller = From}, Err) when From =/= undefined ->
     %% Sync caller (complete/3, prefill_only/3). Reply explicitly: on the
     %% {stop} path the call would also fail on termination, but on the
@@ -3213,7 +3234,7 @@ trim_at_match(Reply, Match) when is_binary(Reply), is_binary(Match) ->
     end.
 
 %% Flush any text held back in pending_text as one final
-%% `{erllama_token, _, _}` message. Only relevant for streaming
+%% `{erllama, _, {token, _}}` message. Only relevant for streaming
 %% requests with stop_sequences active and no match: the trailing
 %% (max_stop_len - 1) bytes were withheld in case they were the
 %% prefix of a future match; at the terminal step they are safe to
@@ -3227,7 +3248,7 @@ flush_pending_text(#req{
 }) when
     is_pid(Pid), is_reference(Ref), is_binary(Tail), Tail =/= <<>>
 ->
-    Pid ! {erllama_token, Ref, Tail},
+    Pid ! {erllama, Ref, {token, Tail}},
     ok;
 flush_pending_text(_Req) ->
     ok.

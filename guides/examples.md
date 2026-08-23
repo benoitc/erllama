@@ -149,22 +149,22 @@ Replies = [receive {N, R} -> {N, R} end || N <- lists:seq(1, 8)],
 Replies.
 ```
 
-## 6. Streaming tokens (`infer/4`) with cancellation
+## 6. Streaming tokens (`stream/3`) with cancellation
 
 ```erlang
 {ok, Tokens} = erllama:tokenize(ModelId, <<"Once upon a time">>),
-{ok, Ref} = erllama:infer(ModelId, Tokens,
-                           #{response_tokens => 200}, self()),
+{ok, Ref} = erllama:stream(ModelId, Tokens,
+                           #{response_tokens => 200}),
 
 loop(Ref) ->
     receive
-        {erllama_token, Ref, Fragment} ->
+        {erllama, Ref, {token, Fragment}} ->
             io:put_chars(Fragment),
             loop(Ref);
-        {erllama_done, Ref, _Stats} ->
+        {erllama, Ref, {done, _Stats}} ->
             io:nl(),
             ok;
-        {erllama_error, Ref, Reason} ->
+        {erllama, Ref, {error, Reason}} ->
             {error, Reason}
     after 30000 ->
         erllama:cancel(Ref),
@@ -174,7 +174,7 @@ loop(Ref) ->
 ```
 
 `cancel/1` is observed at the next inter-token boundary; the model
-always emits a final `{erllama_done, Ref, Stats}` with
+always emits a final `{erllama, Ref, {done, Stats}}` with
 `#{cancelled => true}`.
 
 ## 7. Chat template + embeddings
@@ -182,13 +182,13 @@ always emits a final `{erllama_done, Ref, Stats}` with
 ```erlang
 %% Render a chat request through the model's built-in GGUF template
 %% and tokenise it in one shot. Backed by llama_chat_apply_template.
-{ok, ChatTokens} = erllama:apply_chat_template(ModelId, #{
+{ok, ChatTokens} = erllama:render_chat_template(ModelId, #{
     messages => [
         #{role => system,    content => <<"You are concise.">>},
         #{role => user,      content => <<"What's 2+2?">>}
     ]
 }),
-{ok, Ref} = erllama:infer(ModelId, ChatTokens, #{response_tokens => 8}, self()).
+{ok, Ref} = erllama:stream(ModelId, ChatTokens, #{response_tokens => 8}).
 ```
 
 ```erlang
@@ -209,9 +209,8 @@ Grammar = <<
     "ws    ::= [ \\t\\n]*"
 >>,
 {ok, Toks} = erllama:tokenize(ModelId, <<"Reply with JSON:">>),
-{ok, Ref}  = erllama:infer(ModelId, Toks,
-                           #{response_tokens => 32, grammar => Grammar},
-                           self()).
+{ok, Ref}  = erllama:stream(ModelId, Toks,
+                           #{response_tokens => 32, grammar => Grammar}).
 ```
 
 The grammar is per-request: the sampler chain is reset to grammar →
@@ -245,20 +244,19 @@ end.
 ```
 
 Streaming works the same way: the matched string never appears in
-any `{erllama_token, _, _}` chunk, and the final
-`{erllama_done, _, Stats}` carries the matched value:
+any `{erllama, _, {token, _}}` chunk, and the final
+`{erllama, _, {done, Stats}}` carries the matched value:
 
 ```erlang
 {ok, Tokens} = erllama:tokenize(ModelId, Prompt),
-{ok, Ref} = erllama:infer(ModelId, Tokens,
+{ok, Ref} = erllama:stream(ModelId, Tokens,
                           #{response_tokens => 200,
-                            stop_sequences => [<<"\n\nUser:">>]},
-                          self()),
+                            stop_sequences => [<<"\n\nUser:">>]}),
 
 receive
-    {erllama_done, Ref, #{stop_sequence := <<"\n\nUser:">>}} ->
+    {erllama, Ref, {done, #{stop_sequence := <<"\n\nUser:">>}}} ->
         stopped_at_user_turn;
-    {erllama_done, Ref, _Stats} ->
+    {erllama, Ref, {done, _Stats}} ->
         finished_without_match
 end.
 ```
@@ -320,20 +318,19 @@ documented "no signature" path — the downstream forwards no
 
 ```erlang
 {ok, Tokens} = erllama:tokenize(<<"qwen3-thinking">>, <<"Solve: 23 * 17.">>),
-{ok, Ref} = erllama:infer(<<"qwen3-thinking">>, Tokens,
+{ok, Ref} = erllama:stream(<<"qwen3-thinking">>, Tokens,
                           #{response_tokens => 256,
-                            thinking => enabled},
-                          self()),
+                            thinking => enabled}),
 
 loop(Ref, _Thinking = <<>>, _Answer = <<>>, _Sig = <<>>) ->
     receive
-        {erllama_token, Ref, {thinking_delta, Bin}} ->
+        {erllama, Ref, {thinking, Bin}} ->
             loop(Ref, <<Thinking/binary, Bin/binary>>, Answer, Sig);
-        {erllama_thinking_end, Ref, NewSig} ->
+        {erllama, Ref, {thinking_end, NewSig}} ->
             loop(Ref, Thinking, Answer, NewSig);
-        {erllama_token, Ref, Bin} when is_binary(Bin) ->
+        {erllama, Ref, {token, Bin}} when is_binary(Bin) ->
             loop(Ref, Thinking, <<Answer/binary, Bin/binary>>, Sig);
-        {erllama_done, Ref, _Stats} ->
+        {erllama, Ref, {done, _Stats}} ->
             #{thinking => Thinking, answer => Answer, signature => Sig}
     end.
 ```
@@ -343,17 +340,16 @@ loop(Ref, _Thinking = <<>>, _Answer = <<>>, _Sig = <<>>) ->
 Anthropic's API takes a `thinking.budget_tokens` hint that caps
 the thinking phase. erllama honours it as the maximum number of
 `{thinking_delta, _}` payloads to deliver. Once the budget is
-reached, the scheduler synthesises the `erllama_thinking_end`
+reached, the scheduler synthesises the `{thinking_end, Sig}`
 close immediately and routes any further model-emitted thinking
 tokens through the normal post-thinking pipeline so generation
 still progresses.
 
 ```erlang
-{ok, Ref} = erllama:infer(<<"qwen3-thinking">>, Tokens,
+{ok, Ref} = erllama:stream(<<"qwen3-thinking">>, Tokens,
                           #{response_tokens => 256,
                             thinking => enabled,
-                            thinking_budget_tokens => 64},
-                          self()).
+                            thinking_budget_tokens => 64}).
 ```
 
 Non-positive values and a missing key both mean "no cap".
@@ -379,10 +375,10 @@ erllama:load_model(<<"qwen3-tool">>, #{
 }).
 ```
 
-A streaming `infer/4` against this model receives:
+A streaming `stream/3` against this model receives:
 
 ```erlang
-{erllama_token, Ref, {tool_call_delta, Bin}}    %% one per chunk of the call body
+{erllama, Ref, {token, Bin}}    %% one per chunk of the call body
 {erllama_tool_call_end, Ref, FullBin :: binary()} %% concatenated bytes of every delta
 ```
 
@@ -419,7 +415,7 @@ or for holding a warm session across long pauses without consuming
 generation budget.
 
 ```erlang
-{ok, SysToks} = erllama:apply_chat_template(ModelId, #{
+{ok, SysToks} = erllama:render_chat_template(ModelId, #{
     messages => [
         #{role => system, content => SystemPrompt},
         #{role => user,   content => FirstUserTurn}
@@ -504,7 +500,7 @@ Constraints:
 
 ## 14. Chat-template continuation (`continue/3`)
 
-`infer/4` with `session_id` reuses the live KV cells across turns,
+`stream/3` with `session_id` reuses the live KV cells across turns,
 but only when the new prompt's tokens are a strict prefix extension
 of what was stored on the prior turn. Production chat templates
 typically render different role markers when the same first user
@@ -522,15 +518,14 @@ garbage tokens, but engine state stays consistent.
 ```erlang
 SessionId = ConvId,
 
-%% Turn 1: render the full conversation as today, infer/4 pins the
+%% Turn 1: render the full conversation as today, stream/3 pins the
 %% session on finish.
-{ok, Turn1Tokens} = erllama:apply_chat_template(ModelId, #{
+{ok, Turn1Tokens} = erllama:render_chat_template(ModelId, #{
     messages => [#{role => <<"user">>, content => Q1}]
 }),
-{ok, Ref1} = erllama:infer(ModelId, Turn1Tokens,
+{ok, Ref1} = erllama:stream(ModelId, Turn1Tokens,
                            #{session_id => SessionId,
-                             response_tokens => 64},
-                           self()),
+                             response_tokens => 64}),
 {Reply1, Stats1} = drain(Ref1),
 
 %% After turn 1, the session holds prompt + reply on its pinned seq.
@@ -541,7 +536,7 @@ PriorTokenCount = maps:get(prompt_tokens, Stats1)
 %% tokens the engine already has and pass only the new tail to
 %% continue/3. No need for the slice to match what the model
 %% actually decoded — continue/3 trusts the caller.
-{ok, Turn2Tokens} = erllama:apply_chat_template(ModelId, #{
+{ok, Turn2Tokens} = erllama:render_chat_template(ModelId, #{
     messages => [
         #{role => <<"user">>, content => Q1},
         #{role => <<"assistant">>, content => Reply1},
@@ -551,7 +546,7 @@ PriorTokenCount = maps:get(prompt_tokens, Stats1)
 Suffix = lists:nthtail(PriorTokenCount, Turn2Tokens),
 {ok, Ref2} = erllama:continue(ModelId, Suffix,
                               #{session_id => SessionId,
-                                caller_pid => self(),
+                                to => self(),
                                 response_tokens => 64}),
 {Reply2, Stats2} = drain(Ref2).
 %% Stats2.cache_hit_kind = continuation
@@ -572,7 +567,7 @@ Errors:
 
 - `{error, no_session}` - the session id is not known to the model.
   Falls back to the cold/warm path: rebuild the conversation and
-  call `infer/4` instead.
+  call `stream/3` instead.
 - `{error, sticky_busy}` - an earlier request on the same session
   is still in flight. Serialise calls per session id (typical HTTP
   per-user pipelines do this naturally).
@@ -588,7 +583,7 @@ contract.
 `continue/3` trusts the tail, so a caller whose view of the session
 drifted will silently produce garbage. To catch that, reconstruct
 the prior turn's exact committed tokens from `Stats.generated` (the
-`erllama_done` Stats now carry the exact generated token ids) and
+`done` Stats now carry the exact generated token ids) and
 pass them as `expect_committed`. The engine checks they equal the
 session's stored context before prefilling:
 
@@ -596,7 +591,7 @@ session's stored context before prefilling:
 PriorCommitted = Turn1Prompt ++ maps:get(generated, Stats1),
 {ok, Ref2} = erllama:continue(ModelId, Suffix,
                               #{session_id => SessionId,
-                                caller_pid => self(),
+                                to => self(),
                                 response_tokens => 64,
                                 expect_committed => PriorCommitted}),
 ```
@@ -604,7 +599,7 @@ PriorCommitted = Turn1Prompt ++ maps:get(generated, Stats1),
 On a mismatch the call returns
 `{error, {transcript_mismatch, #{stored_len, expected_len, diverge_at}}}`
 and prefills nothing; the seq stays pinned, so the caller can re-sync
-its transcript and retry (or fall back to `infer/4`). Omit
+its transcript and retry (or fall back to `stream/3`). Omit
 `expect_committed` to keep the historical trust-the-tail behaviour.
 
 ## 15. Multi-tenant concurrent decoding (`n_seq_max`)
@@ -656,7 +651,7 @@ read a public ETS row, never cross the model gen_statem:
 4> erllama:last_cache_hit(<<"chat">>).
 {ok, #{kind => partial, prefix_len => 1024}}
 5> erllama:queue_depth().
-%% global: total admitted streaming infer/4 rows across all loaded models.
+%% global: total admitted streaming stream/3 rows across all loaded models.
 4
 ```
 
@@ -692,7 +687,7 @@ What each combination tells you:
 | any, save below `min_tokens` | warm prefix | `0` (no save fired) |
 
 Streaming consumers read the same map from the final
-`{erllama_done, Ref, Stats}` message; `prefill_only/2` exposes it
+`{erllama, Ref, {done, Stats}}` message; `prefill_only/2` exposes it
 on its result map too.
 
 ## 18. Inspecting cache state

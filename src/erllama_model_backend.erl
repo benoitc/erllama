@@ -232,14 +232,14 @@ inference, etc.) can plug in via this same surface.
     prefilled
     | {token, erllama_nif:token_id(), 0 | 1}
     %% Thinking-phase token: scheduler detokenises and emits
-    %% {erllama_token, Ref, {thinking_delta, Bin}} instead of a plain
+    %% {erllama, Ref, {thinking, Bin}} instead of a plain
     %% text fragment. Backends without extended-thinking support
     %% never emit this variant.
     | {thinking_token, erllama_nif:token_id()}
     %% Marker that the thinking phase has closed for this decode row.
     %% The scheduler resolves a signature via thinking_signature/1
     %% (or `<<>>` when the callback is not exported) and sends
-    %% {erllama_thinking_end, Ref, Sig} before any subsequent token.
+    %% {erllama, Ref, {thinking_end, Sig}} before any subsequent token.
     | thinking_end.
 
 -export_type([sampler_opts/0, seq_id/0, sampler_ref/0, step_op/0, step_result/0]).
