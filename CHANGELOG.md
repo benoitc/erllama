@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-23
+
 ### Removed (BREAKING)
 
 - `unload_model/1` (use `unload/1`), `models/0` (use
@@ -1157,7 +1159,8 @@ Initial public release.
 
 Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
-[Unreleased]: https://github.com/benoitc/erllama/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/benoitc/erllama/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/benoitc/erllama/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/benoitc/erllama/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/benoitc/erllama/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/benoitc/erllama/compare/v0.6.2...v0.7.0
