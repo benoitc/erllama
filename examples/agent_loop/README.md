@@ -56,3 +56,7 @@ corrected template under `models/templates/`, copied here as
 
 Streaming variant: replace `chat/3` with `chat_apply/3` + `stream/3` +
 `chat_parse/3` (see the tool-calls guide).
+
+From a script, end the VM with `init:stop()` rather than `halt()`:
+`halt/0` runs ggml's Metal teardown before the model resources are
+released and trips an assertion on exit (harmless, but noisy).
