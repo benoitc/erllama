@@ -14,11 +14,11 @@ with_writer(Max, Body) ->
     try
         Body(Dir)
     after
-        catch gen_server:stop(erllama_cache_writer),
-        catch gen_server:stop(test_disk),
-        catch gen_server:stop(erllama_cache_ram),
-        catch gen_server:stop(erllama_cache_meta_srv),
-        rm_rf(Dir)
+        erllama_test_helpers:stop_quiet(erllama_cache_writer),
+        erllama_test_helpers:stop_quiet(test_disk),
+        erllama_test_helpers:stop_quiet(erllama_cache_ram),
+        erllama_test_helpers:stop_quiet(erllama_cache_meta_srv),
+        erllama_test_helpers:rm_rf(Dir)
     end.
 
 prompt_bytes(Tokens) ->
@@ -212,10 +212,3 @@ make_tmp_dir() ->
     ),
     ok = file:make_dir(Dir),
     Dir.
-
-rm_rf(Dir) ->
-    case file:list_dir(Dir) of
-        {ok, Entries} -> [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ -> ok
-    end,
-    file:del_dir(Dir).

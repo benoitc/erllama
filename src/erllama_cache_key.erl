@@ -19,6 +19,7 @@
 %% on upstream renumbering.
 %% @end
 -module(erllama_cache_key).
+-moduledoc false.
 
 -export([
     make/1,

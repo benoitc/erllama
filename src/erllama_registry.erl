@@ -2,25 +2,24 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_registry).
--moduledoc """
-ETS-backed `via` callback for naming `erllama_model` gen_statems by
-binary `model_id()`.
-
-Atoms are unbounded global table entries; user-supplied model
-identifiers (e.g. coming from an HTTP request body in a front-end
-server) cannot safely be `binary_to_atom/1`'d. This registry lets a
-gen_statem be registered as
-
-```
-gen_statem:start_link({via, erllama_registry, ModelId}, ...)
-```
-
-with `ModelId :: binary()`, and looked up via `whereis_name/1`.
-
-The registry is a tiny gen_server that owns a public ETS table.
-Lookups happen straight from ETS in the caller process, so the
-gen_server is never on the hot path.
-""".
+-moduledoc false.
+%% ETS-backed `via` callback for naming `erllama_model` gen_statems by
+%% binary `model_id()`.
+%%
+%% Atoms are unbounded global table entries; user-supplied model
+%% identifiers (e.g. coming from an HTTP request body in a front-end
+%% server) cannot safely be `binary_to_atom/1`'d. This registry lets a
+%% gen_statem be registered as
+%%
+%% ```
+%% gen_statem:start_link({via, erllama_registry, ModelId}, ...)
+%% ```
+%%
+%% with `ModelId :: binary()`, and looked up via `whereis_name/1`.
+%%
+%% The registry is a tiny gen_server that owns a public ETS table.
+%% Lookups happen straight from ETS in the caller process, so the
+%% gen_server is never on the hot path.
 -behaviour(gen_server).
 
 -export([
@@ -36,7 +35,7 @@ gen_server is never on the hot path.
 
 -define(TABLE, ?MODULE).
 
--type model_id() :: binary().
+-type model_id() :: erllama:model_id().
 -export_type([model_id/0]).
 
 %% =============================================================================

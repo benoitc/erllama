@@ -8,10 +8,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Removed (BREAKING)
 
-- `erllama:unload_model/1` (use `unload/1`), `erllama:models/0` (use
-  `list_models/0`), `erllama:list_cached_prefixes/2` (renamed
+- `unload_model/1` (use `unload/1`), `models/0` (use
+  `list_models/0`), `list_cached_prefixes/2` (renamed
   `cached_prefix_len/2`).
-- `erllama:infer/4`: use `stream/3` (text or tokens; the receiving
+- `infer/4`: use `stream/3` (text or tokens; the receiving
   process is the `to` option, default the caller). `continue/3` takes
   `to` instead of `caller_pid`; a missing `session_id` is
   `{error, {missing_option, session_id}}`.
@@ -21,12 +21,12 @@ this project adheres to [Semantic Versioning](https://semver.org).
   Event}` with `Event :: {token, Bin} | {token_id, Id} | {thinking,
   Bin} | {thinking_end, Sig} | {done, Stats} | {error, Reason}`
   (`erllama:stream_event()`).
-- `erllama:apply_chat_template/2` renamed `render_chat_template/2`.
-- `erllama:chat_apply/2` is `chat_apply/3` (model, messages, opts) and
+- `apply_chat_template/2` renamed `render_chat_template/2`.
+- `chat_apply/2` is `chat_apply/3` (model, messages, opts) and
   returns `{ok, #{prompt, params}}`; messages and tools are Erlang
   maps, JSON encoding happens at the NIF boundary.
-- `erllama:verify/4` returns `{ok, #{accepted, next}}`.
-- `erllama_chat:set_observer/1` and `clear_observer/0`: use a
+- `verify/4` returns `{ok, #{accepted, next}}`.
+- `set_observer/1` and `clear_observer/0`: use a
   middleware (`erllama_middleware`, `guides/middleware.md`).
 - Application environment: `chat_params_cache_size` renamed
   `chat_cache_size`; `quota_mb` dropped from the `tiers` entries.
@@ -82,6 +82,16 @@ this project adheres to [Semantic Versioning](https://semver.org).
   declared dependency (the `system` pressure source needs memsup).
 - `erllama_scheduler:validate_config/1` checks that `model_evictor`
   names a loadable module exporting `evict_one/0`.
+- Documentation: public modules are `erllama`, `erllama_cache`,
+  `erllama_middleware`, `erllama_scheduler` and the
+  `erllama_model_backend`, `erllama_model_evictor`, `erllama_pressure`
+  behaviours plus the `erllama_model_stub` test backend; every other
+  module is hidden from hexdocs. Guides rewritten around the public
+  API (the tool-calls guide now documents `chat/3`; the
+  `tool_call_markers` option it described never existed). Public
+  types are defined in `erllama`.
+- Tests: shared `erllama_test_helpers`; no `catch Expr` left, so the
+  suite compiles on OTP 29 without `nowarn_deprecated_catch`.
 - `erllama` exports the types its specs use (`token_id/0`,
   `cache_key/0`, `completion_result/0`, `stats/0`, `request_opts/0`,
   `load_config/0`, `error_reason/0`, ...) and documents every error
@@ -142,7 +152,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
-- Public `erllama:chat_apply/2` + `chat_parse/3` that delegate
+- Public `chat_apply/2` + `chat_parse/3` that delegate
   to `erllama_chat` via the model gen_statem so callers can
   build a `chat_params_ref' and parse model output without touching
   the underlying NIF model resource. Backend gains an optional
@@ -173,7 +183,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
   to `common_chat_parse`. The parsed `common_chat_msg` is marshalled
   to `#{role, content, reasoning_content, tool_calls}`; tool-call
   arguments come back as raw JSON binaries and are decoded to maps
-  at the Erlang facade boundary (`erllama_chat:parse/3`).
+  at the Erlang facade boundary (`erllama_chat:parse` (arity 3)).
   New `erllama_chat_SUITE` real-model CT (gated on
   `LLAMA_TEST_MODEL`) covers init / apply / parse round-trip and a
   partial-then-full streaming case.
@@ -204,7 +214,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
   `erllama_tool_call_end` message before the request
   finishes. Previously the buffer was silently dropped in that
   branch (the only emission site was the byte-string end-marker
-  match in `erllama_model_llama:map_marker/2`). The
+  match in `erllama_model_llama:map_marker` (arity 2)). The
   byte-string-end families (Mistral `</s>`, Qwen `</tool_call>`,
   DeepSeek `<｜tool▁call▁end｜>`, Llama 3.1 `<|eom_id|>`) are
   byte-exact unchanged; the new path is opt-in via the sentinel
@@ -233,7 +243,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
   body, end_tok]` shape and the qwen-style `[start, body, end_tok, start, body,
   end_tok]` regression guard run from the same harness).
 - The tool-call end marker now carries the source token's eog flag.
-  `erllama_model_llama:map_marker/2` was discarding `EogFlag` on the end
+  `erllama_model_llama:map_marker` (arity 2) was discarding `EogFlag` on the end
   marker, so a model whose end marker IS the eos token (Mistral tekken uses `</s>` as
   both the per-span end marker and the assistant turn's eos) kept decoding past the
   close and spammed repeated tool calls under the greedy continuation. Backend step
@@ -264,7 +274,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
   `model_info/1` gains `pinned_idle_seqs` (reclaimable headroom; `available_seqs` stays
   ~0 since an admitted request immediately re-pins).
 - Native tool-call capture now keeps the body between the markers. The marker scanner
-  (`erllama_model_llama:map_marker/2`) is stateless - it tags only the start/end
+  (`erllama_model_llama:map_marker` (arity 2)) is stateless - it tags only the start/end
   marker tokens - so for a model whose tool-call body is ordinary tokens (e.g.
   Qwen3-Coder's `<tool_call><function=NAME><parameter=P>v</parameter></function></tool_call>`)
   the body was streamed as content and the captured `tool_call_bytes` held only the
@@ -334,7 +344,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
   exact (SHA-256 over the bytes; no fuzzy match). The KVC file format
   version is bumped to **v2**; old v1 (token-keyed) files are rejected
   on the startup disk scan, so the cache refills under the new scheme.
-  `erllama:list_cached_prefixes/2` now reports the matched
+  `list_cached_prefixes/2` now reports the matched
   **byte** length.
 
 ### Added
@@ -345,7 +355,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
   dominated infer admission for large tool grammars. The cache is a small
   byte-verified LRU on the context resource (a hash is only a pre-filter; identity
   is confirmed by length + `memcmp`), freed with the context. New
-  `erllama_nif:grammar_cache_stats/1` (`#{hits, misses}`) exposes whether
+  `erllama_nif:grammar_cache_stats` (arity 1) (`#{hits, misses}`) exposes whether
   the cache is taking effect.
 
 ## [0.8.0] - 2026-05-23
@@ -361,7 +371,7 @@ agentic tool-continue loops).
   wall-clock budget (`context_opts.decode_budget_ms`, default 30000,
   0 disables); exceeding it aborts the decode and returns
   `{error, decode_timeout}` instead of blocking forever.
-  `erllama_nif:request_abort/1` sets an atomic flag the callback
+  `erllama_nif:request_abort` (arity 1) sets an atomic flag the callback
   honours without taking the context mutex, so a running decode can
   be interrupted from outside the (blocked) gen_statem and returns
   `{error, decode_aborted}`; `cancel/1` fires it best-effort. On
@@ -438,7 +448,7 @@ agentic tool-continue loops).
 
 ### Fixed
 
-- BEAM segfault in `erllama:apply_chat_template/2` on rendered
+- BEAM segfault in `apply_chat_template/2` on rendered
   chat-template output above the initial 4 KiB render buffer. The
   vendored `llama_chat_apply_template` returns the full formatted
   size as a positive value even when the caller's buffer was too
@@ -684,7 +694,7 @@ the llama.cpp multi-GPU / flash-attention / KV-quant params.
 
 #### Multi-sequence batched scheduler (#24, #25, #26, #27)
 
-- `erllama_nif:step/2` is the new multi-sequence batched decode
+- `erllama_nif:step` (arity 2) is the new multi-sequence batched decode
   primitive. One `llama_decode` call mixes prefill and decode rows
   freely (SARATHI-style co-batching), bounded by the live context's
   `n_batch`. Returns `{error, batch_overflow}` cleanly so a
@@ -751,13 +761,13 @@ the llama.cpp multi-GPU / flash-attention / KV-quant params.
 
 #### llama.cpp option passthrough (#23)
 
-- `erllama_nif:load_model/2` now reads three additional keys from
+- `erllama_nif:load_model` (arity 2) now reads three additional keys from
   `model_opts`:
   - `split_mode :: none | layer | row`: multi-GPU split policy.
   - `main_gpu :: non_neg_integer()`: GPU index when `split_mode = none`.
   - `tensor_split :: [float()]`: per-device proportions (up to 16
     entries; shorter lists zero-fill).
-- `erllama_nif:new_context/2` reads three more from `context_opts`:
+- `erllama_nif:new_context` (arity 2) reads three more from `context_opts`:
   - `flash_attn :: boolean() | auto`: enable, disable, or defer to
     llama.cpp.
   - `type_k`, `type_v :: f16 | f32 | bf16 | q4_0 | q5_0 | q5_1 | q8_0`:
@@ -801,11 +811,11 @@ are backwards-compatible; existing API call sites unchanged.
   atomics counter parked in persistent_term, readable cross-node
   via `erpc`. Used by the upcoming `erllama_cluster` load
   balancer (least_loaded, power_of_two strategies).
-- `erllama:list_cached_prefixes/2` returns the longest cached
+- `list_cached_prefixes/2` returns the longest cached
   prefix length of a token list for a given model on this node,
   across all cache tiers. Used by the cluster cache-affinity
   router.
-- `erllama_nif:vram_info/0` walks every loaded ggml backend and
+- `erllama_nif:vram_info` (arity 0) walks every loaded ggml backend and
   sums free + total memory across non-CPU devices; returns
   `{error, no_gpu}` on a CPU-only build. Used by the cluster
   scheduler for bin-packing model placement.
@@ -819,7 +829,7 @@ are backwards-compatible; existing API call sites unchanged.
   next-token ids for a prefix. Times out at 30 s with a clean
   cancel + drain so the caller's mailbox stays clean. Empty
   prefix is rejected as `{error, empty_prefix}`.
-- `erllama:verify/4` runs `PrefixTokens ++ Candidates` through
+- `verify/4` runs `PrefixTokens ++ Candidates` through
   the model in one forward pass and returns the longest accepted
   prefix length plus the verifier's own next token. Acceptance
   walks `Argmax[P + i - 1] == c_i` and stops at the first
@@ -963,17 +973,17 @@ Initial public release.
 - `erllama:list_models/0` returning `[model_info()]` and
   `erllama:model_info/1` keyed on a model id.
 - Public `erllama:tokenize/2` and `erllama:detokenize/2` keyed on a
-  model id. The low-level `erllama_nif:tokenize/3` and
-  `erllama_nif:detokenize/2` remain available.
-- `erllama:unload_model/1` as an alias for `erllama:unload/1`
+  model id. The low-level `erllama_nif:tokenize` (arity 3) and
+  `erllama_nif:detokenize` (arity 2) remain available.
+- `unload_model/1` as an alias for `erllama:unload/1`
   matching the OpenAI/Ollama-style naming downstream HTTP servers
   use.
-- `erllama:infer/4` streaming inference. Returns `{ok, Ref}`;
+- `infer/4` streaming inference. Returns `{ok, Ref}`;
   tokens are delivered to the caller as `{erllama_token, Ref, _}`,
   `{erllama_done, Ref, Stats}`, `{erllama_error, Ref, Reason}`.
 - `erllama:cancel/1`. Idempotent and fire-and-forget; observed
   between tokens.
-- `erllama:apply_chat_template/2`. Renders a normalised chat
+- `apply_chat_template/2`. Renders a normalised chat
   request (`messages`, `system`, `tools`) through the model's
   GGUF chat template and tokenises. Backed by
   `llama_chat_apply_template`.
@@ -985,7 +995,7 @@ Initial public release.
 - Sampler parameters: `complete/3` and `infer/4` honour
   `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
   `seed`, and `grammar` via one combined chain builder
-  (`erllama_nif:configure_sampler/2`). Chain order:
+  (`erllama_nif:configure_sampler` (arity 2)). Chain order:
   `grammar -> repetition_penalty -> top_k -> top_p -> min_p ->
   (temperature > 0 ? temp -> dist(seed) : greedy)`. `set_grammar/2`
   retained as a backwards-compatible alias.
@@ -1134,11 +1144,11 @@ Initial public release.
 - User guides: loading, caching, configuration, building, examples.
 - Internal design notes: cache design, publish protocol, NIF safety.
 - ex_doc-friendly module documentation throughout.
-- `ROADMAP.md`: what 0.1 doesn't do yet (multi-seq concurrent
+- ROADMAP.md: what 0.1 does not do yet (multi-seq concurrent
   decoding, speculative decoding, vision, audio, ONNX/safetensors,
   stop-sequences, telemetry hooks, multi-GPU pressure, KV
   compression, cluster).
-- README closes with a teaser for the upcoming `erllama_cluster`
+- README closes with a teaser for the upcoming erllama_cluster
   application: a separate OTP project that coordinates a fleet of
   erllama nodes (request distribution, cross-node speculative
   decoding, pipeline parallelism over QUIC).

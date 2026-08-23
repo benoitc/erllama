@@ -2,24 +2,23 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_model_llama).
--moduledoc """
-Real-llama.cpp backend for `erllama_model`.
-
-Owns a `model_ref` and a `context_ref` from `erllama_nif`. The
-gen_statem hands its decode/kv operations through this module;
-this module forwards to the NIF.
-
-Config (passed through `erllama_model:start_link/2`):
-  model_path :: file:name() | binary()  (required)
-  model_opts :: map()  (forwarded to erllama_nif:load_model/2)
-  context_opts :: map()  (forwarded to erllama_nif:new_context/2)
-
-`model_opts` and `context_opts` flow through to the NIF unchanged.
-See `erllama_nif:load_model/2` and `erllama_nif:new_context/2` for
-the full set of recognised keys, including the llama.cpp option
-passthroughs `split_mode`, `main_gpu`, `tensor_split`,
-`flash_attn`, `type_k`, and `type_v`.
-""".
+-moduledoc false.
+%% Real-llama.cpp backend for `erllama_model`.
+%%
+%% Owns a `model_ref` and a `context_ref` from `erllama_nif`. The
+%% gen_statem hands its decode/kv operations through this module;
+%% this module forwards to the NIF.
+%%
+%% Config (passed through `erllama_model:start_link/2`):
+%%   model_path :: file:name() | binary()  (required)
+%%   model_opts :: map()  (forwarded to erllama_nif:load_model/2)
+%%   context_opts :: map()  (forwarded to erllama_nif:new_context/2)
+%%
+%% `model_opts` and `context_opts` flow through to the NIF unchanged.
+%% See `erllama_nif:load_model/2` and `erllama_nif:new_context/2` for
+%% the full set of recognised keys, including the llama.cpp option
+%% passthroughs `split_mode`, `main_gpu`, `tensor_split`,
+%% `flash_attn`, `type_k`, and `type_v`.
 -behaviour(erllama_model_backend).
 
 -export([

@@ -72,8 +72,8 @@ init_per_testcase(TC, Config) ->
     [{disk_srv, DiskSrv}, {model, Model}, {dir, Dir} | Config].
 
 end_per_testcase(_TC, Config) ->
-    catch erllama_model:stop(?config(model, Config)),
-    catch gen_server:stop(?config(disk_srv, Config)),
+    erllama_test_helpers:stop_model_quiet(?config(model, Config)),
+    erllama_test_helpers:stop_quiet(?config(disk_srv, Config)),
     ok.
 
 model_config(DiskSrv) ->
@@ -265,7 +265,7 @@ concurrent_complete_under_writer_cap(Config) ->
                 ),
                 Parent ! {done, I}
             after
-                catch erllama_model:stop(ModelN)
+                erllama_test_helpers:stop_model_quiet(ModelN)
             end
         end)
      || I <- lists:seq(1, N)

@@ -47,7 +47,7 @@ Each resource carries a `pthread_mutex` that every NIF function
 acquires before touching the underlying llama struct. This serves
 two ends:
 
-1. **Race-free explicit free.** `erllama_nif:free_context/1`
+1. **Race-free explicit free.** `erllama_nif:free_context` (arity 1)
    acquires the mutex, sets a freed flag, and calls
    `llama_free_context` from a deferred destructor. Subsequent NIF
    calls see the freed flag and return `{error, freed}` cleanly,
@@ -125,7 +125,7 @@ shows up at sizes where the trade-off ceases to be acceptable.
 
 ## `fsync_dir` and link durability
 
-`erllama_nif:fsync_dir/1` opens a directory fd and `fsync(2)`s it.
+`erllama_nif:fsync_dir` (arity 1) opens a directory fd and `fsync(2)`s it.
 The publish protocol calls this after `link(2)` to ensure the
 directory entry is on stable storage; without it, a crash between
 `link` and the next inode flush could lose the linked file.

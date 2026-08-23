@@ -2,32 +2,31 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_cache_meta_srv).
--moduledoc """
-Sole writer for the cache meta and LRU ETS tables; arbitrates
-claim/release and the reservation state machine for save
-publication.
-
-Two read-mostly ETS tables, owned by this process and `protected`
-so any caller can read them without a server hop:
-
-  erllama_cache_meta : set, key = cache_key, row layout per
-                       include/erllama_cache.hrl ?POS_* constants
-  erllama_cache_lru  : ordered_set, key = {LastUsedNs, cache_key},
-                       value = []
-
-Two server-internal maps in process state:
-
-  holders      : MonRef -> {Pid, Key}; one entry per active claim
-  reservations : Key -> #reservation{}; one entry per in-flight save
-
-Plus a waiters map for `lookup_exact_or_wait/2` which defers replies
-until the in-flight save publishes (or the per-call deadline fires).
-
-The reservation state machine has two stages, `pre_link` and
-`post_link`, to make crash cleanup correct: a writer that died
-before `link/2` leaves no file; a writer that died after `link/2`
-may have left a valid `.kvc` we can validate-and-adopt.
-""".
+-moduledoc false.
+%% Sole writer for the cache meta and LRU ETS tables; arbitrates
+%% claim/release and the reservation state machine for save
+%% publication.
+%%
+%% Two read-mostly ETS tables, owned by this process and `protected`
+%% so any caller can read them without a server hop:
+%%
+%%   erllama_cache_meta : set, key = cache_key, row layout per
+%%                        include/erllama_cache.hrl ?POS_* constants
+%%   erllama_cache_lru  : ordered_set, key = {LastUsedNs, cache_key},
+%%                        value = []
+%%
+%% Two server-internal maps in process state:
+%%
+%%   holders      : MonRef -> {Pid, Key}; one entry per active claim
+%%   reservations : Key -> #reservation{}; one entry per in-flight save
+%%
+%% Plus a waiters map for `lookup_exact_or_wait/2` which defers replies
+%% until the in-flight save publishes (or the per-call deadline fires).
+%%
+%% The reservation state machine has two stages, `pre_link` and
+%% `post_link`, to make crash cleanup correct: a writer that died
+%% before `link/2` leaves no file; a writer that died after `link/2`
+%% may have left a valid `.kvc` we can validate-and-adopt.
 -behaviour(gen_server).
 
 -include("erllama_cache.hrl").

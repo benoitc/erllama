@@ -20,8 +20,8 @@ with_app(Body) ->
     try
         Body()
     after
-        catch gen_server:stop(lora_disk),
-        rm_rf(Dir),
+        erllama_test_helpers:stop_quiet(lora_disk),
+        erllama_test_helpers:rm_rf(Dir),
         [application:stop(A) || A <- lists:reverse(Started)],
         ok
     end.
@@ -31,24 +31,6 @@ make_tmp_dir() ->
     Dir = filename:join(Base, integer_to_list(erlang:unique_integer([positive]))),
     ok = filelib:ensure_path(Dir),
     Dir.
-
-rm_rf(Dir) ->
-    case file:list_dir(Dir) of
-        {ok, Files} ->
-            [
-                begin
-                    Full = filename:join(Dir, F),
-                    case filelib:is_dir(Full) of
-                        true -> rm_rf(Full);
-                        false -> file:delete(Full)
-                    end
-                end
-             || F <- Files
-            ],
-            file:del_dir(Dir);
-        _ ->
-            ok
-    end.
 
 write_fixture(Bytes) ->
     Dir = filename:basedir(user_cache, "erllama-lora-fixtures"),

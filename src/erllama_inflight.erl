@@ -2,20 +2,19 @@
 %% See the LICENSE file at the project root.
 %%
 -module(erllama_inflight).
--moduledoc """
-Tracks in-flight streaming inference requests.
-
-Each `erllama:infer/4` admit produces a unique `reference()` and an
-entry in a public ETS table mapping that reference back to the
-serving `erllama_model` gen_statem. `erllama:cancel/1` looks up the
-ref here to find which model owns the request, then casts a
-`{cancel, Ref}` event at it.
-
-The table is a fixed-name public ETS so lookups are lock-free from
-any process. The owning gen_server (this module) is here only to
-keep the table alive across releases and to clean up entries when a
-model dies unexpectedly.
-""".
+-moduledoc false.
+%% Tracks in-flight streaming inference requests.
+%%
+%% Each `erllama:infer/4` admit produces a unique `reference()` and an
+%% entry in a public ETS table mapping that reference back to the
+%% serving `erllama_model` gen_statem. `erllama:cancel/1` looks up the
+%% ref here to find which model owns the request, then casts a
+%% `{cancel, Ref}` event at it.
+%%
+%% The table is a fixed-name public ETS so lookups are lock-free from
+%% any process. The owning gen_server (this module) is here only to
+%% keep the table alive across releases and to clean up entries when a
+%% model dies unexpectedly.
 -behaviour(gen_server).
 
 -export([

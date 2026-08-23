@@ -38,7 +38,6 @@ exact tokens, exact cache keys, and OTP supervision around the whole path.
 2> Path = "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf".
 3> {ok, Bin} = file:read_file(Path).
 4> {ok, Model} = erllama:load_model(#{
-       backend => erllama_model_llama,
        model_path => Path,
        fingerprint => crypto:hash(sha256, Bin)
    }).
@@ -64,7 +63,7 @@ exact tokens, exact cache keys, and OTP supervision around the whole path.
 ```
 
 `load_model/1` returns a binary model id. Pass it to `complete/2,3`,
-`stream/3`, `tokenize/2`, `unload/1`, and the rest of the public API.
+`stream/3`, `chat/3`, `tokenize/2`, `unload/1`, and the rest of the API.
 
 ## Install
 
@@ -74,7 +73,7 @@ Add it to `rebar.config`:
 
 ```erlang
 {deps, [
-    {erllama, "~> 0.5"}
+    {erllama, "~> 0.10"}
 ]}.
 ```
 
@@ -86,6 +85,67 @@ Then start the application before loading models:
 
 The first compile builds the vendored `llama.cpp`. See
 [Building](guides/building.md) for platform notes and CUDA/Metal options.
+
+## API overview
+
+Every call takes the model id (or pid) and returns `{ok, Result}` or
+`{error, Reason}`; an unknown model is `{error, not_loaded}`, a bad
+option is `{error, {unknown_option, Key}}`. `erllama:error_reason()`
+lists every reason.
+
+| Group | Functions |
+|---|---|
+| Lifecycle | `load_model/1,2`, `unload/1`, `whereis/1`, `list_models/0`, `model_info/1` |
+| Completion | `complete/2,3`, `prefill_only/2,3` |
+| Streaming | `stream/3`, `collect/2`, `continue/3`, `cancel/1`, `end_session/2`, `reset_session/2` |
+| Chat | `chat/3`, `chat_apply/3`, `chat_parse/3`, `render_chat_template/2` |
+| Tokens | `tokenize/2,3`, `detokenize/2` |
+| Embeddings | `embed/2`, `embed_batch/2` |
+| Adapters | `load_adapter/2`, `unload_adapter/2`, `set_adapter_scale/3`, `list_adapters/1` |
+| Observability | `status/1`, `phase/1`, `pending_len/1`, `queue_depth/0,1`, `last_cache_hit/1`, `cached_prefix_len/2`, `counters/0`, `vram_info/0`, `pressure/0`, `requests/0` |
+| Speculative | `draft_tokens/3`, `verify/4` |
+| Memory control | `evict/1`, `shutdown/1` |
+
+The cache has its own module, `erllama_cache` (`add_tier/1`, `info/0`,
+`gc/0`, `evict_bytes/1,2`, `get_counters/0`), and every call can be
+wrapped by a hackney-style middleware chain (`erllama_middleware`).
+
+### Stream tokens
+
+```erlang
+{ok, Ref} = erllama:stream(Model, <<"Once upon a time">>, #{response_tokens => 200}),
+loop(Ref).
+
+loop(Ref) ->
+    receive
+        {erllama, Ref, {token, Bin}} -> io:put_chars(Bin), loop(Ref);
+        {erllama, Ref, {done, Stats}} -> {ok, Stats};
+        {erllama, Ref, {error, Reason}} -> {error, Reason}
+    end.
+```
+
+Or let erllama write the loop: `{ok, #{reply := Reply}} = erllama:collect(Ref, 30000)`.
+
+### Chat with tools
+
+```erlang
+Tools = [#{name => <<"weather">>,
+           description => <<"Current weather for a city">>,
+           parameters => #{type => object,
+                           properties => #{city => #{type => string}},
+                           required => [city]}}],
+{ok, #{message := #{content := Text, tool_calls := Calls}}} =
+    erllama:chat(Model,
+                 [#{role => user, content => <<"Weather in Paris?">>}],
+                 #{tools => Tools}).
+%% Calls = [#{name => <<"weather">>, arguments => #{<<"city">> => <<"Paris">>}, id => _}]
+```
+
+### Test without a model
+
+`erllama_model_stub` is a deterministic backend with no NIF and no
+GGUF; load it with `backend => erllama_model_stub` to run your own
+code against the whole API in unit tests.
 
 ## Common patterns
 
@@ -155,14 +215,16 @@ ok = erllama:unload(<<"tiny">>).
 | Configure `sys.config` and per-model options | [Configuration](guides/configuration.md) |
 | Build from source | [Building](guides/building.md) |
 | Copy working snippets | [Examples](guides/examples.md) |
-| Stream tool calls while preserving cache hits | [Tool calls](guides/tool-calls.md) |
+| Run chat turns and tool calls | [Tool calls](guides/tool-calls.md) |
+| Observe or wrap every call | [Middleware](guides/middleware.md) |
 | Understand cache design tradeoffs | [Cache design](internals/cache-design.md) |
 | Understand crash-safe save publication | [Publish protocol](internals/publish-protocol.md) |
 | Understand request admission and decode flow | [Request lifecycle](internals/request-lifecycle.md) |
 | Understand NIF lifetime safety | [NIF safety](internals/nif-safety.md) |
 
-API reference for `erllama`, `erllama_cache`, `erllama_scheduler`, and
-`erllama_nif` is published on
+The API reference (`erllama`, `erllama_cache`, `erllama_middleware`,
+`erllama_scheduler`, and the `erllama_model_backend` / `erllama_pressure`
+behaviours for extensions) is published on
 [HexDocs](https://hexdocs.pm/erllama). You can also build it locally:
 
 ```bash
@@ -175,18 +237,18 @@ rebar3 ex_doc
 erllama_sup
 ├── erllama_cache_sup
 │   ├── erllama_cache_meta_srv
-│   ├── erllama_cache_ram
-│   └── erllama_cache_writer
+│   ├── erllama_cache_ram            the always-on RAM tier
+│   ├── erllama_cache_writer
+│   └── erllama_cache_tier_sup       disk / ram_file tiers (add_tier/1, `tiers` env)
 ├── erllama_registry
 ├── erllama_inflight
+├── erllama_chat_cache
 ├── erllama_model_sup
-│   └── erllama_model      one supervised gen_statem per loaded model
-└── erllama_scheduler      memory-pressure poller, off by default
+│   └── erllama_model                one supervised gen_statem per loaded model
+└── erllama_scheduler                memory-pressure poller, off by default
 ```
 
-Disk and `ram_file` tier servers are started by the operator, one per
-root directory, then referenced by loaded models through `tier_srv` and
-`tier`.
+Models point at a tier with `tier` + `tier_srv` in their load config.
 
 The important invariant is simple: cache hits are byte-exact. A key is
 SHA-256 over the model fingerprint, quantization, context shape, and the

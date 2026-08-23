@@ -17,7 +17,7 @@ evict_one() ->
     persistent_term:get(?EVICT_RET_KEY, none).
 
 evict_ret_set(V) -> persistent_term:put(?EVICT_RET_KEY, V).
-evict_ret_clear() -> catch persistent_term:erase(?EVICT_RET_KEY).
+evict_ret_clear() -> _ = persistent_term:erase(?EVICT_RET_KEY).
 
 %% =============================================================================
 %% Fixtures
@@ -32,7 +32,7 @@ stub_set(Used, Total) ->
     persistent_term:put(?STUB_KEY, {Used, Total}).
 
 stub_clear() ->
-    catch persistent_term:erase(?STUB_KEY).
+    _ = persistent_term:erase(?STUB_KEY).
 
 with_subsystem(Body) ->
     ok = erllama_cache_counters:init(),
@@ -42,8 +42,8 @@ with_subsystem(Body) ->
     try
         Body()
     after
-        catch gen_server:stop(erllama_cache_ram),
-        catch gen_server:stop(erllama_cache_meta_srv),
+        erllama_test_helpers:stop_quiet(erllama_cache_ram),
+        erllama_test_helpers:stop_quiet(erllama_cache_meta_srv),
         stub_clear()
     end.
 
@@ -53,7 +53,7 @@ with_scheduler(Config, Body) ->
         try
             Body()
         after
-            catch gen_server:stop(erllama_scheduler)
+            erllama_test_helpers:stop_quiet(erllama_scheduler)
         end
     end).
 

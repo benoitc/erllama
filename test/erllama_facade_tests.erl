@@ -11,15 +11,6 @@
 %% Fixtures
 %% =============================================================================
 
-with_app(Body) ->
-    {ok, Started} = application:ensure_all_started(erllama),
-    try
-        Body()
-    after
-        [application:stop(A) || A <- lists:reverse(Started)],
-        ok
-    end.
-
 minimal_config() ->
     #{
         backend => erllama_model_stub,
@@ -45,12 +36,12 @@ minimal_config() ->
 %% =============================================================================
 
 empty_list_models_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         ?assertEqual([], erllama:list_models())
     end).
 
 load_unload_model_roundtrip_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         {ok, Id} = erllama:load_model(<<"facade_a">>, minimal_config()),
         ?assertEqual(<<"facade_a">>, Id),
         ?assertMatch([_], erllama:list_models()),
@@ -59,7 +50,7 @@ load_unload_model_roundtrip_test() ->
     end).
 
 load_model_auto_id_returns_binary_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         {ok, Id} = erllama:load_model(minimal_config()),
         try
             ?assert(is_binary(Id)),
@@ -70,7 +61,7 @@ load_model_auto_id_returns_binary_test() ->
     end).
 
 list_models_includes_metadata_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         {ok, Id} = erllama:load_model(<<"facade_b">>, minimal_config()),
         try
             [Info] = erllama:list_models(),
@@ -84,7 +75,7 @@ list_models_includes_metadata_test() ->
     end).
 
 load_same_id_returns_already_loaded_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         {ok, _} = erllama:load_model(<<"dup">>, minimal_config()),
         try
             ?assertEqual(
@@ -101,7 +92,7 @@ load_same_id_returns_already_loaded_test() ->
 %% =============================================================================
 
 model_info_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         {ok, Id} = erllama:load_model(<<"facade_info">>, minimal_config()),
         try
             {ok, Info} = erllama:model_info(Id),
@@ -113,7 +104,7 @@ model_info_test() ->
     end).
 
 tokenize_then_detokenize_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         {ok, Id} = erllama:load_model(<<"facade_tok">>, minimal_config()),
         try
             {ok, Tokens} = erllama:tokenize(Id, <<"hello world">>),
@@ -126,7 +117,7 @@ tokenize_then_detokenize_test() ->
     end).
 
 unload_unknown_returns_not_loaded_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         ?assertEqual({error, not_loaded}, erllama:unload(<<"absent">>))
     end).
 
@@ -135,7 +126,7 @@ unload_unknown_returns_not_loaded_test() ->
 %% =============================================================================
 
 not_loaded_shapes_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         Id = <<"facade_absent">>,
         ?assertEqual({error, not_loaded}, erllama:model_info(Id)),
         ?assertEqual({error, not_loaded}, erllama:status(Id)),
@@ -159,7 +150,7 @@ not_loaded_shapes_test() ->
     end).
 
 loaded_shapes_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         {ok, Id} = erllama:load_model(<<"facade_shapes">>, minimal_config()),
         try
             {ok, Pid} = erllama:whereis(Id),
@@ -180,7 +171,7 @@ loaded_shapes_test() ->
     end).
 
 model_id_from_config_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         Config = (minimal_config())#{model_id => <<"facade_named">>},
         {ok, <<"facade_named">>} = erllama:load_model(Config),
         ?assertEqual({error, already_loaded}, erllama:load_model(Config)),
@@ -188,7 +179,7 @@ model_id_from_config_test() ->
     end).
 
 load_validation_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         ?assertEqual({error, {missing_config, model_path}}, erllama:load_model(#{})),
         ?assertEqual(
             {error, {invalid_config, model_path, "/no/such.gguf"}},
@@ -202,7 +193,7 @@ load_validation_test() ->
     end).
 
 request_validation_test() ->
-    with_app(fun() ->
+    erllama_test_helpers:with_app(fun() ->
         {ok, Id} = erllama:load_model(<<"facade_reqv">>, minimal_config()),
         try
             ?assertEqual(

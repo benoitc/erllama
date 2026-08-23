@@ -15,8 +15,8 @@ with_srv(Body) ->
     try
         Body()
     after
-        catch gen_server:stop(erllama_cache_ram),
-        catch gen_server:stop(erllama_cache_meta_srv)
+        erllama_test_helpers:stop_quiet(erllama_cache_ram),
+        erllama_test_helpers:stop_quiet(erllama_cache_meta_srv)
     end.
 
 key(N) ->
@@ -490,7 +490,7 @@ down_post_link_with_valid_file_adopts_test() ->
                 2000
             )
         after
-            rm_rf(TmpDir)
+            erllama_test_helpers:rm_rf(TmpDir)
         end
     end).
 
@@ -514,7 +514,7 @@ down_post_link_with_invalid_file_deletes_and_clears_test() ->
             wait_for_row_gone(key(1), 2000),
             ?assertEqual({error, enoent}, file:read_file_info(Path))
         after
-            rm_rf(TmpDir)
+            erllama_test_helpers:rm_rf(TmpDir)
         end
     end).
 
@@ -698,12 +698,3 @@ make_tmp_dir() ->
     ),
     ok = file:make_dir(Dir),
     Dir.
-
-rm_rf(Dir) ->
-    case file:list_dir(Dir) of
-        {ok, Entries} ->
-            [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ ->
-            ok
-    end,
-    file:del_dir(Dir).

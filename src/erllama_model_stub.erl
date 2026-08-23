@@ -1,16 +1,31 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Deterministic stub backend for `erllama_model`.
-%%
-%% No NIF, no GGUF. tokenize uses `erlang:phash2/1` over whitespace-
-%% delimited words; decode_one produces a deterministic next-token
-%% from the context's hash; pack/unpack serialise the token list as
-%% bytes. Useful for tests of the cache integration that don't need
-%% real inference.
-%% @end
 -module(erllama_model_stub).
+-moduledoc """
+Deterministic test backend: no NIF, no GGUF, no hardware.
+
+Load it with `backend => erllama_model_stub` to exercise your own code
+against the full erllama API (completion, streaming, sessions, cache
+tiers) in unit tests:
+
+```erlang
+{ok, M} = erllama:load_model(#{backend => erllama_model_stub}),
+{ok, #{reply := Reply}} = erllama:complete(M, <<"hello world">>, #{response_tokens => 4}).
+```
+
+Tokenisation hashes whitespace-delimited words (`erlang:phash2/1`),
+generation derives the next token from the context hash, so the same
+prompt always yields the same tokens; `kv_pack`/`kv_unpack` serialise
+the token list, so cache saves and restores work end to end. Chat
+templates, embeddings-as-vectors and adapters behave as on a model
+without those features (`{error, not_supported}` /
+`{error, chat_not_supported}`).
+
+Load-config keys specific to this backend: `step_delay_ms` (hold each
+decode step that long, to make queueing observable) and
+`thinking_capable` (emit thinking events).
+""".
 -behaviour(erllama_model_backend).
 
 -export([

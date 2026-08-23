@@ -57,9 +57,9 @@ run(ModelPath, OutPath) ->
                 try
                     run_workloads(ModelId)
                 after
-                    catch erllama:unload(ModelId),
-                    catch gen_server:stop(DiskSrv),
-                    catch rm_rf(Dir)
+                    _ = erllama:unload(ModelId),
+                    erllama_test_helpers:stop_quiet(DiskSrv),
+                    erllama_test_helpers:rm_rf(Dir)
                 end,
             ElapsedMs = erlang:monotonic_time(millisecond) - T0,
             Doc = #{
@@ -128,8 +128,8 @@ warmup(Model, TargetTokens) ->
 %% Clear the meta server's index and reset cache counters so the next
 %% workload starts with a clean cache for its admission decision.
 reset_cache() ->
-    catch erllama_cache_meta_srv:gc(),
-    catch erllama_cache_counters:reset(),
+    _ = erllama_cache_meta_srv:gc(),
+    _ = erllama_cache_counters:reset(),
     ok.
 
 measure_complete(Model, Name, Prompt, RespTokens) ->
@@ -359,12 +359,6 @@ make_tmp_dir(Tag) ->
     ok = filelib:ensure_path(Dir),
     Dir.
 
-rm_rf(Dir) ->
-    case file:list_dir(Dir) of
-        {ok, Entries} -> [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ -> ok
-    end,
-    file:del_dir(Dir).
 
 tps(_Tokens, 0) -> 0.0;
 tps(Tokens, Ms) -> Tokens * 1000 / Ms.

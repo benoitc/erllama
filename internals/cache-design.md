@@ -35,7 +35,7 @@ matching was an early temptation and stays rejected:
    tenants. Out of scope for v1; tracked but not roadmapped.
 
 The **longest byte-prefix** lookup
-(`erllama_cache_meta_srv:lookup_longest_text_prefix/2`)
+(`erllama_cache_meta_srv:lookup_longest_text_prefix` (arity 2))
 solves "this prompt is yesterday's prompt plus a new turn": over the
 `available` rows it picks the longest stored `text_bytes <=
 byte_size(prompt_bytes)` whose recomputed key matches, restores that
