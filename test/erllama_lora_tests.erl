@@ -93,9 +93,9 @@ load_unload_round_trip_test() ->
             Path = write_fixture(<<"adapter-bytes-1">>),
             {ok, H} = erllama:load_adapter(Id, Path),
             ?assert(is_reference(H)),
-            ?assertMatch([_], erllama:list_adapters(Id)),
+            ?assertMatch({ok, [_]}, erllama:list_adapters(Id)),
             ok = erllama:unload_adapter(Id, H),
-            ?assertEqual([], erllama:list_adapters(Id))
+            ?assertEqual({ok, []}, erllama:list_adapters(Id))
         after
             erllama:unload(Id)
         end

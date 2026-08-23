@@ -53,7 +53,7 @@
     grammar_plus_sampler/1,
     verify_does_not_mutate_caller_visible_state/1,
     verify_accepted_count_le_k/1,
-    chunked_prefill_matches_unchunked/1,
+    chunked_prefill_sizes_agree/1,
     continue_multi_turn_cache_delta/1,
     tokenize_large_input/1,
     apply_chat_template_large_input/1,
@@ -97,7 +97,7 @@ all() ->
         grammar_plus_sampler,
         verify_does_not_mutate_caller_visible_state,
         verify_accepted_count_le_k,
-        chunked_prefill_matches_unchunked,
+        chunked_prefill_sizes_agree,
         continue_multi_turn_cache_delta,
         tokenize_large_input,
         apply_chat_template_large_input,
@@ -496,20 +496,30 @@ grammar_plus_sampler(Config) ->
 
 %% Under greedy sampling (temperature => 0) two runs of the same
 %% prompt must produce byte-identical output regardless of how the
-%% scheduler slices the prefill. Spin up two parallel models from
-%% the same GGUF, one with `prefill_chunk_size => infinity` and the
-%% other with `=> 16`, feed both the same prompt under the same
-%% params, and assert the replies match. Two distinct model IDs
-%% avoid racing the registry's async DOWN cleanup that a stop +
-%% start_link cycle would hit. Catches positional-embedding bugs
-%% in nif_step and last_logits_idx bookkeeping when the seq's last
-%% logits-emitting row moves between ticks.
-chunked_prefill_matches_unchunked(Config) ->
+%% scheduler slices the prefill. Spin up two models from the same
+%% GGUF with `prefill_chunk_size => 8` and `=> 16`, feed both the
+%% same prompt under the same params, and assert the replies match.
+%% Two distinct model IDs avoid racing the registry's async DOWN
+%% cleanup. Catches positional-embedding bugs in nif_step and
+%% last_logits_idx bookkeeping when the seq's last logits-emitting
+%% row moves between ticks.
+%%
+%% Both sizes stay in the same ggml kernel regime: batches of 64 and
+%% more tokens go through a different matmul (BLAS / Accelerate on
+%% macOS), so greedy equality between a small-chunk prefill and an
+%% unchunked one is not guaranteed by llama.cpp and is not what this
+%% case tests. Both models also run cache-less; see
+%% start_chunked_model/4.
+chunked_prefill_sizes_agree(Config) ->
     Path = ?config(model_path, Config),
     BaseDiskSrv = ?config(disk_srv, Config),
     Params = #{response_tokens => 12, temperature => 0.0, seed => 1},
-    {ModelA, SrvA} = start_chunked_model(Path, BaseDiskSrv, infinity, <<"_a">>),
-    {ModelB, SrvB} = start_chunked_model(Path, BaseDiskSrv, 16, <<"_b">>),
+    %% Private cache-key namespace for this case: rows saved by earlier
+    %% cases (prefilled in one batch) must not be restored by either
+    %% model, or the comparison no longer exercises chunked prefill.
+    Fp = crypto:strong_rand_bytes(32),
+    {ModelA, SrvA} = start_chunked_model(Path, BaseDiskSrv, 8, <<"_a">>, Fp),
+    {ModelB, SrvB} = start_chunked_model(Path, BaseDiskSrv, 16, <<"_b">>, Fp),
     try
         {ok, Tokens} = erllama:tokenize(ModelA, ?LONG_PROMPT),
         {TextA, _} = run_infer(ModelA, Tokens, Params),
@@ -523,7 +533,7 @@ chunked_prefill_matches_unchunked(Config) ->
     end,
     ok.
 
-start_chunked_model(Path, BaseDiskSrv, ChunkSize, Suffix) ->
+start_chunked_model(Path, BaseDiskSrv, ChunkSize, Suffix, Fp) ->
     Srv = list_to_atom(atom_to_list(BaseDiskSrv) ++ binary_to_list(Suffix)),
     Dir = filename:join(
         filename:dirname(code:priv_dir(erllama)),
@@ -534,8 +544,13 @@ start_chunked_model(Path, BaseDiskSrv, ChunkSize, Suffix) ->
     Model = iolist_to_binary([<<"chunked_model">>, Suffix]),
     Base = model_config(Path, Srv),
     Policy0 = maps:get(policy, Base),
-    Policy = Policy0#{prefill_chunk_size => ChunkSize},
-    {ok, _} = erllama_model:start_link(Model, Base#{policy => Policy}),
+    %% No saves either, so neither model can feed the other a row.
+    Policy = Policy0#{
+        prefill_chunk_size => ChunkSize,
+        min_tokens => 1_000_000,
+        cold_min_tokens => 1_000_000
+    },
+    {ok, _} = erllama_model:start_link(Model, Base#{policy => Policy, fingerprint => Fp}),
     {Model, Srv}.
 
 run_infer(Model, Tokens, Params) ->
