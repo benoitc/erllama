@@ -6,8 +6,8 @@
 %% post-idle RSS for each of: eager, lazy, pinned, lazy_pin_resident.
 %%
 %% Run from the repo root after `rebar3 compile':
-%%   BARREL_BENCH_GGUF=/path/to/model.gguf \
-%%     escript apps/barrel_inference/scripts/weight_residency_bench.escript
+%%   ERLLAMA_BENCH_GGUF=/path/to/model.gguf \
+%%     escript apps/erllama/scripts/weight_residency_bench.escript
 %%
 %% Note on OS page cache: modes run back-to-back in the same BEAM, so
 %% by mode 2 the GGUF bytes are warm in the kernel cache. The bench
@@ -16,17 +16,17 @@
 %% numbers. For a true cold-cache run, restart the host between modes.
 
 main(_) ->
-    Gguf = case os:getenv("BARREL_BENCH_GGUF") of
+    Gguf = case os:getenv("ERLLAMA_BENCH_GGUF") of
         false ->
             io:format(standard_error,
-                "error: set BARREL_BENCH_GGUF to the path of a local GGUF "
+                "error: set ERLLAMA_BENCH_GGUF to the path of a local GGUF "
                 "with a chat template (e.g. a Mistral / Qwen / Llama "
                 "instruct quant).~n", []),
             halt(2);
         Path -> Path
     end,
     setup_paths(),
-    {ok, _} = application:ensure_all_started(barrel_inference),
+    {ok, _} = application:ensure_all_started(erllama),
     Modes = [eager, lazy, pinned, lazy_pin_resident],
     Results = [bench_mode(M, Gguf) || M <- Modes],
     print_table(Results),
@@ -36,28 +36,28 @@ bench_mode(Mode, Gguf) ->
     io:format("=== ~p ===~n", [Mode]),
     Model = atom_to_binary(Mode, utf8),
     Cfg = #{
-        backend => barrel_inference_model_llama,
+        backend => erllama_model_llama,
         model_path => list_to_binary(Gguf),
         model_opts => model_opts_for(Mode),
         context_opts => #{n_ctx => 4096, n_batch => 512, n_seq_max => 1}
     },
     LoadT0 = mono_ms(),
-    {ok, _Pid} = barrel_inference:load_model(Model, Cfg),
+    {ok, _Pid} = erllama:load_model(Model, Cfg),
     LoadMs = mono_ms() - LoadT0,
     timer:sleep(200),
     RssLoaded = rss_kb(),
-    ResLoaded = barrel_inference:resident_bytes(Model),
+    ResLoaded = erllama:resident_bytes(Model),
     io:format("loaded: ~B ms, RSS=~.1f GB, resident=~.1f GB~n",
               [LoadMs, gb(RssLoaded * 1024), gb(ResLoaded)]),
 
     Prompt = render_prompt(Model),
-    {ok, Tokens} = barrel_inference:tokenize(
+    {ok, Tokens} = erllama:tokenize(
         Model, Prompt, #{add_special => false, parse_special => true}
     ),
     io:format("prompt: ~B tokens~n", [length(Tokens)]),
 
     InferT0 = mono_ms(),
-    {ok, Ref} = barrel_inference:infer(
+    {ok, Ref} = erllama:infer(
         Model, Tokens,
         #{response_tokens => 64, temperature => 0.7, top_p => 0.9, top_k => 40},
         self()
@@ -65,7 +65,7 @@ bench_mode(Mode, Gguf) ->
     {Stats, _Buf} = collect(Ref),
     InferMs = mono_ms() - InferT0,
     RssAfterInfer = rss_kb(),
-    ResAfterInfer = barrel_inference:resident_bytes(Model),
+    ResAfterInfer = erllama:resident_bytes(Model),
     io:format("inferred: ~B ms wall, RSS=~.1f GB, resident=~.1f GB~n",
               [InferMs, gb(RssAfterInfer * 1024), gb(ResAfterInfer)]),
 
@@ -84,11 +84,11 @@ bench_mode(Mode, Gguf) ->
     io:format("idle 30s...~n", []),
     timer:sleep(30_000),
     RssIdle = rss_kb(),
-    ResIdle = barrel_inference:resident_bytes(Model),
+    ResIdle = erllama:resident_bytes(Model),
     io:format("idle: RSS=~.1f GB, resident=~.1f GB~n",
               [gb(RssIdle * 1024), gb(ResIdle)]),
 
-    ok = barrel_inference:unload(Model),
+    ok = erllama:unload(Model),
     timer:sleep(500),
     #{
         mode => Mode,
@@ -107,11 +107,11 @@ bench_mode(Mode, Gguf) ->
     }.
 
 %% Build a fake OTP lib layout under /tmp/bench_lib so that
-%% application:load(barrel_inference) finds the .app file AND code:priv_dir/1
+%% application:load(erllama) finds the .app file AND code:priv_dir/1
 %% resolves to the directory holding our freshly built NIF .so.
 setup_paths() ->
     Root = "/tmp/bench_lib",
-    AppDir = filename:join(Root, "barrel_inference-0.1.0"),
+    AppDir = filename:join(Root, "erllama-0.1.0"),
     Ebin = filename:join(AppDir, "ebin"),
     Priv = filename:join(AppDir, "priv"),
     ok = filelib:ensure_path(Ebin),
@@ -120,28 +120,28 @@ setup_paths() ->
     [{ok, _} = file:copy(B, filename:join(Ebin, filename:basename(B)))
         || B <- filelib:wildcard("/tmp/bench_ebin/*.beam")],
     {ok, _} = file:copy(
-        "apps/barrel_inference/priv/barrel_inference_nif.so",
-        filename:join(Priv, "barrel_inference_nif.so")
+        "apps/erllama/priv/erllama_nif.so",
+        filename:join(Priv, "erllama_nif.so")
     ),
     %% Synthesize a minimal .app file. Modules are derived from the
     %% beams we just copied. No deps that would force boot ordering.
     Mods = [list_to_atom(filename:basename(F, ".beam"))
              || F <- filelib:wildcard(filename:join(Ebin, "*.beam"))],
-    AppSpec = {application, barrel_inference,
-        [{description, "barrel inference (bench fake)"},
+    AppSpec = {application, erllama,
+        [{description, "erllama (bench fake)"},
          {vsn, "0.1.0"},
          {modules, Mods},
          {registered,
-             [barrel_inference_sup, barrel_inference_cache_sup,
-              barrel_inference_cache_meta_srv]},
-         {mod, {barrel_inference_app, []}},
+             [erllama_sup, erllama_cache_sup,
+              erllama_cache_meta_srv]},
+         {mod, {erllama_app, []}},
          {applications, [kernel, stdlib, sasl, crypto]},
          {env, [
              {tiers, [#{backend => ram, quota_mb => 4096}]},
              {default_fingerprint_mode, safe}
          ]}]},
     ok = file:write_file(
-        filename:join(Ebin, "barrel_inference.app"),
+        filename:join(Ebin, "erllama.app"),
         io_lib:format("~p.~n", [AppSpec])
     ),
     true = code:add_pathz(Ebin),
@@ -170,20 +170,20 @@ render_prompt(Model) ->
         tool_choice => auto,
         parallel_tool_calls => false
     },
-    {ok, _Params, Prompt} = barrel_inference:chat_apply(Model, Inputs),
+    {ok, _Params, Prompt} = erllama:chat_apply(Model, Inputs),
     Prompt.
 
 collect(Ref) -> collect(Ref, []).
 collect(Ref, Acc) ->
     receive
-        {barrel_inference_token, Ref, Bin} when is_binary(Bin) ->
+        {erllama_token, Ref, Bin} when is_binary(Bin) ->
             collect(Ref, [Acc, Bin]);
-        {barrel_inference_token, Ref, _} -> collect(Ref, Acc);
-        {barrel_inference_thinking_end, Ref, _} -> collect(Ref, Acc);
-        {barrel_inference_token_id, Ref, _} -> collect(Ref, Acc);
-        {barrel_inference_done, Ref, Stats} ->
+        {erllama_token, Ref, _} -> collect(Ref, Acc);
+        {erllama_thinking_end, Ref, _} -> collect(Ref, Acc);
+        {erllama_token_id, Ref, _} -> collect(Ref, Acc);
+        {erllama_done, Ref, Stats} ->
             {Stats, iolist_to_binary(Acc)};
-        {barrel_inference_error, Ref, Reason} ->
+        {erllama_error, Ref, Reason} ->
             io:format("engine error: ~p~n", [Reason]),
             {#{}, iolist_to_binary(Acc)}
     after 300000 ->

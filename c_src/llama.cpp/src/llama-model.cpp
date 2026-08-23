@@ -2347,7 +2347,7 @@ void llama_model_free(llama_model * model) {
     delete model;
 }
 
-// barrel_inference local addition: expose the model's mmap regions so a
+// erllama local addition: expose the model's mmap regions so a
 // caller can run mincore(2)/mlock(2) against just the resident working
 // set after the first prefill (the `lazy_then_pin_resident' mode).
 size_t llama_model::n_mappings() const {

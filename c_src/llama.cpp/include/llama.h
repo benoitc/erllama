@@ -516,7 +516,7 @@ extern "C" {
 
     LLAMA_API void llama_model_free(struct llama_model * model);
 
-    // barrel_inference local addition. Expose the model's mmap regions so a
+    // erllama local addition. Expose the model's mmap regions so a
     // caller can run mincore(2)/mlock(2) directly against the resident
     // working set after the first prefill. Used by the runtime's
     // `weight_residency = lazy_then_pin_resident' mode.

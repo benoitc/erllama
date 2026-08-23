@@ -52,13 +52,13 @@ re-prefilling only the divergent tail.
 
 Concretely:
 
-- `barrel_inference_cache_policy`: add a function that yields the ladder of
+- `erllama_cache_policy`: add a function that yields the ladder of
   save boundaries for a prompt given `(ladder_interval, cold_min_tokens,
   cold_max_tokens, boundary_align_tokens)`, e.g. every `ladder_interval`
   tokens from `cold_min_tokens` up to the trimmed boundary. Keep
   `cold_save_split/2` for the final boundary; the ladder is the set of
   earlier ones.
-- `barrel_inference_model` cold prefill (`setup_cold/2`, the cursor-drain
+- `erllama_model` cold prefill (`setup_cold/2`, the cursor-drain
   in `apply_step_results`, `maybe_fire_cold_save/2`): fire a `cold` save
   each time the prefill cursor crosses a ladder boundary, reusing the
   existing async save plumbing (`fire_save_for_tokens(cold, ...)`).

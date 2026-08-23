@@ -35,7 +35,7 @@ matching was an early temptation and stays rejected:
    tenants. Out of scope for v1; tracked but not roadmapped.
 
 The **longest byte-prefix** lookup
-(`barrel_inference_cache_meta_srv:lookup_longest_text_prefix/2`)
+(`erllama_cache_meta_srv:lookup_longest_text_prefix/2`)
 solves "this prompt is yesterday's prompt plus a new turn": over the
 `available` rows it picks the longest stored `text_bytes <=
 byte_size(prompt_bytes)` whose recomputed key matches, restores that
@@ -86,7 +86,7 @@ enough to keep restore cost in the millisecond range.
 
 ## Sole-writer arbitration
 
-The meta server (`barrel_inference_cache_meta_srv`) is the only process that
+The meta server (`erllama_cache_meta_srv`) is the only process that
 mutates the meta ETS, the LRU, and the reservation table. Every
 write — claim, release, evict, save announce — goes through a
 gen_server call. Reads stay on ETS directly via `ets:lookup/2`.

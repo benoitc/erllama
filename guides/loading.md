@@ -1,6 +1,6 @@
 # Loading a model
 
-Barrel Inference serves one or more loaded models concurrently. Each loaded
+erllama serves one or more loaded models concurrently. Each loaded
 model is a supervised `gen_statem` that owns a single
 `llama_context*`, sits behind a registered name, and shares the
 process-wide KV cache with every other model.
@@ -11,30 +11,30 @@ matters in practice.
 ## The minimal call
 
 ```erlang
-1> {ok, _}  = application:ensure_all_started(barrel_inference).
+1> {ok, _}  = application:ensure_all_started(erllama).
 2> {ok, Bin} = file:read_file("/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf").
-3> {ok, M} = barrel_inference:load_model(#{
-       backend     => barrel_inference_model_llama,
+3> {ok, M} = erllama:load_model(#{
+       backend     => erllama_model_llama,
        model_path  => "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf",
        fingerprint => crypto:hash(sha256, Bin)
    }).
-{ok, <<"barrel_inference_model_2375">>}
+{ok, <<"erllama_model_2375">>}
 ```
 
-That is enough to run a completion. Barrel Inference fills in the cache
+That is enough to run a completion. erllama fills in the cache
 parameters from the application defaults; with no `tier`/`tier_srv`
 override the model writes to the RAM tier (the only one started by
 default).
 
 `M` is a binary registered name. Use it for every subsequent call:
-`barrel_inference:complete(M, ...)`, `barrel_inference:unload(M)`, etc. You can also
+`erllama:complete(M, ...)`, `erllama:unload(M)`, etc. You can also
 pass an explicit id via `load_model/2` (also binary).
 
 ## The full option map
 
 ```erlang
 #{
-  backend           => barrel_inference_model_llama,
+  backend           => erllama_model_llama,
   model_path        => "/srv/models/llama-3.1-8b-instruct.Q4_K_M.gguf",
   model_opts        => #{n_gpu_layers => 99, use_mmap => true},
   context_opts      => #{n_ctx => 8192, n_batch => 4096, n_threads => 8},
@@ -52,11 +52,11 @@ pass an explicit id via `load_model/2` (also binary).
 
 ### `backend`
 
-Module implementing the `barrel_inference_model_backend` behaviour. Two
+Module implementing the `erllama_model_backend` behaviour. Two
 shipped today:
 
-- `barrel_inference_model_llama` — the real llama.cpp backend.
-- `barrel_inference_model_stub` — a no-op backend used by the unit tests.
+- `erllama_model_llama` — the real llama.cpp backend.
+- `erllama_model_stub` — a no-op backend used by the unit tests.
 
 ### `model_path`
 
@@ -79,7 +79,7 @@ matter day-to-day:
 | `use_mmap` | true | mmap the GGUF instead of copying into anon RAM. Leave on. |
 | `use_mlock` | false | `mlock(2)` the model pages. Useful on workloads where `vm.swappiness` is non-zero and you can't afford to page out weights. |
 | `prefetch` | true | `POSIX_MADV_WILLNEED` (kernel reads ahead) when true, `POSIX_MADV_RANDOM` (only page in on first touch) when false. The server's named `weight_residency` modes map down to this triple; you can pass it directly here for runtime callers that skip the manifest layer. See [Weight residency](../../server/guides/weight_residency.md). |
-| `pin_resident_after_first_request` | false | Engine-side flag (read by `barrel_inference_model`, not the NIF). When true, the scheduler calls the backend's `pin_resident_pages/1` once after the first request completes, `mlock`ing the working set. Used by the server's `lazy_then_pin_resident` mode. |
+| `pin_resident_after_first_request` | false | Engine-side flag (read by `erllama_model`, not the NIF). When true, the scheduler calls the backend's `pin_resident_pages/1` once after the first request completes, `mlock`ing the working set. Used by the server's `lazy_then_pin_resident` mode. |
 | `vocab_only` | false | Open the file but skip weight loading. Tokenizer-only mode. |
 
 ### `context_opts`
@@ -130,7 +130,7 @@ weights but different quant schemes have different cache rows.
 ### `ctx_params_hash`
 
 A SHA-256 over the parts of `context_opts` that change KV layout —
-typically `(n_ctx, n_batch)`. Barrel Inference treats two contexts with
+typically `(n_ctx, n_batch)`. erllama treats two contexts with
 different params as different cache namespaces.
 
 ```erlang
@@ -146,12 +146,12 @@ Plain integer copy of `n_ctx`. The cache uses it for bounds checks.
 Where saves go.
 
 - `tier_srv` is the registered name of the tier server. Only the RAM
-  tier (`barrel_inference_cache_ram`) is started automatically by the
+  tier (`erllama_cache_ram`) is started automatically by the
   application. To use `ram_file` or `disk`, start a tier server
   yourself and pass its name:
 
   ```erlang
-  {ok, _} = barrel_inference_cache_disk_srv:start_link(my_disk, "/var/lib/barrel_inference/kvc"),
+  {ok, _} = erllama_cache_disk_srv:start_link(my_disk, "/var/lib/erllama/kvc"),
   ...
   tier_srv => my_disk,
   tier => disk,
@@ -167,7 +167,7 @@ and is the cheapest place to keep warm state.
 
 Optional per-model overrides of the cache save-policy gates. Any
 keys you omit fall back to the application defaults declared in
-`barrel_inference.app.src` (`min_tokens`, `cold_min_tokens`,
+`erllama.app.src` (`min_tokens`, `cold_min_tokens`,
 `cold_max_tokens`, `continued_interval`, `boundary_trim_tokens`,
 `boundary_align_tokens`, `session_resume_wait_ms`). See the
 [caching guide](caching.md) for what each gate means. Pass an empty
@@ -181,19 +181,19 @@ map (or omit the key entirely) to use the defaults.
 concurrently:
 
 ```erlang
-{ok, _} = barrel_inference:load_model(<<"tiny">>, TinyConfig).
-{ok, _} = barrel_inference:load_model(<<"big">>,  BigConfig).
-{ok, #{reply := R}}  = barrel_inference:complete(<<"tiny">>, <<"hello">>).
-{ok, #{reply := R2}} = barrel_inference:complete(<<"big">>,  <<"hello">>).
+{ok, _} = erllama:load_model(<<"tiny">>, TinyConfig).
+{ok, _} = erllama:load_model(<<"big">>,  BigConfig).
+{ok, #{reply := R}}  = erllama:complete(<<"tiny">>, <<"hello">>).
+{ok, #{reply := R2}} = erllama:complete(<<"big">>,  <<"hello">>).
 ```
 
-Both share one `barrel_inference_cache` instance — cache rows are scoped by
+Both share one `erllama_cache` instance — cache rows are scoped by
 fingerprint, so they never collide.
 
 ## Unloading
 
 ```erlang
-ok = barrel_inference:unload(M).
+ok = erllama:unload(M).
 ```
 
 Triggers a synchronous `shutdown` save (best-effort: capped by
@@ -209,7 +209,7 @@ in-flight cache writes are awaited up to that timeout.
   bump `n_ctx` for a tenant, expect a one-shot cold prefill across
   every cached prefix until the new rows accumulate.
 - **Mismatched `tier` / `tier_srv`.** `tier => disk` against an
-  `barrel_inference_cache_ram` server name fails at first save; verify the
+  `erllama_cache_ram` server name fails at first save; verify the
   pair before deploy. The RAM tier is the only one auto-started; for
-  `ram_file` / `disk`, start the relevant `barrel_inference_cache_disk_srv`
+  `ram_file` / `disk`, start the relevant `erllama_cache_disk_srv`
   yourself and pass its registered name.

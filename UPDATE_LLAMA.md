@@ -1,6 +1,6 @@
 # Updating the vendored llama.cpp
 
-Barrel Inference vendors a pinned copy of llama.cpp under `c_src/llama.cpp/`.
+erllama vendors a pinned copy of llama.cpp under `c_src/llama.cpp/`.
 The current pin is **b9585**.
 
 This file documents the bump procedure.
@@ -52,7 +52,7 @@ Excluded (unused or out-of-scope for v1):
 - ggml backends we do not link: Vulkan, SYCL, OpenCL, CANN, Hexagon,
   HIP, MUSA, RPC, ZDNN, ZenDNN, Virtgpu, Webgpu, OpenVINO
 
-If a user needs one of the excluded backends they can build Barrel Inference
+If a user needs one of the excluded backends they can build erllama
 against an unvendored llama.cpp via `git+` rebar dep instead of the
 hex package; that path is supported but unsupported in this scaffold.
 
@@ -68,7 +68,7 @@ cd /tmp
 git clone --depth=1 --branch=<TAG> https://github.com/ggml-org/llama.cpp llama.cpp.new
 
 # 2. Sync the parts we vendor.
-cd /Users/benoitc/Projects/barrel_inference
+cd /Users/benoitc/Projects/erllama
 rm -rf c_src/llama.cpp
 mkdir -p c_src/llama.cpp/ggml/src
 
@@ -102,7 +102,7 @@ rebar3 fmt --check && rebar3 lint && rebar3 xref \
 
 The vendored tree carries a handful of additive patches the bumper has
 to re-apply when upstream churns the affected lines. Grep for
-`barrel_inference local addition` to find them.
+`erllama local addition` to find them.
 
 | File | What it adds | Why |
 |---|---|---|
@@ -120,22 +120,22 @@ to existing functionality.
 ## Configuration knobs
 
 The CMake configure step honours these env vars (passed via
-`BARREL_INFERENCE_OPTS` to `do_cmake.sh`):
+`ERLLAMA_OPTS` to `do_cmake.sh`):
 
 ```
-BARREL_INFERENCE_OPTS="-DGGML_CUDA=ON"           # enable CUDA on Linux x86-64
-BARREL_INFERENCE_OPTS="-DGGML_METAL=OFF"         # disable Metal on Darwin
-BARREL_INFERENCE_OPTS="-DGGML_BLAS=OFF"          # disable BLAS
-BARREL_INFERENCE_OPTS="-DCMAKE_BUILD_TYPE=Debug" # debug build
+ERLLAMA_OPTS="-DGGML_CUDA=ON"           # enable CUDA on Linux x86-64
+ERLLAMA_OPTS="-DGGML_METAL=OFF"         # disable Metal on Darwin
+ERLLAMA_OPTS="-DGGML_BLAS=OFF"          # disable BLAS
+ERLLAMA_OPTS="-DCMAKE_BUILD_TYPE=Debug" # debug build
 ```
 
-The build step honours `BARREL_INFERENCE_BUILDOPTS` (passed to `cmake --build`).
+The build step honours `ERLLAMA_BUILDOPTS` (passed to `cmake --build`).
 
 ## Why we ship `common/`
 
 llama.cpp's `common/` carries the chat-template pipeline (`common_chat_*`,
-the PEG autoparser, jinja runtime) that the autoparser path in barrel
-depends on (`apps/barrel_inference/c_src/barrel_inference_chat_nif.cpp`).
+the PEG autoparser, jinja runtime) that the autoparser path in erllama
+depends on (`apps/erllama/c_src/erllama_chat_nif.cpp`).
 It also pulls in HTTP / Hugging Face download helpers we do not use,
 which is why `common/` indirectly depends on `vendor/cpp-httplib` and
 `vendor/nlohmann` — those have to ship too even though we never call

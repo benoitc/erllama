@@ -2750,7 +2750,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     }
 
     if (inputs.skip_parser_synthesis) {
-        // barrel_inference local addition: short-circuit to a render-only
+        // erllama local addition: short-circuit to a render-only
         // path so callers caching the synthesised parser separately do
         // not pay the autoparser cost on every request.
         common_chat_params data;
