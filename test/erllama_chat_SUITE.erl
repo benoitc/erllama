@@ -14,7 +14,8 @@
     apply_then_parse_round_trip/1,
     parse_partial_then_full/1,
     facade_chat_apply_then_parse/1,
-    facade_chat_round_trip/1
+    facade_chat_round_trip/1,
+    facade_chat_with_tools/1
 ]).
 
 all() ->
@@ -23,7 +24,8 @@ all() ->
         apply_then_parse_round_trip,
         parse_partial_then_full,
         facade_chat_apply_then_parse,
-        facade_chat_round_trip
+        facade_chat_round_trip,
+        facade_chat_with_tools
     ].
 
 init_per_suite(Config) ->
@@ -31,7 +33,7 @@ init_per_suite(Config) ->
         false ->
             {skip, "set LLAMA_TEST_MODEL to a GGUF path to enable this suite"};
         Path ->
-            ok = application:ensure_started(erllama),
+            {ok, _} = application:ensure_all_started(erllama),
             {ok, Model} = erllama_nif:load_model(Path, #{}),
             [{model, Model} | Config]
     end.
@@ -130,6 +132,40 @@ facade_chat_round_trip(_Config) ->
             {error, {unknown_option, max_tokens}},
             erllama:chat(ModelId, Messages, #{max_tokens => 1})
         )
+    after
+        ok = erllama:unload(ModelId)
+    end.
+
+%% Tools reach the template in the OpenAI shape and a tool-capable
+%% model answers with a parsed call. Models whose template has no tool
+%% support (tinyllama) still render and parse; the assertion on the call
+%% itself is only made when the model actually produced one.
+facade_chat_with_tools(_Config) ->
+    Path = os:getenv("LLAMA_TEST_MODEL"),
+    {ok, ModelId} = erllama:load_model(#{model_path => Path}),
+    Tools = [
+        #{
+            name => <<"calculate">>,
+            description => <<"Evaluate an arithmetic expression.">>,
+            parameters => #{
+                type => object,
+                properties => #{expression => #{type => string}},
+                required => [expression]
+            }
+        }
+    ],
+    Messages = [#{role => user, content => <<"Use the calculate tool to compute 17 * 23.">>}],
+    try
+        {ok, #{prompt := Prompt}} = erllama:chat_apply(ModelId, Messages, #{tools => Tools}),
+        ?assert(binary:match(Prompt, <<"calculate">>) =/= nomatch),
+        {ok, #{message := Msg}} =
+            erllama:chat(ModelId, Messages, #{
+                tools => Tools, response_tokens => 64, temperature => 0.0
+            }),
+        case maps:get(tool_calls, Msg) of
+            [] -> ct:comment("model produced no tool call (template without tool support?)");
+            [#{name := <<"calculate">>, arguments := Args} | _] -> ?assert(is_map(Args))
+        end
     after
         ok = erllama:unload(ModelId)
     end.

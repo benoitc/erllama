@@ -199,6 +199,18 @@ example `<think>` / `</think>`). With markers set and `thinking =>
 enabled` on the request, the text between them arrives as
 `{thinking, Bin}` stream events instead of `{token, Bin}`.
 
+### `chat_template`
+
+Jinja source (binary) used by `chat/3` and `chat_apply/3` instead of the
+template stored in the GGUF. Use it for files that ship an outdated
+template; llama.cpp keeps corrected ones under `models/templates/` in its
+repository.
+
+```erlang
+{ok, Tmpl} = file:read_file("Qwen-Qwen2.5-7B-Instruct.jinja"),
+{ok, M} = erllama:load_model(#{model_path => Path, chat_template => Tmpl}).
+```
+
 ### `model_id`
 
 Explicit id for `load_model/1`; the same as calling `load_model/2`.
