@@ -393,6 +393,108 @@ int32_t erllama_safe_model_n_layer(const struct llama_model *m) noexcept {
     }
 }
 
+// Family / metadata probes for nif_model_family. Numeric probes
+// return 0 on exception, string probes -1 ("missing"), boolean
+// probes 0 ("no") -- each the caller's conservative default.
+int32_t erllama_safe_model_meta_val_str(const struct llama_model *m,
+                                        const char *key, char *buf,
+                                        size_t buf_size) noexcept {
+    try {
+        return llama_model_meta_val_str(m, key, buf, buf_size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int32_t erllama_safe_model_desc(const struct llama_model *m, char *buf,
+                                size_t buf_size) noexcept {
+    try {
+        return llama_model_desc(m, buf, buf_size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int32_t erllama_safe_model_n_ctx_train(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_n_ctx_train(m);
+    } catch (...) {
+        return 0;
+    }
+}
+
+uint64_t erllama_safe_model_n_params(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_n_params(m);
+    } catch (...) {
+        return 0;
+    }
+}
+
+int32_t erllama_safe_model_n_head(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_n_head(m);
+    } catch (...) {
+        return 0;
+    }
+}
+
+int32_t erllama_safe_model_n_swa(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_n_swa(m);
+    } catch (...) {
+        return 0;
+    }
+}
+
+int erllama_safe_model_is_recurrent(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_is_recurrent(m) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int erllama_safe_model_is_hybrid(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_is_hybrid(m) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int erllama_safe_model_is_diffusion(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_is_diffusion(m) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int erllama_safe_model_has_encoder(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_has_encoder(m) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int erllama_safe_model_has_decoder(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_has_decoder(m) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int erllama_safe_model_ftype(const struct llama_model *m) noexcept {
+    try {
+        return (int) llama_model_ftype(m);
+    } catch (...) {
+        return -1;
+    }
+}
+
 uint32_t erllama_safe_n_ctx(const struct llama_context *c) noexcept {
     try {
         return llama_n_ctx(c);

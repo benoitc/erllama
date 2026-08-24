@@ -6,6 +6,38 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Cache correctness on recurrent / hybrid models (Mamba, RWKV, Jamba,
+  Qwen3-Next, LFM2, ...): a warm exact hit no longer duplicates the
+  last prompt token when the memory refuses the primer's partial
+  removal; the engine falls back to a cold prefill and bumps the new
+  `restore_failed` counter. A failed `kv_unpack` no longer crashes the
+  model process (the row is treated as a miss).
+- Partial warm hits (extended prompts) prefill the suffix directly
+  instead of dropping and re-decoding the last cached token: one fewer
+  decoded token per partial hit, and no partial `seq_rm`, so the path
+  stays warm on recurrent models.
+- `nif_kv_seq_rm` refreshes the per-seq position bookkeeping on
+  failure too, keeping Erlang and llama.cpp in agreement when a
+  partial removal is refused.
+
+### Added
+
+- Model-family probe at load: `model_info/1` reports `arch`,
+  `n_ctx_train`, `n_params`, `n_embd`, `n_layer`, `n_swa`,
+  `recurrent` and `hybrid` (llama backend). Encoder-decoder (T5) and
+  diffusion archs are rejected at load with
+  `{error, {unsupported_model, encoder_decoder | diffusion}}` instead
+  of failing confusingly at the first decode.
+- Context option `n_rs_seq` (recurrent-state rollback snapshots per
+  seq); defaults to 1 on recurrent / hybrid models so warm hits work
+  where the arch supports rollback.
+- `split_mode => tensor` (experimental upstream tensor-parallel
+  split; `row` is deprecated upstream).
+- Cache counter `restore_failed`; stub backend knobs
+  `fail_seq_rm_last` / `fail_kv_unpack` to test the fallback paths.
+
 ## [0.10.1] - 2026-08-23
 
 ### Fixed

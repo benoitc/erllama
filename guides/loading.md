@@ -88,7 +88,7 @@ matter day-to-day:
 | Key | Default | Notes |
 |---|---|---|
 | `n_gpu_layers` | 0 | Number of transformer layers offloaded to GPU. Set high enough to cover the model on Metal/CUDA boxes. 99 effectively means "all". |
-| `split_mode` | `layer` | Multi-GPU split policy. `none` keeps the model on `main_gpu`, `layer` slices by layer range, `row` slices each tensor row-wise. A bad atom raises `badarg`. |
+| `split_mode` | `layer` | Multi-GPU split policy. `none` keeps the model on `main_gpu`, `layer` slices by layer range, `row` slices each tensor row-wise (deprecated upstream), `tensor` splits individual tensors (experimental upstream; needs flash attention and `f16`/`bf16`/`f32` KV types, llama.cpp rejects the context otherwise). A bad atom raises `badarg`. |
 | `main_gpu` | 0 | GPU index when `split_mode = none`, or the device that holds non-split tensors otherwise. |
 | `tensor_split` | `[]` | Per-device proportions when splitting. Up to 16 floats (the vendored llama.cpp's `llama_max_devices()`); shorter lists zero-fill. |
 | `load_mode` | `auto` | How weights are brought in: `auto` (llama.cpp picks), `none` (read into RAM), `mmap`, `mlock`, `mmap_mlock`, `direct_io`. |
@@ -106,6 +106,7 @@ Pass-through to `llama_context_default_params()`.
 | `n_batch` | 512 | Maximum tokens fed to a single `llama_decode` call. Bigger values prefill faster but use more VRAM/RAM. 4096 is a sane upper bound for 8B-class models on a 24 GB GPU. |
 | `n_ubatch` | n_batch | Micro-batch size. Usually leave equal to `n_batch`. |
 | `n_seq_max` | 1 | Maximum concurrent sequences. The default keeps single-tenant behaviour bit-for-bit; set `> 1` to opt into the multi-tenant scheduler so up to N requests prefill and decode concurrently through one `llama_decode` per tick. Capped at 256. |
+| `n_rs_seq` | 0 (1 on recurrent/hybrid) | Recurrent-state rollback snapshots per sequence; only meaningful on recurrent / hybrid models (see Model families below). erllama defaults it to 1 for those families so warm cache hits work where the arch supports rollback; llama.cpp clamps it to 0 elsewhere. |
 | `n_threads` | hw_concurrency | CPU threads for prompt eval. |
 | `n_threads_batch` | n_threads | CPU threads for batch eval. |
 | `flash_attn` | `auto` | `true` enables, `false` disables, `auto` lets llama.cpp decide based on the build and model. |
@@ -215,6 +216,41 @@ repository.
 
 Explicit id for `load_model/1`; the same as calling `load_model/2`.
 Loading an id that is in use returns `{error, already_loaded}`.
+
+## Model families
+
+`load_model` probes the GGUF once and reports what it found through
+`model_info/1`: `arch` (the `general.architecture` string),
+`n_ctx_train`, `n_params`, `n_embd`, `n_layer`, `n_swa`, `recurrent`
+and `hybrid`. Use it when you need to know what kind of model you are
+serving:
+
+```erlang
+{ok, Info} = erllama:model_info(M),
+#{arch := Arch, recurrent := Recurrent} = Info.
+```
+
+What the family means for erllama:
+
+- **Dense attention** (llama, qwen2, gemma, ...): every feature works
+  as documented, including all warm-cache paths. Models with
+  sliding-window attention layers (`n_swa > 0`, e.g. Gemma 3) behave
+  the same.
+- **Recurrent and hybrid** (mamba, rwkv, jamba, granite-hybrid,
+  qwen3-next, lfm2, ...): part or all of the context lives in a
+  compressed recurrent state instead of per-token KV cells, and that
+  state cannot be partially rewound on most archs. Cache saves,
+  restores and suffix prefills all work; the one operation that can
+  fail is the exact-hit primer (dropping the last restored token to
+  regenerate logits). Where the arch supports recurrent-state
+  rollback, `n_rs_seq => 1` (the erllama default for these families)
+  makes it succeed; elsewhere the engine falls back to a cold prefill
+  and bumps the `restore_failed` counter, so results stay correct at
+  the cost of the one reuse. Partial hits (extended prompts, the
+  common agent case) stay warm on every family.
+- **Encoder-decoder and diffusion** (T5, diffusion LMs): rejected at
+  load with `{error, {unsupported_model, encoder_decoder | diffusion}}`;
+  they need inference modes the engine does not drive.
 
 ## Loading multiple models
 

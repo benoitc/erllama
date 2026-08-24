@@ -23,8 +23,11 @@ without those features (`{error, not_supported}` /
 `{error, chat_not_supported}`).
 
 Load-config keys specific to this backend: `step_delay_ms` (hold each
-decode step that long, to make queueing observable) and
-`thinking_capable` (emit thinking events).
+decode step that long, to make queueing observable), `thinking_capable`
+(emit thinking events), and the failure knobs `fail_seq_rm_last` /
+`fail_kv_unpack` (emulate a recurrent-model backend whose partial
+KV removals / state restores fail, driving the engine's cold-fallback
+paths).
 """.
 -behaviour(erllama_model_backend).
 
@@ -101,13 +104,22 @@ decode step that long, to make queueing observable) and
     %% Default 0 disables the hold, so the cache / integration tests
     %% that use the stub pay no `timer:sleep(0)' syscall in their hot
     %% path.
-    step_delay_ms = 0 :: non_neg_integer()
+    step_delay_ms = 0 :: non_neg_integer(),
+    %% Opt-in failure knobs emulating a recurrent / hybrid backend:
+    %% `fail_seq_rm_last' makes seq_rm_last/3 return an error (a
+    %% partial seq_rm the memory refused) and `fail_kv_unpack' makes
+    %% kv_unpack/2,3 return an error (a failed state restore). Both
+    %% let tests drive the engine's cold-fallback paths.
+    fail_seq_rm_last = false :: boolean(),
+    fail_kv_unpack = false :: boolean()
 }).
 
 init(Config) ->
     {ok, #stub{
         thinking_capable = bool_opt(thinking_capable, Config),
-        step_delay_ms = step_delay_opt(step_delay_ms, Config)
+        step_delay_ms = step_delay_opt(step_delay_ms, Config),
+        fail_seq_rm_last = bool_opt(fail_seq_rm_last, Config),
+        fail_kv_unpack = bool_opt(fail_kv_unpack, Config)
     }}.
 
 bool_opt(Key, Config) ->
@@ -150,9 +162,13 @@ kv_pack(_S, Tokens) ->
 kv_pack(_S, Tokens, _SeqId) ->
     erllama_cache_key:encode_tokens(Tokens).
 
+kv_unpack(#stub{fail_kv_unpack = true}, _Bin) ->
+    {error, unpack_failed};
 kv_unpack(_S, _Bin) ->
     ok.
 
+kv_unpack(#stub{fail_kv_unpack = true}, _Bin, _SeqId) ->
+    {error, unpack_failed};
 kv_unpack(_S, _Bin, _SeqId) ->
     ok.
 
@@ -163,13 +179,18 @@ seq_rm(_S, SeqId) ->
     erlang:erase({stub_phase, SeqId}),
     ok.
 
-%% Optional callback: warm_restore_primer/3 calls this to trim a seq's KV
-%% to a prefix. The stub holds no real KV, so it just records the call so
-%% tests can assert the range-trim ran with the expected N (= prefix len).
-seq_rm_last(_S, SeqId, N) ->
+%% Optional callback: the engine calls this to trim a seq's KV to a
+%% prefix (warm-restore primer, sticky-partial tail trim). The stub
+%% holds no real KV, so it just records the call so tests can assert
+%% the range-trim ran with the expected N; with `fail_seq_rm_last' it
+%% then reports the failure a recurrent memory would.
+seq_rm_last(S, SeqId, N) ->
     Prev = persistent_term:get({?MODULE, seq_rm_last_calls}, []),
     persistent_term:put({?MODULE, seq_rm_last_calls}, [{SeqId, N} | Prev]),
-    ok.
+    case S of
+        #stub{fail_seq_rm_last = true} -> {error, seq_rm_failed};
+        _ -> ok
+    end.
 
 seq_rm_last_calls() ->
     lists:reverse(persistent_term:get({?MODULE, seq_rm_last_calls}, [])).

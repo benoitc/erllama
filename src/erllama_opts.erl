@@ -31,7 +31,9 @@
     model_id,
     %% erllama_model_stub only (test backend)
     step_delay_ms,
-    thinking_capable
+    thinking_capable,
+    fail_seq_rm_last,
+    fail_kv_unpack
 ]).
 
 -define(MODEL_OPT_KEYS, [
@@ -43,6 +45,7 @@
     n_batch,
     n_ubatch,
     n_seq_max,
+    n_rs_seq,
     n_threads,
     n_threads_batch,
     embeddings,
@@ -150,6 +153,8 @@ check_load_types(C) ->
         {model_id, fun is_binary/1},
         {step_delay_ms, fun non_neg_int/1},
         {thinking_capable, fun is_boolean/1},
+        {fail_seq_rm_last, fun is_boolean/1},
+        {fail_kv_unpack, fun is_boolean/1},
         {model_opts, fun is_map/1},
         {context_opts, fun is_map/1},
         {policy, fun is_map/1}
@@ -185,7 +190,7 @@ model_opt_checks() ->
         {use_mlock, fun is_boolean/1},
         {load_mode, fun(V) -> lists:member(V, [auto, none, mmap, mlock, mmap_mlock, direct_io]) end},
         {vocab_only, fun is_boolean/1},
-        {split_mode, fun(V) -> lists:member(V, [none, layer, row]) end},
+        {split_mode, fun(V) -> lists:member(V, [none, layer, row, tensor]) end},
         {tensor_split, fun(V) -> is_list(V) andalso lists:all(fun is_number/1, V) end}
     ].
 
@@ -195,6 +200,7 @@ context_opt_checks() ->
         {n_batch, fun pos_int/1},
         {n_ubatch, fun pos_int/1},
         {n_seq_max, fun pos_int/1},
+        {n_rs_seq, fun non_neg_int/1},
         {n_threads, fun pos_int/1},
         {n_threads_batch, fun pos_int/1},
         {embeddings, fun is_boolean/1},

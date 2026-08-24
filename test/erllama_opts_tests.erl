@@ -88,6 +88,9 @@ load_sub_type_checks_test_() ->
         }},
         {{error, {invalid_config, use_mmap, 1}}, Base#{model_opts => #{use_mmap => 1}}},
         {{error, {invalid_config, load_mode, lazy}}, Base#{model_opts => #{load_mode => lazy}}},
+        {{error, {invalid_config, n_rs_seq, -1}}, Base#{context_opts => #{n_rs_seq => -1}}},
+        {{error, {invalid_config, fail_seq_rm_last, 1}}, Base#{fail_seq_rm_last => 1}},
+        {{error, {invalid_config, fail_kv_unpack, maybe_}}, Base#{fail_kv_unpack => maybe_}},
         {{error, {invalid_config, min_tokens, -1}}, Base#{policy => #{min_tokens => -1}}}
     ],
     Good = Base#{
@@ -100,8 +103,14 @@ load_sub_type_checks_test_() ->
         },
         policy => #{min_tokens => 4, prefill_chunk_size => infinity}
     },
+    Good2 = Base#{
+        context_opts => #{n_rs_seq => 1},
+        model_opts => #{split_mode => tensor},
+        fail_seq_rm_last => true,
+        fail_kv_unpack => true
+    },
     [?_assertEqual(Expected, ?M:load_config(Config)) || {Expected, Config} <- Cases] ++
-        [?_assertMatch({ok, _}, ?M:load_config(Good))].
+        [?_assertMatch({ok, _}, ?M:load_config(G)) || G <- [Good, Good2]].
 
 %% ---------------------------------------------------------------------------
 %% request_opts/1 and prefill_opts/1

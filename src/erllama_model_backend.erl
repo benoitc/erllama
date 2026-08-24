@@ -150,13 +150,17 @@ inference, etc.) can plug in via this same surface.
 %% Backend-specific metadata used by erllama_model:list_models/0
 %% beyond what the gen_statem already tracks. The default backend
 %% (erllama_model_llama) returns model byte size, total layer
-%% count, and the n_gpu_layers value the user passed at load
-%% time. erllama_model uses these to compute `vram_estimate_b`.
+%% count, the n_gpu_layers value the user passed at load time, and
+%% the model-family map probed at load (arch, n_ctx_train, n_params,
+%% recurrent, hybrid, ...). erllama_model uses these to compute
+%% `vram_estimate_b` and to extend `model_info/1` with the family
+%% keys.
 -callback extra_metadata(state()) ->
     #{
         model_size_bytes => non_neg_integer(),
         total_layers => non_neg_integer(),
-        n_gpu_layers => integer()
+        n_gpu_layers => integer(),
+        family => map()
     }.
 
 %% Speculative-decoding verifier. Runs PrefixTokens ++ Candidates

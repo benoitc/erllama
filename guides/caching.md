@@ -92,6 +92,16 @@ For stateless callers — OpenAI/Anthropic-shaped HTTP APIs that
 resend the full conversation each turn — option 3 is what you want.
 You don't have to do anything; just call `erllama:complete/2`.
 
+A warm restore can still fail mid-flight: recurrent / hybrid models
+(Mamba, RWKV, Jamba, ...) refuse the 1-token removal the exact-hit
+primer needs unless the arch supports recurrent-state rollback, and
+a stored payload can fail to unpack. Either way the engine drops the
+sequence, bumps the `restore_failed` counter and admits the request
+cold, so the reply stays correct; the hit is just not taken. Partial
+hits (an extended prompt, the common agent case) need no primer and
+stay warm on every family. See the model-families section of the
+loading guide.
+
 ## Save policy gates
 
 Saving every prefix would flood the writer pool. erllama gates saves
