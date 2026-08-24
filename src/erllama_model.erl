@@ -414,6 +414,11 @@
     %% 0 when no GPU layers are offloaded or when the backend does
     %% not report enough metadata to derive it.
     vram_estimate_b = 0 :: non_neg_integer(),
+    %% Family / GGUF metadata reported by the backend's
+    %% extra_metadata/1 under the `family` key (arch, n_ctx_train,
+    %% n_params, recurrent, hybrid, ...). Empty for backends that
+    %% do not report it (stub).
+    family = #{} :: map(),
     %% Optional chat template source overriding the one in the GGUF
     %% (load config `chat_template'); `undefined' uses the model's own.
     chat_template = undefined :: binary() | undefined,
@@ -921,6 +926,7 @@ build_init_data(ModelId, Config, Backend, BState) ->
     CtxOpts = maps:get(context_opts, Config, #{}),
     NSeqMax = maps:get(n_seq_max, CtxOpts, 1),
     NBatch = maps:get(n_batch, CtxOpts, 512),
+    Meta = backend_extra_metadata(Backend, BState),
     #data{
         model_id = ModelId,
         tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
@@ -940,32 +946,34 @@ build_init_data(ModelId, Config, Backend, BState) ->
         adapters = [],
         effective_fp = Fp,
         loaded_at_monotonic = erlang:monotonic_time(nanosecond),
-        vram_estimate_b = compute_vram_estimate(Backend, BState),
+        vram_estimate_b = compute_vram_estimate(Meta),
+        family = maps:get(family, Meta, #{}),
         req_table = #{},
         idle_seq_ids = lists:seq(0, NSeqMax - 1),
         n_seq_max = NSeqMax,
         total_batch_budget = max(1, NBatch)
     }.
 
-%% Best-effort: ask the backend for the byte size, total layer count,
-%% and n_gpu_layers it captured at load time. Backends without the
-%% optional callback (or that return missing keys) get 0.
-compute_vram_estimate(Backend, BState) ->
+%% Backend-reported load-time metadata (byte size, layer counts,
+%% family map). Backends without the optional callback get #{}.
+backend_extra_metadata(Backend, BState) ->
     case erlang:function_exported(Backend, extra_metadata, 1) of
-        false ->
-            0;
-        true ->
-            Meta = Backend:extra_metadata(BState),
-            Size = maps:get(model_size_bytes, Meta, 0),
-            Total = maps:get(total_layers, Meta, 0),
-            NGpu = maps:get(n_gpu_layers, Meta, 0),
-            case {Size, Total, NGpu} of
-                {0, _, _} -> 0;
-                {_, 0, _} -> 0;
-                {_, _, NG} when NG =< 0 -> Size;
-                {_, T, NG} when NG >= T -> Size;
-                {S, T, NG} -> (S * NG) div T
-            end
+        false -> #{};
+        true -> Backend:extra_metadata(BState)
+    end.
+
+%% Best-effort VRAM footprint from the load-time metadata. Missing
+%% keys yield 0.
+compute_vram_estimate(Meta) ->
+    Size = maps:get(model_size_bytes, Meta, 0),
+    Total = maps:get(total_layers, Meta, 0),
+    NGpu = maps:get(n_gpu_layers, Meta, 0),
+    case {Size, Total, NGpu} of
+        {0, _, _} -> 0;
+        {_, 0, _} -> 0;
+        {_, _, NG} when NG =< 0 -> Size;
+        {_, T, NG} when NG >= T -> Size;
+        {S, T, NG} -> (S * NG) div T
     end.
 
 %% Per-model policy. Caller can override any subset; missing keys
@@ -1669,22 +1677,47 @@ setup_admission_path(Req, {continue, StoredTokens}, Suffix, _Opts, _Data) ->
         cache_hit_prefix_len = length(StoredTokens)
     };
 setup_admission_path(Req, {sticky_partial, L}, Prompt, _Opts, Data) ->
-    %% Reuse the longest common prefix of the pinned seq's live KV. Keep
-    %% the first L prompt tokens and route through setup_warm/5: its
-    %% warm_restore_primer/3 calls seq_rm_last(SeqId, L), which removes the
-    %% position RANGE [L-1, inf) - dropping the stale tail [L, M) AND
-    %% priming cell L-1 - then re-prefills cell L-1 plus the divergent
-    %% suffix, regenerating correct logits.
+    %% Reuse the longest common prefix of the pinned seq's live KV,
+    %% which still holds M > L cells with a stale tail. With a
+    %% divergent suffix: trim [L, inf) and prefill the suffix at L.
+    %% With no suffix (the new prompt IS the kept prefix): trim
+    %% [L-1, inf) and re-prefill cell L-1 so the logits regenerate.
+    %% Either trim is a partial seq_rm; recurrent / hybrid memories
+    %% may refuse it, and the admission then falls back to cold.
     erllama_cache_counters:incr(?C_HITS_STICKY_PARTIAL),
     Keep = lists:sublist(Prompt, L),
-    Suffix = lists:nthtail(L, Prompt),
-    setup_warm(Req, Keep, Suffix, partial, Data).
+    case lists:nthtail(L, Prompt) of
+        [] ->
+            case warm_restore_primer(Req#req.seq_id, Keep, Data) of
+                ok ->
+                    Req#req{
+                        prefill_cursor = [lists:last(Keep)],
+                        context_tokens = lists:sublist(Keep, L - 1),
+                        cache_hit_kind = partial,
+                        cache_hit_prefix_len = L
+                    };
+                {error, _} ->
+                    restore_failed_fallback(Req, Data)
+            end;
+        Suffix ->
+            case backend_seq_rm_from(Req#req.seq_id, L, Data) of
+                ok ->
+                    Req#req{
+                        prefill_cursor = Suffix,
+                        context_tokens = Keep,
+                        cache_hit_kind = partial,
+                        cache_hit_prefix_len = L
+                    };
+                {error, _} ->
+                    restore_failed_fallback(Req, Data)
+            end
+    end.
 
 %% Run the cache lookup for this request's prompt and set up the
 %% #req's `prefill_cursor` and `context_tokens` accordingly. The
-%% warm path runs the kv_unpack + seq_rm_last primer flow under
-%% the request's seq_id; the cold path leaves the full prompt in
-%% the prefill cursor.
+%% warm path resumes on the KV that lookup_or_resume just unpacked
+%% into the request's seq_id; the cold path leaves the full prompt
+%% in the prefill cursor.
 setup_lookup(Req, ParentKey, Data) ->
     case lookup_or_resume(Req#req.prompt_tokens, ParentKey, Req, Data) of
         {warm, ContextTokens, RemainingTokens, HitKind} ->
@@ -1693,27 +1726,54 @@ setup_lookup(Req, ParentKey, Data) ->
             setup_cold(Req, Data)
     end.
 
-setup_warm(Req, ContextTokens, RemainingTokens, HitKind, Data) ->
-    ok = warm_restore_primer(Req#req.seq_id, ContextTokens, Data),
-    N = length(ContextTokens),
-    case ContextTokens of
-        [] ->
+%% Warm admission over a freshly unpacked checkpoint: the seq holds
+%% exactly ContextTokens and no logits (state restores never carry
+%% the logits buffer).
+%%
+%% Exact hit (no suffix): drop the last restored cell and re-prefill
+%% its token so the logits regenerate. That 1-token seq_rm is a
+%% partial removal; recurrent / hybrid memories refuse it unless the
+%% arch supports recurrent-state rollback with n_rs_seq >= 1, in
+%% which case the seq is dropped and the admission falls back to
+%% cold.
+%%
+%% Partial hit (non-empty suffix): no primer needed - prefilling the
+%% suffix at position N regenerates logits by itself. This also
+%% avoids re-decoding one already-cached token on every partial hit.
+setup_warm(Req, ContextTokens, [], HitKind, Data) when ContextTokens =/= [] ->
+    case warm_restore_primer(Req#req.seq_id, ContextTokens, Data) of
+        ok ->
+            N = length(ContextTokens),
             Req#req{
-                prefill_cursor = RemainingTokens,
-                context_tokens = [],
-                cache_hit_kind = HitKind,
-                cache_hit_prefix_len = 0
-            };
-        _ ->
-            Last = lists:last(ContextTokens),
-            Kept = lists:sublist(ContextTokens, N - 1),
-            Req#req{
-                prefill_cursor = [Last | RemainingTokens],
-                context_tokens = Kept,
+                prefill_cursor = [lists:last(ContextTokens)],
+                context_tokens = lists:sublist(ContextTokens, N - 1),
                 cache_hit_kind = HitKind,
                 cache_hit_prefix_len = N
-            }
-    end.
+            };
+        {error, _} ->
+            restore_failed_fallback(Req, Data)
+    end;
+setup_warm(Req, [], RemainingTokens, HitKind, _Data) ->
+    Req#req{
+        prefill_cursor = RemainingTokens,
+        context_tokens = [],
+        cache_hit_kind = HitKind,
+        cache_hit_prefix_len = 0
+    };
+setup_warm(Req, ContextTokens, RemainingTokens, HitKind, _Data) ->
+    Req#req{
+        prefill_cursor = RemainingTokens,
+        context_tokens = ContextTokens,
+        cache_hit_kind = HitKind,
+        cache_hit_prefix_len = length(ContextTokens)
+    }.
+
+%% Partial-removal failure fallback: count it, then admit cold.
+%% setup_cold's seq_clear drops the whole seq, and full-seq removal
+%% succeeds on every memory kind.
+restore_failed_fallback(Req, Data) ->
+    erllama_cache_counters:incr(?C_RESTORE_FAILED),
+    setup_cold(Req, Data).
 
 %% Reset the seq's KV before a cold prefill so per_seq.next_pos
 %% starts at 0, then split the prompt into checkpoint-ladder segments.
@@ -1811,34 +1871,40 @@ backend_seq_clear(SeqId, #data{backend = Mod, backend_state = S}) ->
             end
     end.
 
-%% Warm-restore primer: load the cached KV into this seq via
-%% kv_unpack, drop the last cell so the model layer can re-prefill
-%% it to refresh logits. Mirrors the v0.2 prime_logits/3 flow but
-%% per-seq.
-%%
-%% Both seq_rm_last arities take the seq's CURRENT length and
-%% remove the cell at position N-1 (via kv_seq_rm(SeqId, N-1, -1)).
-%% Passing N here, not 1: N is the cell-count after kv_unpack, and
-%% the backend uses N-1 as the start position for the removal.
+%% Warm-restore primer: drop the last cell of the just-restored
+%% prefix so the model layer can re-prefill its token and refresh
+%% the logits (state restores never carry the logits buffer).
+%% Returns the trim result; a failed partial seq_rm (recurrent /
+%% hybrid memories) propagates so the caller can fall back to cold.
 warm_restore_primer(_SeqId, [], _Data) ->
     ok;
 warm_restore_primer(SeqId, ContextTokens, Data) ->
-    N = length(ContextTokens),
+    backend_seq_rm_from(SeqId, length(ContextTokens) - 1, Data).
+
+%% Remove KV cells [Pos, inf) from the seq. The backend callback is
+%% seq_rm_last(State, SeqId, NTokens), which removes [NTokens - 1,
+%% inf) given the seq's token count - hence Pos + 1. Backends
+%% without the callback hold no per-seq KV: ok by definition. Any
+%% non-ok, non-error return from older backends is treated as ok
+%% (the pre-0.11 contract discarded the result entirely).
+backend_seq_rm_from(SeqId, Pos, Data) when is_integer(Pos), Pos >= 0 ->
     Mod = Data#data.backend,
     S = Data#data.backend_state,
     case erlang:function_exported(Mod, seq_rm_last, 3) of
         true ->
-            _ = Mod:seq_rm_last(S, SeqId, N),
-            ok;
+            seq_rm_result(Mod:seq_rm_last(S, SeqId, Pos + 1));
         false ->
             case erlang:function_exported(Mod, seq_rm_last, 2) of
                 true when SeqId =:= 0 ->
-                    _ = Mod:seq_rm_last(S, N),
-                    ok;
+                    seq_rm_result(Mod:seq_rm_last(S, Pos + 1));
                 _ ->
                     ok
             end
     end.
+
+seq_rm_result(ok) -> ok;
+seq_rm_result({error, _} = E) -> E;
+seq_rm_result(_Other) -> ok.
 
 %% Stash a snapshot of the cache_hit + sampler info from the most
 %% recent admission so the obs row and test accessors keep
@@ -2159,7 +2225,14 @@ build_model_info(State, Data) ->
             {_Id, _Phase, _Pending, Kind, PrefixLen} -> #{kind => Kind, prefix_len => PrefixLen};
             undefined -> undefined
         end,
-    #{
+    %% Family keys (arch, n_ctx_train, n_params, n_embd, n_layer,
+    %% n_swa, recurrent, hybrid) are present only when the backend
+    %% reported them (the llama backend does; the stub does not).
+    Family = maps:with(
+        [arch, n_ctx_train, n_params, n_embd, n_layer, n_swa, recurrent, hybrid],
+        Data#data.family
+    ),
+    Family#{
         id => Data#data.model_id,
         model_id => Data#data.model_id,
         pid => self(),
@@ -3332,18 +3405,9 @@ pin_and_load(Key, SeqId, Data) ->
         case erllama_cache_meta_srv:checkout(Key, self()) of
             {ok, HolderRef, Tier, Loc, _Header, TokensBin} ->
                 try
-                    Bin = load_payload(Tier, Loc, Key, Data),
-                    case Bin of
-                        <<>> ->
-                            miss;
-                        _ ->
-                            ok = backend_kv_unpack(Bin, SeqId, Data),
-                            Tokens =
-                                case TokensBin of
-                                    undefined -> [];
-                                    _ -> erllama_cache_key:decode_tokens(TokensBin)
-                                end,
-                            {ok, Tokens}
+                    case load_payload(Tier, Loc, Key, Data) of
+                        <<>> -> miss;
+                        Bin -> unpack_row(Bin, TokensBin, SeqId, Data)
                     end
                 after
                     ok = erllama_cache_meta_srv:checkin(HolderRef)
@@ -3356,6 +3420,24 @@ pin_and_load(Key, SeqId, Data) ->
     Elapsed = erlang:monotonic_time(nanosecond) - T0,
     erllama_cache_counters:add(?C_LOAD_TOTAL_NS, max(Elapsed, 0)),
     Result.
+
+%% Restore a loaded payload into the seq. A failed restore can leave
+%% partial cells behind; drop the seq and treat the row as a miss so
+%% admission falls through (prefix scan, then cold).
+unpack_row(Bin, TokensBin, SeqId, Data) ->
+    case backend_kv_unpack(Bin, SeqId, Data) of
+        ok ->
+            Tokens =
+                case TokensBin of
+                    undefined -> [];
+                    _ -> erllama_cache_key:decode_tokens(TokensBin)
+                end,
+            {ok, Tokens};
+        {error, _} ->
+            erllama_cache_counters:incr(?C_RESTORE_FAILED),
+            ok = backend_seq_clear(SeqId, Data),
+            miss
+    end.
 
 load_payload(ram, _Loc, Key, _Data) ->
     case erllama_cache_ram:load(Key) of
@@ -3548,7 +3630,7 @@ via(ModelId) when is_binary(ModelId) ->
     end.
 
 %% prime_logits/3 is gone — the warm-restore primer is now part of
-%% the per-#req flow. setup_lookup/3 drops the last KV cell via
-%% warm_restore_primer/3, and the resulting #req.prefill_cursor
-%% carries `[LastWarm | Remaining]` so the next step_tick re-prefills
-%% the primer token and any remaining tail in one shot.
+%% the per-#req flow. On an exact hit setup_warm/5 drops the last KV
+%% cell via warm_restore_primer/3 and the #req.prefill_cursor carries
+%% `[Last]` so the next step_tick re-prefills the primer token; a
+%% partial hit prefills the suffix directly at position N.

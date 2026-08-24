@@ -670,6 +670,75 @@ complete_cache_delta_exact_warm_test() ->
         ?assertEqual(Generated, maps:get(created, Delta))
     end).
 
+warm_exact_primer_failure_falls_back_cold_test() ->
+    %% A recurrent-style backend refuses the exact-hit primer's
+    %% 1-token seq_rm: the admission must fall back to cold (full
+    %% seq clear + full prefill) and bump restore_failed instead of
+    %% duplicating the last prompt token.
+    with_model(#{}, #{fail_seq_rm_last => true}, fun(Cfg) ->
+        Tokens = prompt_tokens(long_prompt()),
+        {ok, _R1} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        {ok, _} = wait_for_key(key_for_tokens(Tokens, Cfg), 1000),
+        ok = erllama_model_stub:reset_seq_rm_last_calls(),
+        {ok, R2} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        ?assertEqual(cold, maps:get(cache_hit_kind, R2)),
+        ?assertEqual(0, maps:get(read, maps:get(cache_delta, R2))),
+        %% The primer was attempted before the fallback.
+        ?assertMatch([_ | _], erllama_model_stub:seq_rm_last_calls()),
+        ?assertEqual(1, erllama_cache_counters:get(?C_RESTORE_FAILED))
+    end).
+
+warm_unpack_failure_falls_back_cold_test() ->
+    %% A failed state restore (kv_unpack error) must not crash the
+    %% model process: the row is treated as a miss, restore_failed is
+    %% bumped, and the admission goes cold.
+    with_model(#{}, #{fail_kv_unpack => true}, fun(Cfg) ->
+        Tokens = prompt_tokens(long_prompt()),
+        {ok, _R1} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        {ok, _} = wait_for_key(key_for_tokens(Tokens, Cfg), 1000),
+        {ok, R2} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        ?assertEqual(cold, maps:get(cache_hit_kind, R2)),
+        ?assert(erllama_cache_counters:get(?C_RESTORE_FAILED) >= 1),
+        %% The model process survived the failed restore.
+        ?assertMatch(
+            {ok, _},
+            erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 1})
+        )
+    end).
+
+warm_partial_hit_prefills_suffix_without_primer_test() ->
+    %% A partial hit resumes on freshly unpacked KV that holds exactly
+    %% the checkpoint prefix; prefilling the suffix regenerates the
+    %% logits, so no seq_rm primer must run (recurrent models refuse
+    %% it, and it costs one redundant re-decoded token elsewhere).
+    with_model(#{}, fun(_Cfg) ->
+        Prefix = prompt_tokens(long_prompt()),
+        Suffix = prompt_tokens(short_prompt()),
+        {ok, #{finish_key := PrefixKey}} =
+            erllama_model:prefill_only(<<"test_model">>, Prefix),
+        {ok, _} = wait_for_key(PrefixKey, 1000),
+        ok = erllama_model_stub:reset_seq_rm_last_calls(),
+        {ok, Ref} = erllama_model:infer(
+            <<"test_model">>,
+            Prefix ++ Suffix,
+            #{response_tokens => 2},
+            self()
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(partial, maps:get(cache_hit_kind, Stats)),
+        ?assertEqual(length(Prefix), maps:get(read, maps:get(cache_delta, Stats))),
+        ?assertEqual([], erllama_model_stub:seq_rm_last_calls()),
+        ?assertEqual(0, erllama_cache_counters:get(?C_RESTORE_FAILED))
+    end).
+
 complete_cache_delta_finish_suppressed_test() ->
     with_model(#{min_tokens => 10_000}, fun(_Cfg) ->
         {ok, Result} = erllama_model:complete(
@@ -814,9 +883,66 @@ sticky_partial_reuses_common_prefix_on_divergence_test() ->
         ?assertEqual(partial, maps:get(cache_hit_kind, Stats)),
         Delta = maps:get(cache_delta, Stats),
         ?assertEqual(L, maps:get(read, Delta)),
-        %% The range-trim primer ran with N = L (the common-prefix length).
+        %% The stale tail [L, inf) was trimmed (seq_rm_last carries the
+        %% kept token count, so the recorded N is L + 1) and the
+        %% divergent suffix prefilled directly - no [L-1, inf) primer.
+        Calls = erllama_model_stub:seq_rm_last_calls(),
+        ?assert(lists:any(fun({_SeqId, N}) -> N =:= L + 1 end, Calls))
+    end).
+
+sticky_partial_prompt_prefix_of_stored_runs_primer_test() ->
+    %% Turn 2's prompt is a strict PREFIX of turn 1's committed tokens:
+    %% no suffix to prefill, so the engine trims [L-1, inf) and
+    %% re-prefills cell L-1 to regenerate logits (primer path).
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, #{generated := Gen1}} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        L = length(Turn1Tokens) - 2,
+        Shorter = lists:sublist(Turn1Tokens, L),
+        ok = erllama_model_stub:reset_seq_rm_last_calls(),
+        {ok, Ref} = erllama_model:infer(
+            <<"test_model">>,
+            Shorter,
+            #{response_tokens => 2, session_id => SessionId},
+            self()
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(partial, maps:get(cache_hit_kind, Stats)),
+        ?assertEqual(L, maps:get(read, maps:get(cache_delta, Stats))),
+        %% Primer trim: [L-1, inf) removed, so the recorded N is L.
         Calls = erllama_model_stub:seq_rm_last_calls(),
         ?assert(lists:any(fun({_SeqId, N}) -> N =:= L end, Calls))
+    end).
+
+sticky_partial_trim_failure_falls_back_cold_test() ->
+    %% A recurrent-style backend refuses the partial trim: the sticky
+    %% partial admission must fall back to a cold admit (full seq
+    %% clear) and bump restore_failed, not corrupt the seq.
+    SessionId = make_ref(),
+    with_model(#{}, #{fail_seq_rm_last => true}, fun(_Cfg) ->
+        {ok, #{generated := Gen1}} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        Shared = lists:sublist(Turn1Tokens, length(Turn1Tokens) - 2),
+        Divergent = prompt_tokens(<<"a completely different tail here now">>),
+        {ok, Ref} = erllama_model:infer(
+            <<"test_model">>,
+            Shared ++ Divergent,
+            #{response_tokens => 2, session_id => SessionId},
+            self()
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(cold, maps:get(cache_hit_kind, Stats)),
+        ?assertEqual(0, maps:get(read, maps:get(cache_delta, Stats))),
+        ?assertEqual(1, erllama_cache_counters:get(?C_RESTORE_FAILED))
     end).
 
 sticky_partial_below_floor_admits_cold_test() ->

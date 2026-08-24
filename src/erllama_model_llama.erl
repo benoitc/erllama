@@ -14,9 +14,11 @@
 %%   model_opts :: map()  (forwarded to erllama_nif:load_model/2)
 %%   context_opts :: map()  (forwarded to erllama_nif:new_context/2)
 %%
-%% `model_opts` and `context_opts` flow through to the NIF unchanged.
-%% See `erllama_nif:load_model/2` and `erllama_nif:new_context/2` for
-%% the full set of recognised keys, including the llama.cpp option
+%% `model_opts` and `context_opts` flow through to the NIF unchanged,
+%% with one exception: on recurrent / hybrid models `n_rs_seq`
+%% defaults to 1 (see family_context_opts/2). See
+%% `erllama_nif:load_model/2` and `erllama_nif:new_context/2` for the
+%% full set of recognised keys, including the llama.cpp option
 %% passthroughs `split_mode`, `main_gpu`, `tensor_split`,
 %% `flash_attn`, `type_k`, and `type_v`.
 -behaviour(erllama_model_backend).
@@ -79,39 +81,85 @@
     %% the backend then behaves identically to a non-thinking
     %% backend regardless of the per-request thinking flag.
     thinking_start_ids = [] :: [erllama_nif:token_id()],
-    thinking_end_ids = [] :: [erllama_nif:token_id()]
+    thinking_end_ids = [] :: [erllama_nif:token_id()],
+    %% Family / GGUF metadata map probed once at init via
+    %% erllama_nif:model_family/1. Drives the load-time policy
+    %% (unsupported archs, n_rs_seq injection) and is surfaced
+    %% through extra_metadata/1 into model_info/1.
+    family = #{} :: map()
 }).
 
 init(Config) ->
     Path = maps:get(model_path, Config),
     MOpts = maps:get(model_opts, Config, #{}),
     case erllama_nif:load_model(Path, MOpts) of
-        {ok, Model} -> open_context(Model, Config, MOpts);
-        {error, _} = E -> E
+        {ok, Model} ->
+            Family = probe_family(Model),
+            case check_family(Family) of
+                ok ->
+                    open_context(Model, Config, MOpts, Family);
+                {error, _} = E ->
+                    erllama_nif:free_model(Model),
+                    E
+            end;
+        {error, _} = E ->
+            E
     end.
 
-open_context(Model, Config, MOpts) ->
-    COpts = maps:get(context_opts, Config, #{}),
+probe_family(Model) ->
+    case erllama_nif:model_family(Model) of
+        Family when is_map(Family) -> Family;
+        {error, _} -> #{}
+    end.
+
+%% Load-time family policy. Encoder-bearing archs (T5 and friends)
+%% and diffusion archs need llama_encode / diffusion stepping, which
+%% the engine does not drive; reject at load instead of failing
+%% confusingly at the first decode.
+check_family(#{has_encoder := true}) ->
+    {error, {unsupported_model, encoder_decoder}};
+check_family(#{diffusion := true}) ->
+    {error, {unsupported_model, diffusion}};
+check_family(_) ->
+    ok.
+
+open_context(Model, Config, MOpts, Family) ->
+    COpts = family_context_opts(maps:get(context_opts, Config, #{}), Family),
     case erllama_nif:new_context(Model, COpts) of
         {ok, Ctx} ->
-            {ok, build_state(Model, Ctx, Config, MOpts)};
+            {ok, build_state(Model, Ctx, Config, MOpts, COpts, Family)};
         {error, _} = E ->
             erllama_nif:free_model(Model),
             E
     end.
 
-build_state(Model, Ctx, Config, MOpts) ->
+%% Recurrent / hybrid models keep compressed state, not per-token KV
+%% cells, so the warm-restore primer's 1-token seq_rm only succeeds
+%% when the arch supports recurrent-state rollback AND the context
+%% keeps at least one rollback snapshot. Default n_rs_seq to 1 for
+%% those families (an explicit user value wins); dense models are
+%% untouched.
+family_context_opts(COpts, Family) ->
+    Recurrent = maps:get(recurrent, Family, false),
+    Hybrid = maps:get(hybrid, Family, false),
+    case (Recurrent orelse Hybrid) andalso not maps:is_key(n_rs_seq, COpts) of
+        true -> COpts#{n_rs_seq => 1};
+        false -> COpts
+    end.
+
+build_state(Model, Ctx, Config, MOpts, COpts, Family) ->
     ThinkingMarkers = maps:get(thinking_markers, Config, #{}),
     {ThinkStart, ThinkEnd} = tokenize_markers(Model, ThinkingMarkers),
     #s{
         model = Model,
         ctx = Ctx,
-        context_opts = maps:get(context_opts, Config, #{}),
+        context_opts = COpts,
         model_size_bytes = safe_uint(erllama_nif:model_size(Model)),
         total_layers = safe_uint(erllama_nif:model_n_layer(Model)),
         n_gpu_layers = maps:get(n_gpu_layers, MOpts, 0),
         thinking_start_ids = ThinkStart,
-        thinking_end_ids = ThinkEnd
+        thinking_end_ids = ThinkEnd,
+        family = Family
     }.
 
 safe_uint(N) when is_integer(N), N >= 0 -> N;
@@ -313,9 +361,14 @@ apply_adapters(#s{ctx = C} = S, Adapters) ->
     end.
 
 extra_metadata(#s{
-    model_size_bytes = SB, total_layers = TL, n_gpu_layers = NL
+    model_size_bytes = SB, total_layers = TL, n_gpu_layers = NL, family = Family
 }) ->
-    #{model_size_bytes => SB, total_layers => TL, n_gpu_layers => NL}.
+    #{
+        model_size_bytes => SB,
+        total_layers => TL,
+        n_gpu_layers => NL,
+        family => Family
+    }.
 
 %% Speculative-decoding verifier. Snapshot+restore protocol so
 %% the caller's KV view is unchanged after the call. Empty prefix

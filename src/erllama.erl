@@ -145,7 +145,22 @@ handle for every other call; a pid works too. The cache subsystem is
     %% request) - reclaimable under seq-pool pressure. `available_seqs`
     %% stays ~0 since an admitted request immediately re-pins, so this is
     %% the meaningful "headroom" signal.
-    pinned_idle_seqs := non_neg_integer()
+    pinned_idle_seqs := non_neg_integer(),
+    %% Model-family keys, present only when the backend reports them
+    %% (the llama backend does, the stub does not). `arch` is the
+    %% GGUF `general.architecture` string; `n_swa` > 0 means some
+    %% layers use sliding-window attention; `recurrent` / `hybrid`
+    %% flag models whose cache is (partly) a compressed recurrent
+    %% state rather than per-token KV cells - see the loading guide
+    %% for what that means for cache reuse.
+    arch => binary(),
+    n_ctx_train => integer(),
+    n_params => non_neg_integer(),
+    n_embd => integer(),
+    n_layer => integer(),
+    n_swa => integer(),
+    recurrent => boolean(),
+    hybrid => boolean()
 }.
 -doc "A token id in the model vocabulary.".
 -type token_id() :: non_neg_integer().
@@ -437,6 +452,9 @@ Every `{error, Reason}` the API returns.
   `{decode_failed, Rc}`, `context_overflow`: runtime failures.
 - `oom`, `load_failed`, `malformed_gguf`, `no_gpu`, `too_large`,
   `not_found`: NIF-level failures.
+- `{unsupported_model, encoder_decoder | diffusion}`: the GGUF loads
+  but its architecture needs an inference mode the engine does not
+  drive (T5-style encoders, diffusion LMs); rejected at `load_model`.
 - `{missing_config, Key}`, `{invalid_config, Key, Value}`,
   `{missing_option, Key}`, `{unknown_option, Key}`,
   `{invalid_option, Key, Value}`: validation.
@@ -467,6 +485,7 @@ Backends may add their own atoms; they are documented on the backend.
     | oom
     | load_failed
     | malformed_gguf
+    | {unsupported_model, encoder_decoder | diffusion}
     | no_gpu
     | too_large
     | not_found

@@ -54,6 +54,7 @@
     vram_info/0,
     model_size/1,
     model_n_layer/1,
+    model_family/1,
     grammar_cache_stats/1,
     forward_with_argmax/2,
     chat_templates_init/2,
@@ -108,9 +109,12 @@ Recognised keys in `Opts` (all optional; defaults come from
 
 - `n_gpu_layers :: integer()` — number of layers offloaded to GPU.
 - `main_gpu :: non_neg_integer()` — GPU index when `split_mode = none`.
-- `split_mode :: none | layer | row` — how to split a model across
-  multiple GPUs. Atom mapping: `none -> LLAMA_SPLIT_MODE_NONE`,
-  `layer -> LLAMA_SPLIT_MODE_LAYER`, `row -> LLAMA_SPLIT_MODE_ROW`.
+- `split_mode :: none | layer | row | tensor` — how to split a model
+  across multiple GPUs. Atom mapping: `none -> LLAMA_SPLIT_MODE_NONE`,
+  `layer -> LLAMA_SPLIT_MODE_LAYER`, `row -> LLAMA_SPLIT_MODE_ROW`
+  (deprecated upstream), `tensor -> LLAMA_SPLIT_MODE_TENSOR`
+  (experimental upstream; needs flash attention and f16/bf16/f32 KV
+  types, llama.cpp rejects the context otherwise).
 - `tensor_split :: [float()]` — per-device proportions when splitting.
   Up to `llama_max_devices()` entries (16 in the vendored llama.cpp);
   shorter lists zero-fill the tail.
@@ -134,6 +138,11 @@ Recognised keys in `Opts` (all optional; defaults come from
 `llama_context_default_params()`):
 
 - `n_ctx, n_batch, n_ubatch, n_seq_max :: pos_integer()`.
+- `n_rs_seq :: non_neg_integer()` — recurrent-state rollback
+  snapshots per sequence (recurrent / hybrid archs only; default 0
+  = no rollback; experimental upstream). With `1`, archs that
+  support recurrent-state rollback accept the single-token partial
+  `kv_seq_rm/4` the warm-restore primer issues.
 - `n_threads, n_threads_batch :: pos_integer()`.
 - `embeddings, offload_kqv :: boolean()`.
 - `flash_attn :: boolean() | auto` — `true` enables, `false`
@@ -368,6 +377,36 @@ model_size(Model) ->
 model_n_layer(Model) ->
     nif_model_n_layer(Model).
 
+%% Family / GGUF metadata probe over the loaded model. One read-only
+%% pass; the model layer calls it once at load time to pick its
+%% cache-restore strategy and to surface the family in model_info/1.
+%% `arch` / `name` come from GGUF metadata (`general.architecture` /
+%% `general.name`; empty binary when the key is missing), `desc` is
+%% llama.cpp's one-line description, `ftype` is the raw `llama_ftype`
+%% enum value (-1 when unavailable). `n_swa` > 0 means sliding-window
+%% attention layers are present (iSWA cache).
+-spec model_family(model_ref()) ->
+    #{
+        arch := binary(),
+        name := binary(),
+        desc := binary(),
+        n_ctx_train := integer(),
+        n_params := non_neg_integer(),
+        n_embd := integer(),
+        n_layer := integer(),
+        n_head := integer(),
+        n_swa := integer(),
+        recurrent := boolean(),
+        hybrid := boolean(),
+        diffusion := boolean(),
+        has_encoder := boolean(),
+        has_decoder := boolean(),
+        ftype := integer()
+    }
+    | {error, atom()}.
+model_family(Model) ->
+    nif_model_family(Model).
+
 %% Per-context grammar-cache stats. Advisory metric to confirm the
 %% compiled-grammar cache is taking effect: a client that resends the same
 %% tool grammar each turn should accrue hits after the first request.
@@ -453,6 +492,7 @@ nif_sampler_free(_Sampler) -> erlang:nif_error(nif_not_loaded).
 nif_vram_info() -> erlang:nif_error(nif_not_loaded).
 nif_model_size(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_model_n_layer(_Model) -> erlang:nif_error(nif_not_loaded).
+nif_model_family(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_grammar_cache_stats(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_forward_with_argmax(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_init(_Model, _Override) -> erlang:nif_error(nif_not_loaded).

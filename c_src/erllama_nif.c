@@ -130,6 +130,21 @@ extern const struct llama_vocab *erllama_safe_model_get_vocab(
 extern int32_t erllama_safe_vocab_n_tokens(const struct llama_vocab *v);
 extern uint64_t erllama_safe_model_size(const struct llama_model *m);
 extern int32_t erllama_safe_model_n_layer(const struct llama_model *m);
+extern int32_t erllama_safe_model_meta_val_str(const struct llama_model *m,
+                                               const char *key, char *buf,
+                                               size_t buf_size);
+extern int32_t erllama_safe_model_desc(const struct llama_model *m,
+                                       char *buf, size_t buf_size);
+extern int32_t erllama_safe_model_n_ctx_train(const struct llama_model *m);
+extern uint64_t erllama_safe_model_n_params(const struct llama_model *m);
+extern int32_t erllama_safe_model_n_head(const struct llama_model *m);
+extern int32_t erllama_safe_model_n_swa(const struct llama_model *m);
+extern int erllama_safe_model_is_recurrent(const struct llama_model *m);
+extern int erllama_safe_model_is_hybrid(const struct llama_model *m);
+extern int erllama_safe_model_is_diffusion(const struct llama_model *m);
+extern int erllama_safe_model_has_encoder(const struct llama_model *m);
+extern int erllama_safe_model_has_decoder(const struct llama_model *m);
+extern int erllama_safe_model_ftype(const struct llama_model *m);
 extern uint32_t erllama_safe_n_ctx(const struct llama_context *c);
 extern uint32_t erllama_safe_n_batch(const struct llama_context *c);
 extern size_t erllama_safe_backend_dev_count(void);
@@ -791,9 +806,10 @@ static int get_map_float_list(
  * the call site via the const-array length idiom (sizeof / element
  * size) so the helper sees the count directly. */
 static const erllama_atom_enum_pair_t SPLIT_MODE_TABLE[] = {
-    {"none",  LLAMA_SPLIT_MODE_NONE},
-    {"layer", LLAMA_SPLIT_MODE_LAYER},
-    {"row",   LLAMA_SPLIT_MODE_ROW},
+    {"none",   LLAMA_SPLIT_MODE_NONE},
+    {"layer",  LLAMA_SPLIT_MODE_LAYER},
+    {"row",    LLAMA_SPLIT_MODE_ROW},
+    {"tensor", LLAMA_SPLIT_MODE_TENSOR},
 };
 static const erllama_atom_enum_pair_t LOAD_MODE_TABLE[] = {
     {"auto",       LLAMA_LOAD_MODE_AUTO},
@@ -873,6 +889,80 @@ static ERL_NIF_TERM nif_model_n_layer(ErlNifEnv *env, int argc, const ERL_NIF_TE
     int32_t n = erllama_safe_model_n_layer(m->model);
     pthread_mutex_unlock(&m->mu);
     return enif_make_int(env, n);
+}
+
+/* Copy a NUL-terminated probe result into a binary term. A negative
+ * probe rc (key missing / exception) yields an empty binary. */
+static ERL_NIF_TERM family_str(ErlNifEnv *env, int32_t rc, const char *buf) {
+    size_t len = rc < 0 ? 0 : strlen(buf);
+    ERL_NIF_TERM bin;
+    unsigned char *p = enif_make_new_binary(env, len, &bin);
+    if (len > 0) memcpy(p, buf, len);
+    return bin;
+}
+
+static void family_put(ErlNifEnv *env, ERL_NIF_TERM *map, const char *key,
+                       ERL_NIF_TERM value) {
+    enif_make_map_put(env, *map, enif_make_atom(env, key), value, map);
+}
+
+/* Model family / GGUF metadata probe:
+ *   nif_model_family(ModelRef) -> #{arch, name, desc, n_ctx_train,
+ *     n_params, n_embd, n_layer, n_head, n_swa, recurrent, hybrid,
+ *     diffusion, has_encoder, has_decoder, ftype}
+ * One read-only pass at load time; the model layer keeps the map and
+ * derives its cache-restore policy from it. */
+static ERL_NIF_TERM nif_model_family(ErlNifEnv *env, int argc,
+                                     const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&m->mu);
+    if (!m->model) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    char arch[128] = {0};
+    char name[256] = {0};
+    char desc[256] = {0};
+    int32_t arch_rc = erllama_safe_model_meta_val_str(
+        m->model, "general.architecture", arch, sizeof(arch));
+    int32_t name_rc = erllama_safe_model_meta_val_str(
+        m->model, "general.name", name, sizeof(name));
+    int32_t desc_rc = erllama_safe_model_desc(m->model, desc, sizeof(desc));
+    int32_t n_ctx_train = erllama_safe_model_n_ctx_train(m->model);
+    uint64_t n_params = erllama_safe_model_n_params(m->model);
+    int32_t n_embd = erllama_safe_n_embd(m->model);
+    int32_t n_layer = erllama_safe_model_n_layer(m->model);
+    int32_t n_head = erllama_safe_model_n_head(m->model);
+    int32_t n_swa = erllama_safe_model_n_swa(m->model);
+    int recurrent = erllama_safe_model_is_recurrent(m->model);
+    int hybrid = erllama_safe_model_is_hybrid(m->model);
+    int diffusion = erllama_safe_model_is_diffusion(m->model);
+    int has_encoder = erllama_safe_model_has_encoder(m->model);
+    int has_decoder = erllama_safe_model_has_decoder(m->model);
+    int ftype = erllama_safe_model_ftype(m->model);
+    pthread_mutex_unlock(&m->mu);
+
+    ERL_NIF_TERM map = enif_make_new_map(env);
+    family_put(env, &map, "arch", family_str(env, arch_rc, arch));
+    family_put(env, &map, "name", family_str(env, name_rc, name));
+    family_put(env, &map, "desc", family_str(env, desc_rc, desc));
+    family_put(env, &map, "n_ctx_train", enif_make_int(env, n_ctx_train));
+    family_put(env, &map, "n_params", enif_make_uint64(env, n_params));
+    family_put(env, &map, "n_embd", enif_make_int(env, n_embd));
+    family_put(env, &map, "n_layer", enif_make_int(env, n_layer));
+    family_put(env, &map, "n_head", enif_make_int(env, n_head));
+    family_put(env, &map, "n_swa", enif_make_int(env, n_swa));
+    family_put(env, &map, "recurrent", recurrent ? atom_true : atom_false);
+    family_put(env, &map, "hybrid", hybrid ? atom_true : atom_false);
+    family_put(env, &map, "diffusion", diffusion ? atom_true : atom_false);
+    family_put(env, &map, "has_encoder", has_encoder ? atom_true : atom_false);
+    family_put(env, &map, "has_decoder", has_decoder ? atom_true : atom_false);
+    family_put(env, &map, "ftype", enif_make_int(env, ftype));
+    return map;
 }
 
 /* Per-context grammar-cache stats: #{hits => N, misses => N}. Advisory
@@ -1213,6 +1303,12 @@ static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM
             return enif_make_badarg(env);
         }
         params.n_seq_max = (uint32_t) u;
+    }
+    /* Recurrent-state rollback snapshots per seq (recurrent / hybrid
+     * archs only; 0 = no rollback). With >= 1, RS-capable archs accept
+     * the 1-token partial seq_rm the warm-restore primer issues. */
+    if (get_map_uint(env, argv[1], "n_rs_seq", &u)) {
+        params.n_rs_seq = (uint32_t) u;
     }
     int32_t i32;
     if (get_map_int31(env, argv[1], "n_threads", &i32)) params.n_threads = i32;
@@ -1601,8 +1697,12 @@ static ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
     /* Refresh per-seq tracking: query the remaining max position
      * for this seq and recompute next_pos. last_logits_idx is
      * cleared because the prior batch's logits no longer correspond
-     * to the seq's tail. */
-    if (rc == 0 && seq_id < ERLLAMA_N_SEQ_MAX_CAP) {
+     * to the seq's tail. Refresh on FAILURE too: recurrent / hybrid
+     * memories refuse partial removals (unless RS rollback covers
+     * them) while keeping all their cells, and Erlang must see the
+     * real next_pos to fall back correctly instead of re-prefilling
+     * a token at a position the memory still holds. */
+    if (seq_id < ERLLAMA_N_SEQ_MAX_CAP) {
         long pos_max = erllama_safe_memory_seq_pos_max(c->ctx, seq_id);
         c->per_seq[seq_id].next_pos =
             pos_max < 0 ? 0 : (int32_t) (pos_max + 1);
@@ -3616,6 +3716,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_vram_info",    0, nif_vram_info,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_size",   1, nif_model_size,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_n_layer",1, nif_model_n_layer,ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_model_family", 1, nif_model_family, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_grammar_cache_stats", 1, nif_grammar_cache_stats, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_forward_with_argmax", 2, nif_forward_with_argmax,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},

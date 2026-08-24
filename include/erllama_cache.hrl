@@ -77,7 +77,13 @@
 %% is saved. Distinct from saves_cold; lets ops confirm the pinned
 %% prefix checkpoint is being written.
 -define(C_SAVES_AGENT_PREFIX, 22).
--define(C_NSLOTS, 22).
+%% Bumped when a warm restore fails mid-flight: a partial seq_rm the
+%% memory refused (recurrent / hybrid models without recurrent-state
+%% rollback) or a kv_unpack that did not consume the whole payload.
+%% The admission falls back to cold; a non-zero count on a recurrent
+%% model means exact-hit reuse is degraded, not broken.
+-define(C_RESTORE_FAILED, 23).
+-define(C_NSLOTS, 23).
 
 %% Public types live in `erllama_cache.erl`. Refer to them as
 %% `erllama_cache:cache_key()` etc. from outside this header.
