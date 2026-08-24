@@ -892,11 +892,14 @@ static ERL_NIF_TERM nif_model_n_layer(ErlNifEnv *env, int argc, const ERL_NIF_TE
 }
 
 /* Copy a NUL-terminated probe result into a binary term. A negative
- * probe rc (key missing / exception) yields an empty binary. */
+ * probe rc (key missing / exception) yields an empty binary. The
+ * destination is an Erlang binary, not a C string, so the copy is
+ * deliberately unterminated. */
 static ERL_NIF_TERM family_str(ErlNifEnv *env, int32_t rc, const char *buf) {
     size_t len = rc < 0 ? 0 : strlen(buf);
     ERL_NIF_TERM bin;
     unsigned char *p = enif_make_new_binary(env, len, &bin);
+    /* NOLINTNEXTLINE(bugprone-not-null-terminated-result) */
     if (len > 0) memcpy(p, buf, len);
     return bin;
 }
