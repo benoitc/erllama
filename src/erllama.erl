@@ -281,13 +281,33 @@ assistant messages may carry `tool_calls`, tool results `tool_call_id`.
     parameters => map()
 }.
 -doc """
-Options for `chat/3`: `tools`, `tool_choice` (`auto | required | none`),
-`parallel_tool_calls`, plus any `request_opts()` key.
+Options for `chat/3`: the chat-level keys below plus any
+`request_opts()` key.
+
+- `tools`, `tool_choice` (`auto | required | none`),
+  `parallel_tool_calls`: the tool set. With tools present the
+  template-synthesized grammar is enforced during sampling:
+  `required` constrains the whole reply to a call, `auto` arms a lazy
+  grammar that kicks in when the model opens a call.
+- `json_schema`: response format (map or JSON binary); the reply's
+  content is constrained to the schema. Rejected together with
+  `tools`.
+- `enable_thinking` (default `true`): templates that support thinking
+  render (or suppress) the thinking preamble.
+- `reasoning_format` (default `deepseek`): extract thinking into
+  `reasoning_content`; `none` leaves it inline in `content`.
+- `continue_final_message` (`none | auto | content | reasoning`,
+  default `none`): assistant prefill - the trailing assistant message
+  becomes the beginning of the reply instead of a closed turn.
 """.
 -type chat_opts() :: #{
     tools => [chat_tool()],
     tool_choice => auto | required | none,
     parallel_tool_calls => boolean(),
+    json_schema => map() | binary(),
+    enable_thinking => boolean(),
+    reasoning_format => deepseek | none,
+    continue_final_message => none | auto | content | reasoning,
     response_tokens => pos_integer(),
     parent_key => cache_key() | undefined,
     session_id => term(),
@@ -403,6 +423,13 @@ Options for `complete/3`, `stream/3` and `continue/3`.
 - `thinking`, `thinking_budget_tokens`: extended-thinking control.
 - `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`,
   `seed`, `grammar`: sampling.
+- `grammar_lazy`, `trigger_patterns`, `trigger_tokens`,
+  `grammar_prefill`: lazy / template-grammar variants of `grammar`
+  (normally injected by `chat/3` or taken from `chat_apply/3`'s
+  `sampler_opts`, not hand-written). A lazy grammar activates only
+  once a trigger pattern matches the output (or a trigger token id is
+  sampled); `grammar_prefill` feeds the already-prompted assistant
+  header into a non-lazy template grammar before sampling.
 - `prefix_checkpoint_len`: pin the first N tokens as a static prefix
   checkpoint.
 - `to`: process receiving the stream events (`stream/3`, `continue/3`).
@@ -423,6 +450,10 @@ Options for `complete/3`, `stream/3` and `continue/3`.
     repetition_penalty => number(),
     seed => non_neg_integer(),
     grammar => binary(),
+    grammar_lazy => boolean(),
+    trigger_patterns => [binary()],
+    trigger_tokens => [token_id()],
+    grammar_prefill => binary(),
     prefix_checkpoint_len => non_neg_integer(),
     to => pid(),
     expect_committed => [token_id()],
@@ -878,8 +909,8 @@ Streaming callers use `chat_apply/2` + `stream/3` + `chat_parse/3`.
 -spec chat(model(), [chat_message()], chat_opts()) ->
     {ok, chat_result()} | {error, error_reason()}.
 chat(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
-    case erllama_opts:request_opts(maps:without([tools, tool_choice, parallel_tool_calls], Opts)) of
-        {ok, _} ->
+    case validate_chat_opts(Opts) of
+        ok ->
             {Chain, Opts1} = erllama_middleware:take(Opts),
             Req = #{op => chat, model => Model, args => #{messages => Messages, opts => Opts1}},
             erllama_middleware:run(Req, Chain, fun(
@@ -891,26 +922,86 @@ chat(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
             E
     end.
 
+%% Chat opts are the chat-level keys plus any request opt; validate
+%% the two groups with their own validators.
+validate_chat_opts(Opts) ->
+    ChatKeys = erllama_chat:chat_keys(),
+    case erllama_opts:chat_opts(maps:with(ChatKeys, Opts)) of
+        {ok, _} ->
+            case erllama_opts:request_opts(maps:without(ChatKeys, Opts)) of
+                {ok, _} -> ok;
+                {error, _} = E -> E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
 -doc """
 Render the prompt and build the output parser for one request with
 llama.cpp's `common_chat_templates_apply`. `Messages` and `Opts` are
-those of `chat/3` (only the chat keys of `Opts` are used). Returns the
-prompt bytes and the `chat_params()` to hand to `chat_parse/3` for this
-request's output; tokenise the prompt with `tokenize/3` and
-`#{add_special => false, parse_special => true}`. The parser is not
-reusable across requests.
+those of `chat/3` (only the chat keys of `Opts` are used). Returns:
+
+- `prompt`: the rendered bytes; tokenise with `tokenize/3` and
+  `#{add_special => false, parse_special => true}`.
+- `params`: the `chat_params()` to hand to `chat_parse/3` for this
+  request's output. Not reusable across requests.
+- `sampler_opts`: the template-synthesized constraint set (`grammar`,
+  `grammar_lazy`, `trigger_patterns`, `trigger_tokens`,
+  `grammar_prefill`) ready to merge into the `stream/3` request opts,
+  and `stop_sequences`: the template's additional stop strings. Merge
+  both so `tool_choice => required` / `json_schema` are enforced
+  during sampling, exactly as `chat/3` does internally:
+
+```erlang
+{ok, #{prompt := P, params := Params, sampler_opts := S, stop_sequences := Stops}} =
+    erllama:chat_apply(M, Messages, ChatOpts),
+{ok, Tokens} = erllama:tokenize(M, P, #{add_special => false, parse_special => true}),
+{ok, Ref} = erllama:stream(M, Tokens, maps:merge(S, #{stop_sequences => Stops})).
+```
+
+- `generation_prompt`, `supports_thinking`, `thinking_start_tag`,
+  `thinking_end_tags`: template metadata (informational).
 """.
 -spec chat_apply(model(), [chat_message()], chat_opts()) ->
-    {ok, #{prompt := binary(), params := chat_params()}} | {error, error_reason()}.
+    {ok, #{
+        prompt := binary(),
+        params := chat_params(),
+        sampler_opts := map(),
+        stop_sequences := [binary()],
+        generation_prompt := binary(),
+        supports_thinking := boolean(),
+        thinking_start_tag := binary(),
+        thinking_end_tags := [binary()]
+    }}
+    | {error, error_reason()}.
 chat_apply(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
-    {Chain, Opts1} = erllama_middleware:take(Opts),
-    Req = #{op => chat_apply, model => Model, args => #{messages => Messages, opts => Opts1}},
-    erllama_middleware:run(Req, Chain, fun do_chat_apply/1).
+    case erllama_opts:chat_opts(maps:with(erllama_chat:chat_keys(), Opts)) of
+        {ok, _} ->
+            {Chain, Opts1} = erllama_middleware:take(Opts),
+            Req = #{
+                op => chat_apply, model => Model, args => #{messages => Messages, opts => Opts1}
+            },
+            erllama_middleware:run(Req, Chain, fun do_chat_apply/1);
+        {error, _} = E ->
+            E
+    end.
 
 do_chat_apply(#{model := Model, args := #{messages := Messages, opts := Opts}}) ->
     case erllama_model:chat_apply(Model, erllama_chat:inputs(Messages, Opts)) of
-        {ok, Params, Prompt} -> {ok, #{prompt => Prompt, params => Params}};
-        {error, _} = E -> E
+        {ok, Params, Render} ->
+            Merged = erllama_chat:merge_params(Render, #{}),
+            {ok, #{
+                prompt => maps:get(prompt, Render),
+                params => Params,
+                sampler_opts => maps:remove(stop_sequences, Merged),
+                stop_sequences => maps:get(stop_sequences, Merged, []),
+                generation_prompt => maps:get(generation_prompt, Render, <<>>),
+                supports_thinking => maps:get(supports_thinking, Render, false),
+                thinking_start_tag => maps:get(thinking_start_tag, Render, <<>>),
+                thinking_end_tags => maps:get(thinking_end_tags, Render, [])
+            }};
+        {error, _} = E ->
+            E
     end.
 
 -doc """

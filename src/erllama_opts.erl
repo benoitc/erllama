@@ -10,7 +10,7 @@
 %% Key}}` or `{error, {invalid_option, Key, Value}}` so callers get a
 %% typed reason instead of a crash inside the model process.
 
--export([load_config/1, request_opts/1, prefill_opts/1]).
+-export([load_config/1, request_opts/1, prefill_opts/1, chat_opts/1]).
 
 -define(LOAD_KEYS, [
     backend,
@@ -70,7 +70,29 @@
     max_ladder_rows
 ]).
 
--define(SAMPLER_KEYS, [grammar, repetition_penalty, top_k, top_p, min_p, temperature, seed]).
+-define(SAMPLER_KEYS, [
+    grammar,
+    grammar_lazy,
+    trigger_patterns,
+    trigger_tokens,
+    grammar_prefill,
+    repetition_penalty,
+    top_k,
+    top_p,
+    min_p,
+    temperature,
+    seed
+]).
+
+-define(CHAT_OPT_KEYS, [
+    tools,
+    tool_choice,
+    parallel_tool_calls,
+    json_schema,
+    enable_thinking,
+    reasoning_format,
+    continue_final_message
+]).
 
 -define(REQUEST_KEYS,
     ?SAMPLER_KEYS ++
@@ -269,6 +291,30 @@ prefill_opts(Opts) when is_map(Opts) ->
 prefill_opts(Other) ->
     {error, {invalid_option, opts, Other}}.
 
+%% Chat-level option keys of `erllama:chat/3` / `chat_apply/3` (the
+%% facade validates them separately from the request opts).
+-spec chat_opts(map()) -> {ok, map()} | {error, term()}.
+chat_opts(Opts) when is_map(Opts) ->
+    steps(Opts, [
+        fun(O) -> unknown(O, ?CHAT_OPT_KEYS) end,
+        fun(O) -> check_types_ok(O, chat_checks()) end
+    ]);
+chat_opts(Other) ->
+    {error, {invalid_option, opts, Other}}.
+
+chat_checks() ->
+    [
+        {tools, fun(V) -> is_list(V) andalso lists:all(fun is_map/1, V) end},
+        {tool_choice, fun(V) -> lists:member(V, [auto, required, none]) end},
+        {parallel_tool_calls, fun is_boolean/1},
+        {json_schema, fun(V) -> is_map(V) orelse is_binary(V) end},
+        {enable_thinking, fun is_boolean/1},
+        {reasoning_format, fun(V) -> lists:member(V, [deepseek, none]) end},
+        {continue_final_message, fun(V) ->
+            lists:member(V, [none, auto, content, reasoning])
+        end}
+    ].
+
 request_checks() ->
     [
         {response_tokens, fun pos_int/1},
@@ -284,6 +330,10 @@ request_checks() ->
         {expect_committed, fun(V) -> is_list(V) andalso lists:all(fun non_neg_int/1, V) end},
         {middleware, fun(V) -> is_list(V) andalso lists:all(fun is_function/1, V) end},
         {grammar, fun is_binary/1},
+        {grammar_lazy, fun is_boolean/1},
+        {trigger_patterns, fun(V) -> is_list(V) andalso lists:all(fun is_binary/1, V) end},
+        {trigger_tokens, fun(V) -> is_list(V) andalso lists:all(fun non_neg_int/1, V) end},
+        {grammar_prefill, fun is_binary/1},
         {repetition_penalty, fun is_number/1},
         {top_k, fun is_integer/1},
         {top_p, fun is_number/1},

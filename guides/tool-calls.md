@@ -43,9 +43,20 @@ the template carries ids; mint your own when the client protocol needs
 them.
 
 Options: `tools`, `tool_choice` (`auto` default, `required`, `none`),
-`parallel_tool_calls` (boolean), plus every `erllama:request_opts()`
-key (`response_tokens`, `temperature`, `session_id`, `stop_sequences`,
-...).
+`parallel_tool_calls` (boolean), `json_schema`, `enable_thinking`,
+`reasoning_format`, `continue_final_message`, plus every
+`erllama:request_opts()` key (`response_tokens`, `temperature`,
+`session_id`, `stop_sequences`, ...).
+
+With tools present, the grammar llama.cpp synthesizes from the chat
+template is enforced during sampling, not just suggested by the
+prompt: under `tool_choice => auto` a lazy grammar arms itself when
+the model opens a call (so free text stays unconstrained), and under
+`required` the whole reply is constrained to a call. Any stop strings
+the template declares are honoured too. Passing your own `grammar`
+together with active tools is rejected
+(`{invalid_option, grammar, conflicts_with_tools}`); a caller grammar
+otherwise replaces the template's.
 
 ## The tool loop
 
@@ -90,14 +101,19 @@ calls carries `tool_calls` with `function => #{name, arguments}` where
 ## Streaming
 
 For token-by-token delivery use the three-step form: render, stream,
-parse.
+parse. Merge the `sampler_opts` and `stop_sequences` that
+`chat_apply/3` returns into the stream options - that is the
+template's constraint set (`chat/3` does the same merge internally):
 
 ```erlang
-{ok, #{prompt := Prompt, params := Params}} =
+{ok, #{prompt := Prompt, params := Params,
+       sampler_opts := SamplerOpts, stop_sequences := Stops}} =
     erllama:chat_apply(Model, Messages, #{tools => Tools}),
 {ok, Tokens} = erllama:tokenize(Model, Prompt,
                                 #{add_special => false, parse_special => true}),
-{ok, Ref} = erllama:stream(Model, Tokens, #{temperature => 0.0}),
+StreamOpts = maps:merge(SamplerOpts,
+                        #{temperature => 0.0, stop_sequences => Stops}),
+{ok, Ref} = erllama:stream(Model, Tokens, StreamOpts),
 {ok, #{reply := Reply}} = erllama:collect(Ref, 60000),
 {ok, Msg} = erllama:chat_parse(Params, Reply, false).
 ```
@@ -110,10 +126,35 @@ turn.
 
 ## Forcing a call or a schema
 
-- `tool_choice => required` makes the template and parser expect a
-  call.
-- A `grammar` (GBNF) in the request options constrains every sampled
-  token, tool-call syntax included, for strict output formats.
+- `tool_choice => required`: the template renders for a mandatory
+  call AND the synthesized grammar constrains sampling, so the reply
+  always parses into at least one `tool_calls` entry.
+- `json_schema => Schema` (a map or a JSON binary): the reply's
+  content is constrained to the schema (OpenAI `response_format`
+  semantics); `json:decode(Content)` always succeeds. Cannot be
+  combined with `tools`
+  (`{invalid_option, json_schema, conflicts_with_tools}`).
+- A hand-written `grammar` (GBNF) in the request options still works
+  for custom formats and takes precedence over anything the template
+  synthesizes.
+
+## Thinking and prefill
+
+- `enable_thinking => false` suppresses the thinking preamble on
+  templates that support it; `chat_apply/3` reports
+  `supports_thinking` plus the template's thinking tags.
+- `reasoning_format` (default `deepseek`) extracts thinking text into
+  `reasoning_content`; `reasoning_format => none` leaves it inline in
+  `content`.
+- `continue_final_message => content` (or `auto` / `reasoning`) turns
+  a trailing assistant message into a prefill: the model continues it
+  instead of starting a new turn. The prefill text ends up at the tail
+  of the rendered prompt and is included in the parsed message.
+
+One limitation: a lazy tool-call grammar can also be triggered by the
+marker text appearing inside a thinking block. Upstream suppresses
+that with a reasoning-budget sampler that erllama does not have yet;
+disable thinking or use `tool_choice => required` when it matters.
 
 ## Models without a template
 

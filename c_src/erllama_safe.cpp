@@ -787,6 +787,30 @@ erllama_safe_sampler_init_grammar(const struct llama_vocab *vocab,
     }
 }
 
+// Lazy grammar sampler: constrains sampling only once one of the
+// trigger regex patterns matches the output so far (grammar is fed
+// from the pattern's first match group) or a trigger token is
+// sampled. Used for template-synthesized tool-call grammars with
+// tool_choice=auto. nullptr on exception or invalid grammar.
+struct llama_sampler *
+erllama_safe_sampler_init_grammar_lazy_patterns(
+    const struct llama_vocab *vocab,
+    const char *grammar_str,
+    const char *grammar_root,
+    const char **trigger_patterns,
+    size_t num_trigger_patterns,
+    const llama_token *trigger_tokens,
+    size_t num_trigger_tokens) noexcept {
+    try {
+        return llama_sampler_init_grammar_lazy_patterns(
+            vocab, grammar_str, grammar_root,
+            trigger_patterns, num_trigger_patterns,
+            trigger_tokens, num_trigger_tokens);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 // Clone a sampler: copies a parsed grammar's rules without re-parsing,
 // with fresh per-decode state. nullptr on a thrown exception.
 struct llama_sampler *

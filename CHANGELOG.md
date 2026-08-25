@@ -6,6 +6,37 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- `chat/3` defaults `reasoning_format` to `deepseek`: thinking models
+  now return their thinking text in `reasoning_content` instead of
+  inline in `content` (llama-server's default). Opt out per call with
+  `reasoning_format => none`.
+- `chat_apply/3` returns the template's constraint set alongside
+  `prompt` and `params`: `sampler_opts`, `stop_sequences`,
+  `generation_prompt`, `supports_thinking`, `thinking_start_tag`,
+  `thinking_end_tags`. Merge `sampler_opts` + `stop_sequences` into
+  the `stream/3` options (the tool-calls guide shows how).
+
+### Added
+
+- Tool-call grammar enforcement: `chat/3` merges the grammar llama.cpp
+  synthesizes from the chat template into the request, so
+  `tool_choice => required` always yields a parsed call and
+  `tool_choice => auto` arms a lazy grammar that constrains the reply
+  once the model opens a call. Template-declared stop strings are
+  honoured. A caller `grammar` combined with active tools is rejected.
+- `json_schema` chat option (OpenAI `response_format` semantics): the
+  reply's content is grammar-constrained to the schema. Rejected in
+  combination with `tools`.
+- Chat options `enable_thinking` (default true) and
+  `continue_final_message` (`none | auto | content | reasoning`) for
+  assistant prefill.
+- Request options `grammar_lazy`, `trigger_patterns`,
+  `trigger_tokens`, `grammar_prefill`: the lazy / template-grammar
+  sampler shape (`llama_sampler_init_grammar_lazy_patterns`), usable
+  directly with `stream/3` and friends.
+
 ### Fixed
 
 - Cache correctness on recurrent / hybrid models (Mamba, RWKV, Jamba,
