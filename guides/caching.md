@@ -65,13 +65,13 @@ each with its own `save_reason`:
 
 | Reason | When | Sync? |
 |---|---|---|
-| `cold` | Right after a cold prefill, at the trimmed-prefix boundary. Async — the writer pool does the work. |
+| `cold` | Right after a cold prefill, at the trimmed-prefix boundary. Async - the writer pool does the work. |
 | `continued` | Every `continued_interval` tokens during generation. Async. |
 | `finish` | At the end of a completion, capturing prompt + reply. Async. |
 | `evict` | When a holder is asked to release its slab. Sync (pause decode, pack, release). |
 | `shutdown` | On `prep_stop` or `unload/1`. Sync, capped by `evict_save_timeout_ms`. |
 
-Async saves go through `erllama_cache_writer` — a pool of dirty-IO
+Async saves go through `erllama_cache_writer` - a pool of dirty-IO
 workers. Sync saves block the calling process until the file is on
 stable storage.
 
@@ -88,8 +88,8 @@ Three lookup paths, in order of preference:
    (`boundary_align_tokens`) and probes the index for each
    alignment. The longest cached prefix wins.
 
-For stateless callers — OpenAI/Anthropic-shaped HTTP APIs that
-resend the full conversation each turn — option 3 is what you want.
+For stateless callers - OpenAI/Anthropic-shaped HTTP APIs that
+resend the full conversation each turn - option 3 is what you want.
 You don't have to do anything; just call `erllama:complete/2`.
 
 A warm restore can still fail mid-flight: recurrent / hybrid models
@@ -143,10 +143,10 @@ watermark. Off by default. Enable in `sys.config`:
 
 Sources shipped:
 
-- `noop` — always reports zero pressure.
-- `system` — OTP `memsup`. Linux, macOS, BSD, Windows.
-- `nvidia_smi` — sums VRAM across all visible NVIDIA GPUs.
-- `{module, M}` — calls `M:sample/0`. Implement
+- `noop` - always reports zero pressure.
+- `system` - OTP `memsup`. Linux, macOS, BSD, Windows.
+- `nvidia_smi` - sums VRAM across all visible NVIDIA GPUs.
+- `{module, M}` - calls `M:sample/0`. Implement
   `-behaviour(erllama_pressure)` to write your own.
 
 When the source reports `Used / Total >= high_watermark`, the
@@ -186,13 +186,13 @@ application env to disable all saves at the policy level:
 ]}.
 ```
 
-There is no global "off switch" — disabling was an explicit
+There is no global "off switch" - disabling was an explicit
 non-goal. The cache is the product.
 
 ## See also
 
-- [Loading a model](loading.md) — option-by-option walkthrough.
-- [Configuration reference](configuration.md) — every knob,
+- [Loading a model](loading.md) - option-by-option walkthrough.
+- [Configuration reference](configuration.md) - every knob,
   with defaults.
 - Internals: [cache design](../internals/cache-design.md) and
   [publish protocol](../internals/publish-protocol.md) for the

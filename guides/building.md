@@ -69,7 +69,7 @@ export PATH="/usr/local/lib/erlang28/bin:/usr/local/bin:$PATH"
 
 # llama.cpp's build-info cmake script invokes `git rev-parse`. When
 # the build directory's owner differs from the user (typical inside
-# CI VMs), git refuses with "dubious ownership" — allow the path.
+# CI VMs), git refuses with "dubious ownership" - allow the path.
 git config --global --add safe.directory "$PWD"
 
 # rebar3 isn't always available as a pkg; fetch it once.
@@ -90,26 +90,26 @@ takes precedence (useful for cross-compilation or pinned headers).
 
 ## What the build produces
 
-- `priv/erllama_nif.so` — the single NIF, statically linked against
+- `priv/erllama_nif.so` - the single NIF, statically linked against
   the vendored `c_src/llama.cpp` (libllama, libggml, ggml-cpu, plus
   the platform GPU/BLAS backends) and `c_src/crc32c.c`.
-- `_build/default/lib/erllama/ebin/*.beam` — Erlang modules.
-- `_build/cmake/` — CMake build dir; cached for incremental builds.
+- `_build/default/lib/erllama/ebin/*.beam` - Erlang modules.
+- `_build/cmake/` - CMake build dir; cached for incremental builds.
 
 ## Common build issues
 
-- **`'erl_nif.h' file not found`** — `ERTS_INCLUDE_DIR` is wrong.
+- **`'erl_nif.h' file not found`** - `ERTS_INCLUDE_DIR` is wrong.
   `FindErlang.cmake` should resolve it automatically; if it fails,
   set the env var explicitly:
   `ERTS_INCLUDE_DIR=$(erl -noshell -eval 'io:format("~s",[filename:join([code:root_dir(),"erts-"++erlang:system_info(version),"include"])]),halt().') rebar3 compile`.
-- **`R_X86_64_TPOFF32 against hidden symbol gomp_tls_data`** — your
+- **`R_X86_64_TPOFF32 against hidden symbol gomp_tls_data`** - your
   `libgomp.a` is non-PIC. erllama's CMakeLists already sets
   `GGML_OPENMP OFF` to avoid this. If you re-enabled OpenMP, build
   a PIC `libgomp` or leave it off.
-- **`PCRE2_10.47 not defined`** when running git on FreeBSD — refresh
+- **`PCRE2_10.47 not defined`** when running git on FreeBSD - refresh
   `pcre2` first: `pkg install -y pcre2`. The cached VM image lags
   the latest repo.
-- **macOS metal init slow on first model load** — the lazy
+- **macOS metal init slow on first model load** - the lazy
   `llama_backend_init` runs on the first `erllama:load_model/1` call
   and discovers Metal devices. eunit cases that load a model need
   a generator timeout >5 s; see

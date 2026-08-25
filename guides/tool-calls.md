@@ -1,15 +1,38 @@
 # Tool calls
 
-`erllama:chat/3` runs one chat turn: it renders the messages and the
-tool definitions through the model's own chat template, generates, and
-parses the output back into a structured assistant message with
-`content`, `reasoning_content` and `tool_calls`. The parser is
-llama.cpp's autoparser, so every template family llama.cpp knows
-(Qwen, Llama 3, Mistral, Hermes, GPT-OSS, ...) works without per-model
-configuration. You need this page when your application lets the
-model call functions.
+Letting the model call functions you define: you describe your tools,
+the model asks for calls, you execute them and feed the results back
+until the model answers in plain text. You need this page when you
+build agents, assistants with actions, or anything where the model
+drives your code.
 
-## One turn
+## The round trip
+
+One tool interaction is a loop of chat turns:
+
+```text
+you                          erllama                     model
+ |-- messages + tools ------> chat/3 --- rendered ------> |
+ |                                                        | decides
+ |<-- message with tool_calls --- parsed <--- output ---- |
+ |-- run each call
+ |-- messages ++ assistant turn ++ tool results
+ |------------------------------> chat/3 (same session) ->|
+ |<-- message with content (or more calls: loop again) ---|
+```
+
+`erllama:chat/3` does the erllama half in one call: it renders your
+messages and tool definitions through the model's own chat template,
+generates with the template's tool grammar enforced, and parses the
+output into a structured message. Every template family llama.cpp
+knows (Qwen, Llama 3, Mistral, Hermes, GPT-OSS, ...) works without
+per-model configuration. Your half is running the calls and
+appending the results.
+
+## 1. Define your tools
+
+A tool is a name, a description the model reads, and a JSON schema
+for its arguments:
 
 ```erlang
 Tools = [
@@ -18,12 +41,21 @@ Tools = [
       parameters => #{type => object,
                       properties => #{city => #{type => string}},
                       required => [city]}}
-],
+].
+```
+
+Write descriptions for the model, not for humans: say what the tool
+answers and when to use it. Keep schemas small; every property is
+prompt tokens on every turn.
+
+## 2. Ask for a turn
+
+```erlang
 Messages = [
     #{role => system, content => <<"You are a helpful assistant.">>},
     #{role => user, content => <<"What is the weather in Paris?">>}
 ],
-{ok, #{message := Msg, stats := Stats}} =
+{ok, #{message := Msg}} =
     erllama:chat(Model, Messages, #{tools => Tools, temperature => 0.0}).
 ```
 
@@ -31,43 +63,45 @@ Messages = [
 
 ```erlang
 #{role => <<"assistant">>,
-  content => <<>>,
-  reasoning_content => undefined,
+  content => <<>>,                      %% text the model said, if any
+  reasoning_content => undefined,       %% thinking text, if extracted
   tool_calls => [#{name => <<"get_weather">>,
                    arguments => #{<<"city">> => <<"Paris">>},
                    id => undefined}]}
 ```
 
-`arguments` is already decoded from JSON. `id` is `undefined` unless
-the template carries ids; mint your own when the client protocol needs
-them.
+`arguments` is already decoded from JSON. `tool_calls =:= []` means
+the model answered directly; `content` is your reply and the loop
+ends. `id` is `undefined` unless the template mints ids; mint your
+own when your client protocol needs them.
 
-Options: `tools`, `tool_choice` (`auto` default, `required`, `none`),
-`parallel_tool_calls` (boolean), `json_schema`, `enable_thinking`,
-`reasoning_format`, `continue_final_message`, plus every
-`erllama:request_opts()` key (`response_tokens`, `temperature`,
-`session_id`, `stop_sequences`, ...).
+## 3. Execute the calls
 
-With tools present, the grammar llama.cpp synthesizes from the chat
-template is enforced during sampling, not just suggested by the
-prompt: under `tool_choice => auto` a lazy grammar arms itself when
-the model opens a call (so free text stays unconstrained), and under
-`required` the whole reply is constrained to a call. Any stop strings
-the template declares are honoured too. Passing your own `grammar`
-together with active tools is rejected
-(`{invalid_option, grammar, conflicts_with_tools}`); a caller grammar
-otherwise replaces the template's.
+Run each requested call yourself and produce a result string
+(usually JSON). Treat arguments as untrusted input: validate against
+your schema, bound what the tool can touch, and return errors as
+data so the model can react:
 
-## The tool loop
+```erlang
+run_tool(#{name := <<"get_weather">>, arguments := #{<<"city">> := City}}) ->
+    case weather_api:lookup(City) of
+        {ok, W} -> iolist_to_binary(json:encode(W));
+        {error, unknown_city} -> <<"{\"error\": \"unknown city\"}">>
+    end;
+run_tool(#{name := Name}) ->
+    iolist_to_binary([<<"{\"error\": \"unknown tool ">>, Name, <<"\"}">>]).
+```
 
-Run the tool, append the result as a `tool` message, and call
-`chat/3` again with the whole conversation. The KV cache makes the
-second call cheap: the rendered prompt shares its prefix with the
-first one.
+## 4. Feed the results back and loop
+
+Append two things to the conversation: the assistant turn that made
+the calls (in the OpenAI shape, `arguments` re-encoded as a JSON
+string) and one `tool` message per result, then call `chat/3` again:
 
 ```erlang
 tool_loop(Model, Messages, Tools) ->
-    {ok, #{message := Msg}} = erllama:chat(Model, Messages, #{tools => Tools}),
+    Opts = #{tools => Tools, temperature => 0.0, session_id => agent},
+    {ok, #{message := Msg}} = erllama:chat(Model, Messages, Opts),
     case maps:get(tool_calls, Msg) of
         [] ->
             {ok, maps:get(content, Msg)};
@@ -87,22 +121,78 @@ call_id(#{id := Id}) -> Id.
 call_json(#{name := Name, arguments := Args} = C) ->
     #{id => call_id(C),
       type => function,
-      function => #{name => Name, arguments => iolist_to_binary(json:encode(Args))}}.
-
-run_tool(#{name := <<"get_weather">>, arguments := #{<<"city">> := City}}) ->
-    iolist_to_binary(json:encode(#{city => City, temperature_c => 21})).
+      function => #{name => Name,
+                    arguments => iolist_to_binary(json:encode(Args))}}.
 ```
 
-Messages follow the OpenAI shapes: an assistant message that made
-calls carries `tool_calls` with `function => #{name, arguments}` where
-`arguments` is a JSON string; a `tool` message answers one call by
-`tool_call_id`.
+Two things make this loop cheap and robust:
 
-## Streaming
+- The `session_id` pins the conversation's KV cells, so every round
+  only prefills the new suffix (the tool results), not the whole
+  transcript. See [sessions](sessions.md).
+- Always cap the loop (a max-rounds counter): a confused model can
+  request calls forever.
+
+`examples/agent_loop` in the repository is this loop as a complete
+runnable application.
+
+## Message shapes
+
+The conversation list uses the OpenAI shapes throughout:
+
+| Role | Keys | Meaning |
+|---|---|---|
+| `system` | `content` | instructions, once at the top |
+| `user` | `content` | the human turn |
+| `assistant` | `content`, optional `tool_calls` | a model turn; `tool_calls` entries are `#{id, type => function, function => #{name, arguments}}` with `arguments` as a JSON **string** |
+| `tool` | `content`, `tool_call_id`, optional `name` | one result per call, matched by id |
+
+## Enforcement: `tool_choice`
+
+With tools present, the grammar llama.cpp synthesizes from the chat
+template is enforced during sampling, not just suggested by the
+prompt:
+
+- `tool_choice => auto` (default): the model may answer in text or
+  call tools. A lazy grammar arms itself only when the model opens a
+  call, so free text stays unconstrained, but an opened call is
+  always syntactically valid.
+- `tool_choice => required`: the whole reply is constrained to a
+  call; `tool_calls` is never empty.
+- `tool_choice => none`: tools stay in the prompt for context, but
+  the model cannot call them.
+
+`parallel_tool_calls => true` lets one turn request several calls;
+run them all and append one `tool` message each.
+
+Passing your own `grammar` together with active tools is rejected
+(`{error, {invalid_option, grammar, conflicts_with_tools}}`); a
+caller grammar otherwise replaces the template's.
+
+## Forcing a schema instead of tools
+
+When you want structured output rather than actions, constrain the
+reply itself:
+
+```erlang
+Schema = #{type => object,
+           properties => #{answer => #{type => string}},
+           required => [answer]},
+{ok, #{message := #{content := Json}}} =
+    erllama:chat(Model, Messages, #{json_schema => Schema}),
+#{<<"answer">> := Answer} = json:decode(Json).
+```
+
+`json_schema` (OpenAI `response_format` semantics) grammar-constrains
+the content, so `json:decode/1` always succeeds. It cannot be
+combined with `tools`
+(`{error, {invalid_option, json_schema, conflicts_with_tools}}`).
+
+## Streaming a tool turn
 
 For token-by-token delivery use the three-step form: render, stream,
 parse. Merge the `sampler_opts` and `stop_sequences` that
-`chat_apply/3` returns into the stream options - that is the
+`chat_apply/3` returns into the stream options; that is the
 template's constraint set (`chat/3` does the same merge internally):
 
 ```erlang
@@ -118,25 +208,11 @@ StreamOpts = maps:merge(SamplerOpts,
 {ok, Msg} = erllama:chat_parse(Params, Reply, false).
 ```
 
-While the stream is running, `chat_parse(Params, PartialReply, true)`
-parses a prefix and returns what is complete so far (content deltas,
-a tool call whose arguments are still being generated). `Params` is
-valid for this request only: call `chat_apply/3` again for the next
-turn.
-
-## Forcing a call or a schema
-
-- `tool_choice => required`: the template renders for a mandatory
-  call AND the synthesized grammar constrains sampling, so the reply
-  always parses into at least one `tool_calls` entry.
-- `json_schema => Schema` (a map or a JSON binary): the reply's
-  content is constrained to the schema (OpenAI `response_format`
-  semantics); `json:decode(Content)` always succeeds. Cannot be
-  combined with `tools`
-  (`{invalid_option, json_schema, conflicts_with_tools}`).
-- A hand-written `grammar` (GBNF) in the request options still works
-  for custom formats and takes precedence over anything the template
-  synthesizes.
+While the stream runs, `chat_parse(Params, PartialReply, true)`
+parses a prefix and returns what is complete so far: content deltas
+to show the user, and a tool call whose name is known while its
+arguments are still generating. `Params` is valid for this request
+only; call `chat_apply/3` again for the next turn.
 
 ## Thinking and prefill
 
@@ -148,17 +224,29 @@ turn.
   `content`.
 - `continue_final_message => content` (or `auto` / `reasoning`) turns
   a trailing assistant message into a prefill: the model continues it
-  instead of starting a new turn. The prefill text ends up at the tail
-  of the rendered prompt and is included in the parsed message.
+  instead of starting a new turn. The prefill text ends up at the
+  tail of the rendered prompt and is included in the parsed message.
 
-One limitation: a lazy tool-call grammar can also be triggered by the
-marker text appearing inside a thinking block. Upstream suppresses
-that with a reasoning-budget sampler that erllama does not have yet;
-disable thinking or use `tool_choice => required` when it matters.
+## Troubleshooting
 
-## Models without a template
+- **`{error, {chat_parse_failed, Reason}}`**: the model produced
+  output the parser rejects. With enforcement on this is rare; when
+  it happens with a `Qwen/Qwen2.5-*-Instruct-GGUF` file, the shipped
+  template has doubled braces in its tool example. Load the corrected
+  template with the `chat_template` option (see
+  `examples/agent_loop/priv/qwen2.5-instruct.jinja`).
+- **The model never calls tools** under `auto`: strengthen the tool
+  descriptions, or use `required` for the turn where a call is
+  mandatory.
+- **`{error, chat_not_supported}`**: the stub backend has no chat
+  template; test tool loops against a small real model
+  (see [testing](testing.md)).
+- **`{error, no_template}`**: the GGUF ships no chat template;
+  `render_chat_template/2` is the legacy renderer for that case (it
+  returns tokens and does no parsing).
 
-`chat_apply/3` returns `{error, no_template}` for a GGUF that ships
-no chat template and `{error, chat_not_supported}` for the stub
-backend. `render_chat_template/2` is the legacy renderer for the
-first case: it returns tokens and does no parsing.
+## See also
+
+- [Sessions](sessions.md) - pinning the loop's KV across rounds
+- [Generating text](generation.md) - streaming events, options
+- [Examples](examples.md) - more recipes, including streaming parses

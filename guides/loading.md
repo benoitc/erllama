@@ -133,12 +133,12 @@ Fp = crypto:hash(sha256, Bin).
 
 How aggressively the cache trusts the fingerprint:
 
-- `safe` — recompute the fingerprint at load time. Slow on multi-GB
+- `safe` - recompute the fingerprint at load time. Slow on multi-GB
   files but ironclad.
-- `gguf_chunked` — fingerprint the GGUF metadata chunk and the first
+- `gguf_chunked` - fingerprint the GGUF metadata chunk and the first
   weights tensor only. Order of magnitude faster; defeats accidental
   but not malicious tampering.
-- `fast_unsafe` — trust whatever you pass in. Use only if you
+- `fast_unsafe` - trust whatever you pass in. Use only if you
   fingerprint upstream and pass the result through.
 
 ### `quant_type` and `quant_bits`
@@ -148,7 +148,7 @@ weights but different quant schemes have different cache rows.
 
 ### `ctx_params_hash`
 
-A SHA-256 over the parts of `context_opts` that change KV layout —
+A SHA-256 over the parts of `context_opts` that change KV layout -
 typically `(n_ctx, n_batch)`. erllama treats two contexts with
 different params as different cache namespaces.
 
@@ -307,7 +307,7 @@ concurrently:
 {ok, #{reply := R2}} = erllama:complete(<<"big">>,  <<"hello">>).
 ```
 
-Both share one `erllama_cache` instance — cache rows are scoped by
+Both share one `erllama_cache` instance - cache rows are scoped by
 fingerprint, so they never collide.
 
 ## Unloading
