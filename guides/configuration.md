@@ -200,6 +200,40 @@ if you want a tighter bound.
 
 See [loading a model](loading.md) for the per-field walkthrough.
 
+## Sampling reference
+
+Per-request option keys mirroring the llama.cpp sampler surface.
+Every key is optional; a stage is only added to the chain when its
+key departs from the neutral default, so an empty option map is pure
+greedy decoding.
+
+| Key | Default | Stage |
+|---|---|---|
+| `temperature` | 0.0 | 0 or absent = greedy terminal; > 0 = temperature scaling + seeded sampling (`dist`). |
+| `seed` | 0 | RNG seed for the sampling terminal (no-op under greedy). |
+| `top_k` | off | Keep the k most likely tokens. |
+| `top_p` | 1.0 | Nucleus sampling (< 1.0 enables). |
+| `min_p` | 0.0 | Minimum relative probability (> 0 enables). |
+| `typical_p` | 1.0 | Locally typical sampling (< 1.0 enables). |
+| `top_n_sigma` | off | Keep tokens within n standard deviations of the max logit (> 0 enables). |
+| `xtc_probability` / `xtc_threshold` | 0.0 / 0.1 | XTC: with probability p, cut the most-likely tokens above the threshold. |
+| `dynatemp_range` / `dynatemp_exponent` | 0.0 / 1.0 | Dynamic temperature (entropy-scaled) around `temperature`. |
+| `min_keep` | 1 | Floor on candidates kept by top_p / min_p / typical_p / xtc. |
+| `repetition_penalty` | 1.0 | Classic repetition penalty (with `penalty_last_n`, default 64). |
+| `frequency_penalty` / `presence_penalty` | 0.0 | OpenAI-style penalties, same window. |
+| `dry_multiplier` | 0.0 | DRY anti-repetition (> 0 enables) with `dry_base` 1.75, `dry_allowed_length` 2, `dry_penalty_last_n` 64, `dry_sequence_breakers` (default `["\n", ":", "\"", "*"]`). |
+| `mirostat` | 0 | `1` or `2` replaces every truncation stage with the mirostat controller (`mirostat_tau` 5.0, `mirostat_eta` 0.1) on top of `temperature`. |
+| `logit_bias` | [] | `[{TokenId, Bias}]` added to the logits before anything else. |
+| `ignore_eos` | false | Bias every end-of-generation token to -inf (generation runs to `response_tokens`). |
+| `infill` | false | llama.cpp's FIM-oriented final filter; combine with the `fim_*` ids from `erllama:vocab_info/1`. |
+| `grammar` (+ lazy keys) | off | GBNF constraint; see the tool-calls guide. |
+| `logprobs` | 0 | 1..32: report each token's full-vocab logprob and top-N alternatives as `{logprobs, _}` stream events / the `logprobs` result key. Computed on the raw model distribution, before any sampler stage. |
+
+Chain order (llama.cpp's): grammar -> logit_bias -> penalties -> dry
+-> top_n_sigma -> top_k -> typical_p -> top_p -> min_p -> xtc ->
+infill -> temperature -> dist. With `mirostat => 1 | 2` the middle
+stages are skipped entirely, as upstream does.
+
 ## Inspecting effective config
 
 ```erlang

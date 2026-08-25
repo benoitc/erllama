@@ -48,6 +48,12 @@
     clear_sampler_resets_to_greedy/1,
     grammar_cache_reuses_compiled_template/1,
     seed_determinism/1,
+    extended_samplers_generate/1,
+    logit_bias_suppresses_token/1,
+    ignore_eos_reaches_target/1,
+    logprobs_stream_events/1,
+    vocab_info_reports_specials/1,
+    detokenize_specials/1,
     seed_varies/1,
     temperature_zero_is_greedy/1,
     grammar_plus_sampler/1,
@@ -95,6 +101,12 @@ all() ->
         seed_varies,
         temperature_zero_is_greedy,
         grammar_plus_sampler,
+        extended_samplers_generate,
+        logit_bias_suppresses_token,
+        ignore_eos_reaches_target,
+        logprobs_stream_events,
+        vocab_info_reports_specials,
+        detokenize_specials,
         verify_does_not_mutate_caller_visible_state,
         verify_accepted_count_le_k,
         chunked_prefill_sizes_agree,
@@ -444,6 +456,145 @@ seed_determinism(Config) ->
     {Text1, _} = run_infer(Model, Tokens, Params),
     {Text2, _} = run_infer(Model, Tokens, Params),
     ?assertEqual(Text1, Text2),
+    ok.
+
+%% The extended sampler stages generate without crashing: one run
+%% with the full non-mirostat stack, one with mirostat v2.
+extended_samplers_generate(Config) ->
+    Model = ?config(model, Config),
+    {ok, Tokens} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    {Text1, _} = run_infer(Model, Tokens, #{
+        response_tokens => 8,
+        temperature => 0.8,
+        typical_p => 0.9,
+        top_n_sigma => 2.0,
+        xtc_probability => 0.2,
+        xtc_threshold => 0.15,
+        dynatemp_range => 0.3,
+        min_keep => 2,
+        dry_multiplier => 0.8,
+        frequency_penalty => 0.1,
+        presence_penalty => 0.1,
+        penalty_last_n => 128,
+        seed => 42
+    }),
+    ?assert(byte_size(Text1) > 0),
+    {Text2, _} = run_infer(Model, Tokens, #{
+        response_tokens => 8,
+        temperature => 0.8,
+        mirostat => 2,
+        mirostat_tau => 5.0,
+        mirostat_eta => 0.1,
+        seed => 7
+    }),
+    ?assert(byte_size(Text2) > 0),
+    ok.
+
+%% A -inf-scale bias on the greedy first token forces a different one.
+logit_bias_suppresses_token(Config) ->
+    Model = ?config(model, Config),
+    {ok, #{generated := [First | _]}} = erllama_model:complete(
+        Model, ?SHORT_PROMPT, #{response_tokens => 1, temperature => 0.0}
+    ),
+    {ok, #{generated := [Biased | _]}} = erllama_model:complete(
+        Model, ?SHORT_PROMPT, #{
+            response_tokens => 1,
+            temperature => 0.0,
+            logit_bias => [{First, -1.0e9}]
+        }
+    ),
+    ?assertNotEqual(First, Biased),
+    ok.
+
+%% ignore_eos suppresses every end-of-generation token, so the run
+%% always reaches its response_tokens target.
+ignore_eos_reaches_target(Config) ->
+    Model = ?config(model, Config),
+    {ok, #{stats := Stats}} = erllama_model:complete(
+        Model, ?SHORT_PROMPT, #{
+            response_tokens => 6, temperature => 0.0, ignore_eos => true
+        }
+    ),
+    ?assertEqual(6, maps:get(completion_tokens, Stats)),
+    ok.
+
+%% Greedy + logprobs: one event per token, top sorted descending,
+%% every logprob =< 0, and the sampled token IS the top-1 with the
+%% same logprob.
+logprobs_stream_events(Config) ->
+    Model = ?config(model, Config),
+    {ok, Tokens} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    {ok, Ref} = erllama:stream(Model, Tokens, #{
+        response_tokens => 4, temperature => 0.0, logprobs => 5
+    }),
+    {ok, Result} = erllama:collect(Ref, 60000),
+    Lps = maps:get(logprobs, Result),
+    ?assertEqual(4, length(Lps)),
+    ?assertEqual(maps:get(generated, Result), [maps:get(token_id, L) || L <- Lps]),
+    lists:foreach(
+        fun(#{token_id := T, logprob := Lp, top := Top}) ->
+            ?assert(length(Top) =< 5),
+            ?assert(Lp =< 0.0),
+            Vals = [V || {_, V} <- Top],
+            ?assertEqual(Vals, lists:reverse(lists:sort(Vals))),
+            %% Greedy: sampled == argmax == top-1.
+            [{TopId, TopLp} | _] = Top,
+            ?assertEqual(T, TopId),
+            ?assert(abs(Lp - TopLp) < 1.0e-6)
+        end,
+        Lps
+    ),
+    ok.
+
+%% The vocab probe reports sane specials on a real model.
+vocab_info_reports_specials(Config) ->
+    Model = ?config(model, Config),
+    {ok, V} = erllama:vocab_info(Model),
+    ct:log("vocab_info: ~p", [V]),
+    ?assert(maps:get(n_vocab, V) > 0),
+    ?assert(is_boolean(maps:get(add_bos, V))),
+    lists:foreach(
+        fun(K) ->
+            Val = maps:get(K, V),
+            ?assert(Val =:= undefined orelse (is_integer(Val) andalso Val >= 0))
+        end,
+        [bos, eos, eot, sep, nl, pad, mask, fim_pre, fim_suf, fim_mid, fim_pad, fim_rep, fim_sep]
+    ),
+    ok.
+
+%% detokenize/3 with unparse_special renders special tokens that the
+%% arity-2 (cache-keying) form drops; plain text stays byte-identical
+%% across both forms. Uses the model's own BOS so the case works on
+%% any vocabulary (Qwen, tinyllama, stories260K, ...).
+detokenize_specials(Config) ->
+    Model = ?config(model, Config),
+    {ok, V} = erllama:vocab_info(Model),
+    case maps:get(bos, V) of
+        undefined ->
+            ct:comment("model has no BOS; special-rendering half skipped");
+        Bos ->
+            {ok, Dropped} = erllama:detokenize(Model, [Bos]),
+            {ok, Rendered} = erllama:detokenize(Model, [Bos], #{unparse_special => true}),
+            ct:log("bos=~p dropped=~p rendered=~p", [Bos, Dropped, Rendered]),
+            ?assertEqual(<<>>, Dropped),
+            ?assert(byte_size(Rendered) > 0)
+    end,
+    %% Cache-key guard: the arity-2 form is stable (it is what the
+    %% cache byte-keys are computed over). The arity-3 form may
+    %% legitimately differ in leading whitespace on SPM tokenizers
+    %% (llama_detokenize trims the add_space_prefix space that the
+    %% per-token loop preserves), so the two paths are compared only
+    %% modulo that.
+    {ok, PlainToks} = erllama:tokenize(Model, <<"hello plain world">>, #{
+        add_special => false, parse_special => false
+    }),
+    {ok, A} = erllama:detokenize(Model, PlainToks),
+    {ok, A} = erllama:detokenize(Model, PlainToks),
+    {ok, B} = erllama:detokenize(Model, PlainToks, #{}),
+    ?assertEqual(
+        string:trim(A, leading, " "),
+        string:trim(B, leading, " ")
+    ),
     ok.
 
 %% Same prompt, same temperature, different seeds. Two independent

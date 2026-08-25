@@ -16,11 +16,14 @@
 
 #include "llama.h"
 
+#include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <new>
 #include <pthread.h>
 #include <stdint.h>
+#include <vector>
 
 #ifndef ERLLAMA_THREAD_LOCAL
 #  if defined(__cplusplus) && __cplusplus >= 201103L
@@ -139,6 +142,94 @@ erllama_safe_sampler_init_penalties(int32_t n_vocab, int32_t last_n, float repea
     }
 }
 
+struct llama_sampler *erllama_safe_sampler_init_typical(float p,
+                                                        size_t min_keep) noexcept {
+    try {
+        return llama_sampler_init_typical(p, min_keep);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+struct llama_sampler *
+erllama_safe_sampler_init_temp_ext(float t, float delta, float exponent) noexcept {
+    try {
+        return llama_sampler_init_temp_ext(t, delta, exponent);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+struct llama_sampler *erllama_safe_sampler_init_xtc(float p, float t,
+                                                    size_t min_keep,
+                                                    uint32_t seed) noexcept {
+    try {
+        return llama_sampler_init_xtc(p, t, min_keep, seed);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+struct llama_sampler *erllama_safe_sampler_init_top_n_sigma(float n) noexcept {
+    try {
+        return llama_sampler_init_top_n_sigma(n);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+struct llama_sampler *
+erllama_safe_sampler_init_mirostat(int32_t n_vocab, uint32_t seed, float tau,
+                                   float eta, int32_t m) noexcept {
+    try {
+        return llama_sampler_init_mirostat(n_vocab, seed, tau, eta, m);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+struct llama_sampler *
+erllama_safe_sampler_init_mirostat_v2(uint32_t seed, float tau, float eta) noexcept {
+    try {
+        return llama_sampler_init_mirostat_v2(seed, tau, eta);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+struct llama_sampler *
+erllama_safe_sampler_init_dry(const struct llama_vocab *vocab, float multiplier,
+                              float base, int32_t allowed_length,
+                              int32_t penalty_last_n,
+                              const char **seq_breakers,
+                              size_t num_breakers) noexcept {
+    try {
+        return llama_sampler_init_dry(vocab, multiplier, base, allowed_length,
+                                      penalty_last_n, seq_breakers, num_breakers);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+struct llama_sampler *
+erllama_safe_sampler_init_logit_bias(int32_t n_vocab, int32_t n_bias,
+                                     const llama_logit_bias *bias) noexcept {
+    try {
+        return llama_sampler_init_logit_bias(n_vocab, n_bias, bias);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+struct llama_sampler *
+erllama_safe_sampler_init_infill(const struct llama_vocab *vocab) noexcept {
+    try {
+        return llama_sampler_init_infill(vocab);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 int erllama_safe_sampler_chain_add(struct llama_sampler *chain,
                                    struct llama_sampler *s) noexcept {
     try {
@@ -194,6 +285,24 @@ int32_t erllama_safe_token_to_piece(const struct llama_vocab *vocab,
                                     bool special) noexcept {
     try {
         return llama_token_to_piece(vocab, tok, buf, buf_size, lstrip, special);
+    } catch (...) {
+        return INT32_MIN;
+    }
+}
+
+// llama_detokenize passthrough: bytes written on success, negative
+// needed-size when the buffer is too small, INT32_MIN on a thrown
+// exception. Note upstream may return FEWER bytes than the reported
+// requirement on the retry (whitespace trimming) - callers must size
+// the result from the final return value.
+int32_t erllama_safe_detokenize(const struct llama_vocab *vocab,
+                                const llama_token *tokens, int32_t n_tokens,
+                                char *text, int32_t text_len_max,
+                                bool remove_special,
+                                bool unparse_special) noexcept {
+    try {
+        return llama_detokenize(vocab, tokens, n_tokens, text, text_len_max,
+                                remove_special, unparse_special);
     } catch (...) {
         return INT32_MIN;
     }
@@ -549,6 +658,101 @@ int erllama_safe_vocab_is_eog(const struct llama_vocab *v,
         return llama_vocab_is_eog(v, tok) ? 1 : 0;
     } catch (...) {
         return 0;
+    }
+}
+
+// Special / FIM vocab token getters for nif_vocab_info. Each returns
+// LLAMA_TOKEN_NULL both when the model has no such token and on a
+// thrown exception - the NIF maps LLAMA_TOKEN_NULL to `undefined`.
+#define ERLLAMA_SAFE_VOCAB_TOKEN(name)                                        \
+    llama_token erllama_safe_vocab_##name(const struct llama_vocab *v)        \
+        noexcept {                                                            \
+        try {                                                                 \
+            return llama_vocab_##name(v);                                     \
+        } catch (...) {                                                       \
+            return LLAMA_TOKEN_NULL;                                          \
+        }                                                                     \
+    }
+
+ERLLAMA_SAFE_VOCAB_TOKEN(bos)
+ERLLAMA_SAFE_VOCAB_TOKEN(eos)
+ERLLAMA_SAFE_VOCAB_TOKEN(eot)
+ERLLAMA_SAFE_VOCAB_TOKEN(sep)
+ERLLAMA_SAFE_VOCAB_TOKEN(nl)
+ERLLAMA_SAFE_VOCAB_TOKEN(pad)
+ERLLAMA_SAFE_VOCAB_TOKEN(mask)
+ERLLAMA_SAFE_VOCAB_TOKEN(fim_pre)
+ERLLAMA_SAFE_VOCAB_TOKEN(fim_suf)
+ERLLAMA_SAFE_VOCAB_TOKEN(fim_mid)
+ERLLAMA_SAFE_VOCAB_TOKEN(fim_pad)
+ERLLAMA_SAFE_VOCAB_TOKEN(fim_rep)
+ERLLAMA_SAFE_VOCAB_TOKEN(fim_sep)
+
+#undef ERLLAMA_SAFE_VOCAB_TOKEN
+
+int erllama_safe_vocab_get_add_bos(const struct llama_vocab *v) noexcept {
+    try {
+        return llama_vocab_get_add_bos(v) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int erllama_safe_vocab_get_add_eos(const struct llama_vocab *v) noexcept {
+    try {
+        return llama_vocab_get_add_eos(v) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Full-vocab log-softmax over the logits row `idx`, top-k selection.
+// Fills out_ids/out_lps (capacity k) with the k highest-probability
+// token ids and their logprobs, descending, and *out_sampled_lp with
+// the logprob of `sampled` (0.0 when sampled is out of range).
+// Returns the number of top entries written (<= k), or -1 on a
+// thrown exception / missing logits row. O(n_vocab) plus one
+// partial sort; only runs when a request asked for logprobs.
+int32_t erllama_safe_top_logprobs(struct llama_context *ctx, int32_t idx,
+                                  int32_t n_vocab, int32_t k,
+                                  llama_token sampled,
+                                  llama_token *out_ids, float *out_lps,
+                                  float *out_sampled_lp) noexcept {
+    try {
+        const float *lg = llama_get_logits_ith(ctx, idx);
+        if (!lg || n_vocab <= 0) {
+            return -1;
+        }
+        float mx = lg[0];
+        for (int32_t i = 1; i < n_vocab; i++) {
+            if (lg[i] > mx) mx = lg[i];
+        }
+        double sum = 0.0;
+        for (int32_t i = 0; i < n_vocab; i++) {
+            sum += std::exp((double) lg[i] - (double) mx);
+        }
+        const float lse = mx + (float) std::log(sum);
+        *out_sampled_lp =
+            (sampled >= 0 && sampled < n_vocab) ? lg[sampled] - lse : 0.0f;
+        if (k <= 0) {
+            return 0;
+        }
+        if (k > n_vocab) {
+            k = n_vocab;
+        }
+        std::vector<int32_t> ids((size_t) n_vocab);
+        for (int32_t i = 0; i < n_vocab; i++) {
+            ids[(size_t) i] = i;
+        }
+        std::partial_sort(ids.begin(), ids.begin() + k, ids.end(),
+                          [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
+        for (int32_t i = 0; i < k; i++) {
+            out_ids[i] = ids[(size_t) i];
+            out_lps[i] = lg[ids[(size_t) i]] - lse;
+        }
+        return k;
+    } catch (...) {
+        return -1;
     }
 }
 

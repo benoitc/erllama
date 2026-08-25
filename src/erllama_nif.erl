@@ -34,6 +34,7 @@
     request_abort/1,
     tokenize/3,
     detokenize/2,
+    detokenize/3,
     prefill/2,
     decode_one/1,
     step/2,
@@ -55,6 +56,7 @@
     model_size/1,
     model_n_layer/1,
     model_family/1,
+    vocab_info/1,
     grammar_cache_stats/1,
     forward_with_argmax/2,
     chat_templates_init/2,
@@ -183,6 +185,17 @@ tokenize(Model, Text, Opts) when is_map(Opts) -> nif_tokenize(Model, Text, Opts)
 -spec detokenize(model_ref(), [token_id()]) -> binary() | {error, atom()}.
 detokenize(Model, Tokens) -> nif_detokenize(Model, Tokens).
 
+%% Options-aware detokenize backed by `llama_detokenize`:
+%% `remove_special` strips a leading BOS / trailing EOS when the model
+%% is configured to add them; `unparse_special` renders special /
+%% control tokens into the output (the arity-2 form drops them). The
+%% arity-2 form keeps its own per-token code path: the cache byte-keys
+%% are computed over its output and must stay byte-identical.
+-spec detokenize(model_ref(), [token_id()], map()) ->
+    binary() | {error, atom()}.
+detokenize(Model, Tokens, Opts) when is_map(Opts) ->
+    nif_detokenize(Model, Tokens, Opts).
+
 -spec prefill(context_ref(), [token_id()]) -> ok | {error, term()}.
 prefill(Ctx, Tokens) -> nif_prefill(Ctx, Tokens).
 
@@ -227,12 +240,24 @@ Errors:
   recovery as `decode_timeout`.
 - `{error, {decode_failed, Rc}}` — `llama_decode` returned a
   non-zero code `Rc` for a non-timeout, non-abort reason.
+
+Logprobs: a sampler built with `logprobs => N` (N > 0) turns its
+decode results into 4-tuples `{token, Token, Eog, {SampledLogprob,
+[{TokenId, Logprob}, ...]}}` — the sampled token's full-vocab
+log-softmax logprob plus the top-N ids/logprobs, descending.
 """.
 -spec step(
     context_ref(),
     [{non_neg_integer(), {prefill, [token_id()]} | {decode, sampler_ref()}}]
 ) ->
-    {ok, [{non_neg_integer(), prefilled | {token, token_id(), 0 | 1}}]}
+    {ok, [
+        {
+            non_neg_integer(),
+            prefilled
+            | {token, token_id(), 0 | 1}
+            | {token, token_id(), 0 | 1, {float(), [{token_id(), float()}]}}
+        }
+    ]}
     | {error, atom() | {decode_failed, integer()}}.
 step(Ctx, Ops) when is_list(Ops) -> nif_step(Ctx, Ops).
 
@@ -407,6 +432,34 @@ model_n_layer(Model) ->
 model_family(Model) ->
     nif_model_family(Model).
 
+%% Vocab / special-token probe over the loaded model. Token keys are
+%% integers, or `undefined` when the model has no such token (the
+%% llama getters return LLAMA_TOKEN_NULL). The fim_* tokens are the
+%% fill-in-the-middle markers used for infill prompts
+%% (fim_pre ++ Prefix ++ fim_suf ++ Suffix ++ fim_mid).
+-spec vocab_info(model_ref()) ->
+    #{
+        n_vocab := integer(),
+        add_bos := boolean(),
+        add_eos := boolean(),
+        bos := token_id() | undefined,
+        eos := token_id() | undefined,
+        eot := token_id() | undefined,
+        sep := token_id() | undefined,
+        nl := token_id() | undefined,
+        pad := token_id() | undefined,
+        mask := token_id() | undefined,
+        fim_pre := token_id() | undefined,
+        fim_suf := token_id() | undefined,
+        fim_mid := token_id() | undefined,
+        fim_pad := token_id() | undefined,
+        fim_rep := token_id() | undefined,
+        fim_sep := token_id() | undefined
+    }
+    | {error, atom()}.
+vocab_info(Model) ->
+    nif_vocab_info(Model).
+
 %% Per-context grammar-cache stats. Advisory metric to confirm the
 %% compiled-grammar cache is taking effect: a client that resends the same
 %% tool grammar each turn should accrue hits after the first request.
@@ -482,6 +535,7 @@ nif_free_context(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_request_abort(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_tokenize(_Model, _Text, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_detokenize(_Model, _Tokens) -> erlang:nif_error(nif_not_loaded).
+nif_detokenize(_Model, _Tokens, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_prefill(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_decode_one(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_step(_Ctx, _Ops) -> erlang:nif_error(nif_not_loaded).
@@ -503,6 +557,7 @@ nif_vram_info() -> erlang:nif_error(nif_not_loaded).
 nif_model_size(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_model_n_layer(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_model_family(_Model) -> erlang:nif_error(nif_not_loaded).
+nif_vocab_info(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_grammar_cache_stats(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_forward_with_argmax(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_init(_Model, _Override) -> erlang:nif_error(nif_not_loaded).

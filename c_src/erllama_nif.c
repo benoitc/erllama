@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -93,6 +94,25 @@ extern struct llama_sampler *erllama_safe_sampler_init_min_p(float p,
 extern struct llama_sampler *erllama_safe_sampler_init_temp(float t);
 extern struct llama_sampler *erllama_safe_sampler_init_penalties(
     int32_t n_vocab, int32_t last_n, float repeat, float freq, float present);
+extern struct llama_sampler *erllama_safe_sampler_init_typical(float p,
+                                                               size_t min_keep);
+extern struct llama_sampler *erllama_safe_sampler_init_temp_ext(
+    float t, float delta, float exponent);
+extern struct llama_sampler *erllama_safe_sampler_init_xtc(
+    float p, float t, size_t min_keep, uint32_t seed);
+extern struct llama_sampler *erllama_safe_sampler_init_top_n_sigma(float n);
+extern struct llama_sampler *erllama_safe_sampler_init_mirostat(
+    int32_t n_vocab, uint32_t seed, float tau, float eta, int32_t m);
+extern struct llama_sampler *erllama_safe_sampler_init_mirostat_v2(
+    uint32_t seed, float tau, float eta);
+extern struct llama_sampler *erllama_safe_sampler_init_dry(
+    const struct llama_vocab *vocab, float multiplier, float base,
+    int32_t allowed_length, int32_t penalty_last_n,
+    const char **seq_breakers, size_t num_breakers);
+extern struct llama_sampler *erllama_safe_sampler_init_logit_bias(
+    int32_t n_vocab, int32_t n_bias, const llama_logit_bias *bias);
+extern struct llama_sampler *erllama_safe_sampler_init_infill(
+    const struct llama_vocab *vocab);
 extern int erllama_safe_sampler_chain_add(struct llama_sampler *chain,
                                           struct llama_sampler *s);
 extern int erllama_safe_sampler_free(struct llama_sampler *s);
@@ -152,6 +172,32 @@ extern int erllama_safe_backend_dev_info(size_t idx, size_t *free_b,
                                          size_t *total_b, int *dev_type);
 extern int erllama_safe_vocab_is_eog(const struct llama_vocab *v,
                                      llama_token tok);
+extern llama_token erllama_safe_vocab_bos(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_eos(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_eot(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_sep(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_nl(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_pad(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_mask(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_fim_pre(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_fim_suf(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_fim_mid(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_fim_pad(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_fim_rep(const struct llama_vocab *v);
+extern llama_token erllama_safe_vocab_fim_sep(const struct llama_vocab *v);
+extern int erllama_safe_vocab_get_add_bos(const struct llama_vocab *v);
+extern int erllama_safe_vocab_get_add_eos(const struct llama_vocab *v);
+extern int32_t erllama_safe_detokenize(const struct llama_vocab *vocab,
+                                       const llama_token *tokens,
+                                       int32_t n_tokens, char *text,
+                                       int32_t text_len_max,
+                                       bool remove_special,
+                                       bool unparse_special);
+extern int32_t erllama_safe_top_logprobs(struct llama_context *ctx,
+                                         int32_t idx, int32_t n_vocab,
+                                         int32_t k, llama_token sampled,
+                                         llama_token *out_ids, float *out_lps,
+                                         float *out_sampled_lp);
 extern int32_t erllama_safe_tokenize(const struct llama_vocab *vocab,
                                      const char *text, int32_t text_len,
                                      llama_token *tokens, int32_t n_max,
@@ -395,6 +441,10 @@ typedef struct {
     int mu_inited;
     struct llama_sampler *chain;   /* NULL after explicit free */
     erllama_context_t *ctx_res;    /* keep_resource'd at init */
+    /* Per-request logprobs: number of top-token logprobs to report
+     * with every sampled token (cfg key `logprobs`, 0 = off). Read
+     * by nif_step's pre-sample loop under `mu`. */
+    int n_probs;
 } erllama_sampler_t;
 
 /* Declared in erllama_resources.h so the C++ chat NIF TU can
@@ -970,6 +1020,75 @@ static ERL_NIF_TERM nif_model_family(ErlNifEnv *env, int argc,
     family_put(env, &map, "has_encoder", has_encoder ? atom_true : atom_false);
     family_put(env, &map, "has_decoder", has_decoder ? atom_true : atom_false);
     family_put(env, &map, "ftype", enif_make_int(env, ftype));
+    return map;
+}
+
+/* A vocab token id term: LLAMA_TOKEN_NULL -> `undefined`. */
+static ERL_NIF_TERM vocab_tok_term(ErlNifEnv *env, llama_token t) {
+    if (t == LLAMA_TOKEN_NULL) {
+        return enif_make_atom(env, "undefined");
+    }
+    return enif_make_int(env, t);
+}
+
+/* Vocab / special-token probe:
+ *   nif_vocab_info(ModelRef) -> #{n_vocab, add_bos, add_eos, bos,
+ *     eos, eot, sep, nl, pad, mask, fim_pre, fim_suf, fim_mid,
+ *     fim_pad, fim_rep, fim_sep}
+ * Token keys are integers or `undefined` when the model has no such
+ * token. One read-only pass; callers cache as they see fit. */
+static ERL_NIF_TERM nif_vocab_info(ErlNifEnv *env, int argc,
+                                   const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&m->mu);
+    if (!m->model) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    const struct llama_vocab *vocab = erllama_safe_model_get_vocab(m->model);
+    if (!vocab) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    int32_t n_vocab = erllama_safe_vocab_n_tokens(vocab);
+    int add_bos = erllama_safe_vocab_get_add_bos(vocab);
+    int add_eos = erllama_safe_vocab_get_add_eos(vocab);
+    llama_token bos = erllama_safe_vocab_bos(vocab);
+    llama_token eos = erllama_safe_vocab_eos(vocab);
+    llama_token eot = erllama_safe_vocab_eot(vocab);
+    llama_token sep = erllama_safe_vocab_sep(vocab);
+    llama_token nl = erllama_safe_vocab_nl(vocab);
+    llama_token pad = erllama_safe_vocab_pad(vocab);
+    llama_token mask = erllama_safe_vocab_mask(vocab);
+    llama_token fim_pre = erllama_safe_vocab_fim_pre(vocab);
+    llama_token fim_suf = erllama_safe_vocab_fim_suf(vocab);
+    llama_token fim_mid = erllama_safe_vocab_fim_mid(vocab);
+    llama_token fim_pad = erllama_safe_vocab_fim_pad(vocab);
+    llama_token fim_rep = erllama_safe_vocab_fim_rep(vocab);
+    llama_token fim_sep = erllama_safe_vocab_fim_sep(vocab);
+    pthread_mutex_unlock(&m->mu);
+
+    ERL_NIF_TERM map = enif_make_new_map(env);
+    family_put(env, &map, "n_vocab", enif_make_int(env, n_vocab));
+    family_put(env, &map, "add_bos", add_bos ? atom_true : atom_false);
+    family_put(env, &map, "add_eos", add_eos ? atom_true : atom_false);
+    family_put(env, &map, "bos", vocab_tok_term(env, bos));
+    family_put(env, &map, "eos", vocab_tok_term(env, eos));
+    family_put(env, &map, "eot", vocab_tok_term(env, eot));
+    family_put(env, &map, "sep", vocab_tok_term(env, sep));
+    family_put(env, &map, "nl", vocab_tok_term(env, nl));
+    family_put(env, &map, "pad", vocab_tok_term(env, pad));
+    family_put(env, &map, "mask", vocab_tok_term(env, mask));
+    family_put(env, &map, "fim_pre", vocab_tok_term(env, fim_pre));
+    family_put(env, &map, "fim_suf", vocab_tok_term(env, fim_suf));
+    family_put(env, &map, "fim_mid", vocab_tok_term(env, fim_mid));
+    family_put(env, &map, "fim_pad", vocab_tok_term(env, fim_pad));
+    family_put(env, &map, "fim_rep", vocab_tok_term(env, fim_rep));
+    family_put(env, &map, "fim_sep", vocab_tok_term(env, fim_sep));
     return map;
 }
 
@@ -1759,12 +1878,21 @@ typedef struct {
     erllama_sampler_t *sampler;    /* decode only */
     llama_token sampled;           /* decode only, set during pre-sample */
     int eog;                       /* decode only */
+    /* Optional per-token logprobs (sampler->n_probs > 0): the
+     * sampled token's logprob plus the top-lp_count ids/logprobs,
+     * both enif_alloc'd during pre-sample. lp_count 0 = none. */
+    int32_t lp_count;
+    float sampled_lp;
+    llama_token *lp_ids;
+    float *lp_vals;
 } erllama_step_op_t;
 
 static void free_step_ops(erllama_step_op_t *ops, unsigned int n) {
     if (!ops) return;
     for (unsigned int i = 0; i < n; i++) {
         if (ops[i].prefill_tokens) enif_free(ops[i].prefill_tokens);
+        if (ops[i].lp_ids) enif_free(ops[i].lp_ids);
+        if (ops[i].lp_vals) enif_free(ops[i].lp_vals);
     }
     enif_free(ops);
 }
@@ -1879,6 +2007,7 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
             free_step_ops(ops, n_ops);
             return enif_make_tuple2(env, atom_error, atom_released);
         }
+        int n_probs = ops[i].sampler->n_probs;
         llama_token tok = erllama_safe_sampler_sample(
             ops[i].sampler->chain, c->ctx, li
         );
@@ -1890,6 +2019,30 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         }
         ops[i].sampled = tok;
         ops[i].eog = vocab ? erllama_safe_vocab_is_eog(vocab, tok) : 0;
+        /* Optional logprobs: the raw logits row `li` is untouched by
+         * sampling (the chain works on a candidates copy), so the
+         * full-vocab log-softmax here reports the model's own
+         * distribution, OpenAI-style. Failure downgrades to "no
+         * logprobs for this token" rather than failing the tick. */
+        if (n_probs > 0 && vocab) {
+            int32_t nv = erllama_safe_vocab_n_tokens(vocab);
+            llama_token *ids = enif_alloc(sizeof(llama_token) * (size_t) n_probs);
+            float *vals = enif_alloc(sizeof(float) * (size_t) n_probs);
+            if (ids && vals) {
+                int32_t got = erllama_safe_top_logprobs(
+                    c->ctx, li, nv, n_probs, tok,
+                    ids, vals, &ops[i].sampled_lp);
+                if (got > 0) {
+                    ops[i].lp_count = got;
+                    ops[i].lp_ids = ids;
+                    ops[i].lp_vals = vals;
+                    ids = NULL;
+                    vals = NULL;
+                }
+            }
+            if (ids) enif_free(ids);
+            if (vals) enif_free(vals);
+        }
     }
 
     /* Compute the total batch token count: each decode row contributes
@@ -1988,7 +2141,9 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     pthread_mutex_unlock(&c->mu);
 
     /* Build result list. Prefill rows -> `{seq_id, prefilled}`;
-     * decode rows -> `{seq_id, {token, Token, EogFlag}}`. */
+     * decode rows -> `{seq_id, {token, Token, EogFlag}}`, or with
+     * logprobs requested `{seq_id, {token, Token, EogFlag,
+     * {SampledLp, [{Id, Lp}, ...]}}}`. */
     ERL_NIF_TERM atom_prefilled = enif_make_atom(env, "prefilled");
     ERL_NIF_TERM atom_token     = enif_make_atom(env, "token");
     ERL_NIF_TERM *results = enif_alloc(sizeof(ERL_NIF_TERM) * n_ops);
@@ -2000,6 +2155,22 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         ERL_NIF_TERM payload;
         if (ops[i].is_prefill) {
             payload = atom_prefilled;
+        } else if (ops[i].lp_count > 0) {
+            ERL_NIF_TERM top = enif_make_list(env, 0);
+            for (int32_t j = ops[i].lp_count - 1; j >= 0; j--) {
+                ERL_NIF_TERM pair = enif_make_tuple2(env,
+                    enif_make_int(env, ops[i].lp_ids[j]),
+                    enif_make_double(env, (double) ops[i].lp_vals[j]));
+                top = enif_make_list_cell(env, pair, top);
+            }
+            ERL_NIF_TERM lp = enif_make_tuple2(env,
+                enif_make_double(env, (double) ops[i].sampled_lp),
+                top);
+            payload = enif_make_tuple4(env,
+                atom_token,
+                enif_make_int(env, ops[i].sampled),
+                enif_make_int(env, ops[i].eog ? 1 : 0),
+                lp);
         } else {
             payload = enif_make_tuple3(env,
                 atom_token,
@@ -2209,6 +2380,107 @@ static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     }
     ERL_NIF_TERM tag = eog ? enif_make_atom(env, "eog") : atom_ok;
     return enif_make_tuple2(env, tag, enif_make_int(env, tok));
+}
+
+/* Options-aware detokenize: `nif_detokenize(Model, Tokens, Opts)`
+ * with `#{remove_special => boolean(), unparse_special => boolean()}`
+ * (both default false), backed by llama_detokenize. Kept SEPARATE
+ * from the arity-2 per-token loop below: the cache byte-keys are
+ * computed over the arity-2 output and must stay byte-identical. */
+static ERL_NIF_TERM nif_detokenize_opts(ErlNifEnv *env, int argc,
+                                        const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    if (!enif_is_map(env, argv[2])) {
+        return enif_make_badarg(env);
+    }
+    int remove_special = 0;
+    int unparse_special = 0;
+    {
+        int b;
+        if (get_map_bool(env, argv[2], "remove_special", &b)) remove_special = b;
+        if (get_map_bool(env, argv[2], "unparse_special", &b)) unparse_special = b;
+    }
+    llama_token *tokens = NULL;
+    int32_t n = 0;
+    int rc = read_token_list(env, argv[1], &tokens, &n);
+    if (rc != 1) return token_list_error(env, rc);
+    if (n == 0) {
+        if (tokens) enif_free(tokens);
+        ErlNifBinary empty;
+        if (!enif_alloc_binary(0, &empty)) {
+            return enif_make_tuple2(env, atom_error, atom_oom);
+        }
+        return enif_make_binary(env, &empty);
+    }
+
+    pthread_mutex_lock(&m->mu);
+    if (!m->model || m->release_pending) {
+        pthread_mutex_unlock(&m->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    const struct llama_vocab *vocab = erllama_safe_model_get_vocab(m->model);
+    int32_t n_vocab = vocab ? erllama_safe_vocab_n_tokens(vocab) : 0;
+    if (!vocab || n_vocab <= 0) {
+        pthread_mutex_unlock(&m->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_invalid_token);
+    }
+    for (int32_t i = 0; i < n; i++) {
+        if (tokens[i] >= n_vocab) {
+            pthread_mutex_unlock(&m->mu);
+            enif_free(tokens);
+            return enif_make_tuple2(env, atom_error, atom_invalid_token);
+        }
+    }
+    /* Two-pass resize: a negative return is the needed size; the
+     * retry may legitimately return FEWER bytes than requested
+     * (upstream trims whitespace after per-token detokenization), so
+     * the final return value sizes the result binary. */
+    int32_t cap = n * 32 + 16;
+    char *buf = enif_alloc((size_t) cap);
+    if (!buf) {
+        pthread_mutex_unlock(&m->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    int32_t wrote = erllama_safe_detokenize(vocab, tokens, n, buf, cap,
+                                            remove_special ? true : false,
+                                            unparse_special ? true : false);
+    if (wrote < 0 && wrote != INT32_MIN) {
+        int32_t need = -wrote;
+        char *bigger = enif_realloc(buf, (size_t) need);
+        if (!bigger) {
+            pthread_mutex_unlock(&m->mu);
+            enif_free(buf);
+            enif_free(tokens);
+            return enif_make_tuple2(env, atom_error, atom_oom);
+        }
+        buf = bigger;
+        cap = need;
+        wrote = erllama_safe_detokenize(vocab, tokens, n, buf, cap,
+                                        remove_special ? true : false,
+                                        unparse_special ? true : false);
+    }
+    pthread_mutex_unlock(&m->mu);
+    enif_free(tokens);
+    if (wrote < 0) {
+        enif_free(buf);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    ERL_NIF_TERM bin;
+    unsigned char *out = enif_make_new_binary(env, (size_t) wrote, &bin);
+    if (!out) {
+        enif_free(buf);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    if (wrote > 0) memcpy(out, buf, (size_t) wrote);
+    enif_free(buf);
+    return bin;
 }
 
 static ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
@@ -3410,6 +3682,147 @@ out:
     return rc;
 }
 
+/* Append a stage to the chain; on failure (alloc, or a NULL stage
+ * from a failed init) free the WHOLE chain and set *out_err_atom.
+ * Returns 0 ok, -1 failed. */
+static int chain_append_or_fail(struct llama_sampler *chain,
+                                struct llama_sampler *stage,
+                                ERL_NIF_TERM *out_err_atom) {
+    if (chain_append(chain, stage) != 0) {
+        (void) erllama_safe_sampler_free(chain);
+        *out_err_atom = atom_oom;
+        return -1;
+    }
+    return 0;
+}
+
+/* Build and append the logit-bias stage from the `logit_bias` list
+ * (`[{TokenId, Bias}, ...]`) merged with `ignore_eos` (-inf on every
+ * end-of-generation token, skipped when the model has no eos - same
+ * as upstream common_params expansion). No-op when neither is set.
+ * On failure frees the chain and sets *out_err_atom; returns 0 ok. */
+static int append_logit_bias_sampler(ErlNifEnv *env, ERL_NIF_TERM cfg,
+                                     const struct llama_vocab *vocab,
+                                     int32_t n_vocab,
+                                     struct llama_sampler *chain,
+                                     ERL_NIF_TERM *out_err_atom) {
+    ERL_NIF_TERM v;
+    unsigned int n_user = 0;
+    int has_list =
+        enif_get_map_value(env, cfg, enif_make_atom(env, "logit_bias"), &v);
+    if (has_list && !enif_get_list_length(env, v, &n_user)) {
+        (void) erllama_safe_sampler_free(chain);
+        *out_err_atom = enif_make_atom(env, "badarg");
+        return -1;
+    }
+    int ignore_eos = 0;
+    {
+        int b;
+        if (get_map_bool(env, cfg, "ignore_eos", &b)) ignore_eos = b;
+    }
+    if ((!has_list || n_user == 0) && !ignore_eos) {
+        return 0;
+    }
+    if (!vocab || n_vocab <= 0) {
+        return 0;
+    }
+    /* ignore_eos without an eos token is a silent no-op (upstream
+     * logs and skips). Count the eog ids first to size the array. */
+    int32_t n_eog = 0;
+    if (ignore_eos) {
+        if (erllama_safe_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+            ignore_eos = 0;
+        } else {
+            for (int32_t t = 0; t < n_vocab; t++) {
+                if (erllama_safe_vocab_is_eog(vocab, t)) n_eog++;
+            }
+        }
+    }
+    size_t total = (size_t) n_user + (size_t) n_eog;
+    if (total == 0) {
+        return 0;
+    }
+    llama_logit_bias *bias = enif_alloc(sizeof(llama_logit_bias) * total);
+    if (!bias) {
+        (void) erllama_safe_sampler_free(chain);
+        *out_err_atom = atom_oom;
+        return -1;
+    }
+    size_t n = 0;
+    if (has_list) {
+        ERL_NIF_TERM head, tail = v;
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            const ERL_NIF_TERM *pair;
+            int arity;
+            int tok;
+            double bval;
+            if (!enif_get_tuple(env, head, &arity, &pair) || arity != 2 ||
+                !enif_get_int(env, pair[0], &tok) || tok < 0 ||
+                tok >= n_vocab || !enif_get_double(env, pair[1], &bval)) {
+                enif_free(bias);
+                (void) erllama_safe_sampler_free(chain);
+                *out_err_atom = enif_make_atom(env, "badarg");
+                return -1;
+            }
+            bias[n].token = (llama_token) tok;
+            bias[n].bias = (float) bval;
+            n++;
+        }
+    }
+    if (ignore_eos) {
+        for (int32_t t = 0; t < n_vocab && n < total; t++) {
+            if (erllama_safe_vocab_is_eog(vocab, t)) {
+                bias[n].token = t;
+                bias[n].bias = -INFINITY;
+                n++;
+            }
+        }
+    }
+    struct llama_sampler *stage =
+        erllama_safe_sampler_init_logit_bias(n_vocab, (int32_t) n, bias);
+    enif_free(bias);
+    return chain_append_or_fail(chain, stage, out_err_atom);
+}
+
+/* Build and append the DRY repetition sampler. Breakers default to
+ * upstream's {"\n", ":", "\"", "*"} when the caller supplies none.
+ * On failure frees the chain and sets *out_err_atom; returns 0 ok. */
+static int append_dry_sampler(ErlNifEnv *env, ERL_NIF_TERM cfg,
+                              const struct llama_vocab *vocab,
+                              double multiplier, double base,
+                              int32_t allowed_length, int32_t penalty_last_n,
+                              struct llama_sampler *chain,
+                              ERL_NIF_TERM *out_err_atom) {
+    static const char *default_breakers[] = {"\n", ":", "\"", "*"};
+    if (!vocab) {
+        return 0;
+    }
+    char **user_breakers = NULL;
+    unsigned int n_user = 0;
+    ERL_NIF_TERM v;
+    if (enif_get_map_value(env, cfg,
+                           enif_make_atom(env, "dry_sequence_breakers"), &v)) {
+        if (read_string_list(env, v, &user_breakers, &n_user) != 0) {
+            (void) erllama_safe_sampler_free(chain);
+            *out_err_atom = enif_make_atom(env, "badarg");
+            return -1;
+        }
+    }
+    struct llama_sampler *stage;
+    if (n_user > 0) {
+        stage = erllama_safe_sampler_init_dry(
+            vocab, (float) multiplier, (float) base, allowed_length,
+            penalty_last_n, (const char **) user_breakers, (size_t) n_user);
+    } else {
+        stage = erllama_safe_sampler_init_dry(
+            vocab, (float) multiplier, (float) base, allowed_length,
+            penalty_last_n, default_breakers,
+            sizeof(default_breakers) / sizeof(default_breakers[0]));
+    }
+    free_string_list(user_breakers, n_user);
+    return chain_append_or_fail(chain, stage, out_err_atom);
+}
+
 /* Build a sampler chain from a config map. On failure returns NULL and
  * sets *out_err_atom to one of: atom_oom, atom_grammar_failed,
  * atom_badarg. The lock must already be held by the caller (vocab
@@ -3455,6 +3868,40 @@ build_sampler_chain_from_map(ErlNifEnv *env, ERL_NIF_TERM cfg,
     int has_rep = get_map_double(env, cfg, "repetition_penalty", &f64);
     double rep_val = has_rep ? f64 : 1.0;
 
+    double freq_val = get_map_double(env, cfg, "frequency_penalty", &f64) ? f64 : 0.0;
+    double present_val = get_map_double(env, cfg, "presence_penalty", &f64) ? f64 : 0.0;
+    int32_t pen_last_n = get_map_int31(env, cfg, "penalty_last_n", &i32) ? i32 : 64;
+
+    int has_typical = get_map_double(env, cfg, "typical_p", &f64);
+    double typical_val = has_typical ? f64 : 1.0;
+
+    int has_tns = get_map_double(env, cfg, "top_n_sigma", &f64);
+    double tns_val = has_tns ? f64 : -1.0;
+
+    double xtc_p = get_map_double(env, cfg, "xtc_probability", &f64) ? f64 : 0.0;
+    double xtc_t = get_map_double(env, cfg, "xtc_threshold", &f64) ? f64 : 0.1;
+
+    double dt_range = get_map_double(env, cfg, "dynatemp_range", &f64) ? f64 : 0.0;
+    double dt_exp = get_map_double(env, cfg, "dynatemp_exponent", &f64) ? f64 : 1.0;
+
+    int32_t min_keep = get_map_int31(env, cfg, "min_keep", &i32) ? i32 : 1;
+    if (min_keep < 1) min_keep = 1;
+
+    double dry_mult = get_map_double(env, cfg, "dry_multiplier", &f64) ? f64 : 0.0;
+    double dry_base = get_map_double(env, cfg, "dry_base", &f64) ? f64 : 1.75;
+    int32_t dry_allowed = get_map_int31(env, cfg, "dry_allowed_length", &i32) ? i32 : 2;
+    int32_t dry_last_n = get_map_int31(env, cfg, "dry_penalty_last_n", &i32) ? i32 : 64;
+
+    int32_t mirostat_val = get_map_int31(env, cfg, "mirostat", &i32) ? i32 : 0;
+    double miro_tau = get_map_double(env, cfg, "mirostat_tau", &f64) ? f64 : 5.0;
+    double miro_eta = get_map_double(env, cfg, "mirostat_eta", &f64) ? f64 : 0.1;
+
+    int infill_val = 0;
+    {
+        int b;
+        if (get_map_bool(env, cfg, "infill", &b)) infill_val = b;
+    }
+
     uint32_t seed_val = 0;
     int has_seed = 0;
     {
@@ -3469,6 +3916,10 @@ build_sampler_chain_from_map(ErlNifEnv *env, ERL_NIF_TERM cfg,
             has_seed = 1;
         }
     }
+
+    const struct llama_vocab *vocab =
+        erllama_safe_model_get_vocab(c->model_res->model);
+    int32_t n_vocab = vocab ? erllama_safe_vocab_n_tokens(vocab) : 0;
 
     struct llama_sampler_chain_params sp =
         llama_sampler_chain_default_params();
@@ -3486,62 +3937,127 @@ build_sampler_chain_from_map(ErlNifEnv *env, ERL_NIF_TERM cfg,
         }
     }
 
-    if (has_rep && rep_val != 1.0) {
-        const struct llama_vocab *pen_vocab =
-            erllama_safe_model_get_vocab(c->model_res->model);
-        int32_t pen_n_vocab = pen_vocab ? erllama_safe_vocab_n_tokens(pen_vocab) : 0;
-        if (chain_append(chain,
-                         erllama_safe_sampler_init_penalties(
-                             pen_n_vocab, 64, (float) rep_val, 0.0f, 0.0f)) != 0) {
-            (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_oom;
+    /* logit_bias + ignore_eos, merged into one stage (upstream puts
+     * logit_bias first in the chain, right after the grammar). */
+    if (append_logit_bias_sampler(env, cfg, vocab, n_vocab, chain,
+                                  out_err_atom) != 0) {
+        return NULL; /* helper freed the chain */
+    }
+
+    /* Mirostat overrides the whole middle of the chain, exactly as
+     * upstream common_sampler_init does: temp -> mirostat terminal. */
+    if (mirostat_val == 1 || mirostat_val == 2) {
+        if (has_temp && temp_val > 0.0) {
+            if (chain_append_or_fail(
+                    chain, erllama_safe_sampler_init_temp((float) temp_val),
+                    out_err_atom) != 0) {
+                return NULL;
+            }
+        }
+        struct llama_sampler *miro =
+            mirostat_val == 1
+                ? erllama_safe_sampler_init_mirostat(
+                      n_vocab, seed_val, (float) miro_tau, (float) miro_eta, 100)
+                : erllama_safe_sampler_init_mirostat_v2(
+                      seed_val, (float) miro_tau, (float) miro_eta);
+        if (chain_append_or_fail(chain, miro, out_err_atom) != 0) {
+            return NULL;
+        }
+        return chain;
+    }
+
+    if ((has_rep && rep_val != 1.0) || freq_val != 0.0 || present_val != 0.0) {
+        if (chain_append_or_fail(
+                chain,
+                erllama_safe_sampler_init_penalties(
+                    n_vocab, pen_last_n, (float) rep_val, (float) freq_val,
+                    (float) present_val),
+                out_err_atom) != 0) {
+            return NULL;
+        }
+    }
+    if (dry_mult > 0.0) {
+        if (append_dry_sampler(env, cfg, vocab, dry_mult, dry_base,
+                               dry_allowed, dry_last_n, chain,
+                               out_err_atom) != 0) {
+            return NULL; /* helper freed the chain */
+        }
+    }
+    if (has_tns && tns_val > 0.0) {
+        if (chain_append_or_fail(
+                chain, erllama_safe_sampler_init_top_n_sigma((float) tns_val),
+                out_err_atom) != 0) {
             return NULL;
         }
     }
     if (has_top_k && top_k_val > 0) {
-        if (chain_append(chain,
-                         erllama_safe_sampler_init_top_k(top_k_val)) != 0) {
-            (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_oom;
+        if (chain_append_or_fail(chain,
+                                 erllama_safe_sampler_init_top_k(top_k_val),
+                                 out_err_atom) != 0) {
+            return NULL;
+        }
+    }
+    if (has_typical && typical_val < 1.0) {
+        if (chain_append_or_fail(
+                chain,
+                erllama_safe_sampler_init_typical((float) typical_val,
+                                                  (size_t) min_keep),
+                out_err_atom) != 0) {
             return NULL;
         }
     }
     if (has_top_p && top_p_val < 1.0) {
-        if (chain_append(chain,
-                         erllama_safe_sampler_init_top_p((float) top_p_val,
-                                                         1)) != 0) {
-            (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_oom;
+        if (chain_append_or_fail(
+                chain,
+                erllama_safe_sampler_init_top_p((float) top_p_val,
+                                                (size_t) min_keep),
+                out_err_atom) != 0) {
             return NULL;
         }
     }
     if (has_min_p && min_p_val > 0.0) {
-        if (chain_append(chain,
-                         erllama_safe_sampler_init_min_p((float) min_p_val,
-                                                         1)) != 0) {
-            (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_oom;
+        if (chain_append_or_fail(
+                chain,
+                erllama_safe_sampler_init_min_p((float) min_p_val,
+                                                (size_t) min_keep),
+                out_err_atom) != 0) {
+            return NULL;
+        }
+    }
+    if (xtc_p > 0.0) {
+        if (chain_append_or_fail(
+                chain,
+                erllama_safe_sampler_init_xtc((float) xtc_p, (float) xtc_t,
+                                              (size_t) min_keep, seed_val),
+                out_err_atom) != 0) {
+            return NULL;
+        }
+    }
+    if (infill_val && vocab) {
+        if (chain_append_or_fail(chain,
+                                 erllama_safe_sampler_init_infill(vocab),
+                                 out_err_atom) != 0) {
             return NULL;
         }
     }
     if (has_temp && temp_val > 0.0) {
-        if (chain_append(chain,
-                         erllama_safe_sampler_init_temp((float) temp_val)) != 0) {
-            (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_oom;
+        struct llama_sampler *temp_stage =
+            dt_range > 0.0
+                ? erllama_safe_sampler_init_temp_ext(
+                      (float) temp_val, (float) dt_range, (float) dt_exp)
+                : erllama_safe_sampler_init_temp((float) temp_val);
+        if (chain_append_or_fail(chain, temp_stage, out_err_atom) != 0) {
             return NULL;
         }
-        if (chain_append(chain,
-                         erllama_safe_sampler_init_dist(seed_val)) != 0) {
-            (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_oom;
+        if (chain_append_or_fail(chain,
+                                 erllama_safe_sampler_init_dist(seed_val),
+                                 out_err_atom) != 0) {
             return NULL;
         }
     } else {
         /* temperature == 0 or absent: greedy terminal. */
-        if (chain_append(chain, erllama_safe_sampler_init_greedy()) != 0) {
-            (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_oom;
+        if (chain_append_or_fail(chain, erllama_safe_sampler_init_greedy(),
+                                 out_err_atom) != 0) {
             return NULL;
         }
         (void) has_seed; /* seed without temperature is a no-op. */
@@ -3891,6 +4407,16 @@ static ERL_NIF_TERM nif_sampler_new(ErlNifEnv *env, int argc,
     res->mu_inited = 1;
     res->chain = chain;
     res->ctx_res = c;
+    /* Per-request logprobs count (0 = off). Clamped defensively; the
+     * Erlang validator already enforces 0..32. */
+    {
+        int32_t np;
+        if (get_map_int31(env, argv[1], "logprobs", &np)) {
+            if (np < 0) np = 0;
+            if (np > 32) np = 32;
+            res->n_probs = (int) np;
+        }
+    }
     enif_keep_resource(c);
 
     ERL_NIF_TERM term = enif_make_resource(env, res);
@@ -3922,6 +4448,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_model_size",   1, nif_model_size,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_n_layer",1, nif_model_n_layer,ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_family", 1, nif_model_family, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_vocab_info",   1, nif_vocab_info,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_grammar_cache_stats", 1, nif_grammar_cache_stats, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_forward_with_argmax", 2, nif_forward_with_argmax,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
@@ -3940,6 +4467,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_prefill",      2, nif_prefill,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_decode_one",   1, nif_decode_one,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_detokenize",   2, nif_detokenize,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_detokenize",   3, nif_detokenize_opts, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_apply_chat_template", 2, nif_apply_chat_template, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_embed",        2, nif_embed,        ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_set_grammar",  2, nif_set_grammar,  ERL_NIF_DIRTY_JOB_CPU_BOUND},

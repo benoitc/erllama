@@ -20,6 +20,28 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Full llama.cpp sampler surface as request options: `typical_p`,
+  `top_n_sigma`, `xtc_probability` / `xtc_threshold`,
+  `dynatemp_range` / `dynatemp_exponent`, `min_keep`,
+  `frequency_penalty` / `presence_penalty` / `penalty_last_n`, DRY
+  (`dry_multiplier`, `dry_base`, `dry_allowed_length`,
+  `dry_penalty_last_n`, `dry_sequence_breakers`), `mirostat` (1 | 2)
+  with `mirostat_tau` / `mirostat_eta`, `logit_bias`, `ignore_eos`
+  and `infill`. Chain order follows llama.cpp's default; see the
+  sampling reference in the configuration guide.
+- Per-token logprobs: `logprobs => N` (1..32) emits
+  `{erllama, Ref, {logprobs, #{token_id, logprob, top}}}` stream
+  events and adds a `logprobs` list to `complete/3` / `collect/2`
+  results. Full-vocab log-softmax over the raw model distribution
+  (OpenAI semantics).
+- `erllama:vocab_info/1`: vocabulary size, `add_bos` / `add_eos`, and
+  the special / FIM token ids (`bos`, `eos`, `eot`, `sep`, `nl`,
+  `pad`, `mask`, `fim_pre`, `fim_suf`, `fim_mid`, `fim_pad`,
+  `fim_rep`, `fim_sep`) for fill-in-the-middle prompt assembly.
+- `erllama:detokenize/3` with `remove_special` / `unparse_special`
+  (renders special tokens), backed by `llama_detokenize`.
+  `detokenize/2` is untouched: the cache byte-keys are computed over
+  its output.
 - Tool-call grammar enforcement: `chat/3` merges the grammar llama.cpp
   synthesizes from the chat template into the request, so
   `tool_choice => required` always yields a parsed call and

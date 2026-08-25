@@ -33,6 +33,7 @@ handle for every other call; a pid works too. The cache subsystem is
     whereis/1,
     list_models/0,
     model_info/1,
+    vocab_info/1,
     status/1,
     phase/1,
     pending_len/1,
@@ -54,6 +55,7 @@ handle for every other call; a pid works too. The cache subsystem is
     tokenize/2,
     tokenize/3,
     detokenize/2,
+    detokenize/3,
     render_chat_template/2,
     chat/3,
     chat_apply/3,
@@ -79,10 +81,12 @@ handle for every other call; a pid works too. The cache subsystem is
     model/0,
     model_id/0,
     model_info/0,
+    vocab_info/0,
     load_config/0,
     token_id/0,
     cache_key/0,
     completion_result/0,
+    logprobs_entry/0,
     prefill_result/0,
     stats/0,
     finish_reason/0,
@@ -164,6 +168,29 @@ handle for every other call; a pid works too. The cache subsystem is
 }.
 -doc "A token id in the model vocabulary.".
 -type token_id() :: non_neg_integer().
+-doc """
+Snapshot returned by `vocab_info/1`: vocabulary size, whether the
+tokenizer adds BOS/EOS, and the special / FIM token ids (`undefined`
+when the model has no such token).
+""".
+-type vocab_info() :: #{
+    n_vocab := integer(),
+    add_bos := boolean(),
+    add_eos := boolean(),
+    bos := token_id() | undefined,
+    eos := token_id() | undefined,
+    eot := token_id() | undefined,
+    sep := token_id() | undefined,
+    nl := token_id() | undefined,
+    pad := token_id() | undefined,
+    mask := token_id() | undefined,
+    fim_pre := token_id() | undefined,
+    fim_suf := token_id() | undefined,
+    fim_mid := token_id() | undefined,
+    fim_pad := token_id() | undefined,
+    fim_rep := token_id() | undefined,
+    fim_sep := token_id() | undefined
+}.
 -doc "SHA-256 cache key of a committed context (`finish_key`, `parent_key`).".
 -type cache_key() :: <<_:256>>.
 -doc "Result of `complete/2,3`.".
@@ -192,7 +219,22 @@ handle for every other call; a pid works too. The cache subsystem is
     stats := stats(),
     %% Only present when a caller-supplied `stop_sequences` entry
     %% fired. The value is the binary of the matched stop string.
-    stop_sequence => binary()
+    stop_sequence => binary(),
+    %% Only present when the `logprobs` option was set: one map per
+    %% generated token, in order (see the `{logprobs, _}` stream
+    %% event for the shape).
+    logprobs => [logprobs_entry()]
+}.
+-doc """
+Per-token logprobs report (`logprobs => N` option): the sampled
+token's full-vocab log-softmax logprob and the model's top-N
+`{TokenId, Logprob}` pairs, descending. Logprobs are computed over
+the raw model distribution, before any sampler stage.
+""".
+-type logprobs_entry() :: #{
+    token_id := token_id(),
+    logprob := float(),
+    top := [{token_id(), float()}]
 }.
 -doc "Result of `prefill_only/2,3`.".
 -type prefill_result() :: #{
@@ -338,6 +380,9 @@ as `{erllama, Ref, Event}`.
 
 - `{token, Bin}`: text fragment (omitted when empty)
 - `{token_id, Id}`: every generated token id, in order
+- `{logprobs, Entry}`: per-token logprobs (`logprobs => N` option);
+  precedes the corresponding `{token, _}` / `{token_id, _}` events.
+  See `logprobs_entry()`.
 - `{thinking, Bin}`: extended-thinking fragment (`thinking => enabled`)
 - `{thinking_end, Sig}`: close of a thinking block with its signature
 - `{done, Stats}`: completion; after `cancel/1` `Stats` carries
@@ -347,6 +392,7 @@ as `{erllama, Ref, Event}`.
 -type stream_event() ::
     {token, binary()}
     | {token_id, token_id()}
+    | {logprobs, logprobs_entry()}
     | {thinking, binary()}
     | {thinking_end, binary()}
     | {done, stats()}
@@ -423,6 +469,24 @@ Options for `complete/3`, `stream/3` and `continue/3`.
 - `thinking`, `thinking_budget_tokens`: extended-thinking control.
 - `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`,
   `seed`, `grammar`: sampling.
+- Extended sampling (defaults mirror llama.cpp): `typical_p` (< 1.0
+  enables), `top_n_sigma` (> 0 enables), `xtc_probability` +
+  `xtc_threshold`, `dynatemp_range` + `dynatemp_exponent` (dynamic
+  temperature), `min_keep`, `frequency_penalty` + `presence_penalty`
+  + `penalty_last_n`, `dry_multiplier` + `dry_base` +
+  `dry_allowed_length` + `dry_penalty_last_n` +
+  `dry_sequence_breakers` (DRY anti-repetition), `mirostat`
+  (`1 | 2`; replaces the truncation stages with the mirostat
+  controller) + `mirostat_tau` + `mirostat_eta`, `logit_bias`
+  (`[{TokenId, Bias}]`), `ignore_eos` (suppress every
+  end-of-generation token), `infill` (FIM-oriented final filter).
+  Chain order follows llama.cpp: grammar -> logit_bias -> penalties
+  -> dry -> top_n_sigma -> top_k -> typical_p -> top_p -> min_p ->
+  xtc -> infill -> temperature -> dist (greedy when temperature is
+  0 or absent).
+- `logprobs`: report each token's full-vocab logprob plus the top-N
+  alternatives (0..32) - stream event `{logprobs, _}` /
+  `logprobs` key on the completion result.
 - `grammar_lazy`, `trigger_patterns`, `trigger_tokens`,
   `grammar_prefill`: lazy / template-grammar variants of `grammar`
   (normally injected by `chat/3` or taken from `chat_apply/3`'s
@@ -454,6 +518,28 @@ Options for `complete/3`, `stream/3` and `continue/3`.
     trigger_patterns => [binary()],
     trigger_tokens => [token_id()],
     grammar_prefill => binary(),
+    typical_p => number(),
+    top_n_sigma => number(),
+    xtc_probability => number(),
+    xtc_threshold => number(),
+    dynatemp_range => number(),
+    dynatemp_exponent => number(),
+    min_keep => pos_integer(),
+    frequency_penalty => number(),
+    presence_penalty => number(),
+    penalty_last_n => integer(),
+    dry_multiplier => number(),
+    dry_base => number(),
+    dry_allowed_length => integer(),
+    dry_penalty_last_n => integer(),
+    dry_sequence_breakers => [binary()],
+    mirostat => 0 | 1 | 2,
+    mirostat_tau => number(),
+    mirostat_eta => number(),
+    logit_bias => [{token_id(), number()}],
+    ignore_eos => boolean(),
+    infill => boolean(),
+    logprobs => non_neg_integer(),
     prefix_checkpoint_len => non_neg_integer(),
     to => pid(),
     expect_committed => [token_id()],
@@ -874,6 +960,42 @@ detokenize(Model, Tokens) when is_list(Tokens) ->
     Req = #{op => detokenize, model => Model, args => #{tokens => Tokens}},
     erllama_middleware:run(Req, fun(#{model := M, args := #{tokens := T}}) ->
         erllama_model:detokenize(M, T)
+    end).
+
+-doc """
+Detokenise with options: `#{remove_special => boolean(),
+unparse_special => boolean()}` (both default false).
+`unparse_special` renders special / control tokens (`<|im_start|>`,
+FIM markers, ...) into the output - `detokenize/2` drops them;
+`remove_special` strips a leading BOS / trailing EOS on models
+configured to add them.
+""".
+-spec detokenize(model(), [token_id()], map()) ->
+    {ok, binary()} | {error, error_reason()}.
+detokenize(Model, Tokens, Opts) when is_list(Tokens), is_map(Opts) ->
+    Req = #{op => detokenize, model => Model, args => #{tokens => Tokens, opts => Opts}},
+    erllama_middleware:run(Req, fun(#{model := M, args := #{tokens := T, opts := O}}) ->
+        erllama_model:detokenize(M, T, O)
+    end).
+
+-doc """
+Special / FIM vocab tokens of the loaded model: `n_vocab`,
+`add_bos` / `add_eos`, and the token ids `bos`, `eos`, `eot`, `sep`,
+`nl`, `pad`, `mask`, `fim_pre`, `fim_suf`, `fim_mid`, `fim_pad`,
+`fim_rep`, `fim_sep` (each `undefined` when the model has no such
+token). The FIM ids let you assemble fill-in-the-middle prompts:
+
+```erlang
+{ok, #{fim_pre := Pre, fim_suf := Suf, fim_mid := Mid}} = erllama:vocab_info(M),
+Tokens = [Pre | PrefixTokens] ++ [Suf | SuffixTokens] ++ [Mid],
+{ok, Ref} = erllama:stream(M, Tokens, #{infill => true}).
+```
+""".
+-spec vocab_info(model()) -> {ok, vocab_info()} | {error, error_reason()}.
+vocab_info(Model) ->
+    Req = #{op => vocab_info, model => Model, args => #{}},
+    erllama_middleware:run(Req, fun(#{model := M}) ->
+        erllama_model:vocab_info(M)
     end).
 
 %% =============================================================================

@@ -29,6 +29,8 @@
     tokenize/2,
     tokenize/3,
     detokenize/2,
+    detokenize/3,
+    vocab_info/1,
     prefill/2,
     decode_one/2,
     kv_pack/2,
@@ -216,6 +218,19 @@ tokenize(#s{model = M}, Text, Opts) when is_map(Opts) ->
 
 detokenize(#s{model = M}, Tokens) ->
     erllama_nif:detokenize(M, Tokens).
+
+%% Options-aware detokenize (`remove_special` / `unparse_special`),
+%% backed by llama_detokenize. Distinct from the arity-2 path, whose
+%% output the cache byte-keys are computed over.
+detokenize(#s{model = M}, Tokens, Opts) when is_map(Opts) ->
+    erllama_nif:detokenize(M, Tokens, Opts).
+
+%% Special / FIM vocab tokens for erllama:vocab_info/1.
+vocab_info(#s{model = M}) ->
+    case erllama_nif:vocab_info(M) of
+        Map when is_map(Map) -> {ok, Map};
+        {error, _} = E -> E
+    end.
 
 prefill(#s{ctx = C}, Tokens) ->
     erllama_nif:prefill(C, Tokens).

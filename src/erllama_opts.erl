@@ -77,9 +77,31 @@
     trigger_tokens,
     grammar_prefill,
     repetition_penalty,
+    frequency_penalty,
+    presence_penalty,
+    penalty_last_n,
     top_k,
     top_p,
     min_p,
+    typical_p,
+    top_n_sigma,
+    xtc_probability,
+    xtc_threshold,
+    dynatemp_range,
+    dynatemp_exponent,
+    min_keep,
+    dry_multiplier,
+    dry_base,
+    dry_allowed_length,
+    dry_penalty_last_n,
+    dry_sequence_breakers,
+    mirostat,
+    mirostat_tau,
+    mirostat_eta,
+    logit_bias,
+    ignore_eos,
+    infill,
+    logprobs,
     temperature,
     seed
 ]).
@@ -316,6 +338,9 @@ chat_checks() ->
     ].
 
 request_checks() ->
+    base_request_checks() ++ sampler_checks().
+
+base_request_checks() ->
     [
         {response_tokens, fun pos_int/1},
         {parent_key, fun(V) ->
@@ -333,14 +358,51 @@ request_checks() ->
         {grammar_lazy, fun is_boolean/1},
         {trigger_patterns, fun(V) -> is_list(V) andalso lists:all(fun is_binary/1, V) end},
         {trigger_tokens, fun(V) -> is_list(V) andalso lists:all(fun non_neg_int/1, V) end},
-        {grammar_prefill, fun is_binary/1},
+        {grammar_prefill, fun is_binary/1}
+    ].
+
+sampler_checks() ->
+    [
         {repetition_penalty, fun is_number/1},
+        {frequency_penalty, fun is_number/1},
+        {presence_penalty, fun is_number/1},
+        {penalty_last_n, fun is_integer/1},
         {top_k, fun is_integer/1},
         {top_p, fun is_number/1},
         {min_p, fun is_number/1},
+        {typical_p, fun is_number/1},
+        {top_n_sigma, fun is_number/1},
+        {xtc_probability, fun is_number/1},
+        {xtc_threshold, fun is_number/1},
+        {dynatemp_range, fun is_number/1},
+        {dynatemp_exponent, fun is_number/1},
+        {min_keep, fun pos_int/1},
+        {dry_multiplier, fun is_number/1},
+        {dry_base, fun is_number/1},
+        {dry_allowed_length, fun is_integer/1},
+        {dry_penalty_last_n, fun is_integer/1},
+        {dry_sequence_breakers, fun(V) -> is_list(V) andalso lists:all(fun is_binary/1, V) end},
+        {mirostat, fun(V) -> lists:member(V, [0, 1, 2]) end},
+        {mirostat_tau, fun is_number/1},
+        {mirostat_eta, fun is_number/1},
+        {logit_bias, fun logit_bias_list/1},
+        {ignore_eos, fun is_boolean/1},
+        {infill, fun is_boolean/1},
+        {logprobs, fun(V) -> is_integer(V) andalso V >= 0 andalso V =< 32 end},
         {temperature, fun is_number/1},
         {seed, fun non_neg_int/1}
     ].
+
+logit_bias_list(V) when is_list(V) ->
+    lists:all(
+        fun
+            ({Tok, Bias}) -> non_neg_int(Tok) andalso is_number(Bias);
+            (_) -> false
+        end,
+        V
+    );
+logit_bias_list(_) ->
+    false.
 
 check_types_ok(O, Checks) ->
     case check_types(O, Checks, invalid_option) of

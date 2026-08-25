@@ -28,6 +28,17 @@ inference, etc.) can plug in via this same surface.
 -callback detokenize(state(), [erllama:token_id()]) ->
     binary() | {error, term()}.
 
+%% Optional: detokenize with special-token rendering options
+%% (`remove_special`, `unparse_special`). Backends without it fall
+%% back to detokenize/2, ignoring the options.
+-callback detokenize(state(), [erllama:token_id()], map()) ->
+    binary() | {error, term()}.
+
+%% Optional: special / FIM vocab token map (see
+%% `erllama_nif:vocab_info/1`). Backends without a real vocabulary
+%% omit it; the engine then returns `{error, not_supported}`.
+-callback vocab_info(state()) -> {ok, map()} | {error, term()}.
+
 -callback prefill(state(), [erllama:token_id()]) -> ok | {error, term()}.
 
 -callback decode_one(state(), ContextTokens :: [erllama:token_id()]) ->
@@ -193,6 +204,8 @@ inference, etc.) can plug in via this same surface.
 -callback abort_handle(state()) -> {ok, term()} | undefined.
 
 -optional_callbacks([
+    detokenize/3,
+    vocab_info/1,
     kv_pack/3,
     kv_unpack/3,
     seq_rm/2,
@@ -219,10 +232,36 @@ inference, etc.) can plug in via this same surface.
 
 -type sampler_opts() :: #{
     grammar => binary(),
+    grammar_lazy => boolean(),
+    trigger_patterns => [binary()],
+    trigger_tokens => [erllama:token_id()],
+    grammar_prefill => binary(),
     repetition_penalty => float(),
+    frequency_penalty => float(),
+    presence_penalty => float(),
+    penalty_last_n => integer(),
     top_k => non_neg_integer(),
     top_p => float(),
     min_p => float(),
+    typical_p => float(),
+    top_n_sigma => float(),
+    xtc_probability => float(),
+    xtc_threshold => float(),
+    dynatemp_range => float(),
+    dynatemp_exponent => float(),
+    min_keep => pos_integer(),
+    dry_multiplier => float(),
+    dry_base => float(),
+    dry_allowed_length => integer(),
+    dry_penalty_last_n => integer(),
+    dry_sequence_breakers => [binary()],
+    mirostat => 0 | 1 | 2,
+    mirostat_tau => float(),
+    mirostat_eta => float(),
+    logit_bias => [{erllama:token_id(), number()}],
+    ignore_eos => boolean(),
+    infill => boolean(),
+    logprobs => non_neg_integer(),
     temperature => float(),
     seed => non_neg_integer()
 }.
@@ -235,6 +274,11 @@ inference, etc.) can plug in via this same surface.
 -type step_result() ::
     prefilled
     | {token, erllama:token_id(), 0 | 1}
+    %% Logprobs variant, produced when the request's sampler was
+    %% built with `logprobs => N` (N > 0): the sampled token's
+    %% full-vocab logprob plus the top-N `{TokenId, Logprob}` pairs,
+    %% descending.
+    | {token, erllama:token_id(), 0 | 1, {float(), [{erllama:token_id(), float()}]}}
     %% Thinking-phase token: scheduler detokenises and emits
     %% {erllama, Ref, {thinking, Bin}} instead of a plain
     %% text fragment. Backends without extended-thinking support
