@@ -20,6 +20,18 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- `erllama:fork_session/3`: duplicate a sticky session's live KV into
+  a new session (`llama_memory_seq_cp`), so two continuations explore
+  different branches without re-prefilling the shared prefix. Works
+  on every model family; never queues (`seq_capacity` when no
+  sequence is free).
+- Load progress: `progress_to => Pid` on `load_model` delivers
+  `{erllama_load_progress, ModelId, Float}` messages (whole-percent
+  throttled, final `1.0`) while the GGUF loads.
+- Native logs: llama.cpp / ggml log lines are forwarded into `logger`
+  under the domain `[erllama, native]`, gated by the `native_log_level`
+  application env (`none | error | warning | info | debug`, default
+  `warning`).
 - Full llama.cpp sampler surface as request options: `typical_p`,
   `top_n_sigma`, `xtc_probability` / `xtc_threshold`,
   `dynatemp_range` / `dynatemp_exponent`, `min_keep`,

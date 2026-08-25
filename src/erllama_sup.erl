@@ -20,6 +20,10 @@ init([]) ->
         worker_child(erllama_registry),
         worker_child(erllama_inflight),
         worker_child(erllama_chat_cache),
+        %% Before erllama_model_sup: the native-log receiver must be
+        %% registered before the first model load installs llama.cpp's
+        %% process-wide log callback.
+        worker_child(erllama_log),
         sup_child(erllama_model_sup),
         worker_child(erllama_scheduler)
     ],

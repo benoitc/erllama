@@ -220,8 +220,12 @@ extern size_t erllama_safe_state_seq_set_data(struct llama_context *c,
                                               size_t size, int seq_id);
 extern int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
                                       int p0, int p1);
+extern int erllama_safe_memory_seq_cp(struct llama_context *c, int seq_src,
+                                      int seq_dst);
 extern long erllama_safe_memory_seq_pos_max(struct llama_context *c,
                                             int seq_id);
+extern void erllama_safe_set_log_receiver(ErlNifPid pid, int min_level);
+extern void erllama_safe_clear_log_receiver(void);
 extern int erllama_safe_forward_with_argmax(struct llama_context *c,
                                             const llama_token *tokens,
                                             int32_t n_tokens,
@@ -1166,6 +1170,47 @@ static ERL_NIF_TERM nif_vram_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
  * Model
  * ========================================================================= */
 
+/* Load-progress reporting context. Lives on nif_load_model's stack:
+ * llama.cpp invokes the progress callback synchronously on the
+ * loading thread (once per tensor, then a final 1.0). Messages are
+ * throttled to integer-percent steps; enif_send failure (receiver
+ * gone) is ignored so a dead listener never affects the load. */
+typedef struct {
+    ErlNifPid pid;
+    ErlNifEnv *env; /* NULL = progress reporting disabled */
+    char tag[128];
+    size_t tag_len;
+    unsigned last_pct;
+    int sent_final;
+} erllama_progress_ctx_t;
+
+static bool erllama_load_progress_cb(float progress, void *user_data) {
+    erllama_progress_ctx_t *pc = user_data;
+    unsigned pct = (unsigned) (progress * 100.0f);
+    int final = progress >= 1.0f;
+    if (final) {
+        if (pc->sent_final) return true;
+        pc->sent_final = 1;
+    } else if (pct <= pc->last_pct) {
+        return true;
+    }
+    pc->last_pct = pct;
+    enif_clear_env(pc->env);
+    ERL_NIF_TERM tag;
+    unsigned char *p = enif_make_new_binary(pc->env, pc->tag_len, &tag);
+    if (!p) {
+        return true;
+    }
+    if (pc->tag_len > 0) {
+        memcpy(p, pc->tag, pc->tag_len);
+    }
+    ERL_NIF_TERM msg = enif_make_tuple3(
+        pc->env, enif_make_atom(pc->env, "erllama_load_progress"), tag,
+        enif_make_double(pc->env, (double) progress));
+    (void) enif_send(NULL, &pc->pid, pc->env, msg);
+    return true;
+}
+
 static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
     char path[4097];
@@ -1261,9 +1306,50 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         params.tensor_split = res->tensor_split;
     }
 
+    /* Optional load-progress reporting: `progress_to` (local pid) +
+     * `progress_tag` (binary, usually the model id). The callback
+     * runs synchronously on THIS dirty thread, so the context struct
+     * lives on this stack frame. */
+    erllama_progress_ctx_t pctx;
+    pctx.env = NULL;
+    {
+        ERL_NIF_TERM v;
+        ErlNifPid ppid;
+        if (enif_get_map_value(env, argv[1],
+                               enif_make_atom(env, "progress_to"), &v) &&
+            enif_get_local_pid(env, v, &ppid)) {
+            ErlNifBinary tagbin;
+            tagbin.size = 0;
+            tagbin.data = NULL;
+            ERL_NIF_TERM tv;
+            if (enif_get_map_value(env, argv[1],
+                                   enif_make_atom(env, "progress_tag"), &tv)) {
+                (void) enif_inspect_iolist_as_binary(env, tv, &tagbin);
+            }
+            ErlNifEnv *penv = enif_alloc_env();
+            if (penv) {
+                pctx.pid = ppid;
+                pctx.env = penv;
+                pctx.tag_len = tagbin.size < sizeof(pctx.tag)
+                                   ? tagbin.size
+                                   : sizeof(pctx.tag);
+                if (pctx.tag_len > 0) {
+                    memcpy(pctx.tag, tagbin.data, pctx.tag_len);
+                }
+                pctx.last_pct = 0;
+                pctx.sent_final = 0;
+                params.progress_callback = erllama_load_progress_cb;
+                params.progress_callback_user_data = &pctx;
+            }
+        }
+    }
+
     erllama_load_status_t status = ERLLAMA_LOAD_FAILED;
     struct llama_model *model =
         erllama_safe_model_load_from_file_v2(path, params, &status);
+    if (pctx.env) {
+        enif_free_env(pctx.env);
+    }
     if (!model) {
         enif_release_resource(res);
         ERL_NIF_TERM why = (status == ERLLAMA_LOAD_MALFORMED)
@@ -1839,6 +1925,83 @@ static ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
     if (rc != 0) {
         return enif_make_tuple2(env, atom_error, atom_unpack_failed);
     }
+    return atom_ok;
+}
+
+/* Full-sequence KV copy (session fork):
+ *   nif_kv_seq_cp(CtxRef, SrcSeq, DstSeq) -> ok | {error, atom()}
+ * llama_memory_seq_cp is void with several silent no-op paths, so
+ * success is verified via pos_max(dst) == pos_max(src); on mismatch
+ * the destination is wiped and {error, seq_cp_failed} returned. The
+ * copy carries no logits: the destination behaves exactly like a
+ * freshly kv_unpack'ed seq (a suffix prefill must run before it can
+ * sample). */
+static ERL_NIF_TERM nif_kv_seq_cp(ErlNifEnv *env, int argc,
+                                  const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    int src, dst;
+    if (!enif_get_int(env, argv[1], &src) || src < 0 ||
+        src >= ERLLAMA_N_SEQ_MAX_CAP ||
+        !enif_get_int(env, argv[2], &dst) || dst < 0 ||
+        dst >= ERLLAMA_N_SEQ_MAX_CAP || src == dst) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&c->mu);
+    if (!c->ctx) {
+        pthread_mutex_unlock(&c->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    long src_max = erllama_safe_memory_seq_pos_max(c->ctx, src);
+    if (src_max < 0) {
+        /* Empty (or unreadable) source: nothing to fork. */
+        pthread_mutex_unlock(&c->mu);
+        return enif_make_tuple2(
+            env, atom_error, enif_make_atom(env, "seq_cp_failed"));
+    }
+    int rc = erllama_safe_memory_seq_cp(c->ctx, src, dst);
+    long dst_max =
+        rc == 0 ? erllama_safe_memory_seq_pos_max(c->ctx, dst) : -2;
+    if (rc != 0 || dst_max != src_max) {
+        (void) erllama_safe_memory_seq_rm(c->ctx, dst, 0, -1);
+        c->per_seq[dst].next_pos = 0;
+        c->per_seq[dst].last_logits_idx = -1;
+        pthread_mutex_unlock(&c->mu);
+        return enif_make_tuple2(
+            env, atom_error, enif_make_atom(env, "seq_cp_failed"));
+    }
+    c->decode_ready = 0;
+    c->per_seq[dst].next_pos = (int32_t) (dst_max + 1);
+    c->per_seq[dst].last_logits_idx = -1;
+    pthread_mutex_unlock(&c->mu);
+    return atom_ok;
+}
+
+/* Register / clear the process receiving forwarded native llama.cpp
+ * log lines as `{llama_log, LevelInt, TextBin}` messages. MinLevel
+ * uses the ggml numeric levels (DEBUG 1 .. ERROR 4). */
+static ERL_NIF_TERM nif_set_log_receiver(ErlNifEnv *env, int argc,
+                                         const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    ErlNifPid pid;
+    int lvl;
+    if (!enif_get_local_pid(env, argv[0], &pid) ||
+        !enif_get_int(env, argv[1], &lvl)) {
+        return enif_make_badarg(env);
+    }
+    erllama_safe_set_log_receiver(pid, lvl);
+    return atom_ok;
+}
+
+static ERL_NIF_TERM nif_clear_log_receiver(ErlNifEnv *env, int argc,
+                                           const ERL_NIF_TERM argv[]) {
+    (void) env;
+    (void) argc;
+    (void) argv;
+    erllama_safe_clear_log_receiver();
     return atom_ok;
 }
 
@@ -4456,6 +4619,9 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_kv_pack",      4, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_unpack",    3, nif_kv_unpack,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_seq_rm",    4, nif_kv_seq_rm,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_kv_seq_cp",    3, nif_kv_seq_cp,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_set_log_receiver",   2, nif_set_log_receiver,   0},
+    {"nif_clear_log_receiver", 0, nif_clear_log_receiver, 0},
     {"nif_step",         2, nif_step,         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_fsync_dir",    1, nif_fsync_dir,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_load_model",   2, nif_load_model,   ERL_NIF_DIRTY_JOB_IO_BOUND},

@@ -39,6 +39,7 @@
     kv_unpack/3,
     seq_clear/1,
     seq_rm/2,
+    seq_cp/3,
     seq_rm_last/2,
     seq_rm_last/3,
     step/2,
@@ -93,7 +94,7 @@
 
 init(Config) ->
     Path = maps:get(model_path, Config),
-    MOpts = maps:get(model_opts, Config, #{}),
+    MOpts = progress_opts(maps:get(model_opts, Config, #{}), Config),
     case erllama_nif:load_model(Path, MOpts) of
         {ok, Model} ->
             Family = probe_family(Model),
@@ -106,6 +107,20 @@ init(Config) ->
             end;
         {error, _} = E ->
             E
+    end.
+
+%% Wire the optional `progress_to` load option into the NIF opts:
+%% the NIF sends `{erllama_load_progress, Tag, Float}` messages to
+%% the pid, tagged with the model id the gen_statem injected.
+progress_opts(MOpts, Config) ->
+    case maps:find(progress_to, Config) of
+        {ok, Pid} when is_pid(Pid) ->
+            MOpts#{
+                progress_to => Pid,
+                progress_tag => maps:get(model_id, Config, <<>>)
+            };
+        _ ->
+            MOpts
     end.
 
 probe_family(Model) ->
@@ -265,6 +280,12 @@ seq_rm_last(#s{ctx = C}, SeqId, NTokens) when
     is_integer(SeqId), SeqId >= 0, NTokens > 0
 ->
     erllama_nif:kv_seq_rm(C, SeqId, NTokens - 1, -1).
+
+%% Full-sequence KV copy (session fork). See erllama_nif:kv_seq_cp/3.
+seq_cp(#s{ctx = C}, SrcSeq, DstSeq) when
+    is_integer(SrcSeq), SrcSeq >= 0, is_integer(DstSeq), DstSeq >= 0
+->
+    erllama_nif:kv_seq_cp(C, SrcSeq, DstSeq).
 
 %% Free all KV cells of a specific seq_id. Used by the scheduler when
 %% a request finishes and its seq_id returns to the idle pool.

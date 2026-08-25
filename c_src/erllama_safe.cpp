@@ -16,6 +16,8 @@
 
 #include "llama.h"
 
+#include <erl_nif.h>
+
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -60,15 +62,62 @@ typedef enum {
 // MALFORMED -- informational degradation only.
 static ERLLAMA_THREAD_LOCAL char t_last_log_line[512] = {0};
 
+// Optional forwarding of native log lines to an Erlang receiver
+// process (erllama_log), on top of the classification capture above.
+// The callback fires on arbitrary llama.cpp / ggml threads, so the
+// state is mutex-guarded and each message gets its own enif_alloc_env
+// (enif_send with a NULL caller env is legal from any thread).
+// CONT/NONE fragments (the stderr progress dots) are dropped; lines
+// below `min_level` are dropped.
+static pthread_mutex_t g_log_fwd_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_log_fwd_enabled = 0;
+static int g_log_fwd_min_level = GGML_LOG_LEVEL_WARN;
+static ErlNifPid g_log_fwd_pid;
+
+extern "C" void erllama_safe_clear_log_receiver(void) noexcept;
+
+static void erllama_log_forward(enum ggml_log_level level,
+                                const char *text) noexcept {
+    if (level == GGML_LOG_LEVEL_NONE || level == GGML_LOG_LEVEL_CONT) {
+        return;
+    }
+    pthread_mutex_lock(&g_log_fwd_mu);
+    if (!g_log_fwd_enabled || (int) level < g_log_fwd_min_level) {
+        pthread_mutex_unlock(&g_log_fwd_mu);
+        return;
+    }
+    ErlNifPid pid = g_log_fwd_pid;
+    pthread_mutex_unlock(&g_log_fwd_mu);
+
+    ErlNifEnv *env = enif_alloc_env();
+    if (!env) return;
+    size_t len = strlen(text);
+    ERL_NIF_TERM bin;
+    unsigned char *p = enif_make_new_binary(env, len, &bin);
+    if (p) {
+        /* Erlang binary, deliberately unterminated; std::copy avoids
+         * clang-tidy's bugprone-not-null-terminated-result false
+         * positive on memcpy. */
+        std::copy(text, text + len, p);
+        ERL_NIF_TERM msg = enif_make_tuple3(
+            env, enif_make_atom(env, "llama_log"),
+            enif_make_int(env, (int) level), bin);
+        // Failure (receiver gone) is ignored; logging must never
+        // stall the loader / decode threads.
+        (void) enif_send(nullptr, &pid, env, msg);
+    }
+    enif_free_env(env);
+}
+
 static void erllama_log_capture(enum ggml_log_level level,
                                 const char *text, void *user_data) noexcept {
-    (void) level;
     (void) user_data;
     if (!text) return;
     size_t n = strlen(text);
     if (n >= sizeof(t_last_log_line)) n = sizeof(t_last_log_line) - 1;
     memcpy(t_last_log_line, text, n);
     t_last_log_line[n] = '\0';
+    erllama_log_forward(level, text);
 }
 
 extern "C" {
@@ -359,10 +408,27 @@ int erllama_safe_backend_free(void) noexcept {
 // leave llama.cpp pointing at a function in a soon-to-be-unmapped
 // shared object. Called from the NIF unload path.
 void erllama_safe_log_unset(void) noexcept {
+    erllama_safe_clear_log_receiver();
     try {
         llama_log_set(nullptr, nullptr);
     } catch (...) {
     }
+}
+
+// Register / clear the Erlang process receiving forwarded native log
+// lines. `min_level` uses the ggml numeric levels (DEBUG 1 .. ERROR 4).
+void erllama_safe_set_log_receiver(ErlNifPid pid, int min_level) noexcept {
+    pthread_mutex_lock(&g_log_fwd_mu);
+    g_log_fwd_pid = pid;
+    g_log_fwd_min_level = min_level;
+    g_log_fwd_enabled = 1;
+    pthread_mutex_unlock(&g_log_fwd_mu);
+}
+
+void erllama_safe_clear_log_receiver(void) noexcept {
+    pthread_mutex_lock(&g_log_fwd_mu);
+    g_log_fwd_enabled = 0;
+    pthread_mutex_unlock(&g_log_fwd_mu);
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +932,25 @@ int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
                                    (llama_pos) p0, (llama_pos) p1)
                    ? 0
                    : -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// Full-sequence KV copy (fork). Always the full range: partial-range
+// copies GGML_ASSERT-abort on non-unified caches and are silently
+// ignored by recurrent memories. llama_memory_seq_cp returns void and
+// has several silent no-op paths (NULL memory on embedding archs,
+// shared-cell caches), so the NIF verifies pos_max(dst) == pos_max(src)
+// after the call. -1 on exception or missing memory.
+int erllama_safe_memory_seq_cp(struct llama_context *c, int seq_src,
+                               int seq_dst) noexcept {
+    try {
+        llama_memory_t mem = llama_get_memory(c);
+        if (!mem) return -1;
+        llama_memory_seq_cp(mem, (llama_seq_id) seq_src,
+                            (llama_seq_id) seq_dst, -1, -1);
+        return 0;
     } catch (...) {
         return -1;
     }

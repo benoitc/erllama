@@ -29,11 +29,13 @@
     thinking_markers,
     chat_template,
     model_id,
+    progress_to,
     %% erllama_model_stub only (test backend)
     step_delay_ms,
     thinking_capable,
     fail_seq_rm_last,
-    fail_kv_unpack
+    fail_kv_unpack,
+    fail_seq_cp
 ]).
 
 -define(MODEL_OPT_KEYS, [
@@ -195,10 +197,12 @@ check_load_types(C) ->
         {thinking_markers, fun is_map/1},
         {chat_template, fun is_binary/1},
         {model_id, fun is_binary/1},
+        {progress_to, fun is_pid/1},
         {step_delay_ms, fun non_neg_int/1},
         {thinking_capable, fun is_boolean/1},
         {fail_seq_rm_last, fun is_boolean/1},
         {fail_kv_unpack, fun is_boolean/1},
+        {fail_seq_cp, fun is_boolean/1},
         {model_opts, fun is_map/1},
         {context_opts, fun is_map/1},
         {policy, fun is_map/1}

@@ -969,6 +969,141 @@ sticky_partial_below_floor_admits_cold_test() ->
         ?assertEqual(cold, maps:get(cache_hit_kind, Stats))
     end).
 
+%% =============================================================================
+%% fork_session
+%% =============================================================================
+
+fork_session_continues_on_both_branches_test() ->
+    with_model(#{}, #{context_opts => #{n_seq_max => 2}}, fun(_Cfg) ->
+        ok = erllama_model_stub:reset_seq_cp_calls(),
+        {ok, #{generated := Gen1}} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => a}
+        ),
+        Turn1 = prompt_tokens(long_prompt()) ++ Gen1,
+        ok = erllama_model:fork_session(<<"test_model">>, a, b),
+        ?assertMatch([{_, _}], erllama_model_stub:seq_cp_calls()),
+        %% The fork continues the stored transcript: sticky hit with
+        %% the full stored prefix read from live KV.
+        SufB = prompt_tokens(<<"branch b suffix">>),
+        {ok, RefB} = erllama_model:infer(
+            <<"test_model">>, Turn1 ++ SufB, #{response_tokens => 2, session_id => b}, self()
+        ),
+        StatsB = drain_done(RefB, 5000),
+        ?assertEqual(sticky, maps:get(cache_hit_kind, StatsB)),
+        ?assertEqual(length(Turn1), maps:get(read, maps:get(cache_delta, StatsB))),
+        %% The source session is untouched and continues too.
+        SufA = prompt_tokens(<<"branch a suffix">>),
+        {ok, RefA} = erllama_model:infer(
+            <<"test_model">>, Turn1 ++ SufA, #{response_tokens => 2, session_id => a}, self()
+        ),
+        StatsA = drain_done(RefA, 5000),
+        ?assertEqual(sticky, maps:get(cache_hit_kind, StatsA)),
+        ?assertEqual(length(Turn1), maps:get(read, maps:get(cache_delta, StatsA)))
+    end).
+
+fork_session_error_paths_test() ->
+    with_model(#{}, #{context_opts => #{n_seq_max => 2}}, fun(_Cfg) ->
+        ?assertEqual(
+            {error, no_session},
+            erllama_model:fork_session(<<"test_model">>, nope, b)
+        ),
+        {ok, _} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2, session_id => a}
+        ),
+        %% Forking onto an existing session id (the source itself
+        %% included) is rejected.
+        ?assertEqual(
+            {error, session_exists},
+            erllama_model:fork_session(<<"test_model">>, a, a)
+        )
+    end).
+
+fork_session_busy_source_test() ->
+    with_model(
+        #{},
+        #{context_opts => #{n_seq_max => 2}, step_delay_ms => 50},
+        fun(_Cfg) ->
+            {ok, _} = erllama_model:complete(
+                <<"test_model">>, long_prompt(), #{response_tokens => 2, session_id => a}
+            ),
+            Turn1 = prompt_tokens(long_prompt()),
+            {ok, Ref} = erllama_model:infer(
+                <<"test_model">>,
+                Turn1 ++ prompt_tokens(<<"more">>),
+                #{response_tokens => 4, session_id => a},
+                self()
+            ),
+            %% The source seq is in flight: fork must refuse.
+            ?assertEqual(
+                {error, sticky_busy},
+                erllama_model:fork_session(<<"test_model">>, a, b)
+            ),
+            _ = drain_done(Ref, 5000)
+        end
+    ).
+
+fork_session_capacity_test() ->
+    %% n_seq_max = 1: the only seq is pinned by the source, and the
+    %% source is never reclaimed, so fork reports capacity.
+    with_model(#{}, fun(_Cfg) ->
+        {ok, _} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2, session_id => a}
+        ),
+        ?assertEqual(
+            {error, seq_capacity},
+            erllama_model:fork_session(<<"test_model">>, a, b)
+        )
+    end).
+
+fork_session_reclaims_other_pin_not_source_test() ->
+    %% Pool exhausted by two pinned sessions; the fork reclaims the
+    %% LRU idle pin but never its own source, even when the source is
+    %% the older pin.
+    with_model(#{}, #{context_opts => #{n_seq_max => 2}}, fun(_Cfg) ->
+        {ok, _} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2, session_id => a}
+        ),
+        {ok, _} = erllama_model:complete(
+            <<"test_model">>,
+            <<"another prompt entirely for session c">>,
+            #{response_tokens => 2, session_id => c}
+        ),
+        %% Source `a` is the LRU pin; reclaim must evict `c`.
+        ok = erllama_model:fork_session(<<"test_model">>, a, b),
+        Info = erllama_model:model_info(<<"test_model">>),
+        ?assertEqual(0, maps:get(available_seqs, Info)),
+        %% `c` was evicted; `a` and `b` remain.
+        ?assertEqual(
+            {error, no_session},
+            erllama_model:fork_session(<<"test_model">>, c, d)
+        )
+    end).
+
+fork_session_copy_failure_returns_seq_test() ->
+    with_model(
+        #{},
+        #{context_opts => #{n_seq_max => 2}, fail_seq_cp => true},
+        fun(_Cfg) ->
+            {ok, _} = erllama_model:complete(
+                <<"test_model">>, long_prompt(), #{response_tokens => 2, session_id => a}
+            ),
+            Before = maps:get(available_seqs, erllama_model:model_info(<<"test_model">>)),
+            ?assertEqual(
+                {error, seq_cp_failed},
+                erllama_model:fork_session(<<"test_model">>, a, b)
+            ),
+            After = maps:get(available_seqs, erllama_model:model_info(<<"test_model">>)),
+            %% The allocated seq went back to the pool.
+            ?assertEqual(Before, After),
+            ?assertEqual(
+                {error, no_session},
+                erllama_model:fork_session(<<"test_model">>, b, c)
+            )
+        end
+    ).
+
 sticky_seq_does_not_affect_non_session_callers_test() ->
     %% Sessions only kick in when session_id is set; callers that
     %% omit it see the existing one-shot path bit-identically.

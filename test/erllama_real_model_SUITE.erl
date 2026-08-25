@@ -35,6 +35,7 @@
     end_per_testcase/2
 ]).
 
+-export([log/2]).
 -export([
     load_unload/1,
     tokenize_decode_one/1,
@@ -49,6 +50,9 @@
     grammar_cache_reuses_compiled_template/1,
     seed_determinism/1,
     extended_samplers_generate/1,
+    fork_session_diverges/1,
+    load_progress_events/1,
+    native_logs_reach_logger/1,
     logit_bias_suppresses_token/1,
     ignore_eos_reaches_target/1,
     logprobs_stream_events/1,
@@ -102,6 +106,9 @@ all() ->
         temperature_zero_is_greedy,
         grammar_plus_sampler,
         extended_samplers_generate,
+        fork_session_diverges,
+        load_progress_events,
+        native_logs_reach_logger,
         logit_bias_suppresses_token,
         ignore_eos_reaches_target,
         logprobs_stream_events,
@@ -456,6 +463,116 @@ seed_determinism(Config) ->
     {Text1, _} = run_infer(Model, Tokens, Params),
     {Text2, _} = run_infer(Model, Tokens, Params),
     ?assertEqual(Text1, Text2),
+    ok.
+
+%% Fork a live session and continue both branches independently.
+%% Runs on its own facade-loaded model so the context can carry
+%% multiple sequences.
+fork_session_diverges(Config) ->
+    Path = ?config(model_path, Config),
+    {ok, M} = erllama:load_model(#{
+        model_path => Path,
+        context_opts => #{n_ctx => 2048, n_seq_max => 4, kv_unified => true}
+    }),
+    try
+        {ok, #{reply := R1}} = erllama:complete(M, ?LONG_PROMPT, #{
+            response_tokens => 6, temperature => 0.0, session_id => src
+        }),
+        Turn1 = <<?LONG_PROMPT/binary, R1/binary>>,
+        ok = erllama:fork_session(M, src, fork),
+        %% Same continuation on both branches: both sticky, greedy
+        %% replies byte-identical (same cells, same decode path).
+        Cont = <<Turn1/binary, " The next day">>,
+        {ok, #{reply := RS, cache_hit_kind := KS}} = erllama:complete(M, Cont, #{
+            response_tokens => 6, temperature => 0.0, session_id => src
+        }),
+        {ok, #{reply := RF, cache_hit_kind := KF}} = erllama:complete(M, Cont, #{
+            response_tokens => 6, temperature => 0.0, session_id => fork
+        }),
+        ct:log("src kind=~p ~ts~nfork kind=~p ~ts", [KS, RS, KF, RF]),
+        ?assertEqual(sticky, KF),
+        ?assertEqual(sticky, KS),
+        ?assertEqual(RS, RF),
+        %% Ending the fork leaves the source alive.
+        ok = erllama:end_session(M, fork),
+        {ok, #{cache_hit_kind := K2}} = erllama:complete(
+            M, <<Cont/binary, RS/binary, " and then">>, #{
+                response_tokens => 4, temperature => 0.0, session_id => src
+            }
+        ),
+        ?assertEqual(sticky, K2)
+    after
+        ok = erllama:unload(M)
+    end,
+    ok.
+
+%% progress_to delivers throttled, non-decreasing load progress
+%% ending with exactly 1.0, tagged with the model id.
+load_progress_events(Config) ->
+    Path = ?config(model_path, Config),
+    {ok, M} = erllama:load_model(#{model_path => Path, progress_to => self()}),
+    try
+        {Tags, Values} = collect_progress([], [], 2000),
+        ct:log("progress n=~p values=~p", [length(Values), Values]),
+        ?assert(length(Values) >= 1),
+        ?assert(lists:all(fun(T) -> T =:= M end, Tags)),
+        ?assert(lists:all(fun(V) -> V >= 0.0 andalso V =< 1.0 end, Values)),
+        ?assertEqual(Values, lists:sort(Values)),
+        ?assertEqual(1.0, lists:last(Values))
+    after
+        ok = erllama:unload(M)
+    end,
+    ok.
+
+collect_progress(Tags, Vals, Timeout) ->
+    receive
+        {erllama_load_progress, Tag, V} ->
+            collect_progress([Tag | Tags], [V | Vals], Timeout)
+    after Timeout ->
+        {lists:reverse(Tags), lists:reverse(Vals)}
+    end.
+
+%% Native llama.cpp log lines reach `logger` under [erllama, native]
+%% once the receiver level admits them.
+native_logs_reach_logger(Config) ->
+    Path = ?config(model_path, Config),
+    Self = self(),
+    OldPrimary = maps:get(level, logger:get_primary_config()),
+    ok = logger:set_primary_config(level, info),
+    ok = logger:add_handler(
+        native_tap,
+        ?MODULE,
+        #{config => #{notify => Self}, level => info}
+    ),
+    application:set_env(erllama, native_log_level, info),
+    ok = supervisor:terminate_child(erllama_sup, erllama_log),
+    {ok, _} = supervisor:restart_child(erllama_sup, erllama_log),
+    try
+        {ok, M} = erllama:load_model(#{model_path => Path}),
+        ok = erllama:unload(M),
+        Seen = wait_native_log(5000),
+        ?assert(Seen)
+    after
+        _ = logger:remove_handler(native_tap),
+        ok = logger:set_primary_config(level, OldPrimary),
+        application:unset_env(erllama, native_log_level),
+        _ = supervisor:terminate_child(erllama_sup, erllama_log),
+        _ = supervisor:restart_child(erllama_sup, erllama_log)
+    end,
+    ok.
+
+wait_native_log(Timeout) ->
+    receive
+        native_log_seen -> true
+    after Timeout -> false
+    end.
+
+%% logger handler callback for native_logs_reach_logger: forward a
+%% ping for every [erllama, native]-domain event.
+log(#{meta := #{domain := [erllama, native]}}, #{config := #{notify := Pid}}) ->
+    Pid ! native_log_seen,
+    ok;
+log(_Event, _Config) ->
     ok.
 
 %% The extended sampler stages generate without crashing: one run

@@ -109,6 +109,18 @@ Binary key used to sign the signature attached to `{thinking_end,
 Sig}` events so a client cannot forge a thinking block on a later
 turn. Unset or `<<>>` disables signing.
 
+### `native_log_level`
+
+Forward llama.cpp / ggml native log lines into Erlang's `logger`
+under the domain `[erllama, native]`. One of `none | error | warning
+| info | debug`; default `warning` (quiet). `info` surfaces the full
+model-load banner. Read once at application start by the
+`erllama_log` receiver.
+
+```erlang
+application:set_env(erllama, native_log_level, info).
+```
+
 ### `middleware`
 
 Global middleware chain applied to every API call; see the

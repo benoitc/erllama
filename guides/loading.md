@@ -252,6 +252,47 @@ What the family means for erllama:
   load with `{error, {unsupported_model, encoder_decoder | diffusion}}`;
   they need inference modes the engine does not drive.
 
+## Load progress
+
+Loading blocks for the duration of the GGUF read. Pass a pid to get
+progress while it runs:
+
+```erlang
+{ok, M} = erllama:load_model(#{model_path => Path, progress_to => self()}),
+%% receives {erllama_load_progress, ModelId, Progress} messages:
+%% floats in [0.0, 1.0], non-decreasing, throttled to whole-percent
+%% steps, ending with exactly 1.0.
+```
+
+The stub backend sends no progress messages.
+
+## Forking a session
+
+`erllama:fork_session(Model, SrcSessionId, NewSessionId)` duplicates a
+sticky session's live KV cells into a fresh sequence, so two
+continuations can explore different branches without re-prefilling
+the shared prefix:
+
+```erlang
+{ok, _} = erllama:complete(M, Prompt, #{session_id => a}),
+ok = erllama:fork_session(M, a, b),
+{ok, _} = erllama:complete(M, <<Transcript/binary, " option one">>, #{session_id => a}),
+{ok, _} = erllama:complete(M, <<Transcript/binary, " option two">>, #{session_id => b}).
+```
+
+Notes:
+
+- The context needs free sequences (`context_opts.n_seq_max > 1`);
+  with `kv_unified => true` the copy is metadata-only (the branches
+  share cells until they diverge).
+- The copy carries no logits, so the forked session's first request
+  must extend the stored transcript (any normal continuation does).
+- Works on every model family; on recurrent models it copies the
+  compressed state tail.
+- Never queues: with no free sequence (after reclaiming the
+  least-recently-used idle pin, never the source) the reply is
+  `{error, seq_capacity}`.
+
 ## Loading multiple models
 
 `load_model/2` takes an explicit binary id and is idempotent against
