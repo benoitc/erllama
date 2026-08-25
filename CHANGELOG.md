@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Guides: generating text, sessions, tokens and vocabulary,
+  embeddings, LoRA adapters, observability, and testing with the stub
+  backend; the tool-calls guide now walks the full tool round trip.
+  Examples for fork_session, logprobs, FIM, json_schema, load
+  progress, and native logs.
+
 ## [0.11.0] - 2026-08-25
 
 ### Changed

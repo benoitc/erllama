@@ -86,10 +86,10 @@ multi-turn cold misses on slow storage.
 
 How to verify the model fingerprint at load:
 
-- `safe` — full SHA-256 over the file. Slow on multi-GB GGUFs.
-- `gguf_chunked` — fingerprint metadata + first weights tensor.
+- `safe` - full SHA-256 over the file. Slow on multi-GB GGUFs.
+- `gguf_chunked` - fingerprint metadata + first weights tensor.
   Catches accidental corruption, not malicious tampering.
-- `fast_unsafe` — trust the supplied fingerprint blindly. Use only
+- `fast_unsafe` - trust the supplied fingerprint blindly. Use only
   when you fingerprint upstream and pass the digest through.
 
 ### `writer_max_concurrent`

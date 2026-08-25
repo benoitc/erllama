@@ -97,12 +97,13 @@ lists every reason.
 |---|---|
 | Lifecycle | `load_model/1,2`, `unload/1`, `whereis/1`, `list_models/0`, `model_info/1` |
 | Completion | `complete/2,3`, `prefill_only/2,3` |
-| Streaming | `stream/3`, `collect/2`, `continue/3`, `cancel/1`, `end_session/2`, `reset_session/2` |
+| Streaming | `stream/3`, `collect/2`, `cancel/1` |
+| Sessions | `continue/3`, `end_session/2`, `fork_session/3`, `reset_session/2` |
 | Chat | `chat/3`, `chat_apply/3`, `chat_parse/3`, `render_chat_template/2` |
-| Tokens | `tokenize/2,3`, `detokenize/2` |
+| Tokens | `tokenize/2,3`, `detokenize/2,3`, `vocab_info/1` |
 | Embeddings | `embed/2`, `embed_batch/2` |
 | Adapters | `load_adapter/2`, `unload_adapter/2`, `set_adapter_scale/3`, `list_adapters/1` |
-| Observability | `status/1`, `phase/1`, `pending_len/1`, `queue_depth/0,1`, `last_cache_hit/1`, `cached_prefix_len/2`, `counters/0`, `vram_info/0`, `pressure/0`, `requests/0` |
+| Observability | `status/1`, `phase/1`, `pending_len/1`, `queue_depth/0,1`, `last_cache_hit/1`, `cached_prefix_len/2`, `counters/0`, `vram_info/0`, `pressure/0`, `requests/0`, `request_info/1` |
 | Speculative | `draft_tokens/3`, `verify/4` |
 | Memory control | `evict/1`, `shutdown/1` |
 
@@ -217,11 +218,18 @@ ok = erllama:unload(<<"tiny">>).
 | Need | Read |
 |---|---|
 | Load a model | [Loading a model](guides/loading.md) |
+| Generate text: complete, stream, options, logprobs | [Generating text](guides/generation.md) |
+| Multi-turn state: sessions, continue, fork | [Sessions](guides/sessions.md) |
+| Run chat turns and tool calls | [Tool calls](guides/tool-calls.md) |
+| Tokenize, detokenize, special tokens, FIM | [Tokens and vocabulary](guides/tokens.md) |
+| Compute embeddings | [Embeddings](guides/embeddings.md) |
+| Attach LoRA adapters | [Adapters](guides/adapters.md) |
 | Configure cache tiers and save policy | [Caching](guides/caching.md) |
+| Monitor models, cache, memory, logs | [Observability](guides/observability.md) |
+| Test your code without a model | [Testing](guides/testing.md) |
 | Configure `sys.config` and per-model options | [Configuration](guides/configuration.md) |
 | Build from source | [Building](guides/building.md) |
 | Copy working snippets | [Examples](guides/examples.md) |
-| Run chat turns and tool calls | [Tool calls](guides/tool-calls.md) |
 | Observe or wrap every call | [Middleware](guides/middleware.md) |
 | Understand cache design tradeoffs | [Cache design](internals/cache-design.md) |
 | Understand crash-safe save publication | [Publish protocol](internals/publish-protocol.md) |
