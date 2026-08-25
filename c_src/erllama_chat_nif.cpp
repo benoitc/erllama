@@ -24,6 +24,7 @@
  */
 
 #include "erllama_chat_nif.h"
+#include "erllama_nif_util.h"
 #include "erllama_resources.h"
 #include "chat.h"
 #include "chat-peg-parser.h"
@@ -80,17 +81,9 @@ ERL_NIF_TERM mk_error(ErlNifEnv *env, const char *reason) {
 
 ERL_NIF_TERM mk_error_str(ErlNifEnv *env, const std::string &reason) {
     ERL_NIF_TERM bin;
-    unsigned char *buf =
-        enif_make_new_binary(env, reason.size(), &bin);
-    if (!buf) {
+    if (!erllama_bin_from(env, reason.data(), reason.size(), &bin)) {
         return mk_error(env, "alloc_failed");
     }
-    /* enif_make_new_binary returns a raw binary buffer; null
-     * termination is not required (this is an Erlang binary,
-     * not a C string). std::copy avoids clang-tidy's
-     * bugprone-not-null-terminated-result false positive on
-     * memcpy. */
-    std::copy(reason.begin(), reason.end(), buf);
     return enif_make_tuple2(
         env,
         mk_atom(env, "error"),
@@ -212,69 +205,58 @@ bool map_get_string(
     return term_to_string(env, v, out);
 }
 
-/* Read an atom-valued map key into `out`. Returns:
- *   1  key present and is an atom (out filled)
- *   0  key absent
- *  -1  key present but not an atom (caller should reject) */
-int map_get_atom(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
-                 std::string &out) {
-    ERL_NIF_TERM kterm = enif_make_atom(env, key);
-    ERL_NIF_TERM v;
-    if (!enif_get_map_value(env, map, kterm, &v)) {
-        return 0;
-    }
-    char buf[24];
-    if (enif_get_atom(env, v, buf, sizeof(buf), ERL_NIF_LATIN1) == 0) {
-        return -1;
-    }
-    out.assign(buf);
-    return 1;
-}
+/* Atom -> enum tables consumed through the shared get_map_atom_enum
+ * getter (erllama_nif_util.h), mirroring the C-side option maps. */
+const erllama_atom_enum_pair_t TOOL_CHOICE_TABLE[] = {
+    {"auto",     COMMON_CHAT_TOOL_CHOICE_AUTO},
+    {"required", COMMON_CHAT_TOOL_CHOICE_REQUIRED},
+    {"none",     COMMON_CHAT_TOOL_CHOICE_NONE},
+};
+
+const erllama_atom_enum_pair_t REASONING_FORMAT_TABLE[] = {
+    {"none",     COMMON_REASONING_FORMAT_NONE},
+    {"deepseek", COMMON_REASONING_FORMAT_DEEPSEEK},
+};
+
+const erllama_atom_enum_pair_t CONTINUATION_TABLE[] = {
+    {"none",      COMMON_CHAT_CONTINUATION_NONE},
+    {"auto",      COMMON_CHAT_CONTINUATION_AUTO},
+    {"content",   COMMON_CHAT_CONTINUATION_CONTENT},
+    {"reasoning", COMMON_CHAT_CONTINUATION_REASONING},
+};
 
 /* Map atom keys `auto' | `required' | `none' -> common_chat_tool_choice.
  * Missing key -> AUTO; anything unrecognised is rejected. */
 bool map_tool_choice(ErlNifEnv *env, ERL_NIF_TERM map,
                      common_chat_tool_choice &out) {
-    std::string s;
-    int rc = map_get_atom(env, map, "tool_choice", s);
-    if (rc == 0) {
-        out = COMMON_CHAT_TOOL_CHOICE_AUTO;
-        return true;
-    }
+    int v = 0;
+    int rc = get_map_atom_enum(
+        env, map, "tool_choice", TOOL_CHOICE_TABLE,
+        sizeof(TOOL_CHOICE_TABLE) / sizeof(TOOL_CHOICE_TABLE[0]), &v);
     if (rc < 0) {
         return false;
     }
-    if (s == "auto") {
-        out = COMMON_CHAT_TOOL_CHOICE_AUTO;
-    } else if (s == "required") {
-        out = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
-    } else if (s == "none") {
-        out = COMMON_CHAT_TOOL_CHOICE_NONE;
-    } else {
-        return false;
-    }
+    out = rc > 0 ? static_cast<common_chat_tool_choice>(v)
+                 : COMMON_CHAT_TOOL_CHOICE_AUTO;
     return true;
 }
 
-/* Boolean atom key. Missing -> `deflt'; non-boolean atoms rejected. */
+/* Boolean atom key. Missing -> `deflt'; non-boolean values rejected.
+ * Presence is checked first so the shared get_map_bool (which folds
+ * "absent" and "not a boolean" into one return) keeps the rejection
+ * behavior here. */
 bool map_get_bool(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
                   bool deflt, bool &out) {
-    std::string s;
-    int rc = map_get_atom(env, map, key, s);
-    if (rc == 0) {
+    ERL_NIF_TERM v;
+    if (!enif_get_map_value(env, map, enif_make_atom(env, key), &v)) {
         out = deflt;
         return true;
     }
-    if (rc < 0) {
+    int b = 0;
+    if (!get_map_bool(env, map, key, &b)) {
         return false;
     }
-    if (s == "true") {
-        out = true;
-    } else if (s == "false") {
-        out = false;
-    } else {
-        return false;
-    }
+    out = b != 0;
     return true;
 }
 
@@ -282,20 +264,16 @@ bool map_get_bool(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
  * keeps the struct default (NONE); the Erlang side always sets it. */
 bool map_reasoning_format(ErlNifEnv *env, ERL_NIF_TERM map,
                           common_reasoning_format &out) {
-    std::string s;
-    int rc = map_get_atom(env, map, "reasoning_format", s);
-    if (rc == 0) {
-        return true;
-    }
+    int v = 0;
+    int rc = get_map_atom_enum(
+        env, map, "reasoning_format", REASONING_FORMAT_TABLE,
+        sizeof(REASONING_FORMAT_TABLE) / sizeof(REASONING_FORMAT_TABLE[0]),
+        &v);
     if (rc < 0) {
         return false;
     }
-    if (s == "none") {
-        out = COMMON_REASONING_FORMAT_NONE;
-    } else if (s == "deepseek") {
-        out = COMMON_REASONING_FORMAT_DEEPSEEK;
-    } else {
-        return false;
+    if (rc > 0) {
+        out = static_cast<common_reasoning_format>(v);
     }
     return true;
 }
@@ -304,35 +282,24 @@ bool map_reasoning_format(ErlNifEnv *env, ERL_NIF_TERM map,
  * Missing key keeps the struct default (NONE). */
 bool map_continuation(ErlNifEnv *env, ERL_NIF_TERM map,
                       common_chat_continuation &out) {
-    std::string s;
-    int rc = map_get_atom(env, map, "continue_final_message", s);
-    if (rc == 0) {
-        return true;
-    }
+    int v = 0;
+    int rc = get_map_atom_enum(
+        env, map, "continue_final_message", CONTINUATION_TABLE,
+        sizeof(CONTINUATION_TABLE) / sizeof(CONTINUATION_TABLE[0]), &v);
     if (rc < 0) {
         return false;
     }
-    if (s == "none") {
-        out = COMMON_CHAT_CONTINUATION_NONE;
-    } else if (s == "auto") {
-        out = COMMON_CHAT_CONTINUATION_AUTO;
-    } else if (s == "content") {
-        out = COMMON_CHAT_CONTINUATION_CONTENT;
-    } else if (s == "reasoning") {
-        out = COMMON_CHAT_CONTINUATION_REASONING;
-    } else {
-        return false;
+    if (rc > 0) {
+        out = static_cast<common_chat_continuation>(v);
     }
     return true;
 }
 
 ERL_NIF_TERM mk_string_bin(ErlNifEnv *env, const std::string &s) {
     ERL_NIF_TERM bin;
-    unsigned char *buf = enif_make_new_binary(env, s.size(), &bin);
-    if (!buf) {
+    if (!erllama_bin_from(env, s.data(), s.size(), &bin)) {
         return enif_make_atom(env, "undefined");
     }
-    std::copy(s.begin(), s.end(), buf);
     return bin;
 }
 

@@ -91,7 +91,7 @@ ERL_NIF_TERM nif_request_abort(ErlNifEnv *env, int argc,
         return enif_make_badarg(env);
     }
     if (!c->ctx) {
-        return enif_make_tuple2(env, atom_error, atom_released);
+        return erllama_error(env, atom_released);
     }
     atomic_store_explicit(&c->abort_flag, 1, memory_order_relaxed);
     return atom_ok;
@@ -173,29 +173,24 @@ ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     if (tv_rc < 0) return enif_make_badarg(env);
     if (tv_rc > 0) params.type_v = (enum ggml_type) enum_v;
 
-    pthread_mutex_lock(&m->mu);
-    if (!m->model) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
-    }
-    /* If free_model/1 has been called and is waiting for the last
-     * context to drop, do not let a new caller resurrect the model
-     * by attaching another context. The {ok, deferred} return is
-     * a release contract: no new contexts allowed past that point. */
-    if (m->release_pending) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    /* The release_pending refusal: if free_model/1 has been called
+     * and is waiting for the last context to drop, do not let a new
+     * caller resurrect the model by attaching another context. The
+     * {ok, deferred} return is a release contract: no new contexts
+     * allowed past that point. */
+    if (!erllama_lock_model_live(m)) {
+        return erllama_error(env, atom_released);
     }
     struct llama_context *ctx = erllama_safe_init_from_model(m->model, params);
     if (!ctx) {
         pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_context_failed);
+        return erllama_error(env, atom_context_failed);
     }
     erllama_context_t *res = enif_alloc_resource(CTX_RT, sizeof(*res));
     if (!res) {
         (void) erllama_safe_free(ctx);
         pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     memset(res, 0, sizeof(*res));
     /* per_seq[].last_logits_idx must start at -1 so the first
@@ -210,7 +205,7 @@ ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         enif_release_resource(res);
         (void) erllama_safe_free(ctx);
         pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     res->mu_inited = 1;
     res->ctx = ctx;
@@ -236,10 +231,8 @@ ERL_NIF_TERM nif_free_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
     if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
         return enif_make_badarg(env);
     }
-    pthread_mutex_lock(&c->mu);
-    if (!c->ctx) {
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
     }
     /* Free under the lock so a concurrent reader cannot observe the
      * pointer mid-teardown. On exception we still NULL the pointer
@@ -260,7 +253,7 @@ ERL_NIF_TERM nif_free_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
         enif_release_resource(m);
     }
     if (free_rc != 0) {
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
     return atom_ok;
 }

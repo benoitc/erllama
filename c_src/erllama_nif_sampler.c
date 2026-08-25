@@ -763,28 +763,49 @@ build_sampler_chain_from_map(ErlNifEnv *env, ERL_NIF_TERM cfg,
     return chain;
 }
 
-ERL_NIF_TERM nif_configure_sampler(ErlNifEnv *env, int argc,
-                                          const ERL_NIF_TERM argv[]) {
-    (void) argc;
+/* Shared prologue of nif_configure_sampler / nif_sampler_new: fetch
+ * and validate the {CtxRef, CfgMap} argument pair, take the context
+ * lock, and build the chain. On success returns the chain with
+ * *out_c set and c->mu still HELD (the caller mutates and unlocks).
+ * On failure returns NULL with no lock held and *out_ret set to the
+ * term to return. */
+static struct llama_sampler *chain_from_args(
+    ErlNifEnv *env, const ERL_NIF_TERM argv[],
+    erllama_context_t **out_c, ERL_NIF_TERM *out_ret
+) {
     erllama_context_t *c;
     if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
-        return enif_make_badarg(env);
+        *out_ret = enif_make_badarg(env);
+        return NULL;
     }
     if (!enif_is_map(env, argv[1])) {
-        return enif_make_badarg(env);
+        *out_ret = enif_make_badarg(env);
+        return NULL;
     }
-
-    pthread_mutex_lock(&c->mu);
-    if (!c->ctx) {
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_ctx(c)) {
+        *out_ret = erllama_error(env, atom_released);
+        return NULL;
     }
     ERL_NIF_TERM err = atom_oom;
     struct llama_sampler *chain =
         build_sampler_chain_from_map(env, argv[1], c, &err);
     if (!chain) {
         pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, err);
+        *out_ret = erllama_error(env, err);
+        return NULL;
+    }
+    *out_c = c;
+    return chain;
+}
+
+ERL_NIF_TERM nif_configure_sampler(ErlNifEnv *env, int argc,
+                                          const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c = NULL;
+    ERL_NIF_TERM ret;
+    struct llama_sampler *chain = chain_from_args(env, argv, &c, &ret);
+    if (!chain) {
+        return ret;
     }
     if (c->smpl) {
         (void) erllama_safe_sampler_free(c->smpl);
@@ -833,35 +854,23 @@ ERL_NIF_TERM nif_clear_sampler(ErlNifEnv *env, int argc,
 ERL_NIF_TERM nif_sampler_new(ErlNifEnv *env, int argc,
                                     const ERL_NIF_TERM argv[]) {
     (void) argc;
-    erllama_context_t *c;
-    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
-        return enif_make_badarg(env);
-    }
-    if (!enif_is_map(env, argv[1])) {
-        return enif_make_badarg(env);
-    }
-    pthread_mutex_lock(&c->mu);
-    if (!c->ctx) {
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
-    }
-    ERL_NIF_TERM err = atom_oom;
-    struct llama_sampler *chain =
-        build_sampler_chain_from_map(env, argv[1], c, &err);
-    pthread_mutex_unlock(&c->mu);
+    erllama_context_t *c = NULL;
+    ERL_NIF_TERM ret;
+    struct llama_sampler *chain = chain_from_args(env, argv, &c, &ret);
     if (!chain) {
-        return enif_make_tuple2(env, atom_error, err);
+        return ret;
     }
+    pthread_mutex_unlock(&c->mu);
     erllama_sampler_t *res = enif_alloc_resource(SAMPLER_RT, sizeof(*res));
     if (!res) {
         (void) erllama_safe_sampler_free(chain);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     memset(res, 0, sizeof(*res));
     if (pthread_mutex_init(&res->mu, NULL) != 0) {
         enif_release_resource(res);
         (void) erllama_safe_sampler_free(chain);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     res->mu_inited = 1;
     res->chain = chain;
@@ -893,7 +902,7 @@ ERL_NIF_TERM nif_sampler_free(ErlNifEnv *env, int argc,
     pthread_mutex_lock(&s->mu);
     if (!s->chain) {
         pthread_mutex_unlock(&s->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+        return erllama_error(env, atom_released);
     }
     (void) erllama_safe_sampler_free(s->chain);
     s->chain = NULL;
@@ -916,9 +925,7 @@ nif_grammar_cache_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     uint64_t misses = c->gcache_misses;
     pthread_mutex_unlock(&c->mu);
     ERL_NIF_TERM m = enif_make_new_map(env);
-    enif_make_map_put(
-        env, m, enif_make_atom(env, "hits"), enif_make_uint64(env, hits), &m);
-    enif_make_map_put(
-        env, m, enif_make_atom(env, "misses"), enif_make_uint64(env, misses), &m);
+    erllama_map_put(env, &m, "hits", enif_make_uint64(env, hits));
+    erllama_map_put(env, &m, "misses", enif_make_uint64(env, misses));
     return m;
 }

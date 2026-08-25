@@ -211,7 +211,7 @@ ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
     int max_msgs = (int) msg_len + 1;
     struct llama_chat_message *msgs =
         enif_alloc(sizeof(struct llama_chat_message) * (size_t) max_msgs);
-    if (!msgs) return enif_make_tuple2(env, atom_error, atom_oom);
+    if (!msgs) return erllama_error(env, atom_oom);
     memset(msgs, 0, sizeof(struct llama_chat_message) * (size_t) max_msgs);
 
     int n_msgs = 0;
@@ -221,7 +221,7 @@ ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
         if (!role) {
             enif_free(synthetic_system);
             enif_free(msgs);
-            return enif_make_tuple2(env, atom_error, atom_oom);
+            return erllama_error(env, atom_oom);
         }
         memcpy(role, "system", 7);
         msgs[0].role = role;
@@ -235,26 +235,24 @@ ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
         free_chat_msgs(msgs, n_msgs);
         enif_free(msgs);
         switch (built) {
-            case -2: return enif_make_tuple2(env, atom_error, atom_oom);
-            case -3: return enif_make_tuple2(env, atom_error, atom_invalid_content);
+            case -2: return erllama_error(env, atom_oom);
+            case -3: return erllama_error(env, atom_invalid_content);
             default: return enif_make_badarg(env);
         }
     }
     n_msgs = built;
 
-    pthread_mutex_lock(&m->mu);
-    if (!m->model || m->release_pending) {
-        pthread_mutex_unlock(&m->mu);
+    if (!erllama_lock_model_live(m)) {
         free_chat_msgs(msgs, n_msgs);
         enif_free(msgs);
-        return enif_make_tuple2(env, atom_error, atom_released);
+        return erllama_error(env, atom_released);
     }
     const char *tmpl = erllama_safe_model_chat_template(m->model, NULL);
     if (!tmpl || tmpl[0] == '\0') {
         pthread_mutex_unlock(&m->mu);
         free_chat_msgs(msgs, n_msgs);
         enif_free(msgs);
-        return enif_make_tuple2(env, atom_error, atom_no_template);
+        return erllama_error(env, atom_no_template);
     }
 
     /* Render. Start with a 4 KiB buffer; grow on negative-needed-size. */
@@ -264,7 +262,7 @@ ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
         pthread_mutex_unlock(&m->mu);
         free_chat_msgs(msgs, n_msgs);
         enif_free(msgs);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     int32_t written = erllama_safe_chat_apply_template(
         tmpl, msgs, (size_t) n_msgs, true, buf, buf_size);
@@ -282,7 +280,7 @@ ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
             free_chat_msgs(msgs, n_msgs);
             enif_free(msgs);
             enif_free(buf);
-            return enif_make_tuple2(env, atom_error, atom_too_large);
+            return erllama_error(env, atom_too_large);
         }
         enif_free(buf);
         buf_size = written + 16;
@@ -291,7 +289,7 @@ ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
             pthread_mutex_unlock(&m->mu);
             free_chat_msgs(msgs, n_msgs);
             enif_free(msgs);
-            return enif_make_tuple2(env, atom_error, atom_oom);
+            return erllama_error(env, atom_oom);
         }
         written = erllama_safe_chat_apply_template(
             tmpl, msgs, (size_t) n_msgs, true, buf, buf_size);
@@ -303,7 +301,7 @@ ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
             free_chat_msgs(msgs, n_msgs);
             enif_free(msgs);
             enif_free(buf);
-            return enif_make_tuple2(env, atom_error, atom_template_failed);
+            return erllama_error(env, atom_template_failed);
         }
     }
     if (written < 0) {
@@ -311,75 +309,42 @@ ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
         free_chat_msgs(msgs, n_msgs);
         enif_free(msgs);
         enif_free(buf);
-        return enif_make_tuple2(env, atom_error,
-                                written == INT32_MIN ? atom_exception
-                                                     : atom_template_failed);
+        return erllama_error(env,
+                             written == INT32_MIN ? atom_exception
+                                                  : atom_template_failed);
     }
 
     /* Tokenise the rendered string. parse_special=true so chat-template
      * tokens (`<|user|>`, `<|im_start|>`, etc.) become their special
      * token ids rather than text fragments. */
-    const struct llama_vocab *vocab = erllama_safe_model_get_vocab(m->model);
+    const struct llama_vocab *vocab = erllama_model_vocab(m, NULL);
     if (!vocab) {
         pthread_mutex_unlock(&m->mu);
         free_chat_msgs(msgs, n_msgs);
         enif_free(msgs);
         enif_free(buf);
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
 
-    /* See the matching comment in `nif_tokenize`: written + 8 is a
-     * sound upper bound and clamping down forces unnecessary retries. */
-    int32_t n_max = written + 8;
-    if (n_max < 16) n_max = 16;
-    llama_token *tokens = enif_alloc(sizeof(llama_token) * (size_t) n_max);
-    if (!tokens) {
-        pthread_mutex_unlock(&m->mu);
-        free_chat_msgs(msgs, n_msgs);
-        enif_free(msgs);
-        enif_free(buf);
-        return enif_make_tuple2(env, atom_error, atom_oom);
-    }
-    int32_t n = erllama_safe_tokenize(vocab, buf, written, tokens, n_max,
-                                      true, true);
-    if (n < 0 && n != INT32_MIN) {
-        int32_t needed = -n;
-        if (needed > ERLLAMA_MAX_TOKENS) {
-            pthread_mutex_unlock(&m->mu);
-            free_chat_msgs(msgs, n_msgs);
-            enif_free(msgs);
-            enif_free(buf);
-            enif_free(tokens);
-            return enif_make_tuple2(env, atom_error, atom_too_large);
-        }
-        enif_free(tokens);
-        tokens = enif_alloc(sizeof(llama_token) * (size_t) needed);
-        if (!tokens) {
-            pthread_mutex_unlock(&m->mu);
-            free_chat_msgs(msgs, n_msgs);
-            enif_free(msgs);
-            enif_free(buf);
-            return enif_make_tuple2(env, atom_error, atom_oom);
-        }
-        n = erllama_safe_tokenize(vocab, buf, written, tokens, needed,
-                                  true, true);
-    }
+    llama_token *tokens = NULL;
+    int32_t n = 0;
+    erllama_tok_status_t st =
+        erllama_tokenize_grow(vocab, buf, written, true, true, &tokens, &n);
     pthread_mutex_unlock(&m->mu);
     free_chat_msgs(msgs, n_msgs);
     enif_free(msgs);
     enif_free(buf);
-    if (n == INT32_MIN) {
-        enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_exception);
-    }
-    if (n < 0) {
-        enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
-    }
-    /* See the matching post-success check in `nif_tokenize`. */
-    if (n > ERLLAMA_MAX_TOKENS) {
-        enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_too_large);
+    switch (st) {
+        case ERLLAMA_TOK_OOM:
+            return erllama_error(env, atom_oom);
+        case ERLLAMA_TOK_EXCEPTION:
+            return erllama_error(env, atom_exception);
+        case ERLLAMA_TOK_TOO_LARGE:
+            return erllama_error(env, atom_too_large);
+        case ERLLAMA_TOK_FAILED:
+            return erllama_error(env, atom_tokenize_failed);
+        case ERLLAMA_TOK_OK:
+            break;
     }
 
     ERL_NIF_TERM list = enif_make_list(env, 0);

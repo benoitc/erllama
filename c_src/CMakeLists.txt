@@ -119,6 +119,7 @@ endif()
 # -----------------------------------------------------------------------------
 add_library(erllama_nif SHARED
     erllama_nif.c
+    erllama_nif_util.c
     erllama_nif_model.c
     erllama_nif_context.c
     erllama_nif_kv.c

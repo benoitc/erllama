@@ -1,8 +1,8 @@
 /* Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
  * See the LICENSE file at the project root. */
 /* Text <-> token conversion: tokenize, the cache-keying
- * detokenize loop (byte-stable), the options-aware detokenize,
- * and the shared token-list parsing helpers. */
+ * detokenize loop (byte-stable), and the options-aware
+ * detokenize. */
 
 #include "erllama_nif_int.h"
 #include "erllama_safe.h"
@@ -26,7 +26,7 @@ ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     }
     /* NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result) */
     if (text.size > (size_t) ERLLAMA_MAX_TOKEN_TEXT) {
-        return enif_make_tuple2(env, atom_error, atom_too_large);
+        return erllama_error(env, atom_too_large);
     }
     if (!enif_is_map(env, argv[2])) {
         return enif_make_badarg(env);
@@ -38,76 +38,33 @@ ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     if (get_map_bool(env, argv[2], "add_special", &b)) add_special = b;
     if (get_map_bool(env, argv[2], "parse_special", &b)) parse_special = b;
 
-    pthread_mutex_lock(&m->mu);
-    if (!m->model || m->release_pending) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_model_live(m)) {
+        return erllama_error(env, atom_released);
     }
-    const struct llama_vocab *vocab = erllama_safe_model_get_vocab(m->model);
+    const struct llama_vocab *vocab = erllama_model_vocab(m, NULL);
     if (!vocab) {
         pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
 
-    int32_t text_len = (int32_t) text.size;
-    /* `n_max = text_len + 8` is a sound upper bound: tokens-per-byte
-     * for any tokenizer is `<= 1 + small constant`, the +8 covering
-     * BOS/EOS specials. Clamping it down to ERLLAMA_MAX_TOKENS would
-     * force an unnecessary retry on inputs over ~1 byte/token average
-     * and cap production workloads below the input text cap. The
-     * input text cap (ERLLAMA_MAX_TOKEN_TEXT, enforced above) is
-     * what bounds the allocation. */
-    int32_t n_max = text_len + 8;
-    if (n_max < 16) n_max = 16;
-
-    llama_token *tokens = (llama_token *) enif_alloc(sizeof(llama_token) * (size_t) n_max);
-    if (!tokens) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_oom);
-    }
-    int32_t n = erllama_safe_tokenize(
-        vocab, (const char *) text.data, text_len, tokens,
-        n_max, add_special ? true : false, parse_special ? true : false);
-    if (n == INT32_MIN) {
-        enif_free(tokens);
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_exception);
-    }
-    if (n < 0) {
-        int32_t needed = -n;
-        if (needed > ERLLAMA_MAX_TOKENS) {
-            enif_free(tokens);
-            pthread_mutex_unlock(&m->mu);
-            return enif_make_tuple2(env, atom_error, atom_too_large);
-        }
-        enif_free(tokens);
-        tokens = (llama_token *) enif_alloc(sizeof(llama_token) * (size_t) needed);
-        if (!tokens) {
-            pthread_mutex_unlock(&m->mu);
-            return enif_make_tuple2(env, atom_error, atom_oom);
-        }
-        n = erllama_safe_tokenize(
-            vocab, (const char *) text.data, text_len, tokens,
-            needed, add_special ? true : false, parse_special ? true : false);
-    }
+    llama_token *tokens = NULL;
+    int32_t n = 0;
+    erllama_tok_status_t st = erllama_tokenize_grow(
+        vocab, (const char *) text.data, (int32_t) text.size,
+        add_special ? true : false, parse_special ? true : false,
+        &tokens, &n);
     pthread_mutex_unlock(&m->mu);
-    if (n == INT32_MIN) {
-        enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_exception);
-    }
-    if (n < 0) {
-        enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
-    }
-    /* Enforce the output cap post-success: removing the n_max clamp
-     * before the first call means the tokenizer can fully populate a
-     * buffer larger than ERLLAMA_MAX_TOKENS (e.g. byte-fallback
-     * tokenizers at ~1 byte/token on a 60 MiB input). Convert that
-     * into a clean too_large error rather than returning an
-     * over-cap list to Erlang. */
-    if (n > ERLLAMA_MAX_TOKENS) {
-        enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_too_large);
+    switch (st) {
+        case ERLLAMA_TOK_OOM:
+            return erllama_error(env, atom_oom);
+        case ERLLAMA_TOK_EXCEPTION:
+            return erllama_error(env, atom_exception);
+        case ERLLAMA_TOK_TOO_LARGE:
+            return erllama_error(env, atom_too_large);
+        case ERLLAMA_TOK_FAILED:
+            return erllama_error(env, atom_tokenize_failed);
+        case ERLLAMA_TOK_OK:
+            break;
     }
 
     ERL_NIF_TERM list = enif_make_list(env, 0);
@@ -116,46 +73,6 @@ ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     }
     enif_free(tokens);
     return list;
-}
-
-int read_token_list(ErlNifEnv *env, ERL_NIF_TERM list,
-                           llama_token **out, int32_t *out_len) {
-    unsigned int n;
-    if (!enif_get_list_length(env, list, &n)) return 0;
-    if (n > (unsigned int) ERLLAMA_MAX_TOKENS) return -2;
-    if (n == 0) {
-        *out = NULL;
-        *out_len = 0;
-        return 1;
-    }
-    llama_token *toks = enif_alloc(sizeof(llama_token) * (size_t) n);
-    if (!toks) return -1;
-    ERL_NIF_TERM head, tail = list;
-    unsigned int i = 0;
-    while (enif_get_list_cell(env, tail, &head, &tail)) {
-        int v;
-        if (!enif_get_int(env, head, &v)) {
-            enif_free(toks);
-            return 0;
-        }
-        if (v < 0) {
-            enif_free(toks);
-            return -3;
-        }
-        toks[i++] = (llama_token) v;
-    }
-    *out = toks;
-    *out_len = (int32_t) n;
-    return 1;
-}
-
-ERL_NIF_TERM token_list_error(ErlNifEnv *env, int rc) {
-    switch (rc) {
-        case -1: return enif_make_tuple2(env, atom_error, atom_oom);
-        case -2: return enif_make_tuple2(env, atom_error, atom_too_large);
-        case -3: return enif_make_tuple2(env, atom_error, atom_invalid_token);
-        default: return enif_make_badarg(env);
-    }
 }
 
 /* Options-aware detokenize: `nif_detokenize(Model, Tokens, Opts)`
@@ -186,32 +103,28 @@ ERL_NIF_TERM nif_detokenize_opts(ErlNifEnv *env, int argc,
     if (rc != 1) return token_list_error(env, rc);
     if (n == 0) {
         if (tokens) enif_free(tokens);
-        ErlNifBinary empty;
-        if (!enif_alloc_binary(0, &empty)) {
-            return enif_make_tuple2(env, atom_error, atom_oom);
+        ERL_NIF_TERM empty;
+        if (!erllama_empty_bin(env, &empty)) {
+            return erllama_error(env, atom_oom);
         }
-        return enif_make_binary(env, &empty);
+        return empty;
     }
 
-    pthread_mutex_lock(&m->mu);
-    if (!m->model || m->release_pending) {
-        pthread_mutex_unlock(&m->mu);
+    if (!erllama_lock_model_live(m)) {
         enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_released);
+        return erllama_error(env, atom_released);
     }
-    const struct llama_vocab *vocab = erllama_safe_model_get_vocab(m->model);
-    int32_t n_vocab = vocab ? erllama_safe_vocab_n_tokens(vocab) : 0;
+    int32_t n_vocab = 0;
+    const struct llama_vocab *vocab = erllama_model_vocab(m, &n_vocab);
     if (!vocab || n_vocab <= 0) {
         pthread_mutex_unlock(&m->mu);
         enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_invalid_token);
+        return erllama_error(env, atom_invalid_token);
     }
-    for (int32_t i = 0; i < n; i++) {
-        if (tokens[i] >= n_vocab) {
-            pthread_mutex_unlock(&m->mu);
-            enif_free(tokens);
-            return enif_make_tuple2(env, atom_error, atom_invalid_token);
-        }
+    if (erllama_first_oob_token(tokens, n, n_vocab) >= 0) {
+        pthread_mutex_unlock(&m->mu);
+        enif_free(tokens);
+        return erllama_error(env, atom_invalid_token);
     }
     /* Two-pass resize: a negative return is the needed size; the
      * retry may legitimately return FEWER bytes than requested
@@ -222,7 +135,7 @@ ERL_NIF_TERM nif_detokenize_opts(ErlNifEnv *env, int argc,
     if (!buf) {
         pthread_mutex_unlock(&m->mu);
         enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     int32_t wrote = erllama_safe_detokenize(vocab, tokens, n, buf, cap,
                                             remove_special ? true : false,
@@ -234,7 +147,7 @@ ERL_NIF_TERM nif_detokenize_opts(ErlNifEnv *env, int argc,
             pthread_mutex_unlock(&m->mu);
             enif_free(buf);
             enif_free(tokens);
-            return enif_make_tuple2(env, atom_error, atom_oom);
+            return erllama_error(env, atom_oom);
         }
         buf = bigger;
         cap = need;
@@ -246,15 +159,13 @@ ERL_NIF_TERM nif_detokenize_opts(ErlNifEnv *env, int argc,
     enif_free(tokens);
     if (wrote < 0) {
         enif_free(buf);
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
     ERL_NIF_TERM bin;
-    unsigned char *out = enif_make_new_binary(env, (size_t) wrote, &bin);
-    if (!out) {
+    if (!erllama_bin_from(env, buf, (size_t) wrote, &bin)) {
         enif_free(buf);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
-    if (wrote > 0) memcpy(out, buf, (size_t) wrote);
     enif_free(buf);
     return bin;
 }
@@ -271,43 +182,31 @@ ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     if (rc != 1) return token_list_error(env, rc);
     if (n == 0) {
         if (tokens) enif_free(tokens);
-        ErlNifBinary empty;
-        if (!enif_alloc_binary(0, &empty)) {
-            return enif_make_tuple2(env, atom_error, atom_oom);
+        ERL_NIF_TERM empty;
+        if (!erllama_empty_bin(env, &empty)) {
+            return erllama_error(env, atom_oom);
         }
-        return enif_make_binary(env, &empty);
+        return empty;
     }
 
-    pthread_mutex_lock(&m->mu);
-    if (!m->model || m->release_pending) {
-        pthread_mutex_unlock(&m->mu);
+    if (!erllama_lock_model_live(m)) {
         enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_released);
+        return erllama_error(env, atom_released);
     }
-    const struct llama_vocab *vocab = erllama_safe_model_get_vocab(m->model);
+    int32_t n_vocab = 0;
+    const struct llama_vocab *vocab = erllama_model_vocab(m, &n_vocab);
     if (!vocab) {
         pthread_mutex_unlock(&m->mu);
         enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
-    int32_t n_vocab = erllama_safe_vocab_n_tokens(vocab);
     /* Fail closed if the vocab lookup gave us no usable size: without
-     * n_vocab we cannot validate token IDs, and an out-of-range
-     * positive ID would reach `id_to_token.at(id)` deep inside llama
-     * and throw across the C ABI. Mirrors the prefill path. */
-    if (n_vocab <= 0) {
+     * n_vocab we cannot validate token IDs. Mirrors the prefill
+     * path; validate before any token_to_piece call. */
+    if (n_vocab <= 0 || erllama_first_oob_token(tokens, n, n_vocab) >= 0) {
         pthread_mutex_unlock(&m->mu);
         enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_invalid_token);
-    }
-    /* Validate before any token_to_piece call so out-of-range IDs do
-     * not reach `id_to_token.at(id)` and trigger an internal throw. */
-    for (int32_t i = 0; i < n; i++) {
-        if (tokens[i] >= n_vocab) {
-            pthread_mutex_unlock(&m->mu);
-            enif_free(tokens);
-            return enif_make_tuple2(env, atom_error, atom_invalid_token);
-        }
+        return erllama_error(env, atom_invalid_token);
     }
 
     /* Per-token piece, concatenated. Pieces are typically a handful
@@ -323,14 +222,14 @@ ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     if (n < 0 || n > (1 << 24)) {
         pthread_mutex_unlock(&m->mu);
         enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_too_large);
+        return erllama_error(env, atom_too_large);
     }
     size_t cap = (size_t) n * 32u + 16u;
     char *out = enif_alloc(cap);
     if (!out) {
         pthread_mutex_unlock(&m->mu);
         enif_free(tokens);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     size_t used = 0;
     int err = 0;
@@ -380,16 +279,15 @@ ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     enif_free(tokens);
     if (err) {
         enif_free(out);
-        if (err == 2) return enif_make_tuple2(env, atom_error, atom_oom);
-        return enif_make_tuple2(env, atom_error, atom_invalid_token);
+        if (err == 2) return erllama_error(env, atom_oom);
+        return erllama_error(env, atom_invalid_token);
     }
 
-    ErlNifBinary outbin;
-    if (!enif_alloc_binary(used, &outbin)) {
+    ERL_NIF_TERM outbin;
+    if (!erllama_bin_from(env, out, used, &outbin)) {
         enif_free(out);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
-    memcpy(outbin.data, out, used);
     enif_free(out);
-    return enif_make_binary(env, &outbin);
+    return outbin;
 }

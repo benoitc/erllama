@@ -356,10 +356,7 @@ embed(#s{ctx = C}, Tokens) ->
     erllama_nif:embed(C, Tokens).
 
 set_grammar(#s{ctx = C} = S, Grammar) when is_binary(Grammar) ->
-    case erllama_nif:set_grammar(C, Grammar) of
-        ok -> {ok, S};
-        {error, _} = E -> E
-    end;
+    ok_state(S, erllama_nif:set_grammar(C, Grammar));
 set_grammar(#s{} = S, undefined) ->
     {ok, S}.
 
@@ -368,10 +365,7 @@ configure_sampler(#s{} = S, Cfg) when map_size(Cfg) =:= 0 ->
     %% the lazy greedy fallback in the NIF kicks in on first decode.
     {ok, S};
 configure_sampler(#s{ctx = C} = S, Cfg) when is_map(Cfg) ->
-    case erllama_nif:configure_sampler(C, Cfg) of
-        ok -> {ok, S};
-        {error, _} = E -> E
-    end.
+    ok_state(S, erllama_nif:configure_sampler(C, Cfg)).
 
 clear_sampler(#s{ctx = C} = S) ->
     ok = erllama_nif:clear_sampler(C),
@@ -385,16 +379,19 @@ load_adapter(#s{model = M} = S, Path) ->
 
 unload_adapter(#s{} = S, AdapterRef) ->
     case erllama_nif:adapter_free(AdapterRef) of
-        ok -> {ok, S};
+        %% Double-free is a no-op: the adapter is already gone.
         {error, released} -> {ok, S};
-        {error, _} = E -> E
+        Result -> ok_state(S, Result)
     end.
 
 apply_adapters(#s{ctx = C} = S, Adapters) ->
-    case erllama_nif:set_adapters(C, Adapters) of
-        ok -> {ok, S};
-        {error, _} = E -> E
-    end.
+    ok_state(S, erllama_nif:set_adapters(C, Adapters)).
+
+%% Wrap a NIF's bare ok / {error, _} return into the backend's
+%% {ok, State} shape.
+-spec ok_state(#s{}, ok | {error, term()}) -> {ok, #s{}} | {error, term()}.
+ok_state(S, ok) -> {ok, S};
+ok_state(_S, {error, _} = E) -> E.
 
 extra_metadata(#s{
     model_size_bytes = SB, total_layers = TL, n_gpu_layers = NL, family = Family
