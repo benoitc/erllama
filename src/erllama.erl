@@ -49,6 +49,7 @@ handle for every other call; a pid works too. The cache subsystem is
     continue/3,
     cancel/1,
     end_session/2,
+    fork_session/3,
     reset_session/2,
     evict/1,
     shutdown/1,
@@ -561,7 +562,8 @@ Every `{error, Reason}` the API returns.
 - `not_loaded`: no model with that id or pid.
 - `already_loaded`: `load_model/2` with an id in use.
 - `busy`, `seq_capacity`, `sticky_busy`: admission refused.
-- `no_session`, `{transcript_mismatch, _}`: session errors
+- `no_session`, `session_exists`, `seq_cp_failed`,
+  `{transcript_mismatch, _}`: session errors
   (`continue/3`, `end_session/2`).
 - `not_supported`, `chat_not_supported`, `no_template`: the backend or
   model lacks the feature.
@@ -585,6 +587,8 @@ Backends may add their own atoms; they are documented on the backend.
     | seq_capacity
     | sticky_busy
     | no_session
+    | session_exists
+    | seq_cp_failed
     | {transcript_mismatch, #{
         stored_len := non_neg_integer(),
         expected_len := non_neg_integer(),
@@ -624,6 +628,13 @@ generated (`<<"erllama_model_N">>`). Returns `{error, {missing_config,
 model_path}}` when no path is given for the llama backend and
 `{error, {invalid_config, model_path, Path}}` when the file does not
 exist; the model process is never started on a bad config.
+
+Loading blocks for the duration of the GGUF read. Pass
+`progress_to => Pid` to receive progress while it runs:
+`{erllama_load_progress, ModelId, Progress}` messages with
+`Progress :: float()` in `[0.0, 1.0]`, non-decreasing, throttled to
+whole-percent steps, ending with exactly `1.0`. The stub backend
+sends none.
 """.
 -spec load_model(load_config()) -> {ok, model_id()} | {error, error_reason()}.
 load_model(Config) when is_map(Config) ->
@@ -900,6 +911,40 @@ idle pool. Unknown session ids are a no-op.
 -spec end_session(model(), term()) -> ok | {error, not_loaded | timeout}.
 end_session(Model, SessionId) ->
     erllama_model:end_session(Model, SessionId).
+
+-doc """
+Fork a sticky session: duplicate `SrcSessionId`'s live KV cells into
+a fresh sequence registered as `NewSessionId`, so two continuations
+can explore different branches without re-prefilling the shared
+prefix. Works on every model family (dense KV copy / recurrent state
+copy).
+
+```erlang
+{ok, _} = erllama:complete(M, Prompt, #{session_id => a}),
+ok = erllama:fork_session(M, a, b),
+%% `a` and `b` now diverge independently:
+{ok, _} = erllama:complete(M, <<Prompt/binary, " option one">>, #{session_id => a}),
+{ok, _} = erllama:complete(M, <<Prompt/binary, " option two">>, #{session_id => b}).
+```
+
+The copy carries no logits, so the forked session's first request
+must extend the stored transcript (any normal continuation does).
+Never queues: with no free sequence - after reclaiming the
+least-recently-used idle pin, never the source - the reply is
+`{error, seq_capacity}`. Other errors: `no_session` (unknown
+source), `session_exists`, `sticky_busy` (source has an in-flight
+request), `seq_cp_failed` (the memory refused the copy).
+""".
+-spec fork_session(model(), term(), term()) -> ok | {error, error_reason()}.
+fork_session(Model, SrcSessionId, NewSessionId) ->
+    Req = #{
+        op => fork_session,
+        model => Model,
+        args => #{src => SrcSessionId, new => NewSessionId}
+    },
+    erllama_middleware:run(Req, fun(#{model := M, args := #{src := S, new := N}}) ->
+        erllama_model:fork_session(M, S, N)
+    end).
 
 -doc """
 Forcibly drop a session's live KV cells and fail any in-flight request

@@ -42,6 +42,9 @@
     kv_pack/4,
     kv_unpack/3,
     kv_seq_rm/4,
+    kv_seq_cp/3,
+    set_log_receiver/2,
+    clear_log_receiver/0,
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
@@ -283,6 +286,30 @@ kv_unpack(Ctx, Bin, SeqId) -> nif_kv_unpack(Ctx, Bin, SeqId).
 -spec kv_seq_rm(context_ref(), integer(), integer(), integer()) ->
     ok | {error, atom()}.
 kv_seq_rm(Ctx, SeqId, P0, P1) -> nif_kv_seq_rm(Ctx, SeqId, P0, P1).
+
+%% Copy the FULL sequence SrcSeq into DstSeq (session fork). The
+%% underlying llama_memory_seq_cp is void with several silent no-op
+%% paths, so the NIF verifies pos_max(dst) == pos_max(src) and maps a
+%% mismatch to `{error, seq_cp_failed}` (destination wiped). The copy
+%% carries no logits: the destination must prefill a suffix before it
+%% can sample, exactly like a freshly kv_unpack'ed seq.
+-spec kv_seq_cp(context_ref(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, atom()}.
+kv_seq_cp(Ctx, SrcSeq, DstSeq) -> nif_kv_seq_cp(Ctx, SrcSeq, DstSeq).
+
+%% Register `Pid` to receive forwarded native llama.cpp / ggml log
+%% lines as `{llama_log, LevelInt, TextBin}` messages (ggml levels:
+%% debug 1, info 2, warn 3, error 4; CONT fragments are dropped in
+%% C). Used by the `erllama_log` server; one receiver per node.
+-spec set_log_receiver(pid(), 1..4) -> ok.
+set_log_receiver(Pid, MinLevel) when
+    is_pid(Pid), is_integer(MinLevel), MinLevel >= 1, MinLevel =< 4
+->
+    nif_set_log_receiver(Pid, MinLevel).
+
+-spec clear_log_receiver() -> ok.
+clear_log_receiver() ->
+    nif_clear_log_receiver().
 
 %% Render a normalised chat request through the model's chat template
 %% (read from GGUF metadata) and tokenise the result. Request is a map
@@ -543,6 +570,9 @@ nif_kv_pack(_Ctx, _Tokens, _NTokens) -> erlang:nif_error(nif_not_loaded).
 nif_kv_pack(_Ctx, _Tokens, _NTokens, _SeqId) -> erlang:nif_error(nif_not_loaded).
 nif_kv_unpack(_Ctx, _Bin, _SeqId) -> erlang:nif_error(nif_not_loaded).
 nif_kv_seq_rm(_Ctx, _SeqId, _P0, _P1) -> erlang:nif_error(nif_not_loaded).
+nif_kv_seq_cp(_Ctx, _SrcSeq, _DstSeq) -> erlang:nif_error(nif_not_loaded).
+nif_set_log_receiver(_Pid, _MinLevel) -> erlang:nif_error(nif_not_loaded).
+nif_clear_log_receiver() -> erlang:nif_error(nif_not_loaded).
 nif_apply_chat_template(_Model, _Request) -> erlang:nif_error(nif_not_loaded).
 nif_embed(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_set_grammar(_Ctx, _Grammar) -> erlang:nif_error(nif_not_loaded).

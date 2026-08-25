@@ -67,6 +67,12 @@ inference, etc.) can plug in via this same surface.
 %% returned to the idle pool.
 -callback seq_rm(state(), seq_id()) -> ok | {error, term()}.
 
+%% Optional. Copy the FULL KV state of SrcSeq into DstSeq (session
+%% fork). The copy carries no logits: the destination behaves like a
+%% freshly restored seq and must prefill a suffix before sampling.
+-callback seq_cp(state(), SrcSeq :: seq_id(), DstSeq :: seq_id()) ->
+    ok | {error, term()}.
+
 %% Optional. Drop the last KV cell of the active sequence so the
 %% caller can re-prefill the corresponding token to regenerate logits
 %% after a kv_unpack. Backends that don't carry a real KV cache (the
@@ -208,6 +214,7 @@ inference, etc.) can plug in via this same surface.
     vocab_info/1,
     kv_pack/3,
     kv_unpack/3,
+    seq_cp/3,
     seq_rm/2,
     seq_clear/1,
     seq_rm_last/2,

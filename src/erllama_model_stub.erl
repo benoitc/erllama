@@ -44,6 +44,9 @@ paths).
     kv_unpack/2,
     kv_unpack/3,
     seq_rm/2,
+    seq_cp/3,
+    seq_cp_calls/0,
+    reset_seq_cp_calls/0,
     step/2,
     sampler_new/2,
     sampler_free/1,
@@ -108,11 +111,13 @@ paths).
     step_delay_ms = 0 :: non_neg_integer(),
     %% Opt-in failure knobs emulating a recurrent / hybrid backend:
     %% `fail_seq_rm_last' makes seq_rm_last/3 return an error (a
-    %% partial seq_rm the memory refused) and `fail_kv_unpack' makes
-    %% kv_unpack/2,3 return an error (a failed state restore). Both
-    %% let tests drive the engine's cold-fallback paths.
+    %% partial seq_rm the memory refused), `fail_kv_unpack' makes
+    %% kv_unpack/2,3 return an error (a failed state restore), and
+    %% `fail_seq_cp' makes seq_cp/3 fail (a fork the memory silently
+    %% dropped). Each lets tests drive an engine fallback path.
     fail_seq_rm_last = false :: boolean(),
-    fail_kv_unpack = false :: boolean()
+    fail_kv_unpack = false :: boolean(),
+    fail_seq_cp = false :: boolean()
 }).
 
 init(Config) ->
@@ -120,7 +125,8 @@ init(Config) ->
         thinking_capable = bool_opt(thinking_capable, Config),
         step_delay_ms = step_delay_opt(step_delay_ms, Config),
         fail_seq_rm_last = bool_opt(fail_seq_rm_last, Config),
-        fail_kv_unpack = bool_opt(fail_kv_unpack, Config)
+        fail_kv_unpack = bool_opt(fail_kv_unpack, Config),
+        fail_seq_cp = bool_opt(fail_seq_cp, Config)
     }}.
 
 bool_opt(Key, Config) ->
@@ -183,6 +189,31 @@ kv_unpack(_S, _Bin, _SeqId) ->
 %% seq_id would inherit the prior request's state.
 seq_rm(_S, SeqId) ->
     erlang:erase({stub_phase, SeqId}),
+    ok.
+
+%% Optional callback: session fork. The stub's only per-seq state is
+%% the phase counter; copy it and record the call so tests can assert
+%% the fork ran. `fail_seq_cp' emulates a memory that silently
+%% dropped the copy.
+seq_cp(S, SrcSeq, DstSeq) ->
+    Prev = persistent_term:get({?MODULE, seq_cp_calls}, []),
+    persistent_term:put({?MODULE, seq_cp_calls}, [{SrcSeq, DstSeq} | Prev]),
+    case S of
+        #stub{fail_seq_cp = true} ->
+            {error, seq_cp_failed};
+        _ ->
+            case erlang:get({stub_phase, SrcSeq}) of
+                undefined -> erlang:erase({stub_phase, DstSeq});
+                Phase -> erlang:put({stub_phase, DstSeq}, Phase)
+            end,
+            ok
+    end.
+
+seq_cp_calls() ->
+    lists:reverse(persistent_term:get({?MODULE, seq_cp_calls}, [])).
+
+reset_seq_cp_calls() ->
+    _ = persistent_term:erase({?MODULE, seq_cp_calls}),
     ok.
 
 %% Optional callback: the engine calls this to trim a seq's KV to a

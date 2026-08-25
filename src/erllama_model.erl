@@ -139,6 +139,7 @@
     continue/3,
     cancel/1,
     end_session/2,
+    fork_session/3,
     reset_session/2,
     status/1,
     evict/1,
@@ -700,6 +701,28 @@ cancel(Ref) when is_reference(Ref) ->
 end_session(Model, SessionId) ->
     call(Model, {end_session, SessionId}, infinity).
 
+-doc """
+Fork a sticky session: duplicate `SrcSessionId`'s live KV cells into
+a fresh seq registered under `NewSessionId`. Both sessions then
+evolve independently. The copy carries no logits, so the forked
+session's FIRST request must extend the stored transcript (the
+suffix prefill regenerates them). Never queues: with no seq
+available (after LRU idle-pin reclamation that skips the source)
+the reply is `{error, seq_capacity}`.
+""".
+-spec fork_session(model(), term(), term()) ->
+    ok
+    | {error,
+        no_session
+        | session_exists
+        | sticky_busy
+        | seq_capacity
+        | not_supported
+        | seq_cp_failed
+        | term()}.
+fork_session(Model, SrcSessionId, NewSessionId) ->
+    call(Model, {fork_session, SrcSessionId, NewSessionId}, infinity).
+
 %% Recovery primitive. Uses a 5 s timeout so it stays reachable when
 %% the engine's hot path is wedged. Force-fails any in-flight req on
 %% the session's seq, drops the sticky mapping, returns the seq to
@@ -938,7 +961,11 @@ cache_key_meta(Model) ->
 verify(Model, PrefixTokens, Candidates, K) ->
     call(Model, {verify, PrefixTokens, Candidates, K}, infinity).
 
-init([ModelId, Config]) ->
+init([ModelId, Config0]) ->
+    %% Hand the model id to the backend too (the facade strips it
+    %% from the user config): the llama backend tags load-progress
+    %% messages with it.
+    Config = Config0#{model_id => ModelId},
     Backend = maps:get(backend, Config, erllama_model_stub),
     case Backend:init(Config) of
         {ok, BState} ->
@@ -1073,6 +1100,9 @@ idle({call, From}, status, Data) ->
 idle({call, From}, {end_session, SessionId}, Data) ->
     NewData = drop_session(SessionId, Data),
     {keep_state, NewData, [{reply, From, ok}]};
+idle({call, From}, {fork_session, SrcSessionId, NewSessionId}, Data) ->
+    {Reply, NewData} = do_fork_session(SrcSessionId, NewSessionId, Data),
+    {keep_state, NewData, [{reply, From, Reply}]};
 idle({call, From}, {verify, PrefixTokens, Candidates, K}, Data) ->
     Reply = run_verify(PrefixTokens, Candidates, K, Data),
     case Reply of
@@ -1106,6 +1136,9 @@ running({call, From}, status, Data) ->
 running({call, From}, {end_session, SessionId}, Data) ->
     NewData = drop_session(SessionId, Data),
     {keep_state, NewData, [{reply, From, ok}]};
+running({call, From}, {fork_session, SrcSessionId, NewSessionId}, Data) ->
+    {Reply, NewData} = do_fork_session(SrcSessionId, NewSessionId, Data),
+    {keep_state, NewData, [{reply, From, Reply}]};
 running({call, From}, {verify, _, _, _}, Data) ->
     %% Verify mutates the live context; refuse while any seq is in
     %% flight to keep the snapshot/restore invariant intact.
@@ -1468,6 +1501,77 @@ reclaim_lru_idle_seq(#data{session_seq = SS, req_table = RT} = Data) ->
     case lists:sort(Idle) of
         [{_LastUsed, SessionId} | _] -> {ok, drop_session(SessionId, Data)};
         [] -> none
+    end.
+
+%% Fork handler: validate, allocate a destination seq (idle pool,
+%% then LRU idle-pin reclamation that never evicts the source), copy
+%% the KV via the backend's optional seq_cp/3, and register the new
+%% session with the source's stored tokens. Never queues.
+do_fork_session(SrcSessionId, NewSessionId, Data) ->
+    case maps:find(SrcSessionId, Data#data.session_seq) of
+        error ->
+            {{error, no_session}, Data};
+        {ok, {SrcSeq, StoredTokens, _LastUsed}} ->
+            Busy = maps:is_key(SrcSeq, Data#data.req_table),
+            Exists = maps:is_key(NewSessionId, Data#data.session_seq),
+            fork_checked(
+                Busy, Exists, SrcSessionId, NewSessionId, SrcSeq, StoredTokens, Data
+            )
+    end.
+
+fork_checked(true, _Exists, _Src, _New, _SrcSeq, _Tokens, Data) ->
+    {{error, sticky_busy}, Data};
+fork_checked(false, true, _Src, _New, _SrcSeq, _Tokens, Data) ->
+    {{error, session_exists}, Data};
+fork_checked(false, false, SrcSessionId, NewSessionId, SrcSeq, StoredTokens, Data) ->
+    case fork_alloc_seq(SrcSessionId, Data) of
+        {ok, DstSeq, Data1} ->
+            fork_copy(NewSessionId, SrcSeq, DstSeq, StoredTokens, Data1);
+        {error, _} = E ->
+            {E, Data}
+    end.
+
+fork_alloc_seq(_SrcSessionId, #data{idle_seq_ids = [SeqId | Rest]} = Data) ->
+    {ok, SeqId, Data#data{idle_seq_ids = Rest}};
+fork_alloc_seq(SrcSessionId, #data{idle_seq_ids = []} = Data) ->
+    case reclaim_lru_idle_seq_except(SrcSessionId, Data) of
+        {ok, Data1} -> fork_alloc_seq(SrcSessionId, Data1);
+        none -> {error, seq_capacity}
+    end.
+
+%% LRU idle-pin reclamation that never evicts `Except` (the fork's
+%% own source session).
+reclaim_lru_idle_seq_except(Except, #data{session_seq = SS, req_table = RT} = Data) ->
+    Idle = [
+        {LastUsed, SessionId}
+     || {SessionId, {SeqId, _Toks, LastUsed}} <- maps:to_list(SS),
+        SessionId =/= Except,
+        not maps:is_key(SeqId, RT)
+    ],
+    case lists:sort(Idle) of
+        [{_LastUsed, SessionId} | _] -> {ok, drop_session(SessionId, Data)};
+        [] -> none
+    end.
+
+fork_copy(NewSessionId, SrcSeq, DstSeq, StoredTokens, Data) ->
+    case backend_seq_cp(SrcSeq, DstSeq, Data) of
+        ok ->
+            NewData = Data#data{
+                session_seq = (Data#data.session_seq)#{
+                    NewSessionId => {DstSeq, StoredTokens, erlang:monotonic_time()}
+                }
+            },
+            {ok, NewData};
+        {error, _} = E ->
+            %% The NIF wipes the destination on a failed copy; just
+            %% return the allocated seq to the pool.
+            {E, Data#data{idle_seq_ids = [DstSeq | Data#data.idle_seq_ids]}}
+    end.
+
+backend_seq_cp(SrcSeq, DstSeq, #data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, seq_cp, 3) of
+        true -> Mod:seq_cp(S, SrcSeq, DstSeq);
+        false -> {error, not_supported}
     end.
 
 %% Recovery counterpart of drop_session/2. Force-fails any in-flight

@@ -91,6 +91,8 @@ load_sub_type_checks_test_() ->
         {{error, {invalid_config, n_rs_seq, -1}}, Base#{context_opts => #{n_rs_seq => -1}}},
         {{error, {invalid_config, fail_seq_rm_last, 1}}, Base#{fail_seq_rm_last => 1}},
         {{error, {invalid_config, fail_kv_unpack, maybe_}}, Base#{fail_kv_unpack => maybe_}},
+        {{error, {invalid_config, fail_seq_cp, 1}}, Base#{fail_seq_cp => 1}},
+        {{error, {invalid_config, progress_to, not_a_pid}}, Base#{progress_to => not_a_pid}},
         {{error, {invalid_config, min_tokens, -1}}, Base#{policy => #{min_tokens => -1}}}
     ],
     Good = Base#{
@@ -107,7 +109,9 @@ load_sub_type_checks_test_() ->
         context_opts => #{n_rs_seq => 1},
         model_opts => #{split_mode => tensor},
         fail_seq_rm_last => true,
-        fail_kv_unpack => true
+        fail_kv_unpack => true,
+        fail_seq_cp => true,
+        progress_to => self()
     },
     [?_assertEqual(Expected, ?M:load_config(Config)) || {Expected, Config} <- Cases] ++
         [?_assertMatch({ok, _}, ?M:load_config(G)) || G <- [Good, Good2]].
