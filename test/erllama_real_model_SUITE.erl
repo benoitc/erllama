@@ -579,13 +579,22 @@ detokenize_specials(Config) ->
             ?assertEqual(<<>>, Dropped),
             ?assert(byte_size(Rendered) > 0)
     end,
-    %% Cache-key guard: on plain text both forms agree byte for byte.
+    %% Cache-key guard: the arity-2 form is stable (it is what the
+    %% cache byte-keys are computed over). The arity-3 form may
+    %% legitimately differ in leading whitespace on SPM tokenizers
+    %% (llama_detokenize trims the add_space_prefix space that the
+    %% per-token loop preserves), so the two paths are compared only
+    %% modulo that.
     {ok, PlainToks} = erllama:tokenize(Model, <<"hello plain world">>, #{
         add_special => false, parse_special => false
     }),
     {ok, A} = erllama:detokenize(Model, PlainToks),
+    {ok, A} = erllama:detokenize(Model, PlainToks),
     {ok, B} = erllama:detokenize(Model, PlainToks, #{}),
-    ?assertEqual(A, B),
+    ?assertEqual(
+        string:trim(A, leading, " "),
+        string:trim(B, leading, " ")
+    ),
     ok.
 
 %% Same prompt, same temperature, different seeds. Two independent
