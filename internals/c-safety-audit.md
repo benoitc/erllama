@@ -1,5 +1,10 @@
 # C / NIF safety audit
 
+Note: this audit predates the split of `erllama_nif.c` into
+per-concern files (`erllama_nif_*.c`); the `file:line` references
+below point into the pre-split monolith and remain valid against the
+audit branch.
+
 Audit branch: `audit/c-safety-review`. Scope: `c_src/erllama_nif.c`,
 `c_src/erllama_safe.cpp`, `c_src/crc32c.{c,h}`. The upstream
 `c_src/llama.cpp/` submodule was not examined.

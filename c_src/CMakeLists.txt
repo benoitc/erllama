@@ -119,6 +119,14 @@ endif()
 # -----------------------------------------------------------------------------
 add_library(erllama_nif SHARED
     erllama_nif.c
+    erllama_nif_model.c
+    erllama_nif_context.c
+    erllama_nif_kv.c
+    erllama_nif_tokens.c
+    erllama_nif_decode.c
+    erllama_nif_sampler.c
+    erllama_nif_chat_template.c
+    erllama_nif_adapter.c
     erllama_safe.cpp
     erllama_chat_nif.cpp
     crc32c.c

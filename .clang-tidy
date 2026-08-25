@@ -1,5 +1,6 @@
 ---
-# Scoped to c_src/erllama_nif.c, erllama_safe.cpp, crc32c.c via
+# Scoped to the erllama_nif target sources (c_src/erllama_nif*.c,
+# erllama_safe.cpp, erllama_chat_nif.cpp, crc32c.c) via
 # CMake's C_CLANG_TIDY / CXX_CLANG_TIDY target properties; the vendored
 # llama.cpp tree is not linted.
 #
@@ -32,5 +33,5 @@ Checks: >
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -performance-enum-size
 WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*'
-HeaderFilterRegex: '^.*/c_src/(erllama_nif|erllama_safe|crc32c)\.(h|hpp)$'
+HeaderFilterRegex: '^.*/c_src/(erllama_nif|erllama_nif_int|erllama_safe|erllama_resources|erllama_chat_nif|crc32c)\.(h|hpp)$'
 FormatStyle: none
