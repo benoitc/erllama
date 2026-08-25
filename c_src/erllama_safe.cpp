@@ -95,7 +95,10 @@ static void erllama_log_forward(enum ggml_log_level level,
     ERL_NIF_TERM bin;
     unsigned char *p = enif_make_new_binary(env, len, &bin);
     if (p) {
-        if (len > 0) memcpy(p, text, len);
+        /* Erlang binary, deliberately unterminated; std::copy avoids
+         * clang-tidy's bugprone-not-null-terminated-result false
+         * positive on memcpy. */
+        std::copy(text, text + len, p);
         ERL_NIF_TERM msg = enif_make_tuple3(
             env, enif_make_atom(env, "llama_log"),
             enif_make_int(env, (int) level), bin);
