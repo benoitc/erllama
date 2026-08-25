@@ -21,7 +21,7 @@ remaining events drained.
 """.
 -spec collect(reference(), timeout()) -> {ok, map()} | {error, term()}.
 collect(Ref, Timeout) when is_reference(Ref) ->
-    Init = #{text => [], thinking => [], token_ids => []},
+    Init = #{text => [], thinking => [], token_ids => [], logprobs => []},
     case fold(Ref, Timeout, fun collect_event/2, Init) of
         {ok, Acc, Stats} -> {ok, result(Acc, Stats)};
         {error, _} = E -> E
@@ -33,12 +33,14 @@ collect_event({token_id, Id}, Acc) ->
     Acc#{token_ids := [Id | maps:get(token_ids, Acc)]};
 collect_event({thinking, Bin}, Acc) ->
     Acc#{thinking := [maps:get(thinking, Acc), Bin]};
+collect_event({logprobs, LpMap}, Acc) ->
+    Acc#{logprobs := [LpMap | maps:get(logprobs, Acc)]};
 collect_event(_Other, Acc) ->
     Acc.
 
-result(#{text := Text, thinking := Thinking}, Stats) ->
+result(#{text := Text, thinking := Thinking} = Acc, Stats) ->
     Generated = maps:get(generated, Stats, []),
-    Base = #{
+    Base0 = #{
         reply => iolist_to_binary(Text),
         thinking => iolist_to_binary(Thinking),
         generated => Generated,
@@ -49,6 +51,11 @@ result(#{text := Text, thinking := Thinking}, Stats) ->
         cache_delta => maps:get(cache_delta, Stats, #{read => 0, created => 0}),
         stats => Stats
     },
+    Base =
+        case maps:get(logprobs, Acc, []) of
+            [] -> Base0;
+            Lps -> Base0#{logprobs => lists:reverse(Lps)}
+        end,
     case maps:find(stop_sequence, Stats) of
         {ok, Stop} -> Base#{stop_sequence => Stop};
         error -> Base

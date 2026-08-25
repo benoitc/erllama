@@ -115,3 +115,29 @@ stub_step_delay_ms_rejects_non_neg_integer_test() ->
         erllama_model_stub:step(S, [{0, {prefill, [1, 2, 3]}}]),
     T1 = erlang:monotonic_time(millisecond),
     ?assert(T1 - T0 < 20).
+
+stub_detokenize_opts_matches_plain_test() ->
+    %% The stub has no special tokens; the arity-3 form accepts the
+    %% options and produces the same bytes as the plain form.
+    {ok, S} = erllama_model_stub:init(#{}),
+    Tokens = [1, 22, 333],
+    ?assertEqual(
+        erllama_model_stub:detokenize(S, Tokens),
+        erllama_model_stub:detokenize(S, Tokens, #{unparse_special => true})
+    ).
+
+stub_step_logprobs_shape_test() ->
+    %% A sampler created with `logprobs => N` turns decode results
+    %% into the 4-tuple shape with N descending top entries.
+    {ok, S} = erllama_model_stub:init(#{}),
+    {ok, Sampler} = erllama_model_stub:sampler_new(S, #{logprobs => 2}),
+    {ok, [{0, {token, T, 0, {Lp, Top}}}]} =
+        erllama_model_stub:step(S, [{0, {decode, Sampler}}]),
+    ?assert(is_integer(T)),
+    ?assert(is_float(Lp)),
+    ?assertEqual(2, length(Top)),
+    ok = erllama_model_stub:sampler_free(Sampler),
+    %% After free the knob is gone: plain 3-tuples again.
+    {ok, Sampler2} = erllama_model_stub:sampler_new(S, #{}),
+    {ok, [{0, {token, _, 0}}]} =
+        erllama_model_stub:step(S, [{0, {decode, Sampler2}}]).

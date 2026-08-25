@@ -147,6 +147,8 @@
     tokenize/2,
     tokenize/3,
     detokenize/2,
+    detokenize/3,
+    vocab_info/1,
     apply_chat_template/2,
     chat_apply/2,
     chat_purge/1,
@@ -342,6 +344,11 @@
     %% Drives the finish_reason classifier and the `stop_sequence`
     %% key on the result / stats map.
     matched_stop = undefined :: binary() | undefined,
+    %% Per-token logprobs maps, newest first, accumulated for
+    %% standard-mode requests when the `logprobs` option is set
+    %% (streaming requests get them as events instead). Reversed
+    %% into the result's `logprobs` key at finish.
+    logprobs_acc = [] :: [map()],
     %% Per-request thinking opt-in. The scheduler treats any
     %% `{thinking_token, _}` step result on a request with
     %% `thinking = disabled` as a backend bug (stray thinking
@@ -762,6 +769,26 @@ concurrently with `complete/2,3`.
     {ok, binary()} | {error, term()}.
 detokenize(Model, Tokens) when is_list(Tokens) ->
     call(Model, {detokenize, Tokens}, infinity).
+
+-doc """
+Detokenise with options: `remove_special` strips a leading BOS /
+trailing EOS when the model is configured to add them,
+`unparse_special` renders special tokens into the output (the
+arity-2 form drops them).
+""".
+-spec detokenize(model(), [non_neg_integer()], map()) ->
+    {ok, binary()} | {error, term()}.
+detokenize(Model, Tokens, Opts) when is_list(Tokens), is_map(Opts) ->
+    call(Model, {detokenize, Tokens, Opts}, infinity).
+
+-doc """
+Special / FIM vocab token map for the loaded model; see
+`erllama_nif:vocab_info/1` for the keys. `{error, not_supported}`
+for backends without a real vocabulary (the stub).
+""".
+-spec vocab_info(model()) -> {ok, map()} | {error, term()}.
+vocab_info(Model) ->
+    call(Model, vocab_info).
 
 -doc """
 Render a normalised chat request through the model's chat template
@@ -1978,6 +2005,10 @@ handle_common(_State, {call, From}, {tokenize, Text, Opts}, Data) ->
     reply(From, wrap_ok(backend_tokenize_with_opts(Data, Text, Opts)), Data);
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
     reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
+handle_common(_State, {call, From}, {detokenize, Tokens, Opts}, Data) ->
+    reply(From, wrap_ok(backend_detokenize_with_opts(Data, Tokens, Opts)), Data);
+handle_common(_State, {call, From}, vocab_info, Data) ->
+    reply(From, optional_backend_call(Data, vocab_info, []), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
     reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
 handle_common(_State, {call, From}, {chat_apply, Inputs}, Data) ->
@@ -2515,6 +2546,17 @@ apply_step_results([{{SeqId, {prefill, Slice}}, prefilled} | T], Data) ->
             _ -> Req1
         end,
     apply_step_results(T, put_req(Data, Req2));
+apply_step_results([{{SeqId, {decode, S}}, {token, Tok, EogFlag, {SampledLp, Top}}} | T], Data) ->
+    %% Logprobs variant: peel the payload off, deliver it (event for
+    %% streaming callers, accumulator for standard mode), then re-run
+    %% the plain token clause. The logprobs event precedes the
+    %% corresponding token / token_id events.
+    Req = maps:get(SeqId, Data#data.req_table),
+    LpMap = #{token_id => Tok, logprob => SampledLp, top => Top},
+    Req1 = req_logprobs(Req, LpMap),
+    apply_step_results(
+        [{{SeqId, {decode, S}}, {token, Tok, EogFlag}} | T], put_req(Data, Req1)
+    );
 apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     Req1 = req_append_token(Req, Tok),
@@ -2558,6 +2600,19 @@ apply_step_results([{{SeqId, {decode, _}}, thinking_end} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     Req1 = req_thinking_end(Req, Data),
     apply_step_results(T, put_req(Data, Req1)).
+
+%% Deliver a per-token logprobs map: streaming callers get it as an
+%% `{erllama, Ref, {logprobs, Map}}` event; standard-mode requests
+%% accumulate it for the result's `logprobs` key.
+req_logprobs(
+    #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req, LpMap
+) when is_pid(Pid), is_reference(Ref) ->
+    Pid ! {erllama, Ref, {logprobs, LpMap}},
+    Req;
+req_logprobs(#req{mode = standard} = Req, LpMap) ->
+    Req#req{logprobs_acc = [LpMap | Req#req.logprobs_acc]};
+req_logprobs(Req, _LpMap) ->
+    Req.
 
 %% Append the token to both context_tokens and generated.
 req_append_token(Req, Token) ->
@@ -2927,7 +2982,12 @@ finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKe
         cache_delta => cache_delta_for(Req),
         stats => Stats
     },
-    Result = maybe_add_stop_sequence(Result0, Req#req.matched_stop),
+    Result1 = maybe_add_stop_sequence(Result0, Req#req.matched_stop),
+    Result =
+        case Req#req.logprobs_acc of
+            [] -> Result1;
+            Acc -> Result1#{logprobs => lists:reverse(Acc)}
+        end,
     [{reply, From, {ok, Result}}];
 finish_action(#req{mode = streaming, errored = E} = Req, _FinishReason, _FinishKey, Stats, _Data) ->
     case E of
@@ -3085,9 +3145,31 @@ find_req_by_ref(Data, Ref) ->
     trigger_tokens,
     grammar_prefill,
     repetition_penalty,
+    frequency_penalty,
+    presence_penalty,
+    penalty_last_n,
     top_k,
     top_p,
     min_p,
+    typical_p,
+    top_n_sigma,
+    xtc_probability,
+    xtc_threshold,
+    dynatemp_range,
+    dynatemp_exponent,
+    min_keep,
+    dry_multiplier,
+    dry_base,
+    dry_allowed_length,
+    dry_penalty_last_n,
+    dry_sequence_breakers,
+    mirostat,
+    mirostat_tau,
+    mirostat_eta,
+    logit_bias,
+    ignore_eos,
+    infill,
+    logprobs,
     temperature,
     seed
 ]).
@@ -3614,6 +3696,15 @@ backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) 
     case erlang:function_exported(Mod, tokenize, 3) of
         true -> Mod:tokenize(S, Text, Opts);
         false -> Mod:tokenize(S, Text)
+    end.
+
+%% Detokenize via the backend's optional 3-arity callback (special
+%% token rendering options). Backends without it fall back to the
+%% plain arity-2 form, ignoring the options.
+backend_detokenize_with_opts(#data{backend = Mod, backend_state = S}, Tokens, Opts) ->
+    case erlang:function_exported(Mod, detokenize, 3) of
+        true -> Mod:detokenize(S, Tokens, Opts);
+        false -> Mod:detokenize(S, Tokens)
     end.
 
 %% Bound for the synchronous evict / shutdown saves; app env

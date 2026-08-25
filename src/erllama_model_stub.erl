@@ -36,6 +36,7 @@ paths).
     terminate/1,
     tokenize/2,
     detokenize/2,
+    detokenize/3,
     prefill/2,
     decode_one/2,
     kv_pack/2,
@@ -149,6 +150,11 @@ detokenize(_S, Tokens) ->
         lists:join(<<" ">>, [integer_to_binary(T) || T <- Tokens])
     ).
 
+%% The stub vocabulary has no special tokens; the options are
+%% accepted and ignored so the arity-3 dispatch path is exercised.
+detokenize(S, Tokens, _Opts) ->
+    detokenize(S, Tokens).
+
 prefill(_S, _Tokens) ->
     ok.
 
@@ -254,7 +260,19 @@ advance_phase(SeqId, Sampler, _) ->
 
 decode_token(SeqId, Sampler) ->
     T = erlang:phash2({decode_step_stub, SeqId, Sampler}) rem (1 bsl 32),
-    {SeqId, {token, T, 0}}.
+    case persistent_term:get({?MODULE, sampler_logprobs, Sampler}, 0) of
+        0 ->
+            {SeqId, {token, T, 0}};
+        N ->
+            %% Deterministic synthetic logprobs mirroring the real
+            %% backend's 4-tuple shape: sampled logprob plus a
+            %% descending top-N derived from the same hash.
+            Top = [
+                {(T + I) rem (1 bsl 32), -0.1 - 0.5 * I}
+             || I <- lists:seq(0, N - 1)
+            ],
+            {SeqId, {token, T, 0, {-0.1, Top}}}
+    end.
 
 %% Deterministic per-seq stub signature. The stub ignores `Bytes`
 %% and hashes the seq_id; real backends derive their signature from
@@ -292,10 +310,18 @@ sampler_new(_S, Cfg) ->
     %% => 0.0}` chain vs a request chain carrying a grammar).
     Prev = persistent_term:get({?MODULE, sampler_new_cfgs}, []),
     persistent_term:put({?MODULE, sampler_new_cfgs}, Prev ++ [Cfg]),
-    {ok, make_ref()}.
+    Ref = make_ref(),
+    case maps:get(logprobs, Cfg, 0) of
+        N when is_integer(N), N > 0 ->
+            persistent_term:put({?MODULE, sampler_logprobs, Ref}, N);
+        _ ->
+            ok
+    end,
+    {ok, Ref}.
 
-sampler_free(_Sampler) ->
+sampler_free(Sampler) ->
     %% Stub state is now keyed on seq_id; cleanup happens in seq_rm.
+    _ = persistent_term:erase({?MODULE, sampler_logprobs, Sampler}),
     ok.
 
 %% Render a chat request as `system\nrole: content\nrole: content\n`

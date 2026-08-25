@@ -78,6 +78,74 @@ make_tmp_dir() ->
     ok = file:make_dir(Dir),
     Dir.
 
+%% =============================================================================
+%% Logprobs (stub backend emits deterministic synthetic logprobs when
+%% the request's sampler cfg carries `logprobs => N`)
+%% =============================================================================
+
+logprobs_events_stream_per_token_test() ->
+    with_model(fun(Id) ->
+        {ok, Ref} = erllama:stream(Id, <<"hello logprobs stream">>, #{
+            response_tokens => 3, logprobs => 3
+        }),
+        {Lps, Ids} = collect_logprobs(Ref, 5000, [], []),
+        ?assertEqual(3, length(Lps)),
+        ?assertEqual(3, length(Ids)),
+        lists:foreach(
+            fun(#{token_id := T, logprob := Lp, top := Top}) ->
+                ?assert(is_integer(T)),
+                ?assert(is_float(Lp)),
+                ?assertEqual(3, length(Top)),
+                [{_, L1}, {_, L2}, {_, L3}] = Top,
+                ?assert(L1 >= L2 andalso L2 >= L3)
+            end,
+            Lps
+        ),
+        %% One logprobs map per token id, same order.
+        ?assertEqual(Ids, [maps:get(token_id, L) || L <- Lps])
+    end).
+
+logprobs_land_in_collect_result_test() ->
+    with_model(fun(Id) ->
+        {ok, Ref} = erllama:stream(Id, <<"hello logprobs collect">>, #{
+            response_tokens => 2, logprobs => 2
+        }),
+        {ok, Result} = erllama:collect(Ref, 5000),
+        Lps = maps:get(logprobs, Result),
+        ?assertEqual(2, length(Lps)),
+        ?assertEqual(maps:get(generated, Result), [maps:get(token_id, L) || L <- Lps])
+    end).
+
+logprobs_land_in_complete_result_test() ->
+    with_model(fun(Id) ->
+        {ok, Result} = erllama:complete(Id, <<"hello logprobs complete">>, #{
+            response_tokens => 2, logprobs => 2
+        }),
+        Lps = maps:get(logprobs, Result),
+        ?assertEqual(2, length(Lps)),
+        ?assertEqual(maps:get(generated, Result), [maps:get(token_id, L) || L <- Lps])
+    end).
+
+logprobs_absent_when_not_requested_test() ->
+    with_model(fun(Id) ->
+        {ok, Result} = erllama:complete(Id, <<"hello no logprobs">>, #{
+            response_tokens => 2
+        }),
+        ?assertNot(maps:is_key(logprobs, Result))
+    end).
+
+collect_logprobs(Ref, TimeoutMs, Lps, Ids) ->
+    receive
+        {erllama, Ref, {logprobs, Lp}} ->
+            collect_logprobs(Ref, TimeoutMs, [Lp | Lps], Ids);
+        {erllama, Ref, {token_id, Id}} ->
+            collect_logprobs(Ref, TimeoutMs, Lps, [Id | Ids]);
+        {erllama, Ref, {done, _Stats}} ->
+            {lists:reverse(Lps), lists:reverse(Ids)}
+    after TimeoutMs ->
+        {lists:reverse(Lps), lists:reverse(Ids)}
+    end.
+
 %% Drain messages of a given Ref until {erllama, Ref, {done, _}} or timeout.
 %% Returns {Tokens, Stats} or {error, Reason} on erllama_error.
 collect_stream(Ref, TimeoutMs) ->
