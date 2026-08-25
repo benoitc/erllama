@@ -112,6 +112,40 @@ grammar_opt_lands_on_backend_test() ->
         end
     end).
 
+lazy_grammar_opts_land_on_backend_test() ->
+    %% The template-grammar keys chat/3 injects (grammar_lazy,
+    %% trigger_patterns, trigger_tokens, grammar_prefill) flow through
+    %% request validation and sampler_cfg_from to the backend's
+    %% sampler_new.
+    with_app(fun() ->
+        Id = <<"sampler_lazy">>,
+        {ok, _} = erllama:load_model(Id, minimal_config()),
+        try
+            {ok, _} = erllama:complete(
+                Id, <<"hi">>, #{
+                    grammar => <<"root ::= call">>,
+                    grammar_lazy => true,
+                    trigger_patterns => [<<"<tool_call>">>],
+                    trigger_tokens => [42]
+                }
+            ),
+            Cfg = get_stub_cfg(Id),
+            ?assertEqual(true, maps:get(grammar_lazy, Cfg)),
+            ?assertEqual([<<"<tool_call>">>], maps:get(trigger_patterns, Cfg)),
+            ?assertEqual([42], maps:get(trigger_tokens, Cfg)),
+            {ok, _} = erllama:complete(
+                Id, <<"hi again">>, #{
+                    grammar => <<"root ::= call">>,
+                    grammar_prefill => <<"<|assistant|>">>
+                }
+            ),
+            Cfg2 = get_stub_cfg(Id),
+            ?assertEqual(<<"<|assistant|>">>, maps:get(grammar_prefill, Cfg2))
+        after
+            erllama:unload(Id)
+        end
+    end).
+
 infer_path_also_configures_sampler_test() ->
     %% Same plumbing must work via the streaming infer/4 entry.
     with_app(fun() ->

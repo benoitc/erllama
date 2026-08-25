@@ -388,6 +388,17 @@ grammar_cache_reuses_compiled_template(Config) ->
         %% A different grammar is a miss, not a false hit.
         ok = erllama_nif:configure_sampler(Ctx, #{grammar => <<"root ::= \"a\"">>}),
         ?assertMatch(#{hits := 1, misses := 2}, erllama_nif:grammar_cache_stats(Ctx)),
+        %% The same GBNF compiled lazy (with triggers) is a distinct
+        %% cache entry from the plain compile...
+        Lazy = #{grammar => G, grammar_lazy => true, trigger_patterns => [<<"yes">>]},
+        ok = erllama_nif:configure_sampler(Ctx, Lazy),
+        ?assertMatch(#{hits := 1, misses := 3}, erllama_nif:grammar_cache_stats(Ctx)),
+        %% ...and hits on an identical lazy config.
+        ok = erllama_nif:configure_sampler(Ctx, Lazy),
+        ?assertMatch(#{hits := 2, misses := 3}, erllama_nif:grammar_cache_stats(Ctx)),
+        %% A different trigger set is again a distinct entry.
+        ok = erllama_nif:configure_sampler(Ctx, Lazy#{trigger_patterns => [<<"no">>]}),
+        ?assertMatch(#{hits := 2, misses := 4}, erllama_nif:grammar_cache_stats(Ctx)),
         ok = erllama_nif:free_context(Ctx)
     after
         erllama_nif:free_model(Model)

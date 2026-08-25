@@ -442,9 +442,19 @@ chat_templates_init(Model, TemplateOverride) ->
     nif_chat_templates_init(Model, TemplateOverride).
 
 %% Apply a tools-set + chat inputs to a templates_ref. Returns the
-%% synthesised parser params and the rendered prompt bytes.
+%% synthesised parser params ref and a render map: `prompt` plus the
+%% constraint set the template pass produced (`grammar`,
+%% `grammar_lazy`, `trigger_patterns` (regex, ready for the lazy
+%% sampler), `trigger_tokens`, `additional_stops`,
+%% `generation_prompt`, `supports_thinking`, `thinking_start_tag`,
+%% `thinking_end_tags`, `format`). Recognised input keys: `messages`
+%% (required, JSON binary), `tools` (JSON binary), `tool_choice`
+%% (`auto | required | none`), `parallel_tool_calls`, `json_schema`
+%% (JSON binary), `enable_thinking`, `reasoning_format`
+%% (`none | deepseek`), `continue_final_message`
+%% (`none | auto | content | reasoning`).
 -spec chat_templates_apply(chat_templates_ref(), map()) ->
-    {ok, chat_params_ref(), binary()} | {error, term()}.
+    {ok, chat_params_ref(), map()} | {error, term()}.
 chat_templates_apply(Templates, Inputs) when is_map(Inputs) ->
     nif_chat_templates_apply(Templates, Inputs).
 

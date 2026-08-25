@@ -132,6 +132,10 @@ request_accepts_known_keys_test() ->
         repetition_penalty => 1.1,
         seed => 7,
         grammar => <<"root ::= \"a\"">>,
+        grammar_lazy => true,
+        trigger_patterns => [<<"<tool_call>">>],
+        trigger_tokens => [42],
+        grammar_prefill => <<"<|assistant|>">>,
         prefix_checkpoint_len => 3,
         to => self(),
         expect_committed => [1, 2, 3],
@@ -155,6 +159,10 @@ request_type_checks_test_() ->
         {expect_committed, [a]},
         {middleware, [not_a_fun]},
         {grammar, "string"},
+        {grammar_lazy, 1},
+        {trigger_patterns, [<<"x">>, atom]},
+        {trigger_tokens, [-1]},
+        {grammar_prefill, "string"},
         {temperature, hot},
         {seed, -1}
     ],
@@ -162,6 +170,39 @@ request_type_checks_test_() ->
         ?_assertEqual({error, {invalid_option, K, V}}, ?M:request_opts(maps:put(K, V, #{})))
      || {K, V} <- Bad
     ].
+
+chat_opts_accepts_known_keys_test() ->
+    Opts = #{
+        tools => [#{name => <<"t">>}],
+        tool_choice => required,
+        parallel_tool_calls => true,
+        json_schema => #{type => object},
+        enable_thinking => false,
+        reasoning_format => none,
+        continue_final_message => content
+    },
+    ?assertEqual({ok, Opts}, ?M:chat_opts(Opts)),
+    ?assertMatch({ok, _}, ?M:chat_opts(#{json_schema => <<"{}">>})).
+
+chat_opts_rejections_test_() ->
+    Bad = [
+        {tools, #{name => <<"t">>}},
+        {tool_choice, always},
+        {parallel_tool_calls, 1},
+        {json_schema, 42},
+        {enable_thinking, maybe_},
+        {reasoning_format, auto},
+        {continue_final_message, true}
+    ],
+    [
+        ?_assertEqual({error, {invalid_option, K, V}}, ?M:chat_opts(maps:put(K, V, #{})))
+     || {K, V} <- Bad
+    ] ++
+        [
+            ?_assertEqual(
+                {error, {unknown_option, temperature}}, ?M:chat_opts(#{temperature => 0.1})
+            )
+        ].
 
 prefill_accepts_subset_only_test() ->
     ?assertMatch({ok, _}, ?M:prefill_opts(#{parent_key => undefined, on_full => block})),

@@ -7,8 +7,11 @@
  *   nif_chat_templates_init(ModelRef, TemplateOverride)
  *     -> {ok, ChatTemplatesRef} | {error, Reason}
  *
- *   nif_chat_templates_apply(ChatTemplatesRef, InputsJSON)
- *     -> {ok, ChatParamsRef, PromptBin} | {error, Reason}
+ *   nif_chat_templates_apply(ChatTemplatesRef, InputsMap)
+ *     -> {ok, ChatParamsRef, RenderMap} | {error, Reason}
+ *     RenderMap carries the rendered prompt plus the constraint set
+ *     the template pass synthesized (grammar, lazy triggers,
+ *     additional stops, generation prompt, thinking tags).
  *
  *   nif_chat_parse(ChatParamsRef, Input, IsPartial)
  *     -> {ok, ParsedMsg} | {error, Reason}
@@ -209,41 +212,118 @@ bool map_get_string(
     return term_to_string(env, v, out);
 }
 
-/* Map atom keys `auto' | `required' | `none' -> common_chat_tool_choice.
- * Defaults to AUTO when the key is missing or the value is unrecognised. */
-common_chat_tool_choice map_tool_choice(ErlNifEnv *env, ERL_NIF_TERM map) {
-    ERL_NIF_TERM kterm = enif_make_atom(env, "tool_choice");
+/* Read an atom-valued map key into `out`. Returns:
+ *   1  key present and is an atom (out filled)
+ *   0  key absent
+ *  -1  key present but not an atom (caller should reject) */
+int map_get_atom(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
+                 std::string &out) {
+    ERL_NIF_TERM kterm = enif_make_atom(env, key);
     ERL_NIF_TERM v;
     if (!enif_get_map_value(env, map, kterm, &v)) {
-        return COMMON_CHAT_TOOL_CHOICE_AUTO;
+        return 0;
     }
-    char buf[16];
+    char buf[24];
     if (enif_get_atom(env, v, buf, sizeof(buf), ERL_NIF_LATIN1) == 0) {
-        return COMMON_CHAT_TOOL_CHOICE_AUTO;
+        return -1;
     }
-    std::string s(buf);
-    if (s == "required") {
-        return COMMON_CHAT_TOOL_CHOICE_REQUIRED;
-    }
-    if (s == "none") {
-        return COMMON_CHAT_TOOL_CHOICE_NONE;
-    }
-    return COMMON_CHAT_TOOL_CHOICE_AUTO;
+    out.assign(buf);
+    return 1;
 }
 
-/* Map boolean key `parallel_tool_calls' -> bool.
- * Defaults to false when absent / wrong type. */
-bool map_parallel_tool_calls(ErlNifEnv *env, ERL_NIF_TERM map) {
-    ERL_NIF_TERM kterm = enif_make_atom(env, "parallel_tool_calls");
-    ERL_NIF_TERM v;
-    if (!enif_get_map_value(env, map, kterm, &v)) {
+/* Map atom keys `auto' | `required' | `none' -> common_chat_tool_choice.
+ * Missing key -> AUTO; anything unrecognised is rejected. */
+bool map_tool_choice(ErlNifEnv *env, ERL_NIF_TERM map,
+                     common_chat_tool_choice &out) {
+    std::string s;
+    int rc = map_get_atom(env, map, "tool_choice", s);
+    if (rc == 0) {
+        out = COMMON_CHAT_TOOL_CHOICE_AUTO;
+        return true;
+    }
+    if (rc < 0) {
         return false;
     }
-    char buf[8];
-    if (enif_get_atom(env, v, buf, sizeof(buf), ERL_NIF_LATIN1) == 0) {
+    if (s == "auto") {
+        out = COMMON_CHAT_TOOL_CHOICE_AUTO;
+    } else if (s == "required") {
+        out = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    } else if (s == "none") {
+        out = COMMON_CHAT_TOOL_CHOICE_NONE;
+    } else {
         return false;
     }
-    return std::string(buf) == "true";
+    return true;
+}
+
+/* Boolean atom key. Missing -> `deflt'; non-boolean atoms rejected. */
+bool map_get_bool(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
+                  bool deflt, bool &out) {
+    std::string s;
+    int rc = map_get_atom(env, map, key, s);
+    if (rc == 0) {
+        out = deflt;
+        return true;
+    }
+    if (rc < 0) {
+        return false;
+    }
+    if (s == "true") {
+        out = true;
+    } else if (s == "false") {
+        out = false;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/* `reasoning_format' atom -> common_reasoning_format. Missing key
+ * keeps the struct default (NONE); the Erlang side always sets it. */
+bool map_reasoning_format(ErlNifEnv *env, ERL_NIF_TERM map,
+                          common_reasoning_format &out) {
+    std::string s;
+    int rc = map_get_atom(env, map, "reasoning_format", s);
+    if (rc == 0) {
+        return true;
+    }
+    if (rc < 0) {
+        return false;
+    }
+    if (s == "none") {
+        out = COMMON_REASONING_FORMAT_NONE;
+    } else if (s == "deepseek") {
+        out = COMMON_REASONING_FORMAT_DEEPSEEK;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/* `continue_final_message' atom -> common_chat_continuation.
+ * Missing key keeps the struct default (NONE). */
+bool map_continuation(ErlNifEnv *env, ERL_NIF_TERM map,
+                      common_chat_continuation &out) {
+    std::string s;
+    int rc = map_get_atom(env, map, "continue_final_message", s);
+    if (rc == 0) {
+        return true;
+    }
+    if (rc < 0) {
+        return false;
+    }
+    if (s == "none") {
+        out = COMMON_CHAT_CONTINUATION_NONE;
+    } else if (s == "auto") {
+        out = COMMON_CHAT_CONTINUATION_AUTO;
+    } else if (s == "content") {
+        out = COMMON_CHAT_CONTINUATION_CONTENT;
+    } else if (s == "reasoning") {
+        out = COMMON_CHAT_CONTINUATION_REASONING;
+    } else {
+        return false;
+    }
+    return true;
 }
 
 ERL_NIF_TERM mk_string_bin(ErlNifEnv *env, const std::string &s) {
@@ -340,10 +420,137 @@ static bool build_chat_inputs_from_map(ErlNifEnv *env, ERL_NIF_TERM map,
         inputs.tools =
             common_chat_tools_parse_oaicompat(common_json::parse(tools_json));
     }
-    inputs.tool_choice = map_tool_choice(env, map);
-    inputs.parallel_tool_calls = map_parallel_tool_calls(env, map);
+    if (!map_tool_choice(env, map, inputs.tool_choice)) {
+        *err_out = "invalid_tool_choice";
+        return false;
+    }
+    if (!map_get_bool(env, map, "parallel_tool_calls", false,
+                      inputs.parallel_tool_calls)) {
+        *err_out = "invalid_parallel_tool_calls";
+        return false;
+    }
+    /* Optional response-format schema (raw JSON text). */
+    std::string json_schema;
+    if (map_get_string(env, map, "json_schema", json_schema) &&
+        !json_schema.empty()) {
+        inputs.json_schema = json_schema;
+    }
+    if (!map_get_bool(env, map, "enable_thinking", inputs.enable_thinking,
+                      inputs.enable_thinking)) {
+        *err_out = "invalid_enable_thinking";
+        return false;
+    }
+    if (!map_reasoning_format(env, map, inputs.reasoning_format)) {
+        *err_out = "invalid_reasoning_format";
+        return false;
+    }
+    if (!map_continuation(env, map, inputs.continue_final_message)) {
+        *err_out = "invalid_continue_final_message";
+        return false;
+    }
     return true;
 }
+
+/* ============================================================== */
+/* Render map: the constraint set synthesized by the template pass */
+/* ============================================================== */
+
+namespace {
+
+ERL_NIF_TERM mk_bool(ErlNifEnv *env, bool b) {
+    return enif_make_atom(env, b ? "true" : "false");
+}
+
+ERL_NIF_TERM mk_bin_list(ErlNifEnv *env, const std::vector<std::string> &v) {
+    std::vector<ERL_NIF_TERM> terms;
+    terms.reserve(v.size());
+    for (const auto &s : v) {
+        terms.push_back(mk_string_bin(env, s));
+    }
+    return enif_make_list_from_array(env, terms.data(), terms.size());
+}
+
+/* Convert common_grammar_trigger entries to the shapes
+ * llama_sampler_init_grammar_lazy_patterns takes, mirroring
+ * common_sampler_init (common/sampling.cpp:220-256): WORD is
+ * regex-escaped, PATTERN passes verbatim, PATTERN_FULL is anchored
+ * ^...$, TOKEN goes to the token list. */
+void convert_triggers(const std::vector<common_grammar_trigger> &triggers,
+                      std::vector<std::string> &patterns,
+                      std::vector<llama_token> &tokens) {
+    for (const auto &t : triggers) {
+        switch (t.type) {
+            case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+                patterns.push_back(regex_escape(t.value));
+                break;
+            case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+                patterns.push_back(t.value);
+                break;
+            case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL: {
+                std::string anchored = "^$";
+                if (!t.value.empty()) {
+                    anchored = std::string(t.value.front() == '^' ? "" : "^") +
+                               t.value +
+                               (t.value.back() == '$' ? "" : "$");
+                }
+                patterns.push_back(anchored);
+                break;
+            }
+            case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN:
+                tokens.push_back(t.token);
+                break;
+        }
+    }
+}
+
+/* #{prompt, format, grammar, grammar_lazy, trigger_patterns,
+ *   trigger_tokens, additional_stops, generation_prompt,
+ *   supports_thinking, thinking_start_tag, thinking_end_tags} */
+ERL_NIF_TERM render_map(ErlNifEnv *env, const common_chat_params &params) {
+    std::vector<std::string> patterns;
+    std::vector<llama_token> tokens;
+    convert_triggers(params.grammar_triggers, patterns, tokens);
+
+    std::vector<ERL_NIF_TERM> tok_terms;
+    tok_terms.reserve(tokens.size());
+    for (llama_token t : tokens) {
+        tok_terms.push_back(enif_make_int(env, t));
+    }
+
+    ERL_NIF_TERM keys[11] = {
+        enif_make_atom(env, "prompt"),
+        enif_make_atom(env, "format"),
+        enif_make_atom(env, "grammar"),
+        enif_make_atom(env, "grammar_lazy"),
+        enif_make_atom(env, "trigger_patterns"),
+        enif_make_atom(env, "trigger_tokens"),
+        enif_make_atom(env, "additional_stops"),
+        enif_make_atom(env, "generation_prompt"),
+        enif_make_atom(env, "supports_thinking"),
+        enif_make_atom(env, "thinking_start_tag"),
+        enif_make_atom(env, "thinking_end_tags"),
+    };
+    ERL_NIF_TERM vals[11] = {
+        mk_string_bin(env, params.prompt),
+        mk_string_bin(env, common_chat_format_name(params.format)),
+        mk_string_bin(env, params.grammar),
+        mk_bool(env, params.grammar_lazy),
+        mk_bin_list(env, patterns),
+        enif_make_list_from_array(env, tok_terms.data(), tok_terms.size()),
+        mk_bin_list(env, params.additional_stops),
+        mk_string_bin(env, params.generation_prompt),
+        mk_bool(env, params.supports_thinking),
+        mk_string_bin(env, params.thinking_start_tag),
+        mk_bin_list(env, params.thinking_end_tags),
+    };
+    ERL_NIF_TERM out;
+    if (!enif_make_map_from_arrays(env, keys, vals, 11, &out)) {
+        return mk_error(env, "marshal_failed");
+    }
+    return out;
+}
+
+} /* anonymous namespace */
 
 /* ============================================================== */
 /* nif_chat_templates_apply                                       */
@@ -380,9 +587,9 @@ extern "C" ERL_NIF_TERM nif_chat_templates_apply(
 
         auto *holder = static_cast<chat_params_holder *>(res);
         ERL_NIF_TERM ref = enif_make_resource(env, res);
-        ERL_NIF_TERM prompt = mk_string_bin(env, holder->params.prompt);
+        ERL_NIF_TERM render = render_map(env, holder->params);
         enif_release_resource(res);
-        return enif_make_tuple3(env, mk_atom(env, "ok"), ref, prompt);
+        return enif_make_tuple3(env, mk_atom(env, "ok"), ref, render);
     } catch (const std::exception &e) {
         return mk_error_str(env, e.what());
     } catch (...) {

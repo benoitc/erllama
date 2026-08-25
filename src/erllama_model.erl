@@ -198,11 +198,13 @@
 %% are honoured by `complete/3` Opts and `continue/3`. The sampler
 %% chain is rebuilt per-request: grammar -> repetition_penalty ->
 %% top_k -> top_p -> min_p -> (temperature > 0 ? temp -> dist(seed) :
-%% greedy). A binary `grammar` is authoritative for the whole turn:
-%% it governs tool-call syntax tokens too, disabling the
-%% greedy-on-syntax swap for that request, so `tool_choice` /
-%% `response_format` constraints hold across the turn (including on
-%% `continue/3` rounds).
+%% greedy). A binary `grammar` constrains every sampled token of the
+%% turn; with `grammar_lazy => true` it activates only once one of
+%% `trigger_patterns` matches the output so far (or a
+%% `trigger_tokens` id is sampled) - the shape `erllama_chat` uses
+%% for template-synthesized tool-call grammars. A non-lazy grammar
+%% with `grammar_prefill` first accepts those (already-prompted)
+%% tokens so template grammars that cover the assistant header work.
 %% `stop_sequences` is a list of binaries; generation halts on the
 %% first occurrence (by list order) of any element in the
 %% accumulated detokenized output. The match is trimmed from the
@@ -775,11 +777,11 @@ chat templating.
 apply_chat_template(Model, Request) when is_map(Request) ->
     call(Model, {apply_chat_template, Request}, infinity).
 
-%% Build (or fetch from cache) a chat_params_ref + rendered prompt for
-%% this model and the given tools-set. `ToolsHash' is a stable
-%% binary identifier for the (canonicalised) tools array - same hash
-%% => same cached params_ref + prompt. `Inputs' is the map fed
-%% verbatim to `erllama_chat:apply/2'.
+%% Build a chat_params_ref + render map (prompt plus the template's
+%% synthesized constraint set: grammar, lazy triggers, additional
+%% stops, generation prompt, thinking tags) for this model. `Inputs'
+%% is the map fed verbatim to `erllama_chat:apply/2'. Returns
+%% `{ok, ParamsRef, Render}'.
 chat_apply(Model, Inputs) when is_map(Inputs) ->
     call(Model, {chat_apply, Inputs}, infinity).
 
@@ -3078,6 +3080,10 @@ find_req_by_ref(Data, Ref) ->
 %% parent_key) is dropped.
 -define(SAMPLER_KEYS, [
     grammar,
+    grammar_lazy,
+    trigger_patterns,
+    trigger_tokens,
+    grammar_prefill,
     repetition_penalty,
     top_k,
     top_p,

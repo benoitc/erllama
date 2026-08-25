@@ -190,6 +190,11 @@ extern int32_t erllama_safe_chat_apply_template(
 extern struct llama_sampler *erllama_safe_sampler_init_grammar(
     const struct llama_vocab *vocab, const char *grammar_str,
     const char *grammar_root);
+extern struct llama_sampler *erllama_safe_sampler_init_grammar_lazy_patterns(
+    const struct llama_vocab *vocab, const char *grammar_str,
+    const char *grammar_root, const char **trigger_patterns,
+    size_t num_trigger_patterns, const llama_token *trigger_tokens,
+    size_t num_trigger_tokens);
 extern struct llama_adapter_lora *erllama_safe_adapter_lora_init(
     struct llama_model *model, const char *path);
 extern void erllama_safe_adapter_lora_free(struct llama_adapter_lora *a);
@@ -3164,6 +3169,247 @@ static void grammar_cache_clear(erllama_context_t *c) {
     }
 }
 
+/* Parse a list of iolists/binaries into an enif_alloc'd array of
+ * NUL-terminated C strings. Returns 0 on success, -1 on a bad term or
+ * alloc failure. Free with free_string_list. */
+static int read_string_list(ErlNifEnv *env, ERL_NIF_TERM list,
+                            char ***out, unsigned int *out_n) {
+    unsigned int n;
+    if (!enif_get_list_length(env, list, &n)) return -1;
+    *out = NULL;
+    *out_n = 0;
+    if (n == 0) return 0;
+    char **arr = enif_alloc(sizeof(char *) * n);
+    if (!arr) return -1;
+    memset(arr, 0, sizeof(char *) * n);
+    ERL_NIF_TERM head, tail = list;
+    unsigned int i = 0;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        ErlNifBinary bin;
+        if (!enif_inspect_iolist_as_binary(env, head, &bin)) goto fail;
+        char *s = enif_alloc(bin.size + 1);
+        if (!s) goto fail;
+        memcpy(s, bin.data, bin.size);
+        s[bin.size] = '\0';
+        arr[i++] = s;
+    }
+    *out = arr;
+    *out_n = n;
+    return 0;
+fail:
+    for (unsigned int j = 0; j < n; j++) {
+        if (arr[j]) enif_free(arr[j]);
+    }
+    enif_free(arr);
+    return -1;
+}
+
+static void free_string_list(char **arr, unsigned int n) {
+    if (!arr) return;
+    for (unsigned int i = 0; i < n; i++) {
+        if (arr[i]) enif_free(arr[i]);
+    }
+    enif_free(arr);
+}
+
+static int erllama_is_space(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+}
+
+/* Feed the generation-prompt tokens into a freshly cloned NON-lazy
+ * grammar sampler (mirrors common_sampler_init,
+ * common/sampling.cpp:278-308): a template-synthesized grammar covers
+ * the assistant header that is already part of the prompt, so those
+ * tokens must be accepted before sampling starts. parse_special=true;
+ * a synthetic leading-space token is skipped when the text itself does
+ * not start with whitespace. Returns 0 on success. */
+static int grammar_accept_prefill(const struct llama_vocab *vocab,
+                                  struct llama_sampler *g,
+                                  const unsigned char *text, size_t len) {
+    int32_t cap = (int32_t) len + 16;
+    llama_token *toks = enif_alloc(sizeof(llama_token) * (size_t) cap);
+    if (!toks) return -1;
+    int32_t n = erllama_safe_tokenize(vocab, (const char *) text,
+                                      (int32_t) len, toks, cap,
+                                      false, true);
+    if (n < 0) {
+        enif_free(toks);
+        return -1;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        if (i == 0) {
+            char piece[64];
+            int32_t pn = erllama_safe_token_to_piece(
+                vocab, toks[0], piece, (int32_t) sizeof(piece), 0, true);
+            if (pn > 0 && erllama_is_space(piece[0]) &&
+                !erllama_is_space((char) text[0])) {
+                continue;
+            }
+        }
+        if (erllama_safe_sampler_accept(g, toks[i]) != 0) {
+            enif_free(toks);
+            return -1;
+        }
+    }
+    enif_free(toks);
+    return 0;
+}
+
+/* Compile (or fetch from the per-context cache) the grammar described
+ * by `cfg` and append it to `chain`. Handles both plain and lazy
+ * grammars plus the non-lazy generation-prompt prefill. Returns 0 on
+ * success; on failure returns -1 with *out_err_atom set (the caller
+ * frees `chain`). Caller holds c->mu. */
+static int append_grammar_sampler(ErlNifEnv *env, ERL_NIF_TERM cfg,
+                                  erllama_context_t *c,
+                                  struct llama_sampler *chain,
+                                  ErlNifBinary grammar_bin,
+                                  ERL_NIF_TERM *out_err_atom) {
+    int rc = -1;
+    char **patterns = NULL;
+    unsigned int n_patterns = 0;
+    llama_token *trig_tokens = NULL;
+    int32_t n_trig_tokens = 0;
+    unsigned char *keybuf = NULL;
+    struct llama_sampler *g = NULL;
+
+    const struct llama_model *model = erllama_safe_get_model(c->ctx);
+    const struct llama_vocab *vocab =
+        model ? erllama_safe_model_get_vocab(model) : NULL;
+    if (!vocab) {
+        *out_err_atom = atom_exception;
+        return -1;
+    }
+
+    int lazy = 0;
+    {
+        int b;
+        if (get_map_bool(env, cfg, "grammar_lazy", &b)) lazy = b;
+    }
+    ERL_NIF_TERM v;
+    if (enif_get_map_value(env, cfg,
+                           enif_make_atom(env, "trigger_patterns"), &v)) {
+        if (read_string_list(env, v, &patterns, &n_patterns) != 0) {
+            *out_err_atom = enif_make_atom(env, "badarg");
+            goto out;
+        }
+    }
+    if (enif_get_map_value(env, cfg,
+                           enif_make_atom(env, "trigger_tokens"), &v)) {
+        if (read_token_list(env, v, &trig_tokens, &n_trig_tokens) != 1) {
+            *out_err_atom = enif_make_atom(env, "badarg");
+            goto out;
+        }
+    }
+    ErlNifBinary prefill_bin;
+    int has_prefill = 0;
+    if (enif_get_map_value(env, cfg,
+                           enif_make_atom(env, "grammar_prefill"), &v)) {
+        if (!enif_inspect_iolist_as_binary(env, v, &prefill_bin)) {
+            *out_err_atom = enif_make_atom(env, "badarg");
+            goto out;
+        }
+        has_prefill = prefill_bin.size > 0;
+    }
+
+    /* Cache key: plain grammars keep the raw GBNF bytes (existing
+     * behavior). Lazy grammars / trigger sets get a canonical buffer
+     * [lazy-byte, grammar, 0, pattern 0, ..., tokens LE] so the same
+     * GBNF compiled lazy vs plain occupies two distinct entries. */
+    const unsigned char *key = grammar_bin.data;
+    size_t keylen = grammar_bin.size;
+    if (lazy || n_patterns > 0 || n_trig_tokens > 0) {
+        keylen = 1 + grammar_bin.size + 1;
+        for (unsigned int i = 0; i < n_patterns; i++) {
+            keylen += strlen(patterns[i]) + 1;
+        }
+        keylen += (size_t) n_trig_tokens * 4;
+        keybuf = enif_alloc(keylen);
+        if (!keybuf) {
+            *out_err_atom = atom_oom;
+            goto out;
+        }
+        unsigned char *p = keybuf;
+        *p++ = (unsigned char) (lazy ? 1 : 0);
+        memcpy(p, grammar_bin.data, grammar_bin.size);
+        p += grammar_bin.size;
+        *p++ = 0;
+        for (unsigned int i = 0; i < n_patterns; i++) {
+            size_t plen = strlen(patterns[i]);
+            memcpy(p, patterns[i], plen);
+            p += plen;
+            *p++ = 0;
+        }
+        for (int32_t i = 0; i < n_trig_tokens; i++) {
+            uint32_t t = (uint32_t) trig_tokens[i];
+            *p++ = (unsigned char) (t & 0xFF);
+            *p++ = (unsigned char) ((t >> 8) & 0xFF);
+            *p++ = (unsigned char) ((t >> 16) & 0xFF);
+            *p++ = (unsigned char) ((t >> 24) & 0xFF);
+        }
+        key = keybuf;
+    }
+
+    /* Parse the GBNF at most once per distinct grammar (per context):
+     * cache the parsed template and clone it per request. Re-parsing a
+     * large tool grammar every turn dominates infer admission. */
+    struct llama_sampler *tmpl = grammar_cache_get(c, key, keylen);
+    int from_cache = (tmpl != NULL);
+    if (!tmpl) {
+        char *gstr = enif_alloc(grammar_bin.size + 1);
+        if (!gstr) {
+            *out_err_atom = atom_oom;
+            goto out;
+        }
+        memcpy(gstr, grammar_bin.data, grammar_bin.size);
+        gstr[grammar_bin.size] = '\0';
+        if (lazy) {
+            tmpl = erllama_safe_sampler_init_grammar_lazy_patterns(
+                vocab, gstr, "root",
+                (const char **) patterns, (size_t) n_patterns,
+                trig_tokens, (size_t) n_trig_tokens);
+        } else {
+            tmpl = erllama_safe_sampler_init_grammar(vocab, gstr, "root");
+        }
+        enif_free(gstr);
+        if (!tmpl) {
+            *out_err_atom = atom_grammar_failed;
+            goto out;
+        }
+    }
+    /* Clone before caching: grammar_cache_put may free `tmpl` on its own
+     * alloc failure, and a cache hit must not be mutated by decode. */
+    g = erllama_safe_sampler_clone(tmpl);
+    if (!from_cache) {
+        grammar_cache_put(c, key, keylen, tmpl);
+    }
+    if (!g) {
+        *out_err_atom = atom_grammar_failed;
+        goto out;
+    }
+    if (!lazy && has_prefill) {
+        if (grammar_accept_prefill(vocab, g, prefill_bin.data,
+                                   prefill_bin.size) != 0) {
+            *out_err_atom = enif_make_atom(env, "grammar_prefill_failed");
+            goto out;
+        }
+    }
+    if (chain_append(chain, g) != 0) {
+        g = NULL; /* chain_append freed or adopted it */
+        *out_err_atom = atom_oom;
+        goto out;
+    }
+    g = NULL;
+    rc = 0;
+
+out:
+    if (g) (void) erllama_safe_sampler_free(g);
+    if (keybuf) enif_free(keybuf);
+    if (trig_tokens) enif_free(trig_tokens);
+    free_string_list(patterns, n_patterns);
+    return rc;
+}
+
 /* Build a sampler chain from a config map. On failure returns NULL and
  * sets *out_err_atom to one of: atom_oom, atom_grammar_failed,
  * atom_badarg. The lock must already be held by the caller (vocab
@@ -3172,7 +3418,6 @@ static struct llama_sampler *
 build_sampler_chain_from_map(ErlNifEnv *env, ERL_NIF_TERM cfg,
                              erllama_context_t *c,
                              ERL_NIF_TERM *out_err_atom) {
-    struct llama_context *ctx = c->ctx;
     if (!enif_is_map(env, cfg)) {
         *out_err_atom = enif_make_atom(env, "badarg");
         return NULL;
@@ -3234,52 +3479,9 @@ build_sampler_chain_from_map(ErlNifEnv *env, ERL_NIF_TERM cfg,
     }
 
     if (has_grammar) {
-        const struct llama_model *model = erllama_safe_get_model(ctx);
-        const struct llama_vocab *vocab =
-            model ? erllama_safe_model_get_vocab(model) : NULL;
-        if (!vocab) {
+        if (append_grammar_sampler(env, cfg, c, chain, grammar_bin,
+                                   out_err_atom) != 0) {
             (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_exception;
-            return NULL;
-        }
-        /* Parse the GBNF at most once per distinct grammar (per context):
-         * cache the parsed template and clone it per request. Re-parsing a
-         * large tool grammar every turn dominates infer admission. */
-        struct llama_sampler *tmpl =
-            grammar_cache_get(c, grammar_bin.data, grammar_bin.size);
-        int from_cache = (tmpl != NULL);
-        if (!tmpl) {
-            char *gstr = enif_alloc(grammar_bin.size + 1);
-            if (!gstr) {
-                (void) erllama_safe_sampler_free(chain);
-                *out_err_atom = atom_oom;
-                return NULL;
-            }
-            memcpy(gstr, grammar_bin.data, grammar_bin.size);
-            gstr[grammar_bin.size] = '\0';
-            tmpl = erllama_safe_sampler_init_grammar(vocab, gstr, "root");
-            enif_free(gstr);
-            if (!tmpl) {
-                (void) erllama_safe_sampler_free(chain);
-                *out_err_atom = atom_grammar_failed;
-                return NULL;
-            }
-        }
-        /* Clone before caching: grammar_cache_put may free `tmpl` on its own
-         * alloc failure, and a cache hit must not be mutated by decode. */
-        struct llama_sampler *g = erllama_safe_sampler_clone(tmpl);
-        if (!from_cache) {
-            grammar_cache_put(c, grammar_bin.data, grammar_bin.size, tmpl);
-        }
-        if (!g) {
-            (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_grammar_failed;
-            return NULL;
-        }
-        if (chain_append(chain, g) != 0) {
-            (void) erllama_safe_sampler_free(g);
-            (void) erllama_safe_sampler_free(chain);
-            *out_err_atom = atom_oom;
             return NULL;
         }
     }
