@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-25
+
 ### Changed
 
 - `chat/3` defaults `reasoning_format` to `deepseek`: thinking models
