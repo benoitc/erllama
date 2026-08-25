@@ -30,8 +30,8 @@ struct llama_sampler;
 
 #define ERLLAMA_MAX_DEVICES 16
 
-/* Mirrors erllama_nif.c:275 (erllama_model_t). Held
- * by MODEL_RT resources. */
+/* The canonical erllama_model_t definition (the NIF C files get it
+ * through this header). Held by MODEL_RT resources. */
 typedef struct {
     pthread_mutex_t mu;
     int mu_inited;

@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- Internal: `c_src/erllama_nif.c` split into per-concern files
+  (`erllama_nif_{model,context,kv,tokens,decode,sampler,
+  chat_template,adapter}.c` plus the shared `erllama_nif_int.h` /
+  `erllama_safe.h` headers). Pure code motion; no API or behavior
+  change.
+
 ### Added
 
 - Guides: generating text, sessions, tokens and vocabulary,
