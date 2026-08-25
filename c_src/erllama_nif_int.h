@@ -17,6 +17,8 @@
 
 #include "llama.h"
 
+#include "erllama_nif_util.h"
+
 /* Hard upper bound on `n_seq_max`. Caps the per-context `per_seq[]`
  * array on `erllama_context_t`. Sized well above realistic loads
  * (typical multi-tenant inference servers run 1-32 concurrent
@@ -160,6 +162,46 @@ typedef struct {
     int n_probs;
 } erllama_sampler_t;
 
+/* =========================================================================
+ * Lock + liveness guards
+ *
+ * Each predicate takes the resource mutex and checks that the
+ * underlying llama pointer is still live. On success it returns 1
+ * WITH THE LOCK HELD; on a released resource it unlocks and returns
+ * 0, and the call site writes its own explicit return (usually
+ * `return erllama_error(env, atom_released);`, plus any cleanup).
+ * ========================================================================= */
+
+static inline int erllama_lock_ctx(erllama_context_t *c) {
+    pthread_mutex_lock(&c->mu);
+    if (!c->ctx) {
+        pthread_mutex_unlock(&c->mu);
+        return 0;
+    }
+    return 1;
+}
+
+static inline int erllama_lock_model(erllama_model_t *m) {
+    pthread_mutex_lock(&m->mu);
+    if (!m->model) {
+        pthread_mutex_unlock(&m->mu);
+        return 0;
+    }
+    return 1;
+}
+
+/* Like erllama_lock_model but also refuses a model flagged for
+ * deferred release: once free_model/1 returned {ok, deferred} no new
+ * work may attach to (or run against) the outgoing model. */
+static inline int erllama_lock_model_live(erllama_model_t *m) {
+    pthread_mutex_lock(&m->mu);
+    if (!m->model || m->release_pending) {
+        pthread_mutex_unlock(&m->mu);
+        return 0;
+    }
+    return 1;
+}
+
 /* Declared in erllama_resources.h so the C++ chat NIF TU can
  * reference them through extern visibility. */
 
@@ -198,47 +240,6 @@ extern ERL_NIF_TERM atom_decode_failed;
 extern ERL_NIF_TERM atom_decode_timeout;
 extern ERL_NIF_TERM atom_decode_aborted;
 
-typedef struct {
-    const char *name;
-    int value;
-} erllama_atom_enum_pair_t;
-
-/* Shared helpers (definitions in erllama_nif.c). */
-int copy_path(ErlNifEnv *env, ERL_NIF_TERM term, char *out, size_t cap);
-
-int get_map_int31(
-    ErlNifEnv *env, ERL_NIF_TERM map, const char *key, int32_t *out
-);
-
-int get_map_uint(
-    ErlNifEnv *env, ERL_NIF_TERM map, const char *key, unsigned int *out
-);
-
-int get_map_double(
-    ErlNifEnv *env, ERL_NIF_TERM map, const char *key, double *out
-);
-
-int get_map_bool(
-    ErlNifEnv *env, ERL_NIF_TERM map, const char *key, int *out
-);
-
-int get_map_atom_enum(
-    ErlNifEnv *env,
-    ERL_NIF_TERM map,
-    const char *key,
-    const erllama_atom_enum_pair_t *table,
-    size_t n,
-    int *out
-);
-
-int get_map_float_list(
-    ErlNifEnv *env,
-    ERL_NIF_TERM map,
-    const char *key,
-    float *out,
-    size_t cap
-);
-
 /* Deferred-free protocol (definition in erllama_nif.c). */
 void context_drops_model(erllama_model_t *m);
 
@@ -248,11 +249,48 @@ void arm_decode(erllama_context_t *c);
 ERL_NIF_TERM classify_decode_error(ErlNifEnv *env, erllama_context_t *c,
                                           int rc);
 
-/* Token-list parsing (definitions in erllama_nif_tokens.c). */
+/* Token-list parsing (definitions in erllama_nif_util.c). */
 int read_token_list(ErlNifEnv *env, ERL_NIF_TERM list,
-                           llama_token **out, int32_t *out_len);
+                    llama_token **out, int32_t *out_len);
 
 ERL_NIF_TERM token_list_error(ErlNifEnv *env, int rc);
+
+/* Vocab access + token validation (definitions in
+ * erllama_nif_util.c). Both vocab getters must be called with the
+ * resource lock held and the underlying pointer live. They return
+ * the vocab, or NULL when the lookup threw; a non-NULL `n_vocab`
+ * receives the vocab token count (0 when unavailable) so each call
+ * site keeps its own failure policy and error atom. */
+const struct llama_vocab *erllama_model_vocab(erllama_model_t *m,
+                                              int32_t *n_vocab);
+
+const struct llama_vocab *erllama_ctx_vocab(erllama_context_t *c,
+                                            int32_t *n_vocab);
+
+/* First index in `toks` holding an id >= n_vocab, or -1 when all are
+ * in range. Out-of-range ids must never reach llama_decode /
+ * token_to_piece: they hit `id_to_token.at(id)` deep inside llama and
+ * throw across the C ABI. */
+int32_t erllama_first_oob_token(const llama_token *toks, int32_t n,
+                                int32_t n_vocab);
+
+/* Tokenize with the shared grow-on-retry protocol (nif_tokenize and
+ * nif_apply_chat_template). Runs under the caller's model lock. On
+ * ERLLAMA_TOK_OK, *out is an enif_alloc'd array of *out_n tokens the
+ * caller frees; every other status returns with no allocation live. */
+typedef enum {
+    ERLLAMA_TOK_OK,
+    ERLLAMA_TOK_OOM,
+    ERLLAMA_TOK_EXCEPTION,
+    ERLLAMA_TOK_TOO_LARGE,
+    ERLLAMA_TOK_FAILED
+} erllama_tok_status_t;
+
+erllama_tok_status_t erllama_tokenize_grow(
+    const struct llama_vocab *vocab, const char *text, int32_t len,
+    bool add_special, bool parse_special,
+    llama_token **out, int32_t *out_n
+);
 
 /* Sampler construction + grammar cache (erllama_nif_sampler.c). */
 struct llama_sampler *build_default_greedy_chain(void);

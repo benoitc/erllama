@@ -25,37 +25,31 @@ ERL_NIF_TERM nif_adapter_load(ErlNifEnv *env, int argc,
         return enif_make_badarg(env);
     }
 
-    pthread_mutex_lock(&m->mu);
-    if (!m->model) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
-    }
-    /* Mirror nif_new_context: refuse to attach a new adapter once
-     * free_model/1 has flagged the model for deferred release.
+    /* Mirror nif_new_context: also refuse to attach a new adapter
+     * once free_model/1 has flagged the model for deferred release.
      * Otherwise a new wrapper could resurrect an outgoing model. */
-    if (m->release_pending) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_model_live(m)) {
+        return erllama_error(env, atom_released);
     }
     struct llama_adapter_lora *adapter =
         erllama_safe_adapter_lora_init(m->model, path);
     if (!adapter) {
         pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_load_failed);
+        return erllama_error(env, atom_load_failed);
     }
     erllama_adapter_t *res =
         enif_alloc_resource(ADAPTER_RT, sizeof(*res));
     if (!res) {
         erllama_safe_adapter_lora_free(adapter);
         pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     memset(res, 0, sizeof(*res));
     if (pthread_mutex_init(&res->mu, NULL) != 0) {
         enif_release_resource(res);
         erllama_safe_adapter_lora_free(adapter);
         pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     res->mu_inited = 1;
     res->adapter = adapter;
@@ -79,7 +73,7 @@ ERL_NIF_TERM nif_adapter_free(ErlNifEnv *env, int argc,
     pthread_mutex_lock(&a->mu);
     if (!a->adapter) {
         pthread_mutex_unlock(&a->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+        return erllama_error(env, atom_released);
     }
     erllama_safe_adapter_lora_free(a->adapter);
     a->adapter = NULL;
@@ -138,7 +132,7 @@ ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
             if (adapters) enif_free(adapters);
             if (scales) enif_free(scales);
             if (entries) enif_free(entries);
-            return enif_make_tuple2(env, atom_error, atom_oom);
+            return erllama_error(env, atom_oom);
         }
     }
 
@@ -197,7 +191,7 @@ ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
             if (adapters) enif_free(adapters);
             if (scales) enif_free(scales);
             if (entries) enif_free(entries);
-            return enif_make_tuple2(env, atom_error, atom_released);
+            return erllama_error(env, atom_released);
         }
     }
 
@@ -221,7 +215,7 @@ ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
         if (adapters) enif_free(adapters);
         if (scales) enif_free(scales);
         if (entries) enif_free(entries);
-        return enif_make_tuple2(env, atom_error, atom_released);
+        return erllama_error(env, atom_released);
     }
     rc = erllama_safe_set_adapters_lora(c->ctx, adapters, n, scales);
     pthread_mutex_unlock(&c->mu);
@@ -236,7 +230,7 @@ ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
     if (entries) enif_free(entries);
 
     if (rc != 0) {
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
     return atom_ok;
 

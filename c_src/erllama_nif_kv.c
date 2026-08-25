@@ -38,44 +38,42 @@ ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
         seq_id = (llama_seq_id) sid;
     }
 
-    pthread_mutex_lock(&c->mu);
-    if (!c->ctx) {
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
     }
     size_t need = erllama_safe_state_seq_get_size(c->ctx, seq_id);
     if (need == SIZE_MAX) {
         pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
     if (need == 0) {
         pthread_mutex_unlock(&c->mu);
-        ErlNifBinary empty;
-        if (!enif_alloc_binary(0, &empty)) {
-            return enif_make_tuple2(env, atom_error, atom_oom);
+        ERL_NIF_TERM empty;
+        if (!erllama_empty_bin(env, &empty)) {
+            return erllama_error(env, atom_oom);
         }
-        return enif_make_binary(env, &empty);
+        return empty;
     }
     ErlNifBinary out;
     if (!enif_alloc_binary(need, &out)) {
         pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     size_t written = erllama_safe_state_seq_get_data(
         c->ctx, out.data, out.size, seq_id);
     pthread_mutex_unlock(&c->mu);
     if (written == SIZE_MAX) {
         enif_release_binary(&out);
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
     if (written == 0 || written > need) {
         enif_release_binary(&out);
-        return enif_make_tuple2(env, atom_error, atom_pack_failed);
+        return erllama_error(env, atom_pack_failed);
     }
     if (written < need) {
         if (!enif_realloc_binary(&out, written)) {
             enif_release_binary(&out);
-            return enif_make_tuple2(env, atom_error, atom_oom);
+            return erllama_error(env, atom_oom);
         }
     }
     return enif_make_binary(env, &out);
@@ -95,10 +93,8 @@ ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
     if (!enif_get_int(env, argv[2], &seq_id) || seq_id < 0) {
         return enif_make_badarg(env);
     }
-    pthread_mutex_lock(&c->mu);
-    if (!c->ctx) {
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
     }
     size_t consumed = erllama_safe_state_seq_set_data(
         c->ctx, in.data, in.size, seq_id);
@@ -121,7 +117,7 @@ ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
     }
     pthread_mutex_unlock(&c->mu);
     if (consumed == 0 || consumed != in.size) {
-        return enif_make_tuple2(env, atom_error, atom_unpack_failed);
+        return erllama_error(env, atom_unpack_failed);
     }
     return atom_ok;
 }
@@ -145,10 +141,8 @@ ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
         !enif_get_int(env, argv[3], &p1)) {
         return enif_make_badarg(env);
     }
-    pthread_mutex_lock(&c->mu);
-    if (!c->ctx) {
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
     }
     int rc = erllama_safe_memory_seq_rm(c->ctx, seq_id, p0, p1);
     /* Removing cells invalidates last-decode logits; force a fresh
@@ -170,7 +164,7 @@ ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
     }
     pthread_mutex_unlock(&c->mu);
     if (rc != 0) {
-        return enif_make_tuple2(env, atom_error, atom_unpack_failed);
+        return erllama_error(env, atom_unpack_failed);
     }
     return atom_ok;
 }
@@ -197,17 +191,14 @@ ERL_NIF_TERM nif_kv_seq_cp(ErlNifEnv *env, int argc,
         dst >= ERLLAMA_N_SEQ_MAX_CAP || src == dst) {
         return enif_make_badarg(env);
     }
-    pthread_mutex_lock(&c->mu);
-    if (!c->ctx) {
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
     }
     long src_max = erllama_safe_memory_seq_pos_max(c->ctx, src);
     if (src_max < 0) {
         /* Empty (or unreadable) source: nothing to fork. */
         pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(
-            env, atom_error, enif_make_atom(env, "seq_cp_failed"));
+        return erllama_error(env, enif_make_atom(env, "seq_cp_failed"));
     }
     int rc = erllama_safe_memory_seq_cp(c->ctx, src, dst);
     long dst_max =
@@ -217,8 +208,7 @@ ERL_NIF_TERM nif_kv_seq_cp(ErlNifEnv *env, int argc,
         c->per_seq[dst].next_pos = 0;
         c->per_seq[dst].last_logits_idx = -1;
         pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(
-            env, atom_error, enif_make_atom(env, "seq_cp_failed"));
+        return erllama_error(env, enif_make_atom(env, "seq_cp_failed"));
     }
     c->decode_ready = 0;
     c->per_seq[dst].next_pos = (int32_t) (dst_max + 1);

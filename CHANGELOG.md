@@ -13,6 +13,11 @@ this project adheres to [Semantic Versioning](https://semver.org).
   chat_template,adapter}.c` plus the shared `erllama_nif_int.h` /
   `erllama_safe.h` headers). Pure code motion; no API or behavior
   change.
+- Internal: shared C utility layer (`erllama_nif_util.{h,c}`):
+  error/binary/map term builders, lock + liveness guards, vocab
+  access and token-bounds validation, and the tokenize grow-retry
+  loop now have one canonical implementation each, reused across
+  the NIF C files and the C++ chat NIF. No API or behavior change.
 
 ### Added
 

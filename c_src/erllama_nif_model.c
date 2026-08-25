@@ -40,10 +40,8 @@ ERL_NIF_TERM nif_model_size(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
         return enif_make_badarg(env);
     }
-    pthread_mutex_lock(&m->mu);
-    if (!m->model) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_model(m)) {
+        return erllama_error(env, atom_released);
     }
     uint64_t sz = erllama_safe_model_size(m->model);
     pthread_mutex_unlock(&m->mu);
@@ -56,10 +54,8 @@ ERL_NIF_TERM nif_model_n_layer(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
     if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
         return enif_make_badarg(env);
     }
-    pthread_mutex_lock(&m->mu);
-    if (!m->model) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_model(m)) {
+        return erllama_error(env, atom_released);
     }
     int32_t n = erllama_safe_model_n_layer(m->model);
     pthread_mutex_unlock(&m->mu);
@@ -67,21 +63,15 @@ ERL_NIF_TERM nif_model_n_layer(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 }
 
 /* Copy a NUL-terminated probe result into a binary term. A negative
- * probe rc (key missing / exception) yields an empty binary. The
- * destination is an Erlang binary, not a C string, so the copy is
- * deliberately unterminated. */
+ * probe rc (key missing / exception) yields an empty binary; a
+ * binary-allocation failure degrades to `undefined`. */
 static ERL_NIF_TERM family_str(ErlNifEnv *env, int32_t rc, const char *buf) {
     size_t len = rc < 0 ? 0 : strlen(buf);
     ERL_NIF_TERM bin;
-    unsigned char *p = enif_make_new_binary(env, len, &bin);
-    /* NOLINTNEXTLINE(bugprone-not-null-terminated-result) */
-    if (len > 0) memcpy(p, buf, len);
+    if (!erllama_bin_from(env, buf, len, &bin)) {
+        return enif_make_atom(env, "undefined");
+    }
     return bin;
-}
-
-static void family_put(ErlNifEnv *env, ERL_NIF_TERM *map, const char *key,
-                       ERL_NIF_TERM value) {
-    enif_make_map_put(env, *map, enif_make_atom(env, key), value, map);
 }
 
 /* Model family / GGUF metadata probe:
@@ -97,10 +87,8 @@ ERL_NIF_TERM nif_model_family(ErlNifEnv *env, int argc,
     if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
         return enif_make_badarg(env);
     }
-    pthread_mutex_lock(&m->mu);
-    if (!m->model) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_model(m)) {
+        return erllama_error(env, atom_released);
     }
     char arch[128] = {0};
     char name[256] = {0};
@@ -125,21 +113,21 @@ ERL_NIF_TERM nif_model_family(ErlNifEnv *env, int argc,
     pthread_mutex_unlock(&m->mu);
 
     ERL_NIF_TERM map = enif_make_new_map(env);
-    family_put(env, &map, "arch", family_str(env, arch_rc, arch));
-    family_put(env, &map, "name", family_str(env, name_rc, name));
-    family_put(env, &map, "desc", family_str(env, desc_rc, desc));
-    family_put(env, &map, "n_ctx_train", enif_make_int(env, n_ctx_train));
-    family_put(env, &map, "n_params", enif_make_uint64(env, n_params));
-    family_put(env, &map, "n_embd", enif_make_int(env, n_embd));
-    family_put(env, &map, "n_layer", enif_make_int(env, n_layer));
-    family_put(env, &map, "n_head", enif_make_int(env, n_head));
-    family_put(env, &map, "n_swa", enif_make_int(env, n_swa));
-    family_put(env, &map, "recurrent", recurrent ? atom_true : atom_false);
-    family_put(env, &map, "hybrid", hybrid ? atom_true : atom_false);
-    family_put(env, &map, "diffusion", diffusion ? atom_true : atom_false);
-    family_put(env, &map, "has_encoder", has_encoder ? atom_true : atom_false);
-    family_put(env, &map, "has_decoder", has_decoder ? atom_true : atom_false);
-    family_put(env, &map, "ftype", enif_make_int(env, ftype));
+    erllama_map_put(env, &map, "arch", family_str(env, arch_rc, arch));
+    erllama_map_put(env, &map, "name", family_str(env, name_rc, name));
+    erllama_map_put(env, &map, "desc", family_str(env, desc_rc, desc));
+    erllama_map_put(env, &map, "n_ctx_train", enif_make_int(env, n_ctx_train));
+    erllama_map_put(env, &map, "n_params", enif_make_uint64(env, n_params));
+    erllama_map_put(env, &map, "n_embd", enif_make_int(env, n_embd));
+    erllama_map_put(env, &map, "n_layer", enif_make_int(env, n_layer));
+    erllama_map_put(env, &map, "n_head", enif_make_int(env, n_head));
+    erllama_map_put(env, &map, "n_swa", enif_make_int(env, n_swa));
+    erllama_map_put(env, &map, "recurrent", recurrent ? atom_true : atom_false);
+    erllama_map_put(env, &map, "hybrid", hybrid ? atom_true : atom_false);
+    erllama_map_put(env, &map, "diffusion", diffusion ? atom_true : atom_false);
+    erllama_map_put(env, &map, "has_encoder", has_encoder ? atom_true : atom_false);
+    erllama_map_put(env, &map, "has_decoder", has_decoder ? atom_true : atom_false);
+    erllama_map_put(env, &map, "ftype", enif_make_int(env, ftype));
     return map;
 }
 
@@ -164,17 +152,15 @@ ERL_NIF_TERM nif_vocab_info(ErlNifEnv *env, int argc,
     if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
         return enif_make_badarg(env);
     }
-    pthread_mutex_lock(&m->mu);
-    if (!m->model) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_model(m)) {
+        return erllama_error(env, atom_released);
     }
-    const struct llama_vocab *vocab = erllama_safe_model_get_vocab(m->model);
+    int32_t n_vocab = 0;
+    const struct llama_vocab *vocab = erllama_model_vocab(m, &n_vocab);
     if (!vocab) {
         pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
-    int32_t n_vocab = erllama_safe_vocab_n_tokens(vocab);
     int add_bos = erllama_safe_vocab_get_add_bos(vocab);
     int add_eos = erllama_safe_vocab_get_add_eos(vocab);
     llama_token bos = erllama_safe_vocab_bos(vocab);
@@ -193,22 +179,22 @@ ERL_NIF_TERM nif_vocab_info(ErlNifEnv *env, int argc,
     pthread_mutex_unlock(&m->mu);
 
     ERL_NIF_TERM map = enif_make_new_map(env);
-    family_put(env, &map, "n_vocab", enif_make_int(env, n_vocab));
-    family_put(env, &map, "add_bos", add_bos ? atom_true : atom_false);
-    family_put(env, &map, "add_eos", add_eos ? atom_true : atom_false);
-    family_put(env, &map, "bos", vocab_tok_term(env, bos));
-    family_put(env, &map, "eos", vocab_tok_term(env, eos));
-    family_put(env, &map, "eot", vocab_tok_term(env, eot));
-    family_put(env, &map, "sep", vocab_tok_term(env, sep));
-    family_put(env, &map, "nl", vocab_tok_term(env, nl));
-    family_put(env, &map, "pad", vocab_tok_term(env, pad));
-    family_put(env, &map, "mask", vocab_tok_term(env, mask));
-    family_put(env, &map, "fim_pre", vocab_tok_term(env, fim_pre));
-    family_put(env, &map, "fim_suf", vocab_tok_term(env, fim_suf));
-    family_put(env, &map, "fim_mid", vocab_tok_term(env, fim_mid));
-    family_put(env, &map, "fim_pad", vocab_tok_term(env, fim_pad));
-    family_put(env, &map, "fim_rep", vocab_tok_term(env, fim_rep));
-    family_put(env, &map, "fim_sep", vocab_tok_term(env, fim_sep));
+    erllama_map_put(env, &map, "n_vocab", enif_make_int(env, n_vocab));
+    erllama_map_put(env, &map, "add_bos", add_bos ? atom_true : atom_false);
+    erllama_map_put(env, &map, "add_eos", add_eos ? atom_true : atom_false);
+    erllama_map_put(env, &map, "bos", vocab_tok_term(env, bos));
+    erllama_map_put(env, &map, "eos", vocab_tok_term(env, eos));
+    erllama_map_put(env, &map, "eot", vocab_tok_term(env, eot));
+    erllama_map_put(env, &map, "sep", vocab_tok_term(env, sep));
+    erllama_map_put(env, &map, "nl", vocab_tok_term(env, nl));
+    erllama_map_put(env, &map, "pad", vocab_tok_term(env, pad));
+    erllama_map_put(env, &map, "mask", vocab_tok_term(env, mask));
+    erllama_map_put(env, &map, "fim_pre", vocab_tok_term(env, fim_pre));
+    erllama_map_put(env, &map, "fim_suf", vocab_tok_term(env, fim_suf));
+    erllama_map_put(env, &map, "fim_mid", vocab_tok_term(env, fim_mid));
+    erllama_map_put(env, &map, "fim_pad", vocab_tok_term(env, fim_pad));
+    erllama_map_put(env, &map, "fim_rep", vocab_tok_term(env, fim_rep));
+    erllama_map_put(env, &map, "fim_sep", vocab_tok_term(env, fim_sep));
     return map;
 }
 
@@ -230,7 +216,7 @@ ERL_NIF_TERM nif_vram_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
     (void) argc;
     (void) argv;
     if (erllama_safe_backend_init_once() != 0) {
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
     size_t n = erllama_safe_backend_dev_count();
     size_t total_sum = 0, free_sum = 0;
@@ -250,7 +236,7 @@ ERL_NIF_TERM nif_vram_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
         }
     }
     if (!found_non_cpu) {
-        return enif_make_tuple2(env, atom_error, atom_no_gpu);
+        return erllama_error(env, atom_no_gpu);
     }
     size_t used_sum = (total_sum > free_sum) ? (total_sum - free_sum) : 0;
     ERL_NIF_TERM map = enif_make_new_map(env);
@@ -316,7 +302,7 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     }
 
     if (erllama_safe_backend_init_once() != 0) {
-        return enif_make_tuple2(env, atom_error, atom_load_failed);
+        return erllama_error(env, atom_load_failed);
     }
 
     /* Allocate the resource BEFORE the model load so `params.tensor_split`
@@ -327,7 +313,7 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
      * skips the dangerous frees. */
     erllama_model_t *res = enif_alloc_resource(MODEL_RT, sizeof(*res));
     if (!res) {
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     memset(res, 0, sizeof(*res));
 
@@ -385,7 +371,7 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
      * is one line at the top of this file. */
     if (llama_max_devices() > (size_t) ERLLAMA_MAX_DEVICES) {
         enif_release_resource(res);
-        return enif_make_tuple2(env, atom_error, atom_load_failed);
+        return erllama_error(env, atom_load_failed);
     }
     int ts_n = get_map_float_list(
         env, argv[1], "tensor_split",
@@ -449,13 +435,13 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         ERL_NIF_TERM why = (status == ERLLAMA_LOAD_MALFORMED)
                                ? atom_malformed_gguf
                                : atom_load_failed;
-        return enif_make_tuple2(env, atom_error, why);
+        return erllama_error(env, why);
     }
 
     if (pthread_mutex_init(&res->mu, NULL) != 0) {
         (void) erllama_safe_model_free(model);
         enif_release_resource(res);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+        return erllama_error(env, atom_oom);
     }
     res->mu_inited = 1;
     res->model = model;
@@ -483,10 +469,8 @@ ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
         return enif_make_badarg(env);
     }
-    pthread_mutex_lock(&m->mu);
-    if (!m->model) {
-        pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_released);
+    if (!erllama_lock_model(m)) {
+        return erllama_error(env, atom_released);
     }
     if (m->active_contexts > 0 || m->active_adapters > 0) {
         m->release_pending = 1;
@@ -505,7 +489,7 @@ ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     m->release_pending = 0;
     pthread_mutex_unlock(&m->mu);
     if (rc != 0) {
-        return enif_make_tuple2(env, atom_error, atom_exception);
+        return erllama_error(env, atom_exception);
     }
     return atom_ok;
 }
