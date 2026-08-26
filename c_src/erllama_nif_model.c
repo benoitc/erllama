@@ -550,12 +550,12 @@ static int build_tbo(ErlNifEnv *env, ERL_NIF_TERM map,
             return -1;
         }
         if (moe_n < 0) {
+            /* Single terminal entry: no further pattern writes, so
+             * pat_cursor is not advanced (clang-analyzer dead-store). */
             const char *pat = erllama_safe_ffn_exps_regex();
-            size_t len = strlen(pat);
-            memcpy(pat_cursor, pat, len + 1);
+            memcpy(pat_cursor, pat, strlen(pat) + 1);
             entries[k].pattern = pat_cursor;
             entries[k].buft = cpu_buft;
-            pat_cursor += len + 1;
             k++;
         } else {
             char buf[ERLLAMA_BLOCK_REGEX_CAP];
