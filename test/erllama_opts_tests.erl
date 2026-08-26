@@ -93,7 +93,36 @@ load_sub_type_checks_test_() ->
         {{error, {invalid_config, fail_kv_unpack, maybe_}}, Base#{fail_kv_unpack => maybe_}},
         {{error, {invalid_config, fail_seq_cp, 1}}, Base#{fail_seq_cp => 1}},
         {{error, {invalid_config, progress_to, not_a_pid}}, Base#{progress_to => not_a_pid}},
-        {{error, {invalid_config, min_tokens, -1}}, Base#{policy => #{min_tokens => -1}}}
+        {{error, {invalid_config, min_tokens, -1}}, Base#{policy => #{min_tokens => -1}}},
+        {{error, {invalid_config, devices, []}}, Base#{model_opts => #{devices => []}}},
+        {{error, {invalid_config, devices, [gpu0]}}, Base#{model_opts => #{devices => [gpu0]}}},
+        {{error, {invalid_config, cpu_moe, 0}}, Base#{model_opts => #{cpu_moe => 0}}},
+        {{error, {invalid_config, tensor_buft_overrides, [{<<"p">>, gpu}]}}, Base#{
+            model_opts => #{tensor_buft_overrides => [{<<"p">>, gpu}]}
+        }},
+        {{error, {invalid_config, fit, #{margin_mib => 0}}}, Base#{
+            model_opts => #{fit => #{margin_mib => 0}}
+        }},
+        {{error, {invalid_config, fit, #{n_ctx => 4096}}}, Base#{
+            model_opts => #{fit => #{n_ctx => 4096}}
+        }},
+        %% min_ctx only means anything with n_ctx => auto.
+        {{error, {invalid_config, fit, #{min_ctx => 512}}}, Base#{
+            model_opts => #{fit => #{min_ctx => 512}}
+        }},
+        %% fit excludes the manual placement keys.
+        {{error, {invalid_config, fit, {incompatible, n_gpu_layers}}}, Base#{
+            model_opts => #{fit => true, n_gpu_layers => 8}
+        }},
+        {{error, {invalid_config, fit, {incompatible, cpu_moe}}}, Base#{
+            model_opts => #{fit => true, cpu_moe => true}
+        }},
+        {{error, {invalid_config, fit, {incompatible, split_mode}}}, Base#{
+            model_opts => #{fit => true, split_mode => row}
+        }},
+        {{error, {invalid_config, devices, {incompatible, split_mode}}}, Base#{
+            model_opts => #{devices => none, split_mode => tensor}
+        }}
     ],
     Good = Base#{
         context_opts => #{n_ctx => 4096, kv_unified => true, type_k => q8_0},
@@ -105,16 +134,29 @@ load_sub_type_checks_test_() ->
         },
         policy => #{min_tokens => 4, prefill_chunk_size => infinity}
     },
+    Good3 = Base#{
+        model_opts => #{
+            fit => #{margin_mib => [1024, 512], n_ctx => auto, min_ctx => 2048},
+            devices => none
+        }
+    },
     Good2 = Base#{
         context_opts => #{n_rs_seq => 1},
-        model_opts => #{split_mode => tensor},
+        model_opts => #{
+            split_mode => tensor,
+            devices => [<<"CUDA0">>, <<"CUDA1">>],
+            cpu_moe => 12,
+            tensor_buft_overrides => [
+                {<<"\\.ffn_up\\.">>, cpu}, {<<"blk\\.0\\.">>, <<"CUDA0">>}
+            ]
+        },
         fail_seq_rm_last => true,
         fail_kv_unpack => true,
         fail_seq_cp => true,
         progress_to => self()
     },
     [?_assertEqual(Expected, ?M:load_config(Config)) || {Expected, Config} <- Cases] ++
-        [?_assertMatch({ok, _}, ?M:load_config(G)) || G <- [Good, Good2]].
+        [?_assertMatch({ok, _}, ?M:load_config(G)) || G <- [Good, Good2, Good3]].
 
 %% ---------------------------------------------------------------------------
 %% request_opts/1 and prefill_opts/1

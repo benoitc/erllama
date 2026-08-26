@@ -246,6 +246,80 @@ ERL_NIF_TERM nif_vram_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
     return enif_make_tuple2(env, atom_ok, map);
 }
 
+/* Per-device probe: nif_list_devices() -> {ok, [#{index, name,
+ * description, type, free_b, total_b, device_id, caps}]}. Includes
+ * every registered backend device (CPU too); use it to discover the
+ * names the `devices` and `tensor_buft_overrides` model options
+ * accept. */
+static ERL_NIF_TERM dev_type_atom(ErlNifEnv *env, int t) {
+    switch (t) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU: return enif_make_atom(env, "cpu");
+        case GGML_BACKEND_DEVICE_TYPE_GPU: return enif_make_atom(env, "gpu");
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            return enif_make_atom(env, "igpu");
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            return enif_make_atom(env, "accel");
+        default: return enif_make_atom(env, "meta");
+    }
+}
+
+static ERL_NIF_TERM prop_str_bin(ErlNifEnv *env, const char *str) {
+    ERL_NIF_TERM bin;
+    if (!erllama_bin_from(env, str, strlen(str), &bin)) {
+        return enif_make_atom(env, "undefined");
+    }
+    return bin;
+}
+
+ERL_NIF_TERM nif_list_devices(ErlNifEnv *env, int argc,
+                              const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    if (erllama_safe_backend_init_once() != 0) {
+        return erllama_error(env, atom_exception);
+    }
+    size_t n = erllama_safe_backend_dev_count();
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (size_t i = n; i > 0; i--) {
+        size_t idx = i - 1;
+        erllama_dev_props_t props;
+        if (erllama_safe_backend_dev_props(idx, &props) != 0) {
+            continue;
+        }
+        ERL_NIF_TERM caps = enif_make_new_map(env);
+        erllama_map_put(env, &caps, "async",
+                        props.caps_async ? atom_true : atom_false);
+        erllama_map_put(env, &caps, "host_buffer",
+                        props.caps_host_buffer ? atom_true : atom_false);
+        erllama_map_put(
+            env, &caps, "buffer_from_host_ptr",
+            props.caps_buffer_from_host_ptr ? atom_true : atom_false);
+        erllama_map_put(env, &caps, "events",
+                        props.caps_events ? atom_true : atom_false);
+        erllama_map_put(env, &caps, "mmap_support",
+                        props.caps_mmap ? atom_true : atom_false);
+        ERL_NIF_TERM m = enif_make_new_map(env);
+        erllama_map_put(env, &m, "index",
+                        enif_make_uint64(env, (uint64_t) idx));
+        erllama_map_put(env, &m, "name", prop_str_bin(env, props.name));
+        erllama_map_put(env, &m, "description",
+                        prop_str_bin(env, props.description));
+        erllama_map_put(env, &m, "type",
+                        dev_type_atom(env, props.dev_type));
+        erllama_map_put(env, &m, "free_b",
+                        enif_make_uint64(env, props.free_b));
+        erllama_map_put(env, &m, "total_b",
+                        enif_make_uint64(env, props.total_b));
+        erllama_map_put(env, &m, "device_id",
+                        props.has_device_id
+                            ? prop_str_bin(env, props.device_id)
+                            : enif_make_atom(env, "undefined"));
+        erllama_map_put(env, &m, "caps", caps);
+        list = enif_make_list_cell(env, m, list);
+    }
+    return enif_make_tuple2(env, atom_ok, list);
+}
+
 /* =========================================================================
  * Model
  * ========================================================================= */
@@ -291,6 +365,220 @@ static bool erllama_load_progress_cb(float progress, void *user_data) {
     return true;
 }
 
+/* Parse the `devices` model option (list of device-name binaries, or
+ * the atom `none` for zero offload) into a NULL-terminated handle
+ * array on the caller's stack (llama copies it during load).
+ * Returns 1 (params->devices set), 0 (key absent), -1 (bad shape,
+ * caller raises badarg), -2 (unknown or CPU device; *err_name holds
+ * the offending element's term). */
+static int parse_devices(ErlNifEnv *env, ERL_NIF_TERM map,
+                         ggml_backend_dev_t *devs,
+                         struct llama_model_params *params,
+                         ERL_NIF_TERM *err_name) {
+    ERL_NIF_TERM v;
+    if (!enif_get_map_value(env, map, enif_make_atom(env, "devices"), &v)) {
+        return 0;
+    }
+    if (enif_compare(v, enif_make_atom(env, "none")) == 0) {
+        /* Upstream --device none: an empty but non-NULL list. */
+        devs[0] = NULL;
+        params->devices = devs;
+        return 1;
+    }
+    unsigned int n;
+    if (!enif_get_list_length(env, v, &n) || n == 0 ||
+        n > (unsigned int) ERLLAMA_MAX_DEVICES) {
+        return -1;
+    }
+    char names[ERLLAMA_MAX_DEVICES][64];
+    const char *name_ptrs[ERLLAMA_MAX_DEVICES];
+    ERL_NIF_TERM elems[ERLLAMA_MAX_DEVICES];
+    ERL_NIF_TERM head;
+    ERL_NIF_TERM tail = v;
+    unsigned int i = 0;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        ErlNifBinary bin;
+        if (!enif_inspect_iolist_as_binary(env, head, &bin) ||
+            bin.size == 0 || bin.size >= sizeof(names[0])) {
+            return -1;
+        }
+        memcpy(names[i], bin.data, bin.size);
+        names[i][bin.size] = '\0';
+        name_ptrs[i] = names[i];
+        elems[i] = head;
+        i++;
+    }
+    size_t bad = 0;
+    if (erllama_safe_resolve_devices(name_ptrs, n, devs, &bad) != 0) {
+        *err_name = elems[bad];
+        return -2;
+    }
+    params->devices = devs;
+    return 1;
+}
+
+/* Number of bytes the block-regex for `idx` needs (incl. NUL).
+ * Regenerating is cheap; the two-pass arena build calls this twice. */
+#define ERLLAMA_BLOCK_REGEX_CAP 160
+
+/* Build the resource-owned tensor_buft_overrides arena from the
+ * `tensor_buft_overrides` list ([{PatternBin, cpu | DeviceNameBin}])
+ * and the `cpu_moe` sugar (true = all expert tensors to CPU, N =
+ * first N blocks). Explicit overrides come first (first regex match
+ * wins), sugar entries after. The arena holds the (n+1) entries
+ * followed by the pattern bytes; llama does NOT copy the override
+ * array, so it lives on the resource for the model lifetime.
+ * Returns 1 (params->tensor_buft_overrides set), 0 (nothing
+ * requested), -1 (bad shape), -2 (unknown device name; *err_name
+ * set), -3 (oom). */
+static int build_tbo(ErlNifEnv *env, ERL_NIF_TERM map,
+                     erllama_model_t *res,
+                     struct llama_model_params *params,
+                     ERL_NIF_TERM *err_name) {
+    ERL_NIF_TERM listv;
+    int has_list = enif_get_map_value(
+        env, map, enif_make_atom(env, "tensor_buft_overrides"), &listv);
+    unsigned int n_list = 0;
+    if (has_list && (!enif_get_list_length(env, listv, &n_list))) {
+        return -1;
+    }
+
+    long moe_n = 0; /* 0 = off, -1 = all, N = first N blocks */
+    {
+        ERL_NIF_TERM v;
+        if (enif_get_map_value(env, map, enif_make_atom(env, "cpu_moe"),
+                               &v)) {
+            if (enif_compare(v, atom_true) == 0) {
+                moe_n = -1;
+            } else {
+                long l;
+                if (!enif_get_long(env, v, &l) || l < 1) return -1;
+                moe_n = l;
+            }
+        }
+    }
+    size_t n_moe = moe_n < 0 ? 1 : (size_t) moe_n;
+    if (moe_n == 0) n_moe = 0;
+    size_t n_total = (size_t) n_list + n_moe;
+    if (n_total == 0) return 0;
+    if (n_total > 4096) return -1;
+
+    /* Pass 1: size the pattern bytes. */
+    size_t pat_bytes = 0;
+    ERL_NIF_TERM head;
+    ERL_NIF_TERM tail = listv;
+    if (has_list) {
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            const ERL_NIF_TERM *pair;
+            int arity;
+            ErlNifBinary pat;
+            if (!enif_get_tuple(env, head, &arity, &pair) || arity != 2 ||
+                !enif_inspect_iolist_as_binary(env, pair[0], &pat) ||
+                pat.size == 0) {
+                return -1;
+            }
+            pat_bytes += pat.size + 1;
+        }
+    }
+    if (moe_n < 0) {
+        pat_bytes += strlen(erllama_safe_ffn_exps_regex()) + 1;
+    } else {
+        char buf[ERLLAMA_BLOCK_REGEX_CAP];
+        for (long i = 0; i < moe_n; i++) {
+            if (erllama_safe_ffn_exps_block_regex((int) i, buf,
+                                                  sizeof(buf)) != 0) {
+                return -1;
+            }
+            pat_bytes += strlen(buf) + 1;
+        }
+    }
+
+    size_t entry_bytes =
+        (n_total + 1) * sizeof(struct llama_model_tensor_buft_override);
+    unsigned char *arena = enif_alloc(entry_bytes + pat_bytes);
+    if (!arena) return -3;
+    struct llama_model_tensor_buft_override *entries =
+        (struct llama_model_tensor_buft_override *) arena;
+    char *pat_cursor = (char *) (arena + entry_bytes);
+    size_t k = 0;
+
+    /* Pass 2: fill. Explicit overrides first. */
+    if (has_list) {
+        tail = listv;
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            const ERL_NIF_TERM *pair;
+            int arity;
+            ErlNifBinary pat;
+            (void) enif_get_tuple(env, head, &arity, &pair);
+            (void) enif_inspect_iolist_as_binary(env, pair[0], &pat);
+            ggml_backend_buffer_type_t buft = NULL;
+            if (enif_compare(pair[1], enif_make_atom(env, "cpu")) == 0) {
+                buft = erllama_safe_cpu_buffer_type();
+            } else {
+                ErlNifBinary nameb;
+                char name[64];
+                if (!enif_inspect_iolist_as_binary(env, pair[1], &nameb) ||
+                    nameb.size == 0 || nameb.size >= sizeof(name)) {
+                    enif_free(arena);
+                    return -1;
+                }
+                memcpy(name, nameb.data, nameb.size);
+                name[nameb.size] = '\0';
+                buft = erllama_safe_dev_default_buft_by_name(name);
+                if (!buft) {
+                    enif_free(arena);
+                    *err_name = pair[1];
+                    return -2;
+                }
+            }
+            if (!buft) {
+                enif_free(arena);
+                return -1;
+            }
+            memcpy(pat_cursor, pat.data, pat.size);
+            pat_cursor[pat.size] = '\0';
+            entries[k].pattern = pat_cursor;
+            entries[k].buft = buft;
+            pat_cursor += pat.size + 1;
+            k++;
+        }
+    }
+    if (moe_n != 0) {
+        ggml_backend_buffer_type_t cpu_buft = erllama_safe_cpu_buffer_type();
+        if (!cpu_buft) {
+            enif_free(arena);
+            return -1;
+        }
+        if (moe_n < 0) {
+            /* Single terminal entry: no further pattern writes, so
+             * pat_cursor is not advanced (clang-analyzer dead-store). */
+            const char *pat = erllama_safe_ffn_exps_regex();
+            memcpy(pat_cursor, pat, strlen(pat) + 1);
+            entries[k].pattern = pat_cursor;
+            entries[k].buft = cpu_buft;
+            k++;
+        } else {
+            char buf[ERLLAMA_BLOCK_REGEX_CAP];
+            for (long i = 0; i < moe_n; i++) {
+                (void) erllama_safe_ffn_exps_block_regex((int) i, buf,
+                                                         sizeof(buf));
+                size_t len = strlen(buf);
+                memcpy(pat_cursor, buf, len + 1);
+                entries[k].pattern = pat_cursor;
+                entries[k].buft = cpu_buft;
+                pat_cursor += len + 1;
+                k++;
+            }
+        }
+    }
+    entries[k].pattern = NULL;
+    entries[k].buft = NULL;
+
+    res->tbo = arena;
+    params->tensor_buft_overrides = entries;
+    return 1;
+}
+
 ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
     char path[4097];
@@ -320,7 +608,9 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     struct llama_model_params params = llama_model_default_params();
 
     int32_t i32;
-    if (get_map_int31(env, argv[1], "n_gpu_layers", &i32)) {
+    /* Signed read: any negative n_gpu_layers means "all layers"
+     * (llama.cpp core semantics; -1 is also the fit default). */
+    if (get_map_int32(env, argv[1], "n_gpu_layers", &i32)) {
         params.n_gpu_layers = i32;
     }
     if (get_map_int31(env, argv[1], "main_gpu", &i32)) {
@@ -337,7 +627,10 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         LOAD_MODE_TABLE, sizeof(LOAD_MODE_TABLE) / sizeof(LOAD_MODE_TABLE[0]),
         &lm_v
     );
-    if (lm_rc < 0) return enif_make_badarg(env);
+    if (lm_rc < 0) {
+        enif_release_resource(res);
+        return enif_make_badarg(env);
+    }
     if (lm_rc > 0) {
         params.load_mode = (enum llama_load_mode) lm_v;
     } else {
@@ -384,6 +677,147 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     if (ts_n > 0) {
         res->has_tensor_split = 1;
         params.tensor_split = res->tensor_split;
+    }
+
+    /* Explicit device selection: `devices => [Name] | none`. The
+     * handle array lives on this stack frame; llama copies it during
+     * the load. Unknown / CPU names surface as a typed error, not
+     * badarg: availability is runtime-dependent. */
+    ggml_backend_dev_t devs[ERLLAMA_MAX_DEVICES + 1];
+    {
+        ERL_NIF_TERM bad_name = atom_error;
+        int rc = parse_devices(env, argv[1], devs, &params, &bad_name);
+        if (rc == -1) {
+            enif_release_resource(res);
+            return enif_make_badarg(env);
+        }
+        if (rc == -2) {
+            enif_release_resource(res);
+            return erllama_error(
+                env,
+                enif_make_tuple2(
+                    env, enif_make_atom(env, "unknown_device"), bad_name));
+        }
+    }
+
+    /* MoE offload + generic per-tensor buffer overrides. */
+    {
+        ERL_NIF_TERM bad_name = atom_error;
+        int rc = build_tbo(env, argv[1], res, &params, &bad_name);
+        if (rc == -1) {
+            enif_release_resource(res);
+            return enif_make_badarg(env);
+        }
+        if (rc == -2) {
+            enif_release_resource(res);
+            return erllama_error(
+                env,
+                enif_make_tuple2(
+                    env, enif_make_atom(env, "unknown_device"), bad_name));
+        }
+        if (rc == -3) {
+            enif_release_resource(res);
+            return erllama_error(env, atom_oom);
+        }
+    }
+
+    /* Optional auto-fit pre-pass: measure the model against device
+     * memory and let common_fit_params pick n_gpu_layers /
+     * tensor_split / overrides (and n_ctx when auto). The Erlang
+     * validator guarantees fit excludes the manual placement keys,
+     * so res->tbo is still free for fit's writable override buffer.
+     * On non-success the params snapshot is restored (fit can leave
+     * them partially mutated) and the load proceeds with defaults;
+     * a broken file is classified by the real load below. */
+    int fit_requested = 0;
+    int fit_ok = 0;
+    uint32_t fit_n_ctx = 0;
+    {
+        ERL_NIF_TERM fitv;
+        if (enif_get_map_value(env, argv[1], enif_make_atom(env, "fit"),
+                               &fitv)) {
+            if (!enif_is_map(env, fitv) || res->tbo != NULL) {
+                enif_release_resource(res);
+                return enif_make_badarg(env);
+            }
+            fit_requested = 1;
+            /* Per-device byte margins, default 1 GiB (upstream);
+             * `margins_mib` is a non-empty list, the last entry
+             * broadcast to the remaining devices. */
+            size_t margins[ERLLAMA_MAX_DEVICES];
+            for (size_t i = 0; i < ERLLAMA_MAX_DEVICES; i++) {
+                margins[i] = (size_t) 1024 * 1024 * 1024;
+            }
+            ERL_NIF_TERM mv;
+            if (enif_get_map_value(env, fitv,
+                                   enif_make_atom(env, "margins_mib"),
+                                   &mv)) {
+                ERL_NIF_TERM head;
+                ERL_NIF_TERM tail = mv;
+                size_t i = 0;
+                size_t last = margins[0];
+                while (enif_get_list_cell(env, tail, &head, &tail)) {
+                    unsigned long mib;
+                    if (i >= ERLLAMA_MAX_DEVICES ||
+                        !enif_get_ulong(env, head, &mib)) {
+                        enif_release_resource(res);
+                        return enif_make_badarg(env);
+                    }
+                    last = (size_t) mib * 1024 * 1024;
+                    margins[i++] = last;
+                }
+                if (i == 0) {
+                    enif_release_resource(res);
+                    return enif_make_badarg(env);
+                }
+                for (; i < ERLLAMA_MAX_DEVICES; i++) {
+                    margins[i] = last;
+                }
+            }
+            unsigned int min_ctx = 4096;
+            (void) get_map_uint(env, fitv, "min_ctx", &min_ctx);
+            /* The fit context params approximate the real context
+             * the model layer will open: injected by the Erlang
+             * side as `fit_context` (n_ctx = planned size, or absent
+             * for n_ctx auto where fit chooses). */
+            struct llama_context_params fcp =
+                llama_context_default_params();
+            ERL_NIF_TERM fctx;
+            if (enif_get_map_value(env, argv[1],
+                                   enif_make_atom(env, "fit_context"),
+                                   &fctx) &&
+                enif_is_map(env, fctx)) {
+                if (!erllama_parse_cparams(env, fctx, &fcp)) {
+                    enif_release_resource(res);
+                    return enif_make_badarg(env);
+                }
+            }
+            int nca = 0;
+            if (get_map_bool(env, fitv, "n_ctx_auto", &nca) && nca) {
+                fcp.n_ctx = 0;
+            }
+            size_t entry_bytes =
+                (size_t) 4097 *
+                sizeof(struct llama_model_tensor_buft_override);
+            unsigned char *arena = enif_alloc(entry_bytes);
+            if (!arena) {
+                enif_release_resource(res);
+                return erllama_error(env, atom_oom);
+            }
+            memset(arena, 0, entry_bytes);
+            res->tbo = arena;
+            struct llama_model_params snapshot = params;
+            int frc = erllama_safe_fit_params(
+                path, &params, &fcp, res->tensor_split,
+                (struct llama_model_tensor_buft_override *) arena,
+                margins, (uint32_t) min_ctx);
+            if (frc == 0) {
+                fit_ok = 1;
+            } else {
+                params = snapshot;
+            }
+            fit_n_ctx = fcp.n_ctx;
+        }
     }
 
     /* Optional load-progress reporting: `progress_to` (local pid) +
@@ -449,7 +883,29 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     ERL_NIF_TERM term = enif_make_resource(env, res);
     enif_release_resource(res);
-    return enif_make_tuple2(env, atom_ok, term);
+    if (!fit_requested) {
+        return enif_make_tuple2(env, atom_ok, term);
+    }
+    /* Fit info: the effective values the load ran with (fitted on
+     * success, the caller's/defaults on failure). n_gpu_layers -1 =
+     * all layers. tensor_split is echoed only when fit assigned it. */
+    ERL_NIF_TERM info = enif_make_new_map(env);
+    erllama_map_put(env, &info, "fit",
+                    enif_make_atom(env, fit_ok ? "ok" : "failed"));
+    erllama_map_put(env, &info, "n_gpu_layers",
+                    enif_make_int(env, params.n_gpu_layers));
+    erllama_map_put(env, &info, "n_ctx", enif_make_uint(env, fit_n_ctx));
+    if (fit_ok && params.tensor_split == res->tensor_split) {
+        ERL_NIF_TERM list = enif_make_list(env, 0);
+        for (int i = (int) ERLLAMA_MAX_DEVICES - 1; i >= 0; i--) {
+            list = enif_make_list_cell(
+                env,
+                enif_make_double(env, (double) res->tensor_split[i]),
+                list);
+        }
+        erllama_map_put(env, &info, "tensor_split", list);
+    }
+    return enif_make_tuple3(env, atom_ok, term, info);
 }
 
 /* free_model/1 returns:

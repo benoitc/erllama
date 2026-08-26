@@ -240,6 +240,17 @@ extern ERL_NIF_TERM atom_decode_failed;
 extern ERL_NIF_TERM atom_decode_timeout;
 extern ERL_NIF_TERM atom_decode_aborted;
 
+/* Context-params parsing shared by nif_new_context and the fit
+ * pre-pass in nif_load_model (definition in erllama_nif_util.c).
+ * Returns 1 on success, 0 on a bad value (caller raises badarg). */
+int erllama_parse_cparams(ErlNifEnv *env, ERL_NIF_TERM map,
+                          struct llama_context_params *params);
+
+/* Signed variant of get_map_int31 (definition in
+ * erllama_nif_util.c). */
+int get_map_int32(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
+                  int32_t *out);
+
 /* Deferred-free protocol (definition in erllama_nif.c). */
 void context_drops_model(erllama_model_t *m);
 
@@ -309,6 +320,7 @@ ERL_NIF_TERM nif_model_n_layer(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 ERL_NIF_TERM nif_model_family(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_vocab_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_vram_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_list_devices(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 

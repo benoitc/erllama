@@ -56,6 +56,7 @@
     sampler_new/2,
     sampler_free/1,
     vram_info/0,
+    list_devices/0,
     model_size/1,
     model_n_layer/1,
     model_family/1,
@@ -139,8 +140,15 @@ Recognised keys in `Opts` (all optional; defaults come from
 A bad atom for `split_mode`, or a non-numeric entry in
 `tensor_split`, raises `badarg`.
 """.
--spec load_model(iodata(), map()) -> {ok, model_ref()} | {error, atom()}.
+-spec load_model(iodata(), map()) ->
+    {ok, model_ref()} | {ok, model_ref(), map()} | {error, term()}.
 load_model(Path, Opts) when is_map(Opts) -> nif_load_model(Path, Opts).
+
+%% All registered backend devices with names, memory, and caps. The
+%% `name` binaries are what `model_opts.devices` and the device side
+%% of `tensor_buft_overrides` accept.
+-spec list_devices() -> {ok, [map()]} | {error, atom()}.
+list_devices() -> nif_list_devices().
 
 -spec free_model(model_ref()) -> ok.
 free_model(Model) -> nif_free_model(Model).
@@ -612,6 +620,7 @@ chat_parse(Params, Input, IsPartial) when
 nif_crc32c(_Data) -> erlang:nif_error(nif_not_loaded).
 nif_fsync_dir(_Path) -> erlang:nif_error(nif_not_loaded).
 nif_load_model(_Path, _Opts) -> erlang:nif_error(nif_not_loaded).
+nif_list_devices() -> erlang:nif_error(nif_not_loaded).
 nif_free_model(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_new_context(_Model, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_free_context(_Ctx) -> erlang:nif_error(nif_not_loaded).

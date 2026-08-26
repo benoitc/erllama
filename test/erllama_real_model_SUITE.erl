@@ -66,6 +66,10 @@
     ngram_speculation_matches_plain/1,
     ngram_speculation_stop_sequence_trims_kv/1,
     spec_step_nif_greedy_paths/1,
+    devices_none_loads_cpu_only/1,
+    cpu_moe_is_noop_on_dense_model/1,
+    tensor_buft_overrides_load_and_generate/1,
+    fit_returns_info_and_generates/1,
     chunked_prefill_sizes_agree/1,
     continue_multi_turn_cache_delta/1,
     tokenize_large_input/1,
@@ -122,6 +126,10 @@ all() ->
         ngram_speculation_matches_plain,
         ngram_speculation_stop_sequence_trims_kv,
         spec_step_nif_greedy_paths,
+        devices_none_loads_cpu_only,
+        cpu_moe_is_noop_on_dense_model,
+        tensor_buft_overrides_load_and_generate,
+        fit_returns_info_and_generates,
         chunked_prefill_sizes_agree,
         continue_multi_turn_cache_delta,
         tokenize_large_input,
@@ -1198,3 +1206,66 @@ big_text(Sz) ->
 file_sha256(Path) ->
     {ok, Bin} = file:read_file(Path),
     crypto:hash(sha256, Bin).
+
+%% =============================================================================
+%% Devices / MoE offload / auto-fit
+%% =============================================================================
+
+%% Load a second model with case-specific model_opts (the fixture's
+%% default model stays untouched) and prove it generates.
+load_with_model_opts(Config, Id, MOpts) ->
+    Path = ?config(model_path, Config),
+    DiskSrv = ?config(disk_srv, Config),
+    Cfg0 = model_config(Path, DiskSrv),
+    Cfg = Cfg0#{model_opts => MOpts},
+    {ok, _} = erllama:load_model(Id, Cfg),
+    try
+        {ok, R} = erllama:complete(Id, ?SHORT_PROMPT, #{
+            response_tokens => 4, temperature => 0.0
+        }),
+        ?assertEqual(4, length(maps:get(generated, R))),
+        erllama:model_info(Id)
+    after
+        erllama:unload(Id)
+    end.
+
+devices_none_loads_cpu_only(Config) ->
+    {ok, _Info} = load_with_model_opts(
+        Config, <<"dev_none">>, #{devices => none}
+    ),
+    ok.
+
+%% The expert-tensor regexes match nothing on a dense model; the
+%% load and generation must be unaffected.
+cpu_moe_is_noop_on_dense_model(Config) ->
+    {ok, _} = load_with_model_opts(
+        Config, <<"dev_cpu_moe">>, #{n_gpu_layers => 0, cpu_moe => true}
+    ),
+    {ok, _} = load_with_model_opts(
+        Config, <<"dev_ncpu_moe">>, #{n_gpu_layers => 0, cpu_moe => 4}
+    ),
+    ok.
+
+tensor_buft_overrides_load_and_generate(Config) ->
+    {ok, _} = load_with_model_opts(
+        Config, <<"dev_tbo">>, #{
+            n_gpu_layers => 0,
+            tensor_buft_overrides => [{<<"\\.ffn_up\\.">>, cpu}]
+        }
+    ),
+    ok.
+
+%% Auto-fit: the load returns the effective values; on this suite's
+%% machines the small test model always fits (GPU boxes trivially,
+%% CPU-only boxes against host memory), but keep the assertion
+%% tolerant: fit may report `failed` and the load still succeeds
+%% with default params.
+fit_returns_info_and_generates(Config) ->
+    {ok, Info} = load_with_model_opts(
+        Config, <<"dev_fit">>, #{fit => true}
+    ),
+    Fit = maps:get(fit, Info),
+    ?assert(lists:member(maps:get(fit, Fit), [ok, failed])),
+    ?assert(is_integer(maps:get(n_gpu_layers, Fit))),
+    ?assert(is_integer(maps:get(n_ctx, Fit))),
+    ok.

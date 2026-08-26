@@ -9,24 +9,6 @@
 #include <math.h>
 #include <string.h>
 
-static const erllama_atom_enum_pair_t FLASH_ATTN_TABLE[] = {
-    /* booleans-as-atoms map to the matching enum tristate. `auto`
-     * lets llama.cpp pick based on the build / model. */
-    {"true",  LLAMA_FLASH_ATTN_TYPE_ENABLED},
-    {"false", LLAMA_FLASH_ATTN_TYPE_DISABLED},
-    {"auto",  LLAMA_FLASH_ATTN_TYPE_AUTO},
-};
-
-static const erllama_atom_enum_pair_t GGML_TYPE_TABLE[] = {
-    {"f16",  GGML_TYPE_F16},
-    {"f32",  GGML_TYPE_F32},
-    {"bf16", GGML_TYPE_BF16},
-    {"q4_0", GGML_TYPE_Q4_0},
-    {"q5_0", GGML_TYPE_Q5_0},
-    {"q5_1", GGML_TYPE_Q5_1},
-    {"q8_0", GGML_TYPE_Q8_0},
-};
-
 /* =========================================================================
  * Context
  * ========================================================================= */
@@ -119,59 +101,9 @@ ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     if (get_map_uint(env, argv[1], "decode_budget_ms", &u)) {
         decode_budget_ns = (uint64_t) u * 1000000ULL;
     }
-    if (get_map_uint(env, argv[1], "n_ctx", &u)) params.n_ctx = (uint32_t) u;
-    if (get_map_uint(env, argv[1], "n_batch", &u)) params.n_batch = (uint32_t) u;
-    if (get_map_uint(env, argv[1], "n_ubatch", &u)) params.n_ubatch = (uint32_t) u;
-    if (get_map_uint(env, argv[1], "n_seq_max", &u)) {
-        if (u > ERLLAMA_N_SEQ_MAX_CAP) {
-            return enif_make_badarg(env);
-        }
-        params.n_seq_max = (uint32_t) u;
+    if (!erllama_parse_cparams(env, argv[1], &params)) {
+        return enif_make_badarg(env);
     }
-    /* Recurrent-state rollback snapshots per seq (recurrent / hybrid
-     * archs only; 0 = no rollback). With >= 1, RS-capable archs accept
-     * the 1-token partial seq_rm the warm-restore primer issues. */
-    if (get_map_uint(env, argv[1], "n_rs_seq", &u)) {
-        params.n_rs_seq = (uint32_t) u;
-    }
-    int32_t i32;
-    if (get_map_int31(env, argv[1], "n_threads", &i32)) params.n_threads = i32;
-    if (get_map_int31(env, argv[1], "n_threads_batch", &i32)) {
-        params.n_threads_batch = i32;
-    }
-    int b;
-    if (get_map_bool(env, argv[1], "embeddings", &b)) params.embeddings = b ? true : false;
-    if (get_map_bool(env, argv[1], "offload_kqv", &b)) params.offload_kqv = b ? true : false;
-    /* Unified KV cache: a single sequence may use the full n_ctx and up to
-     * n_seq_max sequences share that buffer, instead of splitting n_ctx
-     * into n_ctx/n_seq_max per sequence (the default). Lets concurrency
-     * (n_seq_max > 1) coexist with large per-request context. */
-    if (get_map_bool(env, argv[1], "kv_unified", &b)) params.kv_unified = b ? true : false;
-
-    int enum_v;
-    int fa_rc = get_map_atom_enum(
-        env, argv[1], "flash_attn",
-        FLASH_ATTN_TABLE, sizeof(FLASH_ATTN_TABLE) / sizeof(FLASH_ATTN_TABLE[0]),
-        &enum_v
-    );
-    if (fa_rc < 0) return enif_make_badarg(env);
-    if (fa_rc > 0) params.flash_attn_type = (enum llama_flash_attn_type) enum_v;
-
-    int tk_rc = get_map_atom_enum(
-        env, argv[1], "type_k",
-        GGML_TYPE_TABLE, sizeof(GGML_TYPE_TABLE) / sizeof(GGML_TYPE_TABLE[0]),
-        &enum_v
-    );
-    if (tk_rc < 0) return enif_make_badarg(env);
-    if (tk_rc > 0) params.type_k = (enum ggml_type) enum_v;
-
-    int tv_rc = get_map_atom_enum(
-        env, argv[1], "type_v",
-        GGML_TYPE_TABLE, sizeof(GGML_TYPE_TABLE) / sizeof(GGML_TYPE_TABLE[0]),
-        &enum_v
-    );
-    if (tv_rc < 0) return enif_make_badarg(env);
-    if (tv_rc > 0) params.type_v = (enum ggml_type) enum_v;
 
     /* The release_pending refusal: if free_model/1 has been called
      * and is waiting for the last context to drop, do not let a new

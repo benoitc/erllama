@@ -604,3 +604,53 @@ spec_seq_bounds_test() ->
     ?assertError(badarg, erllama_nif:spec_begin(Spec, 1, [1, 2, 3])),
     ?assertError(badarg, erllama_nif:spec_draft(Spec, 1, 5, [])),
     ok = erllama_nif:spec_free(Spec).
+
+%% =============================================================================
+%% Device probe + device-selection errors
+%% =============================================================================
+
+%% Every machine has at least the CPU device; assert the full map
+%% shape on whatever is registered.
+list_devices_shape_test() ->
+    {ok, Devs} = erllama_nif:list_devices(),
+    ?assert(length(Devs) >= 1),
+    Types = [maps:get(type, D) || D <- Devs],
+    ?assert(lists:member(cpu, Types)),
+    lists:foreach(
+        fun(D) ->
+            ?assert(is_integer(maps:get(index, D))),
+            ?assert(is_binary(maps:get(name, D))),
+            ?assert(is_binary(maps:get(description, D))),
+            ?assert(
+                lists:member(maps:get(type, D), [cpu, gpu, igpu, accel, meta])
+            ),
+            ?assert(is_integer(maps:get(free_b, D))),
+            ?assert(is_integer(maps:get(total_b, D))),
+            Id = maps:get(device_id, D),
+            ?assert(Id =:= undefined orelse is_binary(Id)),
+            Caps = maps:get(caps, D),
+            ?assert(is_boolean(maps:get(mmap_support, Caps))),
+            ?assert(is_boolean(maps:get(host_buffer, Caps)))
+        end,
+        Devs
+    ).
+
+%% Device resolution runs before the file is opened, so a bogus
+%% path still exercises the typed unknown-device error.
+load_model_unknown_device_test() ->
+    ?assertEqual(
+        {error, {unknown_device, <<"NOPE9">>}},
+        erllama_nif:load_model(<<"/nonexistent.gguf">>, #{
+            devices => [<<"NOPE9">>]
+        })
+    ).
+
+%% The CPU device is rejected in `devices` (mirroring upstream
+%% --device); use `none` for zero offload instead.
+load_model_cpu_device_rejected_test() ->
+    ?assertEqual(
+        {error, {unknown_device, <<"CPU">>}},
+        erllama_nif:load_model(<<"/nonexistent.gguf">>, #{
+            devices => [<<"CPU">>]
+        })
+    ).

@@ -161,6 +161,10 @@ static void model_dtor(ErlNifEnv *env, void *obj) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
     }
+    if (m->tbo) {
+        enif_free(m->tbo);
+        m->tbo = NULL;
+    }
     if (m->mu_inited) {
         pthread_mutex_destroy(&m->mu);
         m->mu_inited = 0;
@@ -442,6 +446,7 @@ static ERL_NIF_TERM nif_clear_log_receiver(ErlNifEnv *env, int argc,
 static ErlNifFunc nif_funcs[] = {
     {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_vram_info",    0, nif_vram_info,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_list_devices", 0, nif_list_devices, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_size",   1, nif_model_size,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_n_layer",1, nif_model_n_layer,ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_family", 1, nif_model_family, ERL_NIF_DIRTY_JOB_CPU_BOUND},

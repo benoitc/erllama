@@ -443,6 +443,11 @@
     %% n_params, recurrent, hybrid, ...). Empty for backends that
     %% do not report it (stub).
     family = #{} :: map(),
+    %% Auto-fit result reported by the backend at load
+    %% (#{fit => ok | failed, n_gpu_layers, n_ctx, ...});
+    %% `undefined` when the fit option was off. Surfaced in
+    %% model_info/1 under `fit`.
+    fit_info = undefined :: map() | undefined,
     %% Optional chat template source overriding the one in the GGUF
     %% (load config `chat_template'); `undefined' uses the model's own.
     chat_template = undefined :: binary() | undefined,
@@ -1025,6 +1030,7 @@ build_init_data(ModelId, Config, Backend, BState) ->
         loaded_at_monotonic = erlang:monotonic_time(nanosecond),
         vram_estimate_b = compute_vram_estimate(Meta),
         family = maps:get(family, Meta, #{}),
+        fit_info = maps:get(fit, Meta, undefined),
         req_table = #{},
         idle_seq_ids = lists:seq(0, NSeqMax - 1),
         n_seq_max = NSeqMax,
@@ -1044,11 +1050,14 @@ backend_extra_metadata(Backend, BState) ->
 compute_vram_estimate(Meta) ->
     Size = maps:get(model_size_bytes, Meta, 0),
     Total = maps:get(total_layers, Meta, 0),
-    NGpu = maps:get(n_gpu_layers, Meta, 0),
+    NGpu = maps:get(n_gpu_layers, Meta, -1),
     case {Size, Total, NGpu} of
         {0, _, _} -> 0;
         {_, 0, _} -> 0;
-        {_, _, NG} when NG =< 0 -> Size;
+        %% Negative = llama's "all layers" default; an explicit 0
+        %% offloads nothing.
+        {_, _, NG} when NG < 0 -> Size;
+        {_, _, 0} -> 0;
         {_, T, NG} when NG >= T -> Size;
         {S, T, NG} -> (S * NG) div T
     end.
@@ -2400,10 +2409,15 @@ build_model_info(State, Data) ->
     %% Family keys (arch, n_ctx_train, n_params, n_embd, n_layer,
     %% n_swa, recurrent, hybrid) are present only when the backend
     %% reported them (the llama backend does; the stub does not).
-    Family = maps:with(
+    Family0 = maps:with(
         [arch, n_ctx_train, n_params, n_embd, n_layer, n_swa, recurrent, hybrid],
         Data#data.family
     ),
+    Family =
+        case Data#data.fit_info of
+            undefined -> Family0;
+            FitInfo -> Family0#{fit => FitInfo}
+        end,
     Family#{
         id => Data#data.model_id,
         model_id => Data#data.model_id,

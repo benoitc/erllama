@@ -95,6 +95,62 @@ matter day-to-day:
 | `use_mmap` | true | Sugar for `load_mode`: with `use_mlock` they map onto `mmap`, `mlock`, `mmap_mlock` or `none`. Ignored when `load_mode` is set. |
 | `use_mlock` | false | `mlock(2)` the model pages so they are never paged out; see `use_mmap`. |
 | `vocab_only` | false | Open the file but skip weight loading. Tokenizer-only mode. |
+| `devices` | all | Explicit offload devices: a list of device-name binaries from `erllama:list_devices/0` (`[<<"MTL0">>]`, `[<<"CUDA0">>, <<"CUDA1">>]`), or `none` for zero offload. Unknown names return `{error, {unknown_device, Name}}`; the CPU device is rejected (use `none`). |
+| `cpu_moe` | off | MoE expert tensors to CPU: `true` keeps all expert FFN tensors in host memory (frees most of the VRAM a MoE model needs), `N` moves only the first N blocks. No-op on dense models. |
+| `tensor_buft_overrides` | [] | `[{RegexBin, cpu \| DeviceNameBin}]`: place tensors whose names match the regex on the CPU buffer or a named device's buffer. First match wins; up to 4096 entries. `cpu_moe` is sugar over this. |
+| `fit` | off | Auto-fit: `true` or `#{margin_mib => M \| [M0, M1, ...], n_ctx => auto, min_ctx => N}`. See below. |
+
+### Devices, MoE offload and auto-fit
+
+Discover what the machine has before choosing:
+
+```erlang
+{ok, Devs} = erllama:list_devices(),
+[#{name := <<"MTL0">>, type := gpu, free_b := Free} | _] =
+    [D || D <- Devs, maps:get(type, D) =/= cpu].
+```
+
+Each entry carries `name`, `description`, `type`
+(`cpu | gpu | igpu | accel | meta`), `free_b` / `total_b`,
+`device_id` (PCI id, `undefined` when the backend reports none) and
+a `caps` map. The `name` binaries are what `devices` and
+`tensor_buft_overrides` accept.
+
+Pin a model to specific devices, or run a MoE model with its expert
+tensors in host memory:
+
+```erlang
+{ok, M} = erllama:load_model(<<"big-moe">>, #{
+    model_path => Path,
+    model_opts => #{devices => [<<"CUDA0">>], cpu_moe => true}
+}).
+```
+
+`fit => true` measures the model against the free memory on each
+device (leaving a 1 GiB margin by default, `margin_mib` to change
+it) and picks `n_gpu_layers`, the multi-GPU `tensor_split`, and
+partial-layer overrides automatically. It only touches parameters
+you left at their defaults, so it is rejected up front when combined
+with `n_gpu_layers`, `tensor_split`, `cpu_moe`,
+`tensor_buft_overrides`, `vocab_only`, or `split_mode` `tensor` /
+`row`. With `n_ctx => auto` the fit also chooses the context size
+(never below `min_ctx`, default 4096) instead of measuring against
+`context_opts.n_ctx`. The chosen values are reported on
+`erllama:model_info/1` under `fit`:
+
+```erlang
+{ok, M2} = erllama:load_model(<<"fitted">>, #{
+    model_path => Path,
+    model_opts => #{fit => #{margin_mib => 2048}}
+}),
+#{fit := #{fit := ok, n_gpu_layers := NGL}} = erllama:model_info(M2).
+```
+
+A fit that finds no fitting allocation reports `fit => failed` and
+the load proceeds with llama.cpp's defaults (upstream behavior).
+Note `cpu_moe` and manual overrides make `vram_estimate_b`
+(`model_info/1`) overstate: the estimate is layer-based and does not
+subtract tensors moved to host memory.
 
 ### `context_opts`
 

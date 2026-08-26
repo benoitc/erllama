@@ -41,6 +41,14 @@ typedef struct {
     int release_pending;
     float tensor_split[ERLLAMA_MAX_DEVICES];
     int has_tensor_split;
+    /* Owned arena for llama_model_params.tensor_buft_overrides:
+     * (n+1) override entries followed by the pattern-string bytes
+     * (entries' pattern pointers point into the arena). llama keeps
+     * the pointer in the model's retained params, so the arena lives
+     * for the model lifetime; freed with one enif_free in
+     * model_dtor. NULL when no overrides were requested. Kept as
+     * void* so this header stays free of llama.h (see above). */
+    void *tbo;
 } erllama_model_t;
 
 extern ErlNifResourceType *MODEL_RT;

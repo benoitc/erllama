@@ -151,12 +151,21 @@ Counters today are bare atomics. A telemetry-style event surface
 operators wire Prometheus, OTel, statsd without forking the metrics
 module.
 
+### RPC / remote devices
+
+Not available: the ggml RPC backend is pruned from the vendored
+llama.cpp tree (scripts/vendor_llama.sh) and GGML_RPC is forced OFF
+in c_src/CMakeLists.txt. Re-vendoring it would enable
+`--rpc`-style remote devices; distribution work is planned at the
+Erlang level instead (see erllama_cluster).
+
 ### Memory-pressure NVIDIA-multi-GPU
 
 `erllama_pressure_nvidia_smi` reads `nvidia-smi` once and sums; a
 real multi-GPU deployment wants per-GPU pressure with per-context
 eviction. The single-source pressure model in 0.1 collapses to "all
-GPUs together".
+GPUs together". `erllama:list_devices/0` now provides the per-device
+free/total probe to build it on.
 
 ### TurboQuant / KV state compression
 
