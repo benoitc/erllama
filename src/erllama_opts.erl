@@ -41,7 +41,18 @@
 ]).
 
 -define(MODEL_OPT_KEYS, [
-    n_gpu_layers, main_gpu, use_mmap, use_mlock, load_mode, vocab_only, split_mode, tensor_split
+    n_gpu_layers,
+    main_gpu,
+    use_mmap,
+    use_mlock,
+    load_mode,
+    vocab_only,
+    split_mode,
+    tensor_split,
+    devices,
+    cpu_moe,
+    tensor_buft_overrides,
+    fit
 ]).
 
 -define(CONTEXT_OPT_KEYS, [
@@ -160,10 +171,48 @@ load_config(Config) when is_map(Config) ->
         fun(C) -> sub_keys(C, context_opts, ?CONTEXT_OPT_KEYS) end,
         fun(C) -> sub_keys(C, policy, ?POLICY_KEYS) end,
         fun check_load_types/1,
+        fun check_fit_exclusive/1,
         fun check_tier/1
     ]);
 load_config(Other) ->
     {error, {invalid_config, config, Other}}.
+
+%% The auto-fit only touches parameters still at their llama
+%% defaults, so combining it with manual placement would fail only
+%% when memory is tight. Reject the combinations loudly instead.
+%% split_mode row is also rejected under fit (upstream only refuses
+%% multi-device row; the blanket rule is simpler and documented).
+check_fit_exclusive(#{model_opts := MOpts} = C) when is_map(MOpts) ->
+    case maps:is_key(fit, MOpts) of
+        false ->
+            check_devices_none_split(C, MOpts);
+        true ->
+            Conflicts = [n_gpu_layers, tensor_split, cpu_moe, tensor_buft_overrides, vocab_only],
+            case [K || K <- Conflicts, maps:is_key(K, MOpts)] of
+                [] ->
+                    case lists:member(maps:get(split_mode, MOpts, layer), [tensor, row]) of
+                        true ->
+                            {error, {invalid_config, fit, {incompatible, split_mode}}};
+                        false ->
+                            check_devices_none_split(C, MOpts)
+                    end;
+                [K | _] ->
+                    {error, {invalid_config, fit, {incompatible, K}}}
+            end
+    end;
+check_fit_exclusive(C) ->
+    {ok, C}.
+
+%% `devices => none` + `split_mode => tensor` fails inside llama
+%% (the tensor meta device needs at least one device); reject early.
+check_devices_none_split(C, MOpts) ->
+    case
+        maps:get(devices, MOpts, undefined) =:= none andalso
+            maps:get(split_mode, MOpts, layer) =:= tensor
+    of
+        true -> {error, {invalid_config, devices, {incompatible, split_mode}}};
+        false -> {ok, C}
+    end.
 
 check_backend(#{backend := B} = C) when is_atom(B) ->
     case code:ensure_loaded(B) of
@@ -244,8 +293,69 @@ model_opt_checks() ->
         {load_mode, fun(V) -> lists:member(V, [auto, none, mmap, mlock, mmap_mlock, direct_io]) end},
         {vocab_only, fun is_boolean/1},
         {split_mode, fun(V) -> lists:member(V, [none, layer, row, tensor]) end},
-        {tensor_split, fun(V) -> is_list(V) andalso lists:all(fun is_number/1, V) end}
+        {tensor_split, fun(V) -> is_list(V) andalso lists:all(fun is_number/1, V) end},
+        {devices, fun devices_opt/1},
+        {cpu_moe, fun cpu_moe_opt/1},
+        {tensor_buft_overrides, fun tbo_opt/1},
+        {fit, fun fit_opt/1}
     ].
+
+%% `cpu_moe => true | N`: all expert tensors to CPU, or the first N
+%% blocks.
+cpu_moe_opt(true) -> true;
+cpu_moe_opt(V) -> pos_int(V).
+
+%% `devices => [NameBin] | none`. Names come from
+%% erllama:list_devices/0; availability is checked at load.
+devices_opt(none) ->
+    true;
+devices_opt(V) when is_list(V), V =/= [] ->
+    length(V) =< 16 andalso
+        lists:all(fun(D) -> is_binary(D) andalso D =/= <<>> end, V);
+devices_opt(_) ->
+    false.
+
+%% `tensor_buft_overrides => [{PatternBin, cpu | DeviceNameBin}]`.
+tbo_opt(V) when is_list(V) ->
+    length(V) =< 4096 andalso
+        lists:all(
+            fun
+                ({P, cpu}) ->
+                    is_binary(P) andalso P =/= <<>>;
+                ({P, D}) ->
+                    is_binary(P) andalso P =/= <<>> andalso
+                        is_binary(D) andalso D =/= <<>>;
+                (_) ->
+                    false
+            end,
+            V
+        );
+tbo_opt(_) ->
+    false.
+
+%% `fit => true | #{margin_mib => pos_int | [pos_int], n_ctx => auto,
+%% min_ctx => pos_int}`. min_ctx only means anything with
+%% `n_ctx => auto` (the auto branch is where fit may reduce the
+%% context, bounded below by min_ctx).
+fit_opt(true) ->
+    true;
+fit_opt(V) when is_map(V) ->
+    Known = [margin_mib, n_ctx, min_ctx],
+    KeysOk = lists:all(fun(K) -> lists:member(K, Known) end, maps:keys(V)),
+    KeysOk andalso
+        margin_ok(maps:get(margin_mib, V, 1)) andalso
+        maps:get(n_ctx, V, auto) =:= auto andalso
+        pos_int(maps:get(min_ctx, V, 1)) andalso
+        (not maps:is_key(min_ctx, V) orelse maps:is_key(n_ctx, V));
+fit_opt(_) ->
+    false.
+
+margin_ok(N) when is_integer(N) ->
+    N > 0;
+margin_ok(L) when is_list(L), L =/= [] ->
+    length(L) =< 16 andalso lists:all(fun pos_int/1, L);
+margin_ok(_) ->
+    false.
 
 context_opt_checks() ->
     [

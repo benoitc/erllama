@@ -81,7 +81,12 @@ Ask the cache what a prompt would hit before running it:
 ```
 
 `vram_info/0` sums GPU memory across devices (`{error, no_gpu}` on
-CPU-only builds). `pressure/0` samples the source the background
+CPU-only builds). For the per-device breakdown use
+`erllama:list_devices/0`: every registered backend device with its
+name, type, free/total bytes, and capability flags (the same names
+the `devices` load option accepts; see
+[loading](loading.md#devices-moe-offload-and-auto-fit)).
+`pressure/0` samples the source the background
 evictor uses; `erllama:pressure_sources/0` lists what is available
 on this host. The scheduler evicts cache tiers under pressure
 automatically; see [configuration](configuration.md).

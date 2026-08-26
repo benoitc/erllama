@@ -135,6 +135,70 @@ extern uint32_t erllama_safe_n_batch(const struct llama_context *c) ERLLAMA_SAFE
 extern size_t erllama_safe_backend_dev_count(void) ERLLAMA_SAFE_NOEXCEPT;
 extern int erllama_safe_backend_dev_info(size_t idx, size_t *free_b,
                                          size_t *total_b, int *dev_type) ERLLAMA_SAFE_NOEXCEPT;
+
+/* Full ggml_backend_dev_get_props snapshot for one device, with the
+ * string fields copied into fixed buffers (props strings are
+ * backend-static but copying keeps the ABI simple). Metal reports no
+ * device_id; has_device_id is 0 then. */
+typedef struct {
+    char name[128];
+    char description[256];
+    char device_id[64];
+    int has_device_id;
+    uint64_t free_b;
+    uint64_t total_b;
+    int dev_type; /* enum ggml_backend_dev_type */
+    int caps_async;
+    int caps_host_buffer;
+    int caps_buffer_from_host_ptr;
+    int caps_events;
+    int caps_mmap;
+} erllama_dev_props_t;
+
+extern int erllama_safe_backend_dev_props(size_t idx,
+                                          erllama_dev_props_t *out) ERLLAMA_SAFE_NOEXCEPT;
+
+/* Resolve `n` device names (case-insensitive) into a NULL-terminated
+ * array of n+1 handles for llama_model_params.devices. Returns 0 on
+ * success, -1 unknown name, -2 the CPU device (rejected, mirroring
+ * upstream --device); *bad_idx names the offending entry. */
+extern int erllama_safe_resolve_devices(const char *const *names, size_t n,
+                                        ggml_backend_dev_t *out,
+                                        size_t *bad_idx) ERLLAMA_SAFE_NOEXCEPT;
+
+/* Buffer types for tensor_buft_overrides: the CPU buffer type, and
+ * the default buffer type of a device looked up by name (NULL when
+ * the name is unknown). */
+extern ggml_backend_buffer_type_t erllama_safe_cpu_buffer_type(void) ERLLAMA_SAFE_NOEXCEPT;
+extern ggml_backend_buffer_type_t erllama_safe_dev_default_buft_by_name(
+    const char *name) ERLLAMA_SAFE_NOEXCEPT;
+
+/* MoE expert-tensor regexes, sourced from common.h's inline helpers
+ * so vendor bumps keep the patterns in sync with upstream --cpu-moe.
+ * The _block variant writes "blk\.<idx><EXPS_REGEX>" into buf;
+ * returns 0 on success, -1 when buf is too small. */
+extern const char *erllama_safe_ffn_exps_regex(void) ERLLAMA_SAFE_NOEXCEPT;
+extern int erllama_safe_ffn_exps_block_regex(int idx, char *buf,
+                                             size_t cap) ERLLAMA_SAFE_NOEXCEPT;
+
+/* common_fit_params: fit n_gpu_layers / tensor_split /
+ * tensor_buft_overrides (and n_ctx when it came in as 0) to measured
+ * memory. ts_buf must hold llama_max_devices() floats, tbo_buf
+ * llama_max_tensor_buft_overrides()+1 entries, margins
+ * llama_max_devices() per-device byte margins. Serialized behind an
+ * internal mutex (fit swaps the process-global llama logger; while a
+ * fit runs, log lines below its level are demoted for every thread -
+ * benign, the thread-local malformed-GGUF capture is unaffected).
+ * Returns 0 success, 1 no fitting allocation found, 2 hard error,
+ * -1 stray exception. On non-zero the params may be partially
+ * mutated; callers snapshot/restore. */
+extern int erllama_safe_fit_params(const char *path,
+                                   struct llama_model_params *mp,
+                                   struct llama_context_params *cp,
+                                   float *ts_buf,
+                                   struct llama_model_tensor_buft_override *tbo_buf,
+                                   const size_t *margins,
+                                   uint32_t n_ctx_min) ERLLAMA_SAFE_NOEXCEPT;
 extern int erllama_safe_vocab_is_eog(const struct llama_vocab *v,
                                      llama_token tok) ERLLAMA_SAFE_NOEXCEPT;
 extern llama_token erllama_safe_vocab_bos(const struct llama_vocab *v) ERLLAMA_SAFE_NOEXCEPT;

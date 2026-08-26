@@ -69,6 +69,7 @@ handle for every other call; a pid works too. The cache subsystem is
     list_adapters/1,
     counters/0,
     vram_info/0,
+    list_devices/0,
     pressure/0,
     pressure_sources/0,
     requests/0,
@@ -423,7 +424,13 @@ Config map for `load_model/1,2`.
 - `model_id`: explicit id (`load_model/1` only).
 - `model_opts`: `n_gpu_layers`, `main_gpu`, `load_mode` (`auto | none |
   mmap | mlock | mmap_mlock | direct_io`; `use_mmap` / `use_mlock`
-  booleans map onto it), `vocab_only`, `split_mode`, `tensor_split`.
+  booleans map onto it), `vocab_only`, `split_mode`, `tensor_split`,
+  `devices` (`[NameBin] | none`, names from `list_devices/0`),
+  `cpu_moe` (`true | N`, MoE expert tensors to CPU),
+  `tensor_buft_overrides` (`[{RegexBin, cpu | DeviceNameBin}]`), and
+  `fit` (`true | #{margin_mib, n_ctx => auto, min_ctx}`, auto-fit of
+  GPU layers to measured memory; incompatible with the manual
+  placement keys).
 - `context_opts`: `n_ctx`, `n_batch`, `n_ubatch`, `n_seq_max`,
   `n_threads`, `n_threads_batch`, `embeddings`, `offload_kqv`,
   `kv_unified`, `flash_attn`, `type_k`, `type_v`, `decode_budget_ms`.
@@ -1295,6 +1302,16 @@ probe in that case.
     | {error, no_gpu | error_reason()}.
 vram_info() ->
     erllama_nif:vram_info().
+
+-doc """
+Every registered backend compute device with its name, description,
+type, free/total memory, PCI id (when the backend reports one), and
+capability flags. The `name` binaries ("MTL0", "CUDA0", ...) are
+what the `devices` and `tensor_buft_overrides` model options accept.
+""".
+-spec list_devices() -> {ok, [map()]} | {error, error_reason()}.
+list_devices() ->
+    erllama_nif:list_devices().
 
 -doc """
 Host or accelerator memory pressure from the scheduler's configured

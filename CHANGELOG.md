@@ -21,6 +21,15 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Device selection, MoE offload, and auto-fit at model load:
+  `model_opts` gains `devices` (`[NameBin] | none`), `cpu_moe`
+  (`true | N`, expert tensors to CPU), `tensor_buft_overrides`
+  (`[{RegexBin, cpu | DeviceNameBin}]`), and `fit` (`true | map()`,
+  llama.cpp `common_fit_params` picking n_gpu_layers / tensor_split
+  / overrides from measured memory; result on `model_info/1` under
+  `fit`). New `erllama:list_devices/0` device probe. Negative
+  `n_gpu_layers` is now honoured (all layers); an explicit 0 no
+  longer counts as full VRAM in `vram_estimate_b`.
 - `speculative` request option: draft-model-free ngram speculation
   (llama.cpp `common_speculative` NGRAM_MOD) on `stream/3`,
   `complete/3` and `continue/3`. Output is byte-identical to

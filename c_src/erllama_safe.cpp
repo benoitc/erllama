@@ -16,6 +16,11 @@
 
 #include "llama.h"
 
+#include "erllama_safe.h"
+
+#include "common.h"
+#include "fit.h"
+
 #include <erl_nif.h>
 
 #include <algorithm>
@@ -35,18 +40,9 @@
 #  endif
 #endif
 
-// Sentinel returned by erllama_safe_decode on a thrown exception.
-// Mirrors the macro in erllama_nif.c; both sides must agree.
-#define ERLLAMA_DECODE_EXC_SENTINEL INT_MIN
-
-// Model-load classification. Mirrored in erllama_nif.c; both
-// sides must agree on the integer values.
-typedef enum {
-    ERLLAMA_LOAD_OK        = 0,
-    ERLLAMA_LOAD_FAILED    = 1,  // generic NULL return
-    ERLLAMA_LOAD_MALFORMED = 2,  // captured ASSERT-style log line
-    ERLLAMA_LOAD_EXCEPTION = 3,  // C++ exception caught
-} erllama_load_status_t;
+// The decode sentinel and load-status enum come from
+// erllama_safe.h (included above), so the ABI contract has a single
+// authoritative definition.
 
 // Best-effort capture of the most recent llama log line on the
 // calling thread. The _v2 model load wrapper clears the buffer
@@ -716,6 +712,158 @@ int erllama_safe_backend_dev_info(size_t idx, size_t *free_b,
     } catch (...) {
         return -1;
     }
+}
+
+// Copy a possibly-NULL C string into a fixed buffer, always
+// NUL-terminated.
+static void copy_prop_str(char *dst, size_t cap, const char *src) {
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t len = strlen(src);
+    if (len >= cap) len = cap - 1;
+    std::copy(src, src + len, dst);
+    dst[len] = '\0';
+}
+
+// Full property snapshot for the device at `idx` (list_devices).
+// Returns 0 on success, -1 on exception or invalid index; *out is
+// zeroed first either way.
+int erllama_safe_backend_dev_props(size_t idx,
+                                   erllama_dev_props_t *out) noexcept {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    try {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(idx);
+        if (!dev) return -1;
+        struct ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        copy_prop_str(out->name, sizeof(out->name), props.name);
+        copy_prop_str(out->description, sizeof(out->description),
+                      props.description);
+        // Metal (among others) reports no device_id.
+        out->has_device_id = props.device_id != NULL;
+        copy_prop_str(out->device_id, sizeof(out->device_id),
+                      props.device_id);
+        out->free_b = (uint64_t) props.memory_free;
+        out->total_b = (uint64_t) props.memory_total;
+        out->dev_type = (int) props.type;
+        out->caps_async = props.caps.async ? 1 : 0;
+        out->caps_host_buffer = props.caps.host_buffer ? 1 : 0;
+        out->caps_buffer_from_host_ptr =
+            props.caps.buffer_from_host_ptr ? 1 : 0;
+        out->caps_events = props.caps.events ? 1 : 0;
+        out->caps_mmap = props.caps.mmap_support ? 1 : 0;
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// Resolve device names into a NULL-terminated handle array for
+// llama_model_params.devices. Mirrors upstream --device: name
+// lookup is case-insensitive, unknown names and the CPU device are
+// rejected. llama copies the array during load, so the caller's
+// stack array is sufficient.
+int erllama_safe_resolve_devices(const char *const *names, size_t n,
+                                 ggml_backend_dev_t *out,
+                                 size_t *bad_idx) noexcept {
+    try {
+        for (size_t i = 0; i < n; i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(names[i]);
+            if (!dev) {
+                if (bad_idx) *bad_idx = i;
+                return -1;
+            }
+            if (ggml_backend_dev_type(dev) ==
+                GGML_BACKEND_DEVICE_TYPE_CPU) {
+                if (bad_idx) *bad_idx = i;
+                return -2;
+            }
+            out[i] = dev;
+        }
+        out[n] = NULL;
+        return 0;
+    } catch (...) {
+        if (bad_idx) *bad_idx = 0;
+        return -1;
+    }
+}
+
+ggml_backend_buffer_type_t erllama_safe_cpu_buffer_type(void) noexcept {
+    try {
+        return ggml_backend_cpu_buffer_type();
+    } catch (...) {
+        return NULL;
+    }
+}
+
+// Default buffer type of the device named `name` (for
+// tensor_buft_overrides targeting a device). NULL when the name is
+// unknown.
+ggml_backend_buffer_type_t
+erllama_safe_dev_default_buft_by_name(const char *name) noexcept {
+    try {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(name);
+        if (!dev) return NULL;
+        return ggml_backend_dev_buffer_type(dev);
+    } catch (...) {
+        return NULL;
+    }
+}
+
+// The MoE expert-tensor regexes come straight from common.h so a
+// vendored llama.cpp bump keeps them in sync with --cpu-moe.
+const char *erllama_safe_ffn_exps_regex(void) noexcept {
+    return LLM_FFN_EXPS_REGEX;
+}
+
+int erllama_safe_ffn_exps_block_regex(int idx, char *buf,
+                                      size_t cap) noexcept {
+    try {
+        std::string pat = llm_ffn_exps_block_regex(idx);
+        if (pat.size() + 1 > cap) return -1;
+        std::copy(pat.begin(), pat.end(), buf);
+        buf[pat.size()] = '\0';
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// common_fit_params is not thread-safe (it swaps the process-global
+// llama logger for its own filtered one and restores it on exit);
+// serialize all fits behind one mutex. While a fit runs, log lines
+// below its level are demoted process-wide - benign: the
+// thread-local last-log capture used for malformed-GGUF
+// classification records lines regardless of level.
+static pthread_mutex_t g_fit_mu = PTHREAD_MUTEX_INITIALIZER;
+
+int erllama_safe_fit_params(const char *path,
+                            struct llama_model_params *mp,
+                            struct llama_context_params *cp,
+                            float *ts_buf,
+                            struct llama_model_tensor_buft_override *tbo_buf,
+                            const size_t *margins,
+                            uint32_t n_ctx_min) noexcept {
+    pthread_mutex_lock(&g_fit_mu);
+    int rc;
+    try {
+        common_params_fit_status st = common_fit_params(
+            path, mp, cp, ts_buf, tbo_buf,
+            const_cast<size_t *>(margins), n_ctx_min,
+            /* extra = */ nullptr, GGML_LOG_LEVEL_INFO);
+        switch (st) {
+            case COMMON_PARAMS_FIT_STATUS_SUCCESS: rc = 0; break;
+            case COMMON_PARAMS_FIT_STATUS_FAILURE: rc = 1; break;
+            default: rc = 2; break;
+        }
+    } catch (...) {
+        rc = -1;
+    }
+    pthread_mutex_unlock(&g_fit_mu);
+    return rc;
 }
 
 int erllama_safe_vocab_is_eog(const struct llama_vocab *v,

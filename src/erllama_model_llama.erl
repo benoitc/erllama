@@ -96,24 +96,72 @@
     %% erllama_nif:model_family/1. Drives the load-time policy
     %% (unsupported archs, n_rs_seq injection) and is surfaced
     %% through extra_metadata/1 into model_info/1.
-    family = #{} :: map()
+    family = #{} :: map(),
+    %% Auto-fit result from the load NIF (`undefined` when the fit
+    %% option was off): #{fit => ok | failed, n_gpu_layers, n_ctx,
+    %% tensor_split => [float()]}. Surfaced via extra_metadata/1.
+    fit_info = undefined :: map() | undefined
 }).
 
 init(Config) ->
     Path = maps:get(model_path, Config),
-    MOpts = progress_opts(maps:get(model_opts, Config, #{}), Config),
+    MOpts0 = progress_opts(maps:get(model_opts, Config, #{}), Config),
+    MOpts = fit_opts(MOpts0, Config),
     case erllama_nif:load_model(Path, MOpts) of
         {ok, Model} ->
-            Family = probe_family(Model),
-            case check_family(Family) of
-                ok ->
-                    open_context(Model, Config, MOpts, Family);
-                {error, _} = E ->
-                    erllama_nif:free_model(Model),
-                    E
-            end;
+            post_load(Model, Config, MOpts, undefined);
+        {ok, Model, FitInfo} ->
+            post_load(Model, Config, MOpts, FitInfo);
         {error, _} = E ->
             E
+    end.
+
+post_load(Model, Config, MOpts, FitInfo) ->
+    Family = probe_family(Model),
+    case check_family(Family) of
+        ok ->
+            open_context(Model, Config, MOpts, Family, FitInfo);
+        {error, _} = E ->
+            erllama_nif:free_model(Model),
+            E
+    end.
+
+%% Normalize the `fit` model option for the NIF: `true` becomes an
+%% empty map, `margin_mib` (single or list, MiB) becomes the
+%% `margins_mib` list the NIF broadcasts, `n_ctx => auto` becomes
+%% the n_ctx_auto flag, and the planned context options ship as
+%% `fit_context` so the fit measures the context the model layer
+%% will actually open.
+fit_opts(MOpts, Config) ->
+    case maps:find(fit, MOpts) of
+        error ->
+            MOpts;
+        {ok, FitOpt} ->
+            Fit0 =
+                case FitOpt of
+                    true -> #{};
+                    M when is_map(M) -> M
+                end,
+            Fit1 =
+                case maps:find(margin_mib, Fit0) of
+                    error -> #{};
+                    {ok, N} when is_integer(N) -> #{margins_mib => [N]};
+                    {ok, L} when is_list(L) -> #{margins_mib => L}
+                end,
+            Fit2 =
+                case maps:find(min_ctx, Fit0) of
+                    error -> Fit1;
+                    {ok, MC} -> Fit1#{min_ctx => MC}
+                end,
+            Fit3 =
+                case maps:get(n_ctx, Fit0, undefined) of
+                    auto -> Fit2#{n_ctx_auto => true};
+                    _ -> Fit2
+                end,
+            MOpts#{
+                fit := Fit3,
+                fit_context => maps:get(context_opts, Config, #{})
+            }
     end.
 
 %% Wire the optional `progress_to` load option into the NIF opts:
@@ -147,15 +195,28 @@ check_family(#{diffusion := true}) ->
 check_family(_) ->
     ok.
 
-open_context(Model, Config, MOpts, Family) ->
-    COpts = family_context_opts(maps:get(context_opts, Config, #{}), Family),
+open_context(Model, Config, MOpts, Family, FitInfo) ->
+    COpts0 = family_context_opts(maps:get(context_opts, Config, #{}), Family),
+    COpts = fit_context_opts(COpts0, MOpts, FitInfo),
     case erllama_nif:new_context(Model, COpts) of
         {ok, Ctx} ->
-            {ok, build_state(Model, Ctx, Config, MOpts, COpts, Family)};
+            {ok, build_state(Model, Ctx, Config, MOpts, COpts, Family, FitInfo)};
         {error, _} = E ->
             erllama_nif:free_model(Model),
             E
     end.
+
+%% With `fit => #{n_ctx => auto}` and a successful fit, the chosen
+%% context size replaces whatever context_opts carried.
+fit_context_opts(COpts, MOpts, FitInfo) when is_map(FitInfo) ->
+    FitMap = maps:get(fit, MOpts, #{}),
+    Auto = is_map(FitMap) andalso maps:get(n_ctx_auto, FitMap, false),
+    case Auto andalso maps:get(fit, FitInfo) =:= ok of
+        true -> COpts#{n_ctx => maps:get(n_ctx, FitInfo)};
+        false -> COpts
+    end;
+fit_context_opts(COpts, _MOpts, undefined) ->
+    COpts.
 
 %% Recurrent / hybrid models keep compressed state, not per-token KV
 %% cells, so the warm-restore primer's 1-token seq_rm only succeeds
@@ -171,7 +232,7 @@ family_context_opts(COpts, Family) ->
         false -> COpts
     end.
 
-build_state(Model, Ctx, Config, MOpts, COpts, Family) ->
+build_state(Model, Ctx, Config, MOpts, COpts, Family, FitInfo) ->
     ThinkingMarkers = maps:get(thinking_markers, Config, #{}),
     {ThinkStart, ThinkEnd} = tokenize_markers(Model, ThinkingMarkers),
     #s{
@@ -180,11 +241,20 @@ build_state(Model, Ctx, Config, MOpts, COpts, Family) ->
         context_opts = COpts,
         model_size_bytes = safe_uint(erllama_nif:model_size(Model)),
         total_layers = safe_uint(erllama_nif:model_n_layer(Model)),
-        n_gpu_layers = maps:get(n_gpu_layers, MOpts, 0),
+        n_gpu_layers = effective_n_gpu_layers(MOpts, FitInfo),
         thinking_start_ids = ThinkStart,
         thinking_end_ids = ThinkEnd,
-        family = Family
+        family = Family,
+        fit_info = FitInfo
     }.
+
+%% The value the VRAM estimate runs on: the fitted layer count when
+%% fit ran, otherwise the requested option. -1 (the llama default)
+%% means all layers.
+effective_n_gpu_layers(MOpts, undefined) ->
+    maps:get(n_gpu_layers, MOpts, -1);
+effective_n_gpu_layers(_MOpts, FitInfo) ->
+    maps:get(n_gpu_layers, FitInfo, -1).
 
 safe_uint(N) when is_integer(N), N >= 0 -> N;
 safe_uint(_) -> 0.
@@ -425,14 +495,22 @@ ok_state(S, ok) -> {ok, S};
 ok_state(_S, {error, _} = E) -> E.
 
 extra_metadata(#s{
-    model_size_bytes = SB, total_layers = TL, n_gpu_layers = NL, family = Family
+    model_size_bytes = SB,
+    total_layers = TL,
+    n_gpu_layers = NL,
+    family = Family,
+    fit_info = FitInfo
 }) ->
-    #{
+    Meta = #{
         model_size_bytes => SB,
         total_layers => TL,
         n_gpu_layers => NL,
         family => Family
-    }.
+    },
+    case FitInfo of
+        undefined -> Meta;
+        _ -> Meta#{fit => FitInfo}
+    end.
 
 %% Speculative-decoding verifier. Snapshot+restore protocol so
 %% the caller's KV view is unchanged after the call. Empty prefix
