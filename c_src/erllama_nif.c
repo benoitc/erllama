@@ -23,6 +23,7 @@
  */
 #include <erl_nif.h>
 #include "erllama_chat_nif.h"
+#include "erllama_spec_nif.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -316,6 +317,12 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
         return -1;
     }
 
+    /* Register the ngram-speculator resource (defined in
+     * erllama_spec_nif.cpp). */
+    if (spec_nif_load(env) != 0) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -477,7 +484,13 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_chat_templates_apply", 2, nif_chat_templates_apply,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_chat_parse",           3, nif_chat_parse,
-        ERL_NIF_DIRTY_JOB_CPU_BOUND}
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_spec_new",    1, nif_spec_new,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_spec_begin",  3, nif_spec_begin,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_spec_draft",  4, nif_spec_draft,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_spec_accept", 3, nif_spec_accept, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_spec_free",   1, nif_spec_free,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_spec_step",   4, nif_spec_step,   ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)

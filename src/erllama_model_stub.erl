@@ -78,7 +78,20 @@ paths).
     %% (range KV trim). Instrumented so tests can assert it was called.
     seq_rm_last/3,
     seq_rm_last_calls/0,
-    reset_seq_rm_last_calls/0
+    reset_seq_rm_last_calls/0,
+    %% Ngram-speculation callbacks. Deterministic: the stub's next
+    %% token per (SeqId, Sampler) is constant and equals the last
+    %% committed token, so `spec_draft => perfect' drafts always
+    %% verify and `wrong' drafts always miss.
+    spec_supported/1,
+    spec_new/2,
+    spec_begin/4,
+    spec_draft/5,
+    spec_accept/4,
+    spec_free/2,
+    spec_step/4,
+    spec_accept_calls/0,
+    reset_spec_accept_calls/0
 ]).
 
 %% Stub state.
@@ -117,7 +130,13 @@ paths).
     %% dropped). Each lets tests drive an engine fallback path.
     fail_seq_rm_last = false :: boolean(),
     fail_kv_unpack = false :: boolean(),
-    fail_seq_cp = false :: boolean()
+    fail_seq_cp = false :: boolean(),
+    %% Speculation knobs: `spec_draft' picks what spec_draft/5
+    %% returns (perfect drafts that verify fully, wrong drafts that
+    %% miss on the first token, or none), `spec_draft_len' its
+    %% length.
+    spec_draft = perfect :: perfect | wrong | none,
+    spec_draft_len = 4 :: pos_integer()
 }).
 
 init(Config) ->
@@ -126,8 +145,23 @@ init(Config) ->
         step_delay_ms = step_delay_opt(step_delay_ms, Config),
         fail_seq_rm_last = bool_opt(fail_seq_rm_last, Config),
         fail_kv_unpack = bool_opt(fail_kv_unpack, Config),
-        fail_seq_cp = bool_opt(fail_seq_cp, Config)
+        fail_seq_cp = bool_opt(fail_seq_cp, Config),
+        spec_draft = spec_draft_opt(Config),
+        spec_draft_len = spec_draft_len_opt(Config)
     }}.
+
+spec_draft_opt(Config) ->
+    case maps:get(spec_draft, Config, perfect) of
+        wrong -> wrong;
+        none -> none;
+        _ -> perfect
+    end.
+
+spec_draft_len_opt(Config) ->
+    case maps:get(spec_draft_len, Config, 4) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> 4
+    end.
 
 bool_opt(Key, Config) ->
     case maps:get(Key, Config, false) of
@@ -251,14 +285,23 @@ step(#stub{step_delay_ms = D} = S, Ops) when D > 0 ->
     timer:sleep(D),
     step(S#stub{step_delay_ms = 0}, Ops);
 step(S, Ops) ->
-    case persistent_term:get({?MODULE, wedge}, undefined) of
+    case take_wedge() of
         undefined ->
             Results = [stub_step_op(Op, S) || Op <- Ops],
             {ok, Results};
         Reason ->
-            %% Test knob: simulate a wedged/aborted decode once.
-            persistent_term:erase({?MODULE, wedge}),
             {error, Reason}
+    end.
+
+%% Test knob: consume a one-shot wedge armed by wedge_next_step/1
+%% (shared by step/2 and spec_step/4).
+take_wedge() ->
+    case persistent_term:get({?MODULE, wedge}, undefined) of
+        undefined ->
+            undefined;
+        Reason ->
+            persistent_term:erase({?MODULE, wedge}),
+            Reason
     end.
 
 stub_step_op({SeqId, {prefill, _Tokens}}, _S) ->
@@ -289,8 +332,12 @@ advance_phase(SeqId, _Sampler, thinking_end_due) ->
 advance_phase(SeqId, Sampler, _) ->
     decode_token(SeqId, Sampler).
 
+%% The constant decode-stream token for one (seq, sampler) pair.
+stub_token(SeqId, Sampler) ->
+    erlang:phash2({decode_step_stub, SeqId, Sampler}) rem (1 bsl 32).
+
 decode_token(SeqId, Sampler) ->
-    T = erlang:phash2({decode_step_stub, SeqId, Sampler}) rem (1 bsl 32),
+    T = stub_token(SeqId, Sampler),
     case persistent_term:get({?MODULE, sampler_logprobs, Sampler}, 0) of
         0 ->
             {SeqId, {token, T, 0}};
@@ -304,6 +351,75 @@ decode_token(SeqId, Sampler) ->
             ],
             {SeqId, {token, T, 0, {-0.1, Top}}}
     end.
+
+%% -----------------------------------------------------------------
+%% Ngram speculation (deterministic)
+%%
+%% The stub's decode stream is the constant token
+%% `phash2({decode_step_stub, SeqId, Sampler})`, so once one token is
+%% committed, IdLast IS that constant: a perfect draft is IdLast
+%% repeated, a wrong draft misses on its first token. spec_step
+%% verifies against the same constant and mirrors the NIF contract
+%% ({spec, Committed, Eog, NAcc}, committed = matched prefix plus
+%% the correction/bonus token).
+%% -----------------------------------------------------------------
+
+spec_supported(#stub{thinking_capable = TC}) ->
+    not TC.
+
+spec_new(_S, _Cfg) ->
+    {ok, make_ref()}.
+
+spec_begin(_S, _SpecRef, _SeqId, _PromptTokens) ->
+    ok.
+
+spec_draft(#stub{spec_draft = none}, _SpecRef, _SeqId, _IdLast, _Delta) ->
+    {ok, []};
+spec_draft(
+    #stub{spec_draft = Mode, spec_draft_len = Len}, _SpecRef, _SeqId, IdLast, _Delta
+) ->
+    Tok =
+        case Mode of
+            perfect -> IdLast;
+            wrong -> (IdLast + 1) rem (1 bsl 32)
+        end,
+    {ok, lists:duplicate(Len, Tok)}.
+
+spec_accept(_S, _SpecRef, SeqId, NAcc) ->
+    Calls = persistent_term:get({?MODULE, spec_accept_calls}, []),
+    persistent_term:put({?MODULE, spec_accept_calls}, [{SeqId, NAcc} | Calls]),
+    ok.
+
+spec_free(_S, _SpecRef) ->
+    ok.
+
+spec_step(#stub{step_delay_ms = D} = S, Sampler, SeqId, Draft) when D > 0 ->
+    timer:sleep(D),
+    spec_step(S#stub{step_delay_ms = 0}, Sampler, SeqId, Draft);
+spec_step(_S, Sampler, SeqId, Draft) ->
+    case take_wedge() of
+        undefined ->
+            T = stub_token(SeqId, Sampler),
+            Matched = matched_prefix(Draft, T),
+            %% Matched drafts, then the correction (miss) or bonus
+            %% (all matched) token - always T for the stub.
+            Committed = Matched ++ [T],
+            {ok, {spec, Committed, 0, length(Matched)}};
+        Reason ->
+            {error, Reason}
+    end.
+
+matched_prefix(Draft, T) ->
+    lists:takewhile(fun(D) -> D =:= T end, Draft).
+
+%% Test helpers: spec_accept/4 calls since the last reset (newest
+%% first).
+spec_accept_calls() ->
+    persistent_term:get({?MODULE, spec_accept_calls}, []).
+
+reset_spec_accept_calls() ->
+    persistent_term:put({?MODULE, spec_accept_calls}, []),
+    ok.
 
 %% Deterministic per-seq stub signature. The stub ignores `Bytes`
 %% and hashes the seq_id; real backends derive their signature from

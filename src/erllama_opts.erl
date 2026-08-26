@@ -35,7 +35,9 @@
     thinking_capable,
     fail_seq_rm_last,
     fail_kv_unpack,
-    fail_seq_cp
+    fail_seq_cp,
+    spec_draft,
+    spec_draft_len
 ]).
 
 -define(MODEL_OPT_KEYS, [
@@ -131,7 +133,8 @@
             prefix_checkpoint_len,
             to,
             expect_committed,
-            middleware
+            middleware,
+            speculative
         ]
 ).
 
@@ -203,6 +206,8 @@ check_load_types(C) ->
         {fail_seq_rm_last, fun is_boolean/1},
         {fail_kv_unpack, fun is_boolean/1},
         {fail_seq_cp, fun is_boolean/1},
+        {spec_draft, fun(V) -> lists:member(V, [perfect, wrong, none]) end},
+        {spec_draft_len, fun pos_int/1},
         {model_opts, fun is_map/1},
         {context_opts, fun is_map/1},
         {policy, fun is_map/1}
@@ -362,8 +367,26 @@ base_request_checks() ->
         {grammar_lazy, fun is_boolean/1},
         {trigger_patterns, fun(V) -> is_list(V) andalso lists:all(fun is_binary/1, V) end},
         {trigger_tokens, fun(V) -> is_list(V) andalso lists:all(fun non_neg_int/1, V) end},
-        {grammar_prefill, fun is_binary/1}
+        {grammar_prefill, fun is_binary/1},
+        {speculative, fun speculative_opt/1}
     ].
+
+%% `speculative => true | false | #{type => ngram_mod, n_match | n_max
+%% | n_min => pos_int()}`. `true` = ngram_mod with upstream defaults.
+speculative_opt(V) when is_boolean(V) ->
+    true;
+speculative_opt(V) when is_map(V) ->
+    Known = [type, n_match, n_max, n_min],
+    maps:fold(
+        fun
+            (type, T, Acc) -> Acc andalso T =:= ngram_mod;
+            (K, N, Acc) -> Acc andalso lists:member(K, Known) andalso pos_int(N)
+        end,
+        true,
+        V
+    );
+speculative_opt(_) ->
+    false.
 
 sampler_checks() ->
     [

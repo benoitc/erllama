@@ -62,6 +62,12 @@
     vocab_info/1,
     grammar_cache_stats/1,
     forward_with_argmax/2,
+    spec_new/1,
+    spec_begin/3,
+    spec_draft/4,
+    spec_accept/3,
+    spec_free/1,
+    spec_step/4,
     chat_templates_init/2,
     chat_templates_apply/2,
     chat_parse/3
@@ -70,6 +76,9 @@
 -export_type([chat_templates_ref/0, chat_params_ref/0]).
 -type chat_templates_ref() :: reference().
 -type chat_params_ref() :: reference().
+
+-export_type([spec_ref/0]).
+-type spec_ref() :: reference().
 
 -export_type([adapter_ref/0, sampler_ref/0]).
 
@@ -511,6 +520,53 @@ grammar_cache_stats(Ctx) ->
 forward_with_argmax(Ctx, Tokens) when is_list(Tokens) ->
     nif_forward_with_argmax(Ctx, Tokens).
 
+%% Draft-model-free ngram speculator (llama.cpp common_speculative,
+%% NGRAM_MOD). The speculator is independent from any context: it
+%% only ever sees token ids. Cfg keys: n_match | n_max | n_min
+%% (upstream defaults 24/64/48) and n_seq (sequence slots, default 1).
+-spec spec_new(map()) -> {ok, spec_ref()} | {error, atom()}.
+spec_new(Cfg) when is_map(Cfg) ->
+    nif_spec_new(Cfg).
+
+%% Start a generation on SeqId: folds the full prompt into the ngram
+%% table and resets the per-seq draft state. The shared table itself
+%% survives across begins (cross-request ngram reuse).
+-spec spec_begin(spec_ref(), non_neg_integer(), [token_id()]) ->
+    ok | {error, atom()}.
+spec_begin(Spec, SeqId, PromptTokens) when is_list(PromptTokens) ->
+    nif_spec_begin(Spec, SeqId, PromptTokens).
+
+%% Produce a draft continuation after IdLast. Delta is the committed
+%% tokens since the previous spec_begin/spec_draft call, EXCLUDING
+%% IdLast (the shim keeps committed[0..K-2]; IdLast is
+%% committed[K-1]). Returns {ok, []} when nothing useful is found.
+-spec spec_draft(spec_ref(), non_neg_integer(), token_id(), [token_id()]) ->
+    {ok, [token_id()]} | {error, atom()}.
+spec_draft(Spec, SeqId, IdLast, Delta) when is_list(Delta) ->
+    nif_spec_draft(Spec, SeqId, IdLast, Delta).
+
+%% Report how many tokens of the last draft the target accepted.
+%% Must be at most the length of the last draft; consuming resets
+%% the guard, so call exactly once per non-empty draft.
+-spec spec_accept(spec_ref(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, atom()}.
+spec_accept(Spec, SeqId, NAcc) ->
+    nif_spec_accept(Spec, SeqId, NAcc).
+
+-spec spec_free(spec_ref()) -> ok | {error, released}.
+spec_free(Spec) ->
+    nif_spec_free(Spec).
+
+%% One speculative verify tick for SeqId (see nif_spec_step in
+%% c_src/erllama_nif_decode.c). Commits between 1 and
+%% length(Draft)+1 tokens to KV and returns them; NAcc counts the
+%% matched draft tokens for spec_accept feedback. The caller must be
+%% the sole active request on the context.
+-spec spec_step(context_ref(), sampler_ref(), non_neg_integer(), [token_id()]) ->
+    {ok, {spec, [token_id()], 0 | 1, non_neg_integer()}} | {error, term()}.
+spec_step(Ctx, Sampler, SeqId, Draft) when is_list(Draft), Draft =/= [] ->
+    nif_spec_step(Ctx, Sampler, SeqId, Draft).
+
 %% Initialise a llama.cpp `common_chat_templates_ptr' from a loaded
 %% model. The TemplateOverride is either the chat-template binary to
 %% use (overriding the GGUF's default) or the atom `undefined' to use
@@ -590,6 +646,12 @@ nif_model_family(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_vocab_info(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_grammar_cache_stats(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_forward_with_argmax(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
+nif_spec_new(_Cfg) -> erlang:nif_error(nif_not_loaded).
+nif_spec_begin(_Spec, _SeqId, _Tokens) -> erlang:nif_error(nif_not_loaded).
+nif_spec_draft(_Spec, _SeqId, _IdLast, _Delta) -> erlang:nif_error(nif_not_loaded).
+nif_spec_accept(_Spec, _SeqId, _N) -> erlang:nif_error(nif_not_loaded).
+nif_spec_free(_Spec) -> erlang:nif_error(nif_not_loaded).
+nif_spec_step(_Ctx, _Sampler, _SeqId, _Draft) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_init(_Model, _Override) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_apply(_Templates, _Inputs) -> erlang:nif_error(nif_not_loaded).
 nif_chat_parse(_Params, _Input, _IsPartial) -> erlang:nif_error(nif_not_loaded).

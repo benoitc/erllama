@@ -400,7 +400,21 @@
     %% `{thinking_token, _}` step result is treated as a normal
     %% `{token, _, 0}` for the rest of the request so generation
     %% progresses without surfacing further `thinking_delta`s.
-    thinking_capped = false :: boolean()
+    thinking_capped = false :: boolean(),
+    %% Ngram speculation. `spec` holds the normalized per-request
+    %% config (#{n_match, n_max, n_min}) or `undefined` when the
+    %% option is off or one of the admission gates disabled it
+    %% (recurrent/hybrid family, thinking, logprobs, backend veto).
+    spec = undefined :: map() | undefined,
+    %% Prompt length at admission; base for indexing `generated`
+    %% when computing the delta shipped to the speculator.
+    spec_prompt_len = 0 :: non_neg_integer(),
+    %% Committed-token index already shipped to the speculator
+    %% (the shim's prompt vector holds committed[0..spec_cursor-1]).
+    spec_cursor = 0 :: non_neg_integer(),
+    %% Stats: draft tokens offered to / accepted by spec_step.
+    spec_drafted = 0 :: non_neg_integer(),
+    spec_accepted = 0 :: non_neg_integer()
 }).
 
 -record(data, {
@@ -465,6 +479,13 @@
     %% Test-visible holdover so erllama_sampler_tests can inspect
     %% the current sampler_ref after a complete returns.
     last_sampler_ref = undefined :: term() | undefined,
+    %% Per-model ngram speculator: {NormalizedCfg, SpecRef} once the
+    %% first speculative request created it, reused while requests
+    %% carry the same config (the shared ngram table persisting
+    %% across requests is the point: re-sent transcripts draft
+    %% immediately). Recreated on a config change only when no
+    %% spec-enabled request is in flight.
+    spec = undefined :: undefined | {map(), term()},
     %% FIFO queue of admits that arrived while idle_seq_ids was
     %% empty. Each entry is one of:
     %%   {complete, From, Prompt, Opts}
@@ -1054,9 +1075,20 @@ resolve_policy(Config, NBatch) ->
     },
     maps:merge(Defaults, maps:get(policy, Config, #{})).
 
-terminate(_Reason, _State, #data{model_id = ModelId, backend = B, backend_state = S}) ->
+terminate(_Reason, _State, #data{model_id = ModelId, backend = B, backend_state = S} = Data) ->
     _ = erllama_inflight:obs_delete(ModelId),
     _ = erllama_inflight:delete_abort_handle(self()),
+    _ =
+        case Data#data.spec of
+            {_Cfg, SpecRef} ->
+                try
+                    B:spec_free(S, SpecRef)
+                catch
+                    _:_ -> ok
+                end;
+            undefined ->
+                ok
+        end,
     B:terminate(S),
     ok;
 terminate(_Reason, _State, _Data) ->
@@ -1669,8 +1701,9 @@ start_request({complete, From, Prompt, Opts}, SeqId, Mode, Data) ->
                 thinking_budget = thinking_budget_from(Opts),
                 session_id = maps:get(session_id, Opts, undefined)
             },
-            Req1 = setup_admission_path(Req, Mode, PromptTokens, Opts, Data0),
-            Data1 = put_req(Data0, Req1),
+            {Req0, DataS} = setup_spec(Req, Opts, Data0),
+            Req1 = setup_admission_path(Req0, Mode, PromptTokens, Opts, DataS),
+            Data1 = put_req(DataS, Req1),
             {ok, snapshot_admission(Data1, Req1), []};
         {error, Reason} ->
             {error, Reason, From}
@@ -1724,8 +1757,9 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
                 thinking_budget = thinking_budget_from(Params),
                 session_id = maps:get(session_id, Params, undefined)
             },
-            Req1 = setup_admission_path(Req, Mode, Tokens, Params, Data0),
-            Data1 = put_req(Data0, Req1),
+            {Req0, DataS} = setup_spec(Req, Params, Data0),
+            Req1 = setup_admission_path(Req0, Mode, Tokens, Params, DataS),
+            Data1 = put_req(DataS, Req1),
             {ok, snapshot_admission(Data1, Req1), [{reply, From, {ok, Ref}}]};
         {error, Reason} ->
             {error, Reason, From}
@@ -1764,8 +1798,9 @@ start_request({continue, From, Suffix, Opts}, SeqId, {continue, StoredTokens} = 
                 thinking_budget = thinking_budget_from(Opts),
                 session_id = maps:get(session_id, Opts)
             },
-            Req1 = setup_admission_path(Req, Mode, Suffix, Opts, Data0),
-            Data1 = put_req(Data0, Req1),
+            {Req0, DataS} = setup_spec(Req, Opts, Data0),
+            Req1 = setup_admission_path(Req0, Mode, Suffix, Opts, DataS),
+            Data1 = put_req(DataS, Req1),
             {ok, snapshot_admission(Data1, Req1), [{reply, From, {ok, Ref}}]};
         {error, Reason} ->
             {error, Reason, From}
@@ -2441,6 +2476,14 @@ obs_row(Phase, Data) ->
 step_tick(Data) ->
     ok = obs_refresh(running_phase(Data), Data),
     Data1 = honour_cancellations(Data),
+    case maybe_spec_tick(Data1) of
+        {spec, Req, Draft, DataS} ->
+            run_spec_tick(DataS, Req, Draft);
+        {no, DataS} ->
+            step_tick_ops(DataS)
+    end.
+
+step_tick_ops(Data1) ->
     case build_op_list(Data1) of
         {[], FinishersFirst} ->
             %% Nothing to step (e.g. only finishing-marked reqs).
@@ -2467,6 +2510,279 @@ step_tick(Data) ->
                             {stop, {step_failed, Err}, Data1}
                     end
             end
+    end.
+
+%% =============================================================================
+%% Ngram speculation
+%%
+%% A speculative request replaces its normal one-token decode tick
+%% with a spec tick: draft a continuation from the per-model ngram
+%% speculator, verify it in one batched decode (backend spec_step),
+%% commit the matched prefix plus the correction/bonus token, and
+%% feed acceptance back. Spec ticks only run when the request is the
+%% SOLE active request (the verify decode invalidates other seqs'
+%% logits rows); under concurrency the request falls back to the
+%% normal co-batched path and resumes speculating when alone again.
+%% =============================================================================
+
+%% Normalize the request option into the effective config map, or
+%% `undefined` when speculation is off or gated off for this request.
+setup_spec(Req, Opts, Data) ->
+    case spec_request_cfg(Req, Opts, Data) of
+        undefined ->
+            {Req, Data};
+        Cfg ->
+            case ensure_spec_resource(Cfg, Data) of
+                {ok, SpecRef, Data1} ->
+                    PLen = length(Req#req.prompt_tokens),
+                    Begin = backend_call(Data1, spec_begin, [
+                        SpecRef, Req#req.seq_id, Req#req.prompt_tokens
+                    ]),
+                    case Begin of
+                        ok ->
+                            {
+                                Req#req{
+                                    spec = Cfg,
+                                    spec_prompt_len = PLen,
+                                    spec_cursor = PLen
+                                },
+                                Data1
+                            };
+                        {error, _} ->
+                            {Req, Data1}
+                    end;
+                error ->
+                    {Req, Data}
+            end
+    end.
+
+spec_request_cfg(Req, Opts, Data) ->
+    case normalize_spec_opt(maps:get(speculative, Opts, false)) of
+        undefined ->
+            undefined;
+        Cfg ->
+            case spec_gates_ok(Req, Data) of
+                true -> Cfg;
+                false -> undefined
+            end
+    end.
+
+normalize_spec_opt(false) ->
+    undefined;
+normalize_spec_opt(true) ->
+    normalize_spec_opt(#{});
+normalize_spec_opt(Map) when is_map(Map) ->
+    #{
+        n_match => maps:get(n_match, Map, 24),
+        n_max => maps:get(n_max, Map, 64),
+        n_min => maps:get(n_min, Map, 48)
+    }.
+
+%% All gates that silently disable speculation for a request:
+%%  - the backend must implement the spec callbacks and not veto
+%%    (the llama backend vetoes when thinking markers are
+%%    configured: spec_step bypasses its marker mapping);
+%%  - recurrent / hybrid memories refuse the partial seq_rm every
+%%    draft mismatch needs;
+%%  - thinking-enabled requests route tokens off context_tokens;
+%%  - logprobs ride the normal per-token sampling path.
+spec_gates_ok(Req, Data) ->
+    B = Data#data.backend,
+    Family = Data#data.family,
+    %% Every admission path that reaches here built a sampler, so
+    %% last_sampler_cfg is always a map.
+    SamplerCfg = Req#req.last_sampler_cfg,
+    Recurrent = maps:get(recurrent, Family, false),
+    Hybrid = maps:get(hybrid, Family, false),
+    spec_backend_ok(B) andalso
+        B:spec_supported(Data#data.backend_state) andalso
+        not (Recurrent orelse Hybrid) andalso
+        Req#req.thinking =:= disabled andalso
+        maps:get(logprobs, SamplerCfg, 0) =:= 0.
+
+spec_backend_ok(B) ->
+    lists:all(
+        fun({F, A}) -> erlang:function_exported(B, F, A) end,
+        [
+            {spec_supported, 1},
+            {spec_new, 2},
+            {spec_begin, 4},
+            {spec_draft, 5},
+            {spec_accept, 4},
+            {spec_free, 2},
+            {spec_step, 4}
+        ]
+    ).
+
+%% Per-model speculator resource, keyed by config. The shared ngram
+%% table persisting across requests is the point; a config change
+%% recreates it only when no spec-enabled request is in flight.
+ensure_spec_resource(Cfg, #data{spec = {Cfg, Ref}} = Data) ->
+    {ok, Ref, Data};
+ensure_spec_resource(Cfg, #data{spec = undefined} = Data) ->
+    new_spec_resource(Cfg, Data);
+ensure_spec_resource(Cfg, #data{spec = {_Other, OldRef}} = Data) ->
+    InFlight = lists:any(
+        fun(#req{spec = C}) -> C =/= undefined end,
+        maps:values(Data#data.req_table)
+    ),
+    case InFlight of
+        true ->
+            error;
+        false ->
+            _ = backend_call(Data, spec_free, [OldRef]),
+            new_spec_resource(Cfg, Data#data{spec = undefined})
+    end.
+
+new_spec_resource(Cfg, Data) ->
+    case backend_call(Data, spec_new, [Cfg#{n_seq => Data#data.n_seq_max}]) of
+        {ok, Ref} -> {ok, Ref, Data#data{spec = {Cfg, Ref}}};
+        {error, _} -> error
+    end.
+
+%% Decide whether this tick runs speculatively: exactly one active
+%% request, spec-enabled, decode-ready, with at least one generated
+%% token (IdLast). Ships the committed delta to the speculator and
+%% returns the (truncated) draft, or falls back to the normal path.
+maybe_spec_tick(#data{req_table = Tab} = Data) ->
+    Active = [R || R <- maps:values(Tab), not R#req.finishing],
+    case Active of
+        [
+            #req{
+                spec = Cfg,
+                prefill_cursor = undefined,
+                sampler_ref = SRef,
+                generated = [_ | _]
+            } = Req
+        ] when Cfg =/= undefined, SRef =/= undefined ->
+            spec_draft_for(Req, Data);
+        _ ->
+            {no, Data}
+    end.
+
+spec_draft_for(#req{spec = Cfg} = Req, #data{spec = {_C, SpecRef}} = Data) ->
+    GenLen = length(Req#req.generated),
+    Remaining = Req#req.response_target - GenLen,
+    %% committed per spec tick <= draft length + 1, so capping the
+    %% draft at Remaining - 1 makes response_target overshoot
+    %% impossible; the batch budget bounds the verify decode.
+    MaxDraft = lists:min([
+        Data#data.total_batch_budget,
+        Remaining - 1,
+        maps:get(n_max, Cfg)
+    ]),
+    case MaxDraft >= 1 of
+        false ->
+            {no, Data};
+        true ->
+            K = Req#req.spec_prompt_len + GenLen,
+            Cursor = Req#req.spec_cursor,
+            %% Delta = committed[Cursor..K-2]; IdLast = committed[K-1].
+            %% Both live in the generated suffix (Cursor >= prompt len).
+            GenBase = Cursor - Req#req.spec_prompt_len,
+            Delta = lists:sublist(
+                Req#req.generated, GenBase + 1, (K - 1) - Cursor
+            ),
+            IdLast = lists:last(Req#req.generated),
+            Call = backend_call(Data, spec_draft, [
+                SpecRef, Req#req.seq_id, IdLast, Delta
+            ]),
+            case Call of
+                {ok, []} ->
+                    Req1 = Req#req{spec_cursor = K - 1},
+                    {no, put_req(Data, Req1)};
+                {ok, Draft0} ->
+                    Draft = lists:sublist(Draft0, MaxDraft),
+                    Req1 = Req#req{spec_cursor = K - 1},
+                    {spec, Req1, Draft, put_req(Data, Req1)};
+                {error, _} ->
+                    %% Drafting failure is never fatal; disable
+                    %% speculation for the request and fall back.
+                    {no, put_req(Data, Req#req{spec = undefined})}
+            end
+    end;
+spec_draft_for(_Req, Data) ->
+    {no, Data}.
+
+%% One speculative tick: backend spec_step commits between 1 and
+%% length(Draft) + 1 tokens; feed each through the normal decode
+%% commit clause one at a time (so stop-sequence scanning, stream
+%% events, warm-save triggers and terminal checks all apply), trim
+%% the KV overshoot when a stop string fires mid-batch, then report
+%% acceptance back to the speculator.
+run_spec_tick(Data, Req, Draft) ->
+    SeqId = Req#req.seq_id,
+    Call = backend_call(Data, spec_step, [Req#req.sampler_ref, SeqId, Draft]),
+    case Call of
+        {ok, {spec, Committed, Eog, NAcc}} ->
+            {Leftover, Data1} = apply_spec_committed(SeqId, Committed, Eog, Data),
+            Data2 =
+                case Leftover of
+                    0 -> Data1;
+                    _ -> spec_trim_overshoot(SeqId, Data1)
+                end,
+            Data3 = spec_record_feedback(SeqId, length(Draft), NAcc, Data2),
+            tick_after_step(Data3, [], []);
+        {error, Reason} = Err ->
+            case is_recoverable_decode_error(Reason) of
+                true ->
+                    recover_in_place(Data, Err);
+                false ->
+                    fail_all_requests(Data, Err),
+                    {stop, {step_failed, Err}, Data}
+            end
+    end.
+
+%% Feed committed tokens one at a time through the decode commit
+%% clause, stopping as soon as the request flips to finishing (a
+%% stop string matched mid-batch). Returns how many committed tokens
+%% were NOT applied - those are in KV but not in context_tokens and
+%% must be trimmed.
+apply_spec_committed(_SeqId, [], _Eog, Data) ->
+    {0, Data};
+apply_spec_committed(SeqId, [Tok | Rest] = All, Eog, Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    case Req#req.finishing of
+        true ->
+            {length(All), Data};
+        false ->
+            EogFlag =
+                case Rest of
+                    [] -> Eog;
+                    _ -> 0
+                end,
+            Data1 = apply_step_results(
+                [{{SeqId, {decode, spec}}, {token, Tok, EogFlag}}], Data
+            ),
+            apply_spec_committed(SeqId, Rest, Eog, Data1)
+    end.
+
+%% Roll KV back to exactly context_tokens after a mid-batch stop
+%% match, so the finish save and session pinning (both keyed on
+%% context_tokens) see consistent state. Best-effort: recurrent
+%% memories are gated off speculation, so the trim cannot fail on
+%% the llama backend.
+spec_trim_overshoot(SeqId, Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    _ = backend_seq_rm_from(SeqId, length(Req#req.context_tokens), Data),
+    Data.
+
+spec_record_feedback(SeqId, NDrafted, NAcc, Data) ->
+    _ =
+        case Data#data.spec of
+            {_Cfg, SpecRef} ->
+                backend_call(Data, spec_accept, [SpecRef, SeqId, NAcc]);
+            undefined ->
+                ok
+        end,
+    case maps:find(SeqId, Data#data.req_table) of
+        {ok, Req} ->
+            put_req(Data, Req#req{
+                spec_drafted = Req#req.spec_drafted + NDrafted,
+                spec_accepted = Req#req.spec_accepted + NAcc
+            });
+        error ->
+            Data
     end.
 
 %% Decode errors the engine recovers from in place (without a
@@ -3087,10 +3403,11 @@ finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKe
         stats => Stats
     },
     Result1 = maybe_add_stop_sequence(Result0, Req#req.matched_stop),
+    Result2 = maybe_add_speculative(Result1, Req),
     Result =
         case Req#req.logprobs_acc of
-            [] -> Result1;
-            Acc -> Result1#{logprobs => lists:reverse(Acc)}
+            [] -> Result2;
+            Acc -> Result2#{logprobs => lists:reverse(Acc)}
         end,
     [{reply, From, {ok, Result}}];
 finish_action(#req{mode = streaming, errored = E} = Req, _FinishReason, _FinishKey, Stats, _Data) ->
@@ -3363,7 +3680,13 @@ build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
         committed_tokens => length(Req#req.context_tokens),
         cache_delta => cache_delta_for(Req)
     },
-    maybe_add_stop_sequence(Stats0, Req#req.matched_stop).
+    Stats1 = maybe_add_speculative(Stats0, Req),
+    maybe_add_stop_sequence(Stats1, Req#req.matched_stop).
+
+maybe_add_speculative(Stats, #req{spec = undefined}) ->
+    Stats;
+maybe_add_speculative(Stats, #req{spec_drafted = D, spec_accepted = A}) ->
+    Stats#{speculative => #{drafted => D, accepted => A}}.
 
 %% Anthropic-style per-request cache breakdown. `read` counts tokens
 %% served from the warm prefix at admission; `created` counts tokens

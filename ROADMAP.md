@@ -96,10 +96,14 @@ caller need.
 
 ### Speculative decoding
 
-Pair a small draft model with a target model; speculate-and-verify
-to improve throughput. Needs a "verify N tokens at offset" NIF and
-a draft-model registry. The KV cache layer is largely orthogonal
-(verifications run on the target context).
+Draft-model-free ngram speculation shipped as the per-request
+`speculative` option (llama.cpp `common_speculative` NGRAM_MOD;
+solo-request verify ticks via `nif_spec_step`). Remaining:
+co-batched speculation under concurrency, the ngram-map-k4v /
+ngram-cache draft sources, logprobs alongside speculation, and the
+two-model variant (needs a draft-model registry; the KV cache layer
+is largely orthogonal since verifications run on the target
+context).
 
 ### Vision / LLaVA
 

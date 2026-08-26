@@ -130,6 +130,7 @@ add_library(erllama_nif SHARED
     erllama_nif_adapter.c
     erllama_safe.cpp
     erllama_chat_nif.cpp
+    erllama_spec_nif.cpp
     crc32c.c
 )
 

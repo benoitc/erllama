@@ -148,7 +148,41 @@ Thinking tokens do not land in `reply` or in the cache keys.
 
 ## Speculative decoding
 
-Use a small model to draft and a large one to verify:
+Speed up generation without changing its output. The `speculative`
+option enables draft-model-free ngram speculation: a per-model hash
+table over previously seen tokens drafts likely continuations, one
+batched decode verifies the whole draft against the model, and the
+accepted prefix commits in a single tick. Rejected tokens are rolled
+back, so the output is byte-identical to non-speculative decoding,
+including seeded sampling at any temperature.
+
+```erlang
+{ok, R} = erllama:complete(M, Prompt, #{
+    response_tokens => 256,
+    speculative => true
+}),
+#{drafted := D, accepted := A} = maps:get(speculative, R).
+```
+
+It works on `stream/3`, `complete/3` and `continue/3`. It helps most
+when the continuation repeats material the model has already seen:
+agent loops re-sending transcripts, quoting or editing code,
+structured output with recurring keys. The ngram table persists
+across requests on the same model, so a re-sent transcript drafts
+immediately on the next turn.
+
+Tune it with a map instead of `true`:
+
+```erlang
+speculative => #{n_match => 24, n_max => 64, n_min => 48}
+```
+
+`n_match` is the window hashed for lookup, `n_max` caps the draft
+length, and drafts shorter than `n_min` are discarded (defaults are
+llama.cpp's). See [configuration](configuration.md#speculation) for
+when the option is silently ignored.
+
+For a two-model setup, the manual building blocks remain:
 
 ```erlang
 {ok, Draft} = erllama:draft_tokens(SmallModel, PrefixTokens, #{max => 8}),

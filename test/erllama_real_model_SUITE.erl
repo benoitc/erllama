@@ -63,6 +63,9 @@
     grammar_plus_sampler/1,
     verify_does_not_mutate_caller_visible_state/1,
     verify_accepted_count_le_k/1,
+    ngram_speculation_matches_plain/1,
+    ngram_speculation_stop_sequence_trims_kv/1,
+    spec_step_nif_greedy_paths/1,
     chunked_prefill_sizes_agree/1,
     continue_multi_turn_cache_delta/1,
     tokenize_large_input/1,
@@ -116,6 +119,9 @@ all() ->
         detokenize_specials,
         verify_does_not_mutate_caller_visible_state,
         verify_accepted_count_le_k,
+        ngram_speculation_matches_plain,
+        ngram_speculation_stop_sequence_trims_kv,
+        spec_step_nif_greedy_paths,
         chunked_prefill_sizes_agree,
         continue_multi_turn_cache_delta,
         tokenize_large_input,
@@ -887,6 +893,129 @@ verify_accepted_count_le_k(Config) ->
             {[7, 7, 7], 3}
         ]
     ],
+    ok.
+
+%% A strongly repetitive prompt at temperature 0: ngram speculation
+%% must reproduce the non-speculative output exactly (same sampler
+%% chain state per committed token) while accepting drafts. Small
+%% n_match / n_min so the short CI prompt still populates the table.
+%% Note: GPU batched matmuls can in rare cases flip near-tied greedy
+%% picks between 1-row and M-row decodes; the strongly repetitive
+%% prompt keeps the distribution far from ties.
+-define(REPEAT_PROMPT, <<
+    "one two three four five six seven eight nine ten "
+    "one two three four five six seven eight nine ten "
+    "one two three four five six seven eight nine ten "
+    "one two three four five six seven eight nine ten "
+    "one two three four five six seven eight nine ten "
+>>).
+
+ngram_speculation_matches_plain(Config) ->
+    Model = ?config(model, Config),
+    Opts = #{response_tokens => 32, temperature => 0.0},
+    {ok, Plain} = erllama:complete(Model, ?REPEAT_PROMPT, Opts),
+    {ok, Spec} = erllama:complete(Model, ?REPEAT_PROMPT, Opts#{
+        speculative => #{n_match => 6, n_max => 16, n_min => 2}
+    }),
+    ?assertEqual(maps:get(generated, Plain), maps:get(generated, Spec)),
+    ?assertEqual(maps:get(reply, Plain), maps:get(reply, Spec)),
+    ?assertNot(maps:is_key(speculative, Plain)),
+    #{drafted := D, accepted := A} = maps:get(speculative, Spec),
+    ?assert(A =< D),
+    %% Whether drafts fire depends on the model actually revisiting
+    %% a seen n-gram at temperature 0; tiny CI models (stories260K)
+    %% may never do so. The spec_step NIF itself is covered
+    %% model-independently by spec_step_nif_greedy_paths.
+    case D of
+        0 -> ct:comment("no drafts on this model; equality still holds");
+        _ -> ?assert(A > 0)
+    end,
+    ok.
+
+%% Deterministic nif_spec_step coverage on any model: derive the
+%% greedy continuation with plain step decodes, reset the sequence,
+%% and verify the same tokens as a draft. A perfect draft must
+%% commit draft ++ bonus with every draft token accepted; a draft
+%% wrong at its second position must commit the matched first token
+%% plus the model's own correction.
+spec_step_nif_greedy_paths(Config) ->
+    Model = ?config(model, Config),
+    {ok, Prompt} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    BState = erllama_model:get_backend_state(Model),
+    Ctx = element(3, BState),
+    Greedy = #{temperature => 0.0},
+    %% Reference: 4 greedy tokens via the plain step path.
+    {ok, S1} = erllama_nif:sampler_new(Ctx, Greedy),
+    {ok, [{0, prefilled}]} = erllama_nif:step(Ctx, [{0, {prefill, Prompt}}]),
+    [T1, T2, T3, T4] = [
+        begin
+            {ok, [{0, {token, T, _}}]} =
+                erllama_nif:step(Ctx, [{0, {decode, S1}}]),
+            T
+        end
+     || _ <- lists:seq(1, 4)
+    ],
+    ok = erllama_nif:sampler_free(S1),
+    %% Perfect draft: [T1, T2, T3] verifies fully, bonus is T4.
+    ok = erllama_nif:kv_seq_rm(Ctx, 0, 0, -1),
+    {ok, S2} = erllama_nif:sampler_new(Ctx, Greedy),
+    {ok, [{0, prefilled}]} = erllama_nif:step(Ctx, [{0, {prefill, Prompt}}]),
+    {ok, {spec, Committed, _Eog, NAcc}} =
+        erllama_nif:spec_step(Ctx, S2, 0, [T1, T2, T3]),
+    ?assertEqual([T1, T2, T3, T4], Committed),
+    ?assertEqual(3, NAcc),
+    %% The context continues seamlessly after the spec commit.
+    {ok, [{0, {token, T5, _}}]} = erllama_nif:step(Ctx, [{0, {decode, S2}}]),
+    ?assert(is_integer(T5)),
+    ok = erllama_nif:sampler_free(S2),
+    %% Wrong second token: T1 accepted, correction is the model's
+    %% own T2, rejected cells rolled back.
+    ok = erllama_nif:kv_seq_rm(Ctx, 0, 0, -1),
+    {ok, S3} = erllama_nif:sampler_new(Ctx, Greedy),
+    {ok, [{0, prefilled}]} = erllama_nif:step(Ctx, [{0, {prefill, Prompt}}]),
+    {ok, VI} = erllama:vocab_info(Model),
+    Wrong = (T2 + 1) rem maps:get(n_vocab, VI),
+    {ok, {spec, Committed2, _Eog2, NAcc2}} =
+        erllama_nif:spec_step(Ctx, S3, 0, [T1, Wrong, Wrong]),
+    ?assertEqual([T1, T2], Committed2),
+    ?assertEqual(1, NAcc2),
+    ok = erllama_nif:sampler_free(S3),
+    ok = erllama_nif:kv_seq_rm(Ctx, 0, 0, -1),
+    ok.
+
+%% A stop string aimed mid-way into the known (temp 0) continuation:
+%% speculation commits past the match inside one verify batch, the
+%% scheduler trims the KV overshoot, and the request's committed KV
+%% equals context_tokens (asserted through committed_tokens plus a
+%% session continuation over the same seq working cleanly).
+ngram_speculation_stop_sequence_trims_kv(Config) ->
+    Model = ?config(model, Config),
+    Opts = #{response_tokens => 32, temperature => 0.0},
+    {ok, Plain} = erllama:complete(Model, ?REPEAT_PROMPT, Opts),
+    Reply = maps:get(reply, Plain),
+    ?assert(byte_size(Reply) >= 8),
+    %% Stop on a fragment starting a few bytes in, so the match
+    %% cannot fire on the very first committed token.
+    Stop = binary:part(Reply, 4, min(6, byte_size(Reply) - 4)),
+    {ok, Spec} = erllama:complete(Model, ?REPEAT_PROMPT, Opts#{
+        speculative => #{n_match => 6, n_max => 16, n_min => 2},
+        stop_sequences => [Stop],
+        session_id => spec_trim_sess
+    }),
+    ?assertEqual(stop, maps:get(finish_reason, Spec)),
+    ?assertEqual(Stop, maps:get(stop_sequence, Spec)),
+    ?assertEqual(
+        length(maps:get(context_tokens, Spec)),
+        maps:get(committed_tokens, Spec)
+    ),
+    %% The pinned session seq must continue cleanly from the trimmed
+    %% transcript (KV == context_tokens after the trim).
+    Transcript = <<?REPEAT_PROMPT/binary, (maps:get(reply, Spec))/binary>>,
+    {ok, Cont} = erllama:complete(Model, Transcript, Opts#{
+        response_tokens => 4,
+        session_id => spec_trim_sess
+    }),
+    ?assertEqual(4, length(maps:get(generated, Cont))),
     ok.
 
 %% =============================================================================

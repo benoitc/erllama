@@ -334,6 +334,7 @@ ERL_NIF_TERM nif_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_embed(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_forward_with_argmax(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_spec_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 
 /* erllama_nif_sampler.c */
 ERL_NIF_TERM nif_configure_sampler(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);

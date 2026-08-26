@@ -162,6 +162,7 @@ request_accepts_known_keys_test() ->
         ignore_eos => true,
         infill => true,
         logprobs => 5,
+        speculative => #{type => ngram_mod, n_match => 16, n_max => 32, n_min => 8},
         prefix_checkpoint_len => 3,
         to => self(),
         expect_committed => [1, 2, 3],
@@ -200,6 +201,7 @@ request_type_checks_test_() ->
         {ignore_eos, 1},
         {infill, maybe_},
         {logprobs, 33},
+        {speculative, #{type => draft_model}},
         {temperature, hot},
         {seed, -1}
     ],
