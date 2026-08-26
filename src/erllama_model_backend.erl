@@ -196,6 +196,44 @@ inference, etc.) can plug in via this same surface.
         NewState :: state()}
     | {error, term()}.
 
+%% Draft-model-free ngram speculation (llama.cpp common_speculative,
+%% NGRAM_MOD). The scheduler creates one speculator per model
+%% (spec_new), announces each speculative request's prompt
+%% (spec_begin), asks for a draft each solo decode tick (spec_draft:
+%% Delta = committed tokens since the previous call excluding IdLast,
+%% which is the last committed token), verifies drafts through
+%% spec_step (one tick: sample, batched verify decode, rollback of
+%% rejected cells, correction/bonus decode; returns the committed
+%% tokens, the eog flag of the last one, and the accepted-draft
+%% count), and feeds acceptance back (spec_accept). spec_supported/1
+%% lets a backend veto speculation (the llama backend does when
+%% thinking markers are configured: spec_step bypasses marker
+%% mapping).
+-callback spec_supported(state()) -> boolean().
+
+-callback spec_new(state(), map()) -> {ok, SpecRef :: term()} | {error, term()}.
+
+-callback spec_begin(state(), SpecRef :: term(), seq_id(), [erllama:token_id()]) ->
+    ok | {error, term()}.
+
+-callback spec_draft(
+    state(),
+    SpecRef :: term(),
+    seq_id(),
+    IdLast :: erllama:token_id(),
+    Delta :: [erllama:token_id()]
+) ->
+    {ok, [erllama:token_id()]} | {error, term()}.
+
+-callback spec_accept(state(), SpecRef :: term(), seq_id(), non_neg_integer()) ->
+    ok | {error, term()}.
+
+-callback spec_free(state(), SpecRef :: term()) -> ok | {error, term()}.
+
+-callback spec_step(state(), sampler_ref(), seq_id(), Draft :: [erllama:token_id()]) ->
+    {ok, {spec, Committed :: [erllama:token_id()], Eog :: 0 | 1, NAcc :: non_neg_integer()}}
+    | {error, term()}.
+
 %% Recreate the inference context in place after a wedged/aborted
 %% decode, keeping the model loaded. Drops all live KV state; the
 %% caller resets its per-seq bookkeeping and the next admission is
@@ -232,6 +270,13 @@ inference, etc.) can plug in via this same surface.
     apply_adapters/2,
     extra_metadata/1,
     verify/4,
+    spec_supported/1,
+    spec_new/2,
+    spec_begin/4,
+    spec_draft/5,
+    spec_accept/4,
+    spec_free/2,
+    spec_step/4,
     thinking_signature/3,
     reset_context/1,
     abort_handle/1

@@ -499,6 +499,14 @@ Options for `complete/3`, `stream/3` and `continue/3`.
   checkpoint.
 - `to`: process receiving the stream events (`stream/3`, `continue/3`).
 - `middleware`: per-call middleware chain (see `erllama_middleware`).
+- `speculative`: `true` or `#{n_match | n_max | n_min => pos_integer()}`
+  (defaults 24/64/48) enables draft-model-free ngram speculation: a
+  per-model hash table over previously seen tokens drafts likely
+  continuations, one batched decode verifies them, and the output is
+  byte-identical to non-speculative decoding (including seeded
+  sampling). Pauses while other requests run concurrently; silently
+  disabled on recurrent/hybrid models, with `thinking`, or with
+  `logprobs`. Stats gain `speculative => #{drafted, accepted}`.
 """.
 -type request_opts() :: #{
     response_tokens => pos_integer(),
@@ -541,6 +549,7 @@ Options for `complete/3`, `stream/3` and `continue/3`.
     ignore_eos => boolean(),
     infill => boolean(),
     logprobs => non_neg_integer(),
+    speculative => boolean() | map(),
     prefix_checkpoint_len => non_neg_integer(),
     to => pid(),
     expect_committed => [token_id()],

@@ -21,6 +21,16 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- `speculative` request option: draft-model-free ngram speculation
+  (llama.cpp `common_speculative` NGRAM_MOD) on `stream/3`,
+  `complete/3` and `continue/3`. Output is byte-identical to
+  non-speculative decoding (including seeded sampling); drafts are
+  verified in one batched decode and rejected tokens rolled back.
+  Pauses under concurrent requests; disabled on recurrent/hybrid
+  models, with `thinking`, or with `logprobs`. Stats gain
+  `speculative => #{drafted, accepted}`. New NIFs: the
+  `erllama_spec_nif` speculator shim and `nif_spec_step`.
+
 - Guides: generating text, sessions, tokens and vocabulary,
   embeddings, LoRA adapters, observability, and testing with the stub
   backend; the tool-calls guide now walks the full tool round trip.

@@ -246,6 +246,38 @@ Chain order (llama.cpp's): grammar -> logit_bias -> penalties -> dry
 infill -> temperature -> dist. With `mirostat => 1 | 2` the middle
 stages are skipped entirely, as upstream does.
 
+## Speculation
+
+The per-request `speculative` option enables draft-model-free ngram
+speculation (see [generating text](generation.md#speculative-decoding)
+for usage). It is a decode strategy, not a sampler stage: output is
+unchanged, only latency improves.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `n_match` | 24 | Token window hashed for the ngram lookup. Smaller windows draft more but mispredict more. |
+| `n_max` | 64 | Cap on drafted tokens per verify tick (also bounded by `n_batch` and the remaining `response_tokens`). |
+| `n_min` | 48 | Drafts shorter than this are discarded rather than verified. |
+
+The speculator is one shared table per model, sized 16 MiB,
+created on the first speculative request and reused while requests
+carry the same config.
+
+Speculation is silently skipped, with the request decoding
+normally, when:
+
+- other requests are active on the same model (it resumes when the
+  request is alone again);
+- the model family is recurrent or hybrid (their memories refuse
+  the partial KV rollback a draft miss needs);
+- the request sets `thinking => enabled` or `logprobs`;
+- the backend does not support it (the stub does; a llama model
+  with thinking markers configured does not).
+
+Requests that enabled the option report
+`speculative => #{drafted => N, accepted => N}` on the result /
+done stats either way, so you can see whether drafts are landing.
+
 ## Inspecting effective config
 
 ```erlang

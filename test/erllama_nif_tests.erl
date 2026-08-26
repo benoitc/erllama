@@ -561,3 +561,46 @@ bad_content(Path) ->
     after
         ok = erllama_nif:free_model(Model)
     end.
+
+%% =============================================================================
+%% Ngram speculator (spec_new / spec_begin / spec_draft / spec_accept)
+%% =============================================================================
+
+%% A repetitive token stream with a small n_match drafts the pattern
+%% continuation; an unseen ngram drafts nothing.
+spec_draft_roundtrip_test() ->
+    {ok, Spec} = erllama_nif:spec_new(#{
+        n_match => 4, n_max => 8, n_min => 2, n_seq => 2
+    }),
+    Pattern = lists:seq(1, 10),
+    Prompt = lists:append(lists:duplicate(5, Pattern)),
+    ok = erllama_nif:spec_begin(Spec, 0, Prompt),
+    %% Committed = Prompt ++ [1]; the shim already holds Prompt, so
+    %% the delta is empty and IdLast continues the pattern.
+    {ok, Draft} = erllama_nif:spec_draft(Spec, 0, 1, []),
+    ?assertEqual(lists:seq(2, 9), Draft),
+    ok = erllama_nif:spec_accept(Spec, 0, length(Draft)),
+    %% Unseen ngram: nothing to draft; accept(0) is always legal.
+    {ok, []} = erllama_nif:spec_draft(Spec, 0, 4095, Draft ++ [1]),
+    ok = erllama_nif:spec_accept(Spec, 0, 0),
+    ok = erllama_nif:spec_free(Spec),
+    ?assertEqual({error, released}, erllama_nif:spec_free(Spec)).
+
+%% Accepting more than the last draft length would trip an upstream
+%% assert (process abort); the shim rejects it with badarg first.
+spec_accept_guard_test() ->
+    {ok, Spec} = erllama_nif:spec_new(#{n_match => 4, n_seq => 1}),
+    ok = erllama_nif:spec_begin(Spec, 0, lists:seq(1, 8)),
+    ?assertError(badarg, erllama_nif:spec_accept(Spec, 0, 1)),
+    ok = erllama_nif:spec_accept(Spec, 0, 0),
+    ok = erllama_nif:spec_free(Spec).
+
+spec_new_rejects_bad_cfg_test() ->
+    ?assertError(badarg, erllama_nif:spec_new(#{n_match => 0})),
+    ?assertError(badarg, erllama_nif:spec_new(#{n_seq => 0})).
+
+spec_seq_bounds_test() ->
+    {ok, Spec} = erllama_nif:spec_new(#{n_seq => 1}),
+    ?assertError(badarg, erllama_nif:spec_begin(Spec, 1, [1, 2, 3])),
+    ?assertError(badarg, erllama_nif:spec_draft(Spec, 1, 5, [])),
+    ok = erllama_nif:spec_free(Spec).

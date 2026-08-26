@@ -728,3 +728,331 @@ ERL_NIF_TERM nif_forward_with_argmax(ErlNifEnv *env, int argc,
     enif_free(out);
     return enif_make_tuple2(env, atom_ok, list);
 }
+
+/* =========================================================================
+ * nif_spec_step: speculative verify tick (ngram drafts)
+ *
+ *   nif_spec_step(CtxRef, SamplerRef, SeqId, [DraftTok])
+ *     -> {ok, {spec, [CommittedTok], Eog :: 0 | 1, NAcc}}
+ *      | {error, atom()}
+ *
+ * One speculative tick for a single sequence: sample the next token
+ * from the prior tick's logits; when it matches the first drafted
+ * token, decode the whole draft in one batch with logits on every
+ * row, verify each subsequent draft token by sampling at the
+ * previous row, roll rejected cells back, and decode the correction
+ * (or bonus) token so the returned tokens are all committed to KV.
+ *
+ * Chain-state exactness: every llama_sampler_sample call's token is
+ * committed and every committed token comes from exactly one sample
+ * call, in commit order - so grammar, penalties, DRY, and seeded RNG
+ * state end identical to sequential decoding, for temperature 0 and
+ * for temperature > 0 with a seed.
+ *
+ * NAcc counts the matched DRAFT tokens (the correction/bonus token
+ * is excluded); the Erlang side feeds it back to spec_accept.
+ *
+ * The caller must be the sole active request on the context: the
+ * per-op decodes invalidate every other sequence's last_logits_idx
+ * implicitly (the logits buffer belongs to the last llama_decode).
+ * The scheduler only issues spec ticks when exactly one request is
+ * active.
+ * ========================================================================= */
+
+/* Decode a single token at `pos` on `seq_id` with logits enabled.
+ * Returns 0, or the raw decode rc / ERLLAMA_DECODE_EXC_SENTINEL.
+ * Caller holds c->mu. */
+static int spec_decode_single(erllama_context_t *c, llama_token tok,
+                              int32_t pos, int seq_id) {
+    struct llama_batch b = erllama_safe_batch_init(1, 0, 1);
+    if (!b.token || !b.pos || !b.n_seq_id || !b.seq_id || !b.logits) {
+        erllama_safe_batch_free(b);
+        return ERLLAMA_DECODE_EXC_SENTINEL;
+    }
+    b.n_tokens = 1;
+    b.token[0] = tok;
+    b.pos[0] = pos;
+    b.n_seq_id[0] = 1;
+    b.seq_id[0][0] = (llama_seq_id) seq_id;
+    b.logits[0] = 1;
+    arm_decode(c);
+    int rc = erllama_safe_decode(c->ctx, b);
+    erllama_safe_batch_free(b);
+    return rc;
+}
+
+/* Fail the op after KV/logits state may already be torn: force a
+ * clean re-prefill before any further sampling on this context. */
+static ERL_NIF_TERM spec_fail(ErlNifEnv *env, erllama_context_t *c,
+                              int seq_id, ERL_NIF_TERM why) {
+    c->decode_ready = 0;
+    c->per_seq[seq_id].last_logits_idx = -1;
+    pthread_mutex_unlock(&c->mu);
+    return erllama_error(env, why);
+}
+
+ERL_NIF_TERM nif_spec_step(ErlNifEnv *env, int argc,
+                           const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    erllama_sampler_t *s;
+    if (!enif_get_resource(env, argv[1], SAMPLER_RT, (void **) &s)) {
+        return enif_make_badarg(env);
+    }
+    int seq_id;
+    if (!enif_get_int(env, argv[2], &seq_id) || seq_id < 0 ||
+        seq_id >= ERLLAMA_N_SEQ_MAX_CAP) {
+        return enif_make_badarg(env);
+    }
+    llama_token *draft = NULL;
+    int32_t m = 0;
+    int rc = read_token_list(env, argv[3], &draft, &m);
+    if (rc != 1) return token_list_error(env, rc);
+    if (m < 1) {
+        if (draft) enif_free(draft);
+        return enif_make_badarg(env);
+    }
+
+    if (!erllama_lock_ctx(c)) {
+        enif_free(draft);
+        return erllama_error(env, atom_released);
+    }
+    int32_t li = c->per_seq[seq_id].last_logits_idx;
+    if (!c->decode_ready || li < 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(draft);
+        return erllama_error(env, atom_no_logits);
+    }
+    int32_t n_vocab = 0;
+    const struct llama_vocab *vocab = erllama_ctx_vocab(c, &n_vocab);
+    if (!vocab || n_vocab <= 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(draft);
+        return erllama_error(env, atom_exception);
+    }
+    if (erllama_first_oob_token(draft, m, n_vocab) >= 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(draft);
+        return erllama_error(env, atom_invalid_token);
+    }
+    uint32_t n_batch_cap = erllama_safe_n_batch(c->ctx);
+    if (n_batch_cap == 0 || (uint32_t) m > n_batch_cap) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(draft);
+        return erllama_error(env, atom_batch_overflow);
+    }
+
+    pthread_mutex_lock(&s->mu);
+    if (!s->chain) {
+        pthread_mutex_unlock(&s->mu);
+        pthread_mutex_unlock(&c->mu);
+        enif_free(draft);
+        return erllama_error(env, atom_released);
+    }
+    if (s->ctx_res != c || s->n_probs > 0) {
+        pthread_mutex_unlock(&s->mu);
+        pthread_mutex_unlock(&c->mu);
+        enif_free(draft);
+        return enif_make_badarg(env);
+    }
+
+    int32_t next_pos = c->per_seq[seq_id].next_pos;
+
+    /* Sample the next token from the prior tick's logits (this is
+     * the same sample a plain decode op would take). */
+    llama_token s0 = erllama_safe_sampler_sample(s->chain, c->ctx, li);
+    if (s0 < 0) {
+        pthread_mutex_unlock(&s->mu);
+        enif_free(draft);
+        return spec_fail(env, c, seq_id, atom_exception);
+    }
+    int eog0 = erllama_safe_vocab_is_eog(vocab, s0);
+
+    /* committed[] holds every token this op returns; all of them are
+     * in KV by the time we return. */
+    llama_token *committed =
+        enif_alloc(sizeof(llama_token) * ((size_t) m + 1));
+    if (!committed) {
+        pthread_mutex_unlock(&s->mu);
+        pthread_mutex_unlock(&c->mu);
+        enif_free(draft);
+        return erllama_error(env, atom_oom);
+    }
+    int32_t n_committed = 0;
+    int32_t n_acc = 0;
+    int eog_flag = 0;
+
+    if (s0 != draft[0] || eog0) {
+        /* Draft miss (or immediate EOG): behave exactly like a plain
+         * decode op - commit s0 alone. A matching EOG still counts
+         * as an accepted draft token for the stats. */
+        int dr = spec_decode_single(c, s0, next_pos, seq_id);
+        pthread_mutex_unlock(&s->mu);
+        if (dr != 0) {
+            ERL_NIF_TERM why = (dr == ERLLAMA_DECODE_EXC_SENTINEL)
+                                   ? atom_exception
+                                   : classify_decode_error(env, c, dr);
+            enif_free(draft);
+            enif_free(committed);
+            return spec_fail(env, c, seq_id, why);
+        }
+        committed[0] = s0;
+        n_committed = 1;
+        n_acc = (s0 == draft[0]) ? 1 : 0;
+        eog_flag = eog0;
+        c->per_seq[seq_id].next_pos = next_pos + 1;
+        c->per_seq[seq_id].last_logits_idx = 0;
+        c->decode_ready = 1;
+    } else {
+        /* Draft hit: decode all m draft rows in one batch, logits on
+         * every row so each position can be verified by sampling. */
+        struct llama_batch batch = erllama_safe_batch_init(m, 0, 1);
+        if (!batch.token || !batch.pos || !batch.n_seq_id ||
+            !batch.seq_id || !batch.logits) {
+            erllama_safe_batch_free(batch);
+            pthread_mutex_unlock(&s->mu);
+            pthread_mutex_unlock(&c->mu);
+            enif_free(draft);
+            enif_free(committed);
+            return erllama_error(env, atom_oom);
+        }
+        for (int32_t j = 0; j < m; j++) {
+            batch.token[j] = draft[j];
+            batch.pos[j] = next_pos + j;
+            batch.n_seq_id[j] = 1;
+            batch.seq_id[j][0] = (llama_seq_id) seq_id;
+            batch.logits[j] = 1;
+        }
+        batch.n_tokens = m;
+        arm_decode(c);
+        int dr = erllama_safe_decode(c->ctx, batch);
+        erllama_safe_batch_free(batch);
+        if (dr != 0) {
+            ERL_NIF_TERM why = (dr == ERLLAMA_DECODE_EXC_SENTINEL)
+                                   ? atom_exception
+                                   : classify_decode_error(env, c, dr);
+            pthread_mutex_unlock(&s->mu);
+            enif_free(draft);
+            enif_free(committed);
+            return spec_fail(env, c, seq_id, why);
+        }
+
+        /* Verify rows 1..m-1. All sampling happens before any
+         * seq_rm; the sampled tokens ARE the committed sequence, so
+         * the chain state stays exact. */
+        committed[0] = draft[0];
+        n_committed = 1;
+        n_acc = 1;
+        llama_token correction = -1;
+        int correction_eog = 0;
+        int32_t mismatch_at = -1;
+        int32_t eog_at = -1;
+        for (int32_t i = 1; i < m; i++) {
+            llama_token si =
+                erllama_safe_sampler_sample(s->chain, c->ctx, i - 1);
+            if (si < 0) {
+                pthread_mutex_unlock(&s->mu);
+                enif_free(draft);
+                enif_free(committed);
+                return spec_fail(env, c, seq_id, atom_exception);
+            }
+            if (si != draft[i]) {
+                mismatch_at = i;
+                correction = si;
+                correction_eog = erllama_safe_vocab_is_eog(vocab, si);
+                break;
+            }
+            committed[n_committed++] = draft[i];
+            n_acc++;
+            if (erllama_safe_vocab_is_eog(vocab, draft[i])) {
+                eog_at = i;
+                break;
+            }
+        }
+
+        if (eog_at >= 0) {
+            /* Accepted EOG mid-draft: it is already in KV; drop the
+             * rows past it, no correction decode. The logits of the
+             * big decode stay valid (they belong to the decode, not
+             * the KV), and the request is finishing anyway. */
+            if (eog_at + 1 < m) {
+                int rrc = erllama_safe_memory_seq_rm(
+                    c->ctx, seq_id, next_pos + eog_at + 1, -1);
+                if (rrc != 0) {
+                    pthread_mutex_unlock(&s->mu);
+                    enif_free(draft);
+                    enif_free(committed);
+                    return spec_fail(env, c, seq_id, atom_decode_failed);
+                }
+            }
+            eog_flag = 1;
+            c->per_seq[seq_id].next_pos = next_pos + eog_at + 1;
+            c->per_seq[seq_id].last_logits_idx = eog_at;
+            c->decode_ready = 1;
+        } else {
+            /* Mismatch: the sampled token at the first divergent
+             * position is the correct next token. All matched: the
+             * sample at the last row is the bonus token. Either way
+             * it is not yet in KV - roll back rejects, then decode
+             * it so the invariant (returned => committed) holds. */
+            llama_token tail_tok;
+            int32_t tail_pos;
+            if (mismatch_at >= 0) {
+                int rrc = erllama_safe_memory_seq_rm(
+                    c->ctx, seq_id, next_pos + mismatch_at, -1);
+                if (rrc != 0) {
+                    pthread_mutex_unlock(&s->mu);
+                    enif_free(draft);
+                    enif_free(committed);
+                    return spec_fail(env, c, seq_id, atom_decode_failed);
+                }
+                tail_tok = correction;
+                tail_pos = next_pos + mismatch_at;
+                eog_flag = correction_eog;
+            } else {
+                llama_token bonus =
+                    erllama_safe_sampler_sample(s->chain, c->ctx, m - 1);
+                if (bonus < 0) {
+                    pthread_mutex_unlock(&s->mu);
+                    enif_free(draft);
+                    enif_free(committed);
+                    return spec_fail(env, c, seq_id, atom_exception);
+                }
+                tail_tok = bonus;
+                tail_pos = next_pos + m;
+                eog_flag = erllama_safe_vocab_is_eog(vocab, bonus);
+            }
+            int dr2 = spec_decode_single(c, tail_tok, tail_pos, seq_id);
+            if (dr2 != 0) {
+                ERL_NIF_TERM why = (dr2 == ERLLAMA_DECODE_EXC_SENTINEL)
+                                       ? atom_exception
+                                       : classify_decode_error(env, c, dr2);
+                pthread_mutex_unlock(&s->mu);
+                enif_free(draft);
+                enif_free(committed);
+                return spec_fail(env, c, seq_id, why);
+            }
+            committed[n_committed++] = tail_tok;
+            c->per_seq[seq_id].next_pos = tail_pos + 1;
+            c->per_seq[seq_id].last_logits_idx = 0;
+            c->decode_ready = 1;
+        }
+        pthread_mutex_unlock(&s->mu);
+    }
+    pthread_mutex_unlock(&c->mu);
+    enif_free(draft);
+
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (int32_t i = n_committed - 1; i >= 0; i--) {
+        list = enif_make_list_cell(env, enif_make_int(env, committed[i]),
+                                   list);
+    }
+    enif_free(committed);
+    ERL_NIF_TERM payload = enif_make_tuple4(
+        env, enif_make_atom(env, "spec"), list,
+        enif_make_int(env, eog_flag), enif_make_int(env, n_acc));
+    return enif_make_tuple2(env, atom_ok, payload);
+}

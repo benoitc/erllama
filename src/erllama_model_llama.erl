@@ -43,6 +43,13 @@
     seq_rm_last/2,
     seq_rm_last/3,
     step/2,
+    spec_supported/1,
+    spec_new/2,
+    spec_begin/4,
+    spec_draft/5,
+    spec_accept/4,
+    spec_free/2,
+    spec_step/4,
     sampler_new/2,
     sampler_free/1,
     apply_chat_template/2,
@@ -330,6 +337,30 @@ map_marker({SeqId, {token, Tok, _Eog}} = R, #s{
     end;
 map_marker(R, _S) ->
     R.
+
+%% Ngram speculation: thin forwards to the NIF shim. Speculation is
+%% vetoed while thinking markers are configured because spec_step
+%% bypasses the map_marker routing above.
+spec_supported(#s{} = S) ->
+    all_markers_empty(S).
+
+spec_new(#s{}, Cfg) ->
+    erllama_nif:spec_new(Cfg).
+
+spec_begin(#s{}, SpecRef, SeqId, PromptTokens) ->
+    erllama_nif:spec_begin(SpecRef, SeqId, PromptTokens).
+
+spec_draft(#s{}, SpecRef, SeqId, IdLast, Delta) ->
+    erllama_nif:spec_draft(SpecRef, SeqId, IdLast, Delta).
+
+spec_accept(#s{}, SpecRef, SeqId, NAcc) ->
+    erllama_nif:spec_accept(SpecRef, SeqId, NAcc).
+
+spec_free(#s{}, SpecRef) ->
+    erllama_nif:spec_free(SpecRef).
+
+spec_step(#s{ctx = C}, SamplerRef, SeqId, Draft) ->
+    erllama_nif:spec_step(C, SamplerRef, SeqId, Draft).
 
 %% Surface the underlying NIF model resource for callers that need to
 %% hand it to `erllama_chat:init/2' (the autoparser

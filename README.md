@@ -104,7 +104,7 @@ lists every reason.
 | Embeddings | `embed/2`, `embed_batch/2` |
 | Adapters | `load_adapter/2`, `unload_adapter/2`, `set_adapter_scale/3`, `list_adapters/1` |
 | Observability | `status/1`, `phase/1`, `pending_len/1`, `queue_depth/0,1`, `last_cache_hit/1`, `cached_prefix_len/2`, `counters/0`, `vram_info/0`, `pressure/0`, `requests/0`, `request_info/1` |
-| Speculative | `draft_tokens/3`, `verify/4` |
+| Speculative | `speculative` request option (ngram, no draft model), `draft_tokens/3`, `verify/4` |
 | Memory control | `evict/1`, `shutdown/1` |
 
 The cache has its own module, `erllama_cache` (`add_tier/1`, `info/0`,

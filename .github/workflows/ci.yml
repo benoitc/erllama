@@ -297,7 +297,7 @@ jobs:
         run: |
           # Touch our sources so cmake recompiles them under the wrapper
           # even when an earlier cache hit left .o files in place.
-          touch c_src/erllama_nif*.c c_src/erllama_safe.cpp c_src/erllama_chat_nif.cpp c_src/crc32c.c
+          touch c_src/erllama_nif*.c c_src/erllama_safe.cpp c_src/erllama_chat_nif.cpp c_src/erllama_spec_nif.cpp c_src/crc32c.c
           scan-build --status-bugs -o /tmp/scan-reports \
               cmake --build _build/scan --target erllama_nif -- -j $(nproc)
       - name: Upload scan-build reports on failure
