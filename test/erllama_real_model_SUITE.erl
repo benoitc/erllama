@@ -65,6 +65,7 @@
     verify_accepted_count_le_k/1,
     ngram_speculation_matches_plain/1,
     ngram_speculation_stop_sequence_trims_kv/1,
+    spec_step_nif_greedy_paths/1,
     chunked_prefill_sizes_agree/1,
     continue_multi_turn_cache_delta/1,
     tokenize_large_input/1,
@@ -120,6 +121,7 @@ all() ->
         verify_accepted_count_le_k,
         ngram_speculation_matches_plain,
         ngram_speculation_stop_sequence_trims_kv,
+        spec_step_nif_greedy_paths,
         chunked_prefill_sizes_agree,
         continue_multi_turn_cache_delta,
         tokenize_large_input,
@@ -919,9 +921,66 @@ ngram_speculation_matches_plain(Config) ->
     ?assertEqual(maps:get(reply, Plain), maps:get(reply, Spec)),
     ?assertNot(maps:is_key(speculative, Plain)),
     #{drafted := D, accepted := A} = maps:get(speculative, Spec),
-    ?assert(D > 0),
-    ?assert(A > 0),
     ?assert(A =< D),
+    %% Whether drafts fire depends on the model actually revisiting
+    %% a seen n-gram at temperature 0; tiny CI models (stories260K)
+    %% may never do so. The spec_step NIF itself is covered
+    %% model-independently by spec_step_nif_greedy_paths.
+    case D of
+        0 -> ct:comment("no drafts on this model; equality still holds");
+        _ -> ?assert(A > 0)
+    end,
+    ok.
+
+%% Deterministic nif_spec_step coverage on any model: derive the
+%% greedy continuation with plain step decodes, reset the sequence,
+%% and verify the same tokens as a draft. A perfect draft must
+%% commit draft ++ bonus with every draft token accepted; a draft
+%% wrong at its second position must commit the matched first token
+%% plus the model's own correction.
+spec_step_nif_greedy_paths(Config) ->
+    Model = ?config(model, Config),
+    {ok, Prompt} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    BState = erllama_model:get_backend_state(Model),
+    Ctx = element(3, BState),
+    Greedy = #{temperature => 0.0},
+    %% Reference: 4 greedy tokens via the plain step path.
+    {ok, S1} = erllama_nif:sampler_new(Ctx, Greedy),
+    {ok, [{0, prefilled}]} = erllama_nif:step(Ctx, [{0, {prefill, Prompt}}]),
+    [T1, T2, T3, T4] = [
+        begin
+            {ok, [{0, {token, T, _}}]} =
+                erllama_nif:step(Ctx, [{0, {decode, S1}}]),
+            T
+        end
+     || _ <- lists:seq(1, 4)
+    ],
+    ok = erllama_nif:sampler_free(S1),
+    %% Perfect draft: [T1, T2, T3] verifies fully, bonus is T4.
+    ok = erllama_nif:kv_seq_rm(Ctx, 0, 0, -1),
+    {ok, S2} = erllama_nif:sampler_new(Ctx, Greedy),
+    {ok, [{0, prefilled}]} = erllama_nif:step(Ctx, [{0, {prefill, Prompt}}]),
+    {ok, {spec, Committed, _Eog, NAcc}} =
+        erllama_nif:spec_step(Ctx, S2, 0, [T1, T2, T3]),
+    ?assertEqual([T1, T2, T3, T4], Committed),
+    ?assertEqual(3, NAcc),
+    %% The context continues seamlessly after the spec commit.
+    {ok, [{0, {token, T5, _}}]} = erllama_nif:step(Ctx, [{0, {decode, S2}}]),
+    ?assert(is_integer(T5)),
+    ok = erllama_nif:sampler_free(S2),
+    %% Wrong second token: T1 accepted, correction is the model's
+    %% own T2, rejected cells rolled back.
+    ok = erllama_nif:kv_seq_rm(Ctx, 0, 0, -1),
+    {ok, S3} = erllama_nif:sampler_new(Ctx, Greedy),
+    {ok, [{0, prefilled}]} = erllama_nif:step(Ctx, [{0, {prefill, Prompt}}]),
+    {ok, VI} = erllama:vocab_info(Model),
+    Wrong = (T2 + 1) rem maps:get(n_vocab, VI),
+    {ok, {spec, Committed2, _Eog2, NAcc2}} =
+        erllama_nif:spec_step(Ctx, S3, 0, [T1, Wrong, Wrong]),
+    ?assertEqual([T1, T2], Committed2),
+    ?assertEqual(1, NAcc2),
+    ok = erllama_nif:sampler_free(S3),
+    ok = erllama_nif:kv_seq_rm(Ctx, 0, 0, -1),
     ok.
 
 %% A stop string aimed mid-way into the known (temp 0) continuation:
