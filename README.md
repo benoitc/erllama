@@ -100,6 +100,7 @@ lists every reason.
 | Streaming | `stream/3`, `collect/2`, `cancel/1` |
 | Sessions | `continue/3`, `end_session/2`, `fork_session/3`, `reset_session/2` |
 | Chat | `chat/3`, `chat_apply/3`, `chat_parse/3`, `render_chat_template/2` |
+| Multimodal | image/audio chat content parts, `media` request option, `media_marker/0` |
 | Tokens | `tokenize/2,3`, `detokenize/2,3`, `vocab_info/1` |
 | Embeddings | `embed/2`, `embed_batch/2` |
 | Adapters | `load_adapter/2`, `unload_adapter/2`, `set_adapter_scale/3`, `list_adapters/1` |
@@ -221,6 +222,7 @@ ok = erllama:unload(<<"tiny">>).
 | Generate text: complete, stream, options, logprobs | [Generating text](guides/generation.md) |
 | Multi-turn state: sessions, continue, fork | [Sessions](guides/sessions.md) |
 | Run chat turns and tool calls | [Tool calls](guides/tool-calls.md) |
+| Send images and audio to multimodal models | [Vision and audio input](guides/multimodal.md) |
 | Tokenize, detokenize, special tokens, FIM | [Tokens and vocabulary](guides/tokens.md) |
 | Compute embeddings | [Embeddings](guides/embeddings.md) |
 | Attach LoRA adapters | [Adapters](guides/adapters.md) |

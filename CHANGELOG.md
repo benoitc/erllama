@@ -21,6 +21,19 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Vision and audio input via libmtmd (`tools/mtmd` now vendored,
+  built through the upstream `LLAMA_BUILD_MTMD` standalone hook):
+  load an `mmproj_path` projector alongside the model, send
+  `#{type => image | audio, data => Bytes}` chat content parts or
+  the `media` request option on `stream/3` / `complete/3` (one
+  `media_marker/0` per item in the prompt). Formats: jpg/png/bmp/gif
+  and wav/mp3/flac. `model_info/1` reports `mmproj` modalities;
+  stats gain `media => #{items, n_tokens, n_pos}`. v1 limits: media
+  requests bypass the KV cache, reject the session/cache/speculation
+  options, and prefill as the sole active request; video, webp and
+  mtmd's experimental TTS are not exposed. A dedicated
+  whisper.cpp-style transcription API remains a separate roadmap
+  item.
 - Device selection, MoE offload, and auto-fit at model load:
   `model_opts` gains `devices` (`[NameBin] | none`), `cpu_moe`
   (`true | N`, expert tensors to CPU), `tensor_buft_overrides`

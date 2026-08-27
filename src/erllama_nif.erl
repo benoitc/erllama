@@ -69,6 +69,11 @@
     spec_accept/3,
     spec_free/1,
     spec_step/4,
+    mtmd_init/3,
+    mtmd_free/1,
+    mtmd_caps/1,
+    mtmd_caps_file/1,
+    media_prefill/6,
     chat_templates_init/2,
     chat_templates_apply/2,
     chat_parse/3
@@ -80,6 +85,9 @@
 
 -export_type([spec_ref/0]).
 -type spec_ref() :: reference().
+
+-export_type([mtmd_ref/0]).
+-type mtmd_ref() :: reference().
 
 -export_type([adapter_ref/0, sampler_ref/0]).
 
@@ -575,6 +583,50 @@ spec_free(Spec) ->
 spec_step(Ctx, Sampler, SeqId, Draft) when is_list(Draft), Draft =/= [] ->
     nif_spec_step(Ctx, Sampler, SeqId, Draft).
 
+%% Multimodal projector (libmtmd): load an mmproj GGUF against a
+%% loaded text model. Opts: use_gpu (default true), n_threads,
+%% image_min_tokens, image_max_tokens.
+-spec mtmd_init(model_ref(), iodata(), map()) ->
+    {ok, mtmd_ref()} | {error, atom()}.
+mtmd_init(Model, Path, Opts) when is_map(Opts) ->
+    nif_mtmd_init(Model, Path, Opts).
+
+-spec mtmd_free(mtmd_ref()) -> ok | {error, released}.
+mtmd_free(Mtmd) ->
+    nif_mtmd_free(Mtmd).
+
+%% Modalities of a live projector: #{vision, audio,
+%% audio_sample_rate (when audio), marker}.
+-spec mtmd_caps(mtmd_ref()) -> {ok, map()} | {error, atom()}.
+mtmd_caps(Mtmd) ->
+    nif_mtmd_caps(Mtmd).
+
+%% Capability probe from the mmproj file alone (no GPU commit).
+-spec mtmd_caps_file(iodata()) -> {ok, map()} | {error, atom()}.
+mtmd_caps_file(Path) ->
+    nif_mtmd_caps_file(Path).
+
+%% Whole-prompt multimodal prefill: evaluates the rendered prompt
+%% (one media marker per item) plus the decoded media into the
+%% sequence; on success the seq is decode-ready with logits on the
+%% final prompt position. NPos is KV positions consumed (differs
+%% from NTokens on M-RoPE models). The per-step decode deadline is
+%% disabled for the call; request_abort/1 still interrupts it.
+-spec media_prefill(
+    context_ref(),
+    mtmd_ref(),
+    iodata(),
+    [{image | audio, binary()}],
+    non_neg_integer(),
+    map()
+) ->
+    {ok, NTokens :: non_neg_integer(), NPos :: non_neg_integer()}
+    | {error, atom()}.
+media_prefill(Ctx, Mtmd, Prompt, Media, SeqId, Opts) when
+    is_list(Media), is_map(Opts)
+->
+    nif_media_prefill(Ctx, Mtmd, Prompt, Media, SeqId, Opts).
+
 %% Initialise a llama.cpp `common_chat_templates_ptr' from a loaded
 %% model. The TemplateOverride is either the chat-template binary to
 %% use (overriding the GGUF's default) or the atom `undefined' to use
@@ -661,6 +713,12 @@ nif_spec_draft(_Spec, _SeqId, _IdLast, _Delta) -> erlang:nif_error(nif_not_loade
 nif_spec_accept(_Spec, _SeqId, _N) -> erlang:nif_error(nif_not_loaded).
 nif_spec_free(_Spec) -> erlang:nif_error(nif_not_loaded).
 nif_spec_step(_Ctx, _Sampler, _SeqId, _Draft) -> erlang:nif_error(nif_not_loaded).
+nif_mtmd_init(_Model, _Path, _Opts) -> erlang:nif_error(nif_not_loaded).
+nif_mtmd_free(_Mtmd) -> erlang:nif_error(nif_not_loaded).
+nif_mtmd_caps(_Mtmd) -> erlang:nif_error(nif_not_loaded).
+nif_mtmd_caps_file(_Path) -> erlang:nif_error(nif_not_loaded).
+nif_media_prefill(_Ctx, _Mtmd, _Prompt, _Media, _SeqId, _Opts) ->
+    erlang:nif_error(nif_not_loaded).
 nif_chat_templates_init(_Model, _Override) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_apply(_Templates, _Inputs) -> erlang:nif_error(nif_not_loaded).
 nif_chat_parse(_Params, _Input, _IsPartial) -> erlang:nif_error(nif_not_loaded).

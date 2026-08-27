@@ -403,6 +403,10 @@ int erllama_safe_backend_free(void) noexcept {
 // Clear the process-global log callback so a NIF unload cannot
 // leave llama.cpp pointing at a function in a soon-to-be-unmapped
 // shared object. Called from the NIF unload path.
+ggml_log_callback erllama_safe_log_callback(void) noexcept {
+    return erllama_log_capture;
+}
+
 void erllama_safe_log_unset(void) noexcept {
     erllama_safe_clear_log_receiver();
     try {

@@ -38,6 +38,9 @@ typedef struct {
     struct llama_model *model;
     int active_contexts;
     int active_adapters;
+    /* Live mtmd projector contexts borrowing this model; free_model
+     * defers while non-zero (same contract as adapters). */
+    int active_mtmd;
     int release_pending;
     float tensor_split[ERLLAMA_MAX_DEVICES];
     int has_tensor_split;

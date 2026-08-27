@@ -13,7 +13,7 @@ architectures are adopted.
 `scripts/vendor_llama.sh` copies these upstream paths wholesale:
 
 ```
-cmake/ CMakeLists.txt common/ ggml/ include/ src/ LICENSE vendor/
+cmake/ CMakeLists.txt common/ ggml/ include/ src/ LICENSE vendor/ tools/mtmd/
 ```
 
 and then removes whole directories we never build:
@@ -23,7 +23,10 @@ and then removes whole directories we never build:
 - `.gitignore` files
 
 `vendor/` is kept whole: upstream builds it as CMake targets that
-`common/` links against.
+`common/` links against. `tools/mtmd/` is the multimodal library
+(libmtmd: mmproj projectors, image/audio input); it is built through
+the upstream `LLAMA_BUILD_MTMD` standalone hook with `MTMD_VIDEO`
+forced off, and it links `vendor/{stb,miniaudio,hash,sheredom}`.
 
 No file is edited. `common/` is needed for the chat template pipeline
 (`common_chat_*`, the PEG autoparser, the jinja runtime). It links

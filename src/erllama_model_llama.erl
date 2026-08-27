@@ -50,6 +50,8 @@
     spec_accept/4,
     spec_free/2,
     spec_step/4,
+    media_caps/1,
+    media_prefill/4,
     sampler_new/2,
     sampler_free/1,
     apply_chat_template/2,
@@ -100,7 +102,12 @@
     %% Auto-fit result from the load NIF (`undefined` when the fit
     %% option was off): #{fit => ok | failed, n_gpu_layers, n_ctx,
     %% tensor_split => [float()]}. Surfaced via extra_metadata/1.
-    fit_info = undefined :: map() | undefined
+    fit_info = undefined :: map() | undefined,
+    %% Multimodal projector (libmtmd) handle + its modality caps;
+    %% `undefined` when no mmproj_path was configured. Survives
+    %% reset_context (bound to the model, not the context).
+    mtmd = undefined :: erllama_nif:mtmd_ref() | undefined,
+    mtmd_caps = undefined :: map() | undefined
 }).
 
 init(Config) ->
@@ -200,10 +207,39 @@ open_context(Model, Config, MOpts, Family, FitInfo) ->
     COpts = fit_context_opts(COpts0, MOpts, FitInfo),
     case erllama_nif:new_context(Model, COpts) of
         {ok, Ctx} ->
-            {ok, build_state(Model, Ctx, Config, MOpts, COpts, Family, FitInfo)};
+            case open_mtmd(Model, Config) of
+                {ok, Mtmd, MtmdCaps} ->
+                    {ok,
+                        build_state(
+                            Model, Ctx, Config, MOpts, COpts, Family, FitInfo, Mtmd, MtmdCaps
+                        )};
+                {error, _} = E ->
+                    erllama_nif:free_context(Ctx),
+                    erllama_nif:free_model(Model),
+                    E
+            end;
         {error, _} = E ->
             erllama_nif:free_model(Model),
             E
+    end.
+
+%% Optional multimodal projector: `mmproj_path` in the load config
+%% opens a libmtmd context bound to the model (vision/audio input).
+open_mtmd(Model, Config) ->
+    case maps:get(mmproj_path, Config, undefined) of
+        undefined ->
+            {ok, undefined, undefined};
+        Path ->
+            MtmdOpts = maps:get(mmproj_opts, Config, #{}),
+            case erllama_nif:mtmd_init(Model, Path, MtmdOpts) of
+                {ok, Mtmd} ->
+                    case erllama_nif:mtmd_caps(Mtmd) of
+                        {ok, Caps} -> {ok, Mtmd, Caps};
+                        {error, _} = E -> E
+                    end;
+                {error, _} = E ->
+                    E
+            end
     end.
 
 %% With `fit => #{n_ctx => auto}` and a successful fit, the chosen
@@ -232,10 +268,12 @@ family_context_opts(COpts, Family) ->
         false -> COpts
     end.
 
-build_state(Model, Ctx, Config, MOpts, COpts, Family, FitInfo) ->
+build_state(Model, Ctx, Config, MOpts, COpts, Family, FitInfo, Mtmd, MtmdCaps) ->
     ThinkingMarkers = maps:get(thinking_markers, Config, #{}),
     {ThinkStart, ThinkEnd} = tokenize_markers(Model, ThinkingMarkers),
     #s{
+        mtmd = Mtmd,
+        mtmd_caps = MtmdCaps,
         model = Model,
         ctx = Ctx,
         context_opts = COpts,
@@ -283,7 +321,14 @@ tokenize_marker(Model, Bin) when is_binary(Bin) ->
         _ -> []
     end.
 
-terminate(#s{ctx = Ctx, model = Model}) ->
+terminate(#s{ctx = Ctx, model = Model, mtmd = Mtmd}) ->
+    %% The projector borrows the model; free it first so free_model
+    %% is not deferred behind the mtmd refcount.
+    _ =
+        case Mtmd of
+            undefined -> ok;
+            _ -> erllama_nif:mtmd_free(Mtmd)
+        end,
     erllama_nif:free_context(Ctx),
     erllama_nif:free_model(Model),
     ok.
@@ -432,6 +477,23 @@ spec_free(#s{}, SpecRef) ->
 spec_step(#s{ctx = C}, SamplerRef, SeqId, Draft) ->
     erllama_nif:spec_step(C, SamplerRef, SeqId, Draft).
 
+%% Multimodal: the projector's modality caps and the whole-prompt
+%% media prefill (see erllama_nif:media_prefill/6).
+media_caps(#s{mtmd_caps = undefined}) ->
+    undefined;
+media_caps(#s{mtmd_caps = Caps}) ->
+    #{
+        vision => maps:get(vision, Caps, false),
+        audio => maps:get(audio, Caps, false)
+    }.
+
+media_prefill(#s{ctx = C, mtmd = Mtmd}, Prompt, Media, Opts) when Mtmd =/= undefined ->
+    SeqId = maps:get(seq_id, Opts, 0),
+    AddSpecial = maps:get(add_special, Opts, true),
+    erllama_nif:media_prefill(C, Mtmd, Prompt, Media, SeqId, #{add_special => AddSpecial});
+media_prefill(#s{}, _Prompt, _Media, _Opts) ->
+    {error, no_mmproj}.
+
 %% Surface the underlying NIF model resource for callers that need to
 %% hand it to `erllama_chat:init/2' (the autoparser
 %% templates init expects a model_ref). The scheduler holds the
@@ -494,22 +556,29 @@ apply_adapters(#s{ctx = C} = S, Adapters) ->
 ok_state(S, ok) -> {ok, S};
 ok_state(_S, {error, _} = E) -> E.
 
-extra_metadata(#s{
-    model_size_bytes = SB,
-    total_layers = TL,
-    n_gpu_layers = NL,
-    family = Family,
-    fit_info = FitInfo
-}) ->
+extra_metadata(
+    #s{
+        model_size_bytes = SB,
+        total_layers = TL,
+        n_gpu_layers = NL,
+        family = Family,
+        fit_info = FitInfo
+    } = S
+) ->
     Meta = #{
         model_size_bytes => SB,
         total_layers => TL,
         n_gpu_layers => NL,
         family => Family
     },
-    case FitInfo of
-        undefined -> Meta;
-        _ -> Meta#{fit => FitInfo}
+    Meta1 =
+        case FitInfo of
+            undefined -> Meta;
+            _ -> Meta#{fit => FitInfo}
+        end,
+    case S#s.mtmd_caps of
+        undefined -> Meta1;
+        Caps -> Meta1#{mmproj => Caps}
     end.
 
 %% Speculative-decoding verifier. Snapshot+restore protocol so

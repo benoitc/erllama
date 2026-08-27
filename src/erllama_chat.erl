@@ -13,7 +13,13 @@
 %% `erllama_model:chat_apply/2` is the entry point used by the façade.
 
 -export([init/2, apply/2, parse/3]).
--export([chat/3, inputs/2, chat_keys/0, merge_params/2]).
+-export([
+    chat/3,
+    inputs/2,
+    extract_media/1,
+    chat_keys/0,
+    merge_params/2
+]).
 
 -export_type([templates_ref/0, params_ref/0, parsed_msg/0, message/0, tool/0]).
 
@@ -103,14 +109,94 @@ prompt.
     | {error, term()}.
 chat(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
     RequestOpts = maps:without(?CHAT_KEYS, Opts),
+    {Messages1, Media} = extract_media(Messages),
     case check_conflicts(Opts) of
         ok ->
-            case erllama_model:chat_apply(Model, inputs(Messages, Opts)) of
+            case erllama_model:chat_apply(Model, inputs(Messages1, Opts)) of
                 {ok, Params, Render} ->
-                    chat_generate(Model, Params, Render, merge_params(Render, RequestOpts));
+                    Merged = merge_params(Render, RequestOpts),
+                    case Media of
+                        [] ->
+                            chat_generate(Model, Params, Render, Merged);
+                        _ ->
+                            chat_generate_media(Model, Params, Render, Merged, Media)
+                    end;
                 {error, _} = E ->
                     E
             end;
+        {error, _} = E ->
+            E
+    end.
+
+-doc """
+Split media content parts out of the message list: each
+`#{type := image | audio, data := Binary}` part is replaced by the
+`media_marker` part the chat template renders verbatim, and the
+media itself is returned as an ordered side-channel list matched
+positionally to the markers. Text parts and plain binary content
+pass through unchanged.
+""".
+-spec extract_media([message()]) ->
+    {[message()], [#{type := image | audio, data := binary()}]}.
+extract_media(Messages) ->
+    {RevMsgs, RevMedia} = lists:foldl(
+        fun(Msg, {MAcc, DAcc}) ->
+            case Msg of
+                #{content := Parts} when is_list(Parts) ->
+                    {Parts1, DAcc1} = extract_media_parts(Parts, DAcc),
+                    {[Msg#{content := Parts1} | MAcc], DAcc1};
+                _ ->
+                    {[Msg | MAcc], DAcc}
+            end
+        end,
+        {[], []},
+        Messages
+    ),
+    {lists:reverse(RevMsgs), lists:reverse(RevMedia)}.
+
+extract_media_parts(Parts, DAcc0) ->
+    {RevParts, DAcc} = lists:foldl(
+        fun(Part, {PAcc, DAcc1}) ->
+            case Part of
+                #{type := image, data := Bytes} when is_binary(Bytes) ->
+                    {
+                        [marker_part() | PAcc],
+                        [#{type => image, data => Bytes} | DAcc1]
+                    };
+                #{type := audio, data := Bytes} when is_binary(Bytes) ->
+                    {
+                        [marker_part() | PAcc],
+                        [#{type => audio, data => Bytes} | DAcc1]
+                    };
+                _ ->
+                    {[Part | PAcc], DAcc1}
+            end
+        end,
+        {[], DAcc0},
+        Parts
+    ),
+    {lists:reverse(RevParts), DAcc}.
+
+marker_part() ->
+    #{type => media_marker, text => erllama:media_marker()}.
+
+%% Media-bearing chat: the rendered prompt (carrying one media
+%% marker per extracted item) is evaluated whole by the backend's
+%% media prefill; no facade tokenize. The chat template already
+%% added BOS-class specials, so add_special is off, matching the
+%% text path's tokenize options.
+chat_generate_media(Model, Params, Render, RequestOpts, Media) ->
+    Prompt = maps:get(prompt, Render),
+    InferOpts = maps:remove(to, RequestOpts),
+    Call = erllama_model:infer(
+        Model,
+        Prompt,
+        InferOpts#{media => Media, media_add_special => false},
+        self()
+    ),
+    case Call of
+        {ok, Ref} ->
+            chat_collect(Ref, Params, Prompt);
         {error, _} = E ->
             E
     end.

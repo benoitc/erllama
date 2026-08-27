@@ -414,7 +414,21 @@
     spec_cursor = 0 :: non_neg_integer(),
     %% Stats: draft tokens offered to / accepted by spec_step.
     spec_drafted = 0 :: non_neg_integer(),
-    spec_accepted = 0 :: non_neg_integer()
+    spec_accepted = 0 :: non_neg_integer(),
+    %% Multimodal request state. `media` holds the decoded-input
+    %% list ([{image | audio, Bytes}]); `media_prompt` the rendered
+    %% prompt binary (media requests carry no token list - the
+    %% whole prompt is evaluated by the backend's media_prefill).
+    %% `media_state` pending -> done gates op building: a pending
+    %% media request emits no step ops and prefills only as the
+    %% sole active request. Media requests bypass the KV cache
+    %% entirely (no lookup, no saves).
+    media = undefined :: [{image | audio, binary()}] | undefined,
+    media_prompt = undefined :: binary() | undefined,
+    media_add_special = true :: boolean(),
+    media_state = undefined :: undefined | pending | done,
+    media_n_tokens = 0 :: non_neg_integer(),
+    media_n_pos = 0 :: non_neg_integer()
 }).
 
 -record(data, {
@@ -448,6 +462,10 @@
     %% `undefined` when the fit option was off. Surfaced in
     %% model_info/1 under `fit`.
     fit_info = undefined :: map() | undefined,
+    %% Multimodal projector modalities reported by the backend at
+    %% load (#{vision, audio}); `undefined` when the model has no
+    %% mmproj. Gates media-bearing requests at admission.
+    media_caps = undefined :: map() | undefined,
     %% Optional chat template source overriding the one in the GGUF
     %% (load config `chat_template'); `undefined' uses the model's own.
     chat_template = undefined :: binary() | undefined,
@@ -611,12 +629,19 @@ FIFO. The reply `{ok, Ref}` is sent as soon as the call is admitted;
 streaming events follow once the queue head advances to this
 request.
 """.
--spec infer(model(), [non_neg_integer()], infer_params(), pid()) ->
+-spec infer(model(), [non_neg_integer()] | binary(), infer_params(), pid()) ->
     {ok, reference()} | {error, term()}.
 infer(Model, Tokens, Params, CallerPid) when
     is_list(Tokens), is_map(Params), is_pid(CallerPid)
 ->
-    call(Model, {infer, Tokens, Params, CallerPid}, infinity).
+    call(Model, {infer, Tokens, Params, CallerPid}, infinity);
+infer(Model, Prompt, Params, CallerPid) when
+    is_binary(Prompt), is_map(Params), is_pid(CallerPid), is_map_key(media, Params)
+->
+    %% Media-bearing request: the prompt travels as the rendered
+    %% binary (one media marker per item); the backend evaluates it
+    %% whole via media_prefill.
+    call(Model, {infer, Prompt, Params, CallerPid}, infinity).
 
 -doc """
 Streaming inference that extends a pinned sticky session by prefilling
@@ -1031,6 +1056,7 @@ build_init_data(ModelId, Config, Backend, BState) ->
         vram_estimate_b = compute_vram_estimate(Meta),
         family = maps:get(family, Meta, #{}),
         fit_info = maps:get(fit, Meta, undefined),
+        media_caps = maps:get(mmproj, Meta, undefined),
         req_table = #{},
         idle_seq_ids = lists:seq(0, NSeqMax - 1),
         n_seq_max = NSeqMax,
@@ -1685,6 +1711,10 @@ prompt_tokens_of({infer, _From, Tokens, _Params, _CallerPid}, _Data) ->
 %% the seq's KV cells already hold `StoredTokens` and the new
 %% prompt is `StoredTokens ++ Suffix` — we just prefill the suffix
 %% in place.
+start_request({complete, From, Prompt, #{media := _} = Opts}, SeqId, _Mode, Data) when
+    is_binary(Prompt)
+->
+    start_media_request({standard, From, undefined}, Prompt, Opts, SeqId, Data);
 start_request({complete, From, Prompt, Opts}, SeqId, Mode, Data) ->
     case sampler_for(Opts, Data) of
         {ok, SamplerRef, SamplerCfg, Data0} ->
@@ -1739,6 +1769,12 @@ start_request({prefill_only, From, PromptTokens, Opts}, SeqId, Mode, Data) ->
     %% get_request_sampler_ref reflects current state.
     Data2 = Data1#data{last_sampler_ref = undefined},
     {ok, snapshot_admission(Data2, Req1), []};
+start_request({infer, From, Prompt, #{media := _} = Params, CallerPid}, SeqId, _Mode, Data) when
+    is_binary(Prompt)
+->
+    start_media_request(
+        {streaming, From, CallerPid}, Prompt, Params, SeqId, Data
+    );
 start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
     case sampler_for(Params, Data) of
         {ok, SamplerRef, SamplerCfg, Data0} ->
@@ -2413,10 +2449,15 @@ build_model_info(State, Data) ->
         [arch, n_ctx_train, n_params, n_embd, n_layer, n_swa, recurrent, hybrid],
         Data#data.family
     ),
-    Family =
+    Family1 =
         case Data#data.fit_info of
             undefined -> Family0;
             FitInfo -> Family0#{fit => FitInfo}
+        end,
+    Family =
+        case Data#data.media_caps of
+            undefined -> Family1;
+            MediaCaps -> Family1#{mmproj => MediaCaps}
         end,
     Family#{
         id => Data#data.model_id,
@@ -2490,11 +2531,16 @@ obs_row(Phase, Data) ->
 step_tick(Data) ->
     ok = obs_refresh(running_phase(Data), Data),
     Data1 = honour_cancellations(Data),
-    case maybe_spec_tick(Data1) of
-        {spec, Req, Draft, DataS} ->
-            run_spec_tick(DataS, Req, Draft);
-        {no, DataS} ->
-            step_tick_ops(DataS)
+    case maybe_media_tick(Data1) of
+        {media, MReq, DataM} ->
+            run_media_tick(DataM, MReq);
+        no ->
+            case maybe_spec_tick(Data1) of
+                {spec, Req, Draft, DataS} ->
+                    run_spec_tick(DataS, Req, Draft);
+                {no, DataS} ->
+                    step_tick_ops(DataS)
+            end
     end.
 
 step_tick_ops(Data1) ->
@@ -2525,6 +2571,169 @@ step_tick_ops(Data1) ->
                     end
             end
     end.
+
+%% =============================================================================
+%% Multimodal requests
+%%
+%% A media-bearing request carries the rendered prompt binary plus
+%% the media items; the whole prompt is evaluated by the backend's
+%% media_prefill in one sole-active-request tick (mtmd's chunk eval
+%% cannot co-batch). Media requests bypass the KV cache entirely -
+%% two different images render byte-identical prompts, so lookup
+%% would false-hit, and the checkpoint format cannot represent a
+%% media chunk. The incompatible options (session_id, parent_key,
+%% expect_committed, speculative, prefix_checkpoint_len) are
+%% rejected by erllama_opts before the request reaches this module.
+%% =============================================================================
+
+start_media_request({ModeKind, From, CallerPid}, Prompt, Opts, SeqId, Data) ->
+    case media_gates(Opts, Data) of
+        ok ->
+            case sampler_for(Opts, Data) of
+                {ok, SamplerRef, SamplerCfg, Data0} ->
+                    start_media_request2(
+                        {ModeKind, From, CallerPid},
+                        Prompt,
+                        Opts,
+                        SeqId,
+                        SamplerRef,
+                        SamplerCfg,
+                        Data0
+                    );
+                {error, Reason} ->
+                    {error, Reason, From}
+            end;
+        {error, Reason} ->
+            {error, Reason, From}
+    end.
+
+start_media_request2(
+    {ModeKind, From, CallerPid}, Prompt, Opts, SeqId, SamplerRef, SamplerCfg, Data0
+) ->
+    {Stops, StopPat, StopMax} = stop_sequences_from(Opts),
+    Media = [{T, D} || #{type := T, data := D} <- maps:get(media, Opts)],
+    Base = #req{
+        seq_id = SeqId,
+        mode = ModeKind,
+        prompt_tokens = [],
+        response_target = maps:get(response_tokens, Opts, ?DEFAULT_RESPONSE_TOKENS),
+        generated = [],
+        last_save_at = 0,
+        context_tokens = [],
+        request_fp = Data0#data.effective_fp,
+        sampler_ref = SamplerRef,
+        last_sampler_cfg = SamplerCfg,
+        prefill_started_at = erlang:monotonic_time(millisecond),
+        stop_sequences = Stops,
+        stop_pattern = StopPat,
+        stop_max_len = StopMax,
+        thinking = thinking_from(Opts),
+        thinking_budget = thinking_budget_from(Opts),
+        media = Media,
+        media_prompt = Prompt,
+        media_add_special = maps:get(media_add_special, Opts, true),
+        media_state = pending
+    },
+    case ModeKind of
+        streaming ->
+            Ref = make_ref(),
+            ok = erllama_inflight:register(Ref, self()),
+            Req = Base#req{caller_pid = CallerPid, request_ref = Ref},
+            Data1 = put_req(Data0, Req),
+            {ok, Data1, [{reply, From, {ok, Ref}}]};
+        standard ->
+            Req = Base#req{caller = From},
+            Data1 = put_req(Data0, Req),
+            {ok, Data1, []}
+    end.
+
+%% Admission gates for media: the model must carry an mmproj whose
+%% modalities cover every item, and the backend must implement the
+%% media callbacks.
+media_gates(Opts, Data) ->
+    B = Data#data.backend,
+    Media = maps:get(media, Opts),
+    HasCb =
+        erlang:function_exported(B, media_prefill, 4) andalso
+            erlang:function_exported(B, media_caps, 1),
+    Caps =
+        case HasCb of
+            true -> B:media_caps(Data#data.backend_state);
+            false -> undefined
+        end,
+    case {HasCb, Caps} of
+        {false, _} ->
+            {error, no_mmproj};
+        {_, undefined} ->
+            {error, no_mmproj};
+        {true, _} ->
+            Missing = [
+                T
+             || #{type := T} <- Media,
+                not media_cap_ok(T, Caps)
+            ],
+            case Missing of
+                [] -> ok;
+                [T | _] -> {error, {unsupported_media, T}}
+            end
+    end.
+
+media_cap_ok(image, Caps) ->
+    case maps:get(vision, Caps, false) of
+        true -> true;
+        _ -> false
+    end;
+media_cap_ok(audio, Caps) ->
+    case maps:get(audio, Caps, false) of
+        true -> true;
+        _ -> false
+    end.
+
+%% Decide whether this tick runs a media prefill: some request is
+%% media-pending, and it is the sole active request (mtmd eval
+%% cannot co-batch with other sequences' ticks). While others are
+%% active the media request just waits (its ops are skipped in
+%% build_op_list).
+maybe_media_tick(#data{req_table = Tab} = Data) ->
+    Active = [R || R <- maps:values(Tab), not R#req.finishing],
+    case Active of
+        [#req{media_state = pending} = Req] ->
+            {media, Req, Data};
+        _ ->
+            no
+    end.
+
+run_media_tick(Data, Req) ->
+    SeqId = Req#req.seq_id,
+    Call = backend_call(Data, media_prefill, [
+        Req#req.media_prompt,
+        Req#req.media,
+        #{seq_id => SeqId, add_special => Req#req.media_add_special}
+    ]),
+    case Call of
+        {ok, NTokens, NPos} ->
+            Req1 = Req#req{
+                media_state = done,
+                media_n_tokens = NTokens,
+                media_n_pos = NPos,
+                generation_started_at = erlang:monotonic_time(millisecond)
+            },
+            tick_after_step(put_req(Data, Req1), [], []);
+        {error, Reason} ->
+            fail_media_req(Data, Req, {media_failed, Reason})
+    end.
+
+%% Fail just the media request: notify the caller, free its sampler,
+%% clear whatever partial chunks landed in the seq's KV, and return
+%% the seq to the pool. The model stays up (the failure is scoped to
+%% this request's inputs, not the context).
+fail_media_req(Data, Req, Err) ->
+    _ = notify_failure(Req, Err),
+    _ = release_sampler(Req, Data),
+    _ = release_seq(Req#req.seq_id, Data),
+    Data1 = remove_req(Data, Req#req.seq_id),
+    Data2 = Data1#data{idle_seq_ids = [Req#req.seq_id | Data1#data.idle_seq_ids]},
+    tick_after_step(Data2, [], []).
 
 %% =============================================================================
 %% Ngram speculation
@@ -2869,7 +3078,11 @@ build_op_list(Data) ->
     Active = [R || R <- Reqs, not R#req.finishing],
     {DecodeOps, PrefillOps} = lists:foldr(
         fun(R, {Decodes, Prefills}) ->
-            case R#req.prefill_cursor of
+            case R#req.media_state =:= pending orelse R#req.prefill_cursor of
+                true ->
+                    %% Media-pending request: no ops until its
+                    %% sole-active media prefill runs.
+                    {Decodes, Prefills};
                 undefined ->
                     case R#req.sampler_ref of
                         undefined ->
@@ -3319,6 +3532,9 @@ fire_agent_prefix_save(Ctx, Req, Data) ->
 
 %% Continued-save: fire every continued_interval tokens since the
 %% last save fired.
+maybe_fire_continued_for_req(#req{media = Media} = Req, _Data) when Media =/= undefined ->
+    %% Media requests bypass the cache entirely.
+    Req;
 maybe_fire_continued_for_req(Req, Data) ->
     LiveCount = length(Req#req.context_tokens),
     Should = erllama_cache_policy:should_continued_save(
@@ -3417,7 +3633,7 @@ finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKe
         stats => Stats
     },
     Result1 = maybe_add_stop_sequence(Result0, Req#req.matched_stop),
-    Result2 = maybe_add_speculative(Result1, Req),
+    Result2 = maybe_add_media(maybe_add_speculative(Result1, Req), Req),
     Result =
         case Req#req.logprobs_acc of
             [] -> Result2;
@@ -3695,12 +3911,18 @@ build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
         cache_delta => cache_delta_for(Req)
     },
     Stats1 = maybe_add_speculative(Stats0, Req),
-    maybe_add_stop_sequence(Stats1, Req#req.matched_stop).
+    Stats2 = maybe_add_media(Stats1, Req),
+    maybe_add_stop_sequence(Stats2, Req#req.matched_stop).
 
 maybe_add_speculative(Stats, #req{spec = undefined}) ->
     Stats;
 maybe_add_speculative(Stats, #req{spec_drafted = D, spec_accepted = A}) ->
     Stats#{speculative => #{drafted => D, accepted => A}}.
+
+maybe_add_media(Stats, #req{media = undefined}) ->
+    Stats;
+maybe_add_media(Stats, #req{media = Media, media_n_tokens = NT, media_n_pos = NP}) ->
+    Stats#{media => #{items => length(Media), n_tokens => NT, n_pos => NP}}.
 
 %% Anthropic-style per-request cache breakdown. `read` counts tokens
 %% served from the warm prefix at admission; `created` counts tokens
@@ -3998,6 +4220,9 @@ fire_save_for_tokens(Reason, Tokens, Req, Data) ->
 
 %% Returns `{ok, Key}` if a finish save fired. Returns `skipped` if
 %% the policy suppressed it (live token count below `min_tokens`).
+fire_finish_save_for_req(_LiveTokens, #req{media = Media}, _Data) when Media =/= undefined ->
+    %% Media requests bypass the cache entirely.
+    skipped;
 fire_finish_save_for_req(LiveTokens, Req, Data) ->
     Should = erllama_cache_policy:should_finish_save(
         length(LiveTokens), Data#data.policy

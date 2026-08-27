@@ -155,7 +155,11 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
         if (ops[i].is_prefill) continue;
         int seq_id = ops[i].seq_id;
         int32_t li = c->per_seq[seq_id].last_logits_idx;
-        if (li < 0) {
+        if (li == ERLLAMA_LOGITS_LAST) {
+            /* Media prefill left logits on the final prompt
+             * position; llama addresses it as index -1. */
+            li = -1;
+        } else if (li < 0) {
             pthread_mutex_unlock(&c->mu);
             free_step_ops(ops, n_ops);
             return erllama_error(env, atom_no_logits);
@@ -1055,4 +1059,148 @@ ERL_NIF_TERM nif_spec_step(ErlNifEnv *env, int argc,
         env, enif_make_atom(env, "spec"), list,
         enif_make_int(env, eog_flag), enif_make_int(env, n_acc));
     return enif_make_tuple2(env, atom_ok, payload);
+}
+
+/* =========================================================================
+ * nif_media_prefill: whole-prompt multimodal prefill (libmtmd)
+ *
+ *   nif_media_prefill(CtxRef, MtmdRef, PromptBin,
+ *                     [{image | audio, Bytes}], SeqId, AddSpecial)
+ *     -> {ok, NTokens, NPos} | {error, atom()}
+ *
+ * Evaluates the whole rendered prompt (text plus one <__media__>
+ * marker per media item) into the sequence in one call: libmtmd
+ * decodes the media, tokenizes into chunks, and runs a llama_decode
+ * per chunk with logits on the final position. NPos is the number
+ * of KV positions consumed (on M-RoPE models this differs from
+ * NTokens). On success the seq is decode-ready and the next
+ * nif_step decode samples from the final prompt position (the
+ * ERLLAMA_LOGITS_LAST sentinel).
+ *
+ * The per-step decode deadline is disabled for the duration (the
+ * eval spans several internal decodes); explicit request_abort
+ * still interrupts every one of them through the abort callback.
+ * mtmd evaluation is not thread-safe; both the context lock and the
+ * projector lock are held (ctx first, then projector).
+ * ========================================================================= */
+#include "erllama_mtmd_nif.h"
+
+ERL_NIF_TERM nif_media_prefill(ErlNifEnv *env, int argc,
+                               const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    void *mres;
+    if (!enif_get_resource(env, argv[1], ERLLAMA_MTMD_RT, &mres)) {
+        return enif_make_badarg(env);
+    }
+    ErlNifBinary prompt;
+    if (!enif_inspect_iolist_as_binary(env, argv[2], &prompt)) {
+        return enif_make_badarg(env);
+    }
+    /* NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result) */
+    if (prompt.size > (size_t) ERLLAMA_MAX_TOKEN_TEXT) {
+        return erllama_error(env, atom_too_large);
+    }
+    unsigned int n_items;
+    if (!enif_get_list_length(env, argv[3], &n_items) || n_items > 64) {
+        return enif_make_badarg(env);
+    }
+    erllama_media_item_t items[64];
+    {
+        ERL_NIF_TERM head;
+        ERL_NIF_TERM tail = argv[3];
+        unsigned int i = 0;
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            const ERL_NIF_TERM *pair;
+            int arity;
+            ErlNifBinary bytes;
+            if (!enif_get_tuple(env, head, &arity, &pair) || arity != 2 ||
+                !enif_inspect_binary(env, pair[1], &bytes) ||
+                bytes.size == 0) {
+                return enif_make_badarg(env);
+            }
+            if (enif_compare(pair[0], enif_make_atom(env, "audio")) == 0) {
+                items[i].is_audio = 1;
+            } else if (enif_compare(pair[0],
+                                    enif_make_atom(env, "image")) == 0) {
+                items[i].is_audio = 0;
+            } else {
+                return enif_make_badarg(env);
+            }
+            items[i].data = bytes.data;
+            items[i].len = bytes.size;
+            i++;
+        }
+    }
+    int seq_id;
+    if (!enif_get_int(env, argv[4], &seq_id) || seq_id < 0 ||
+        seq_id >= ERLLAMA_N_SEQ_MAX_CAP) {
+        return enif_make_badarg(env);
+    }
+    int add_special = 1;
+    {
+        int b;
+        if (get_map_bool(env, argv[5], "add_special", &b)) add_special = b;
+    }
+
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
+    }
+    if (!erllama_mtmd_lock_live(mres)) {
+        pthread_mutex_unlock(&c->mu);
+        return erllama_error(env, atom_released);
+    }
+    uint32_t n_batch = erllama_safe_n_batch(c->ctx);
+    if (n_batch == 0) {
+        erllama_mtmd_unlock(mres);
+        pthread_mutex_unlock(&c->mu);
+        return erllama_error(env, atom_exception);
+    }
+    int32_t n_past = c->per_seq[seq_id].next_pos;
+
+    /* Multi-decode call: clear any stale abort and DISABLE the
+     * per-step deadline (a single budget cannot bound the whole
+     * eval); request_abort remains the interrupt path. */
+    atomic_store_explicit(&c->abort_flag, 0, memory_order_relaxed);
+    atomic_store_explicit(&c->decode_deadline_ns, 0, memory_order_relaxed);
+
+    int32_t n_tokens = 0;
+    int32_t new_n_past = n_past;
+    int rc = erllama_mtmd_prefill_run(
+        mres, c->ctx, (const char *) prompt.data, prompt.size, items,
+        n_items, add_special, seq_id, (int32_t) n_batch, n_past,
+        &n_tokens, &new_n_past);
+    erllama_mtmd_unlock(mres);
+
+    if (rc != 0) {
+        int aborted =
+            atomic_load_explicit(&c->abort_flag, memory_order_relaxed);
+        c->decode_ready = 0;
+        c->per_seq[seq_id].last_logits_idx = -1;
+        pthread_mutex_unlock(&c->mu);
+        ERL_NIF_TERM why;
+        switch (rc) {
+            case -1: why = enif_make_atom(env, "media_decode_failed"); break;
+            case -2: why = enif_make_atom(env, "marker_mismatch"); break;
+            case -3:
+                why = enif_make_atom(env, "media_preprocess_failed");
+                break;
+            case -4:
+                why = aborted ? atom_decode_aborted : atom_decode_failed;
+                break;
+            case -6: why = atom_context_overflow; break;
+            default: why = atom_exception; break;
+        }
+        return erllama_error(env, why);
+    }
+
+    c->per_seq[seq_id].next_pos = new_n_past;
+    c->per_seq[seq_id].last_logits_idx = ERLLAMA_LOGITS_LAST;
+    c->decode_ready = 1;
+    pthread_mutex_unlock(&c->mu);
+    return enif_make_tuple3(env, atom_ok, enif_make_int(env, n_tokens),
+                            enif_make_int(env, new_n_past - n_past));
 }
