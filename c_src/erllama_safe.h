@@ -97,6 +97,9 @@ extern int erllama_safe_backend_init(void) ERLLAMA_SAFE_NOEXCEPT;
 extern int erllama_safe_backend_init_once(void) ERLLAMA_SAFE_NOEXCEPT;
 extern int erllama_safe_backend_free(void) ERLLAMA_SAFE_NOEXCEPT;
 extern void erllama_safe_log_unset(void) ERLLAMA_SAFE_NOEXCEPT;
+/* The process-wide log-capture callback installed on llama; exposed
+ * so the mtmd NIF can route mtmd/clip logs into the same capture. */
+extern ggml_log_callback erllama_safe_log_callback(void) ERLLAMA_SAFE_NOEXCEPT;
 extern struct llama_model *erllama_safe_model_load_from_file(
     const char *path, struct llama_model_params params) ERLLAMA_SAFE_NOEXCEPT;
 extern struct llama_model *erllama_safe_model_load_from_file_v2(

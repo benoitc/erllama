@@ -37,7 +37,13 @@
     fail_kv_unpack,
     fail_seq_cp,
     spec_draft,
-    spec_draft_len
+    spec_draft_len,
+    media_caps,
+    media_n_pos,
+    fail_media_prefill,
+    %% multimodal projector (libmtmd)
+    mmproj_path,
+    mmproj_opts
 ]).
 
 -define(MODEL_OPT_KEYS, [
@@ -145,7 +151,8 @@
             to,
             expect_committed,
             middleware,
-            speculative
+            speculative,
+            media
         ]
 ).
 
@@ -214,6 +221,18 @@ check_devices_none_split(C, MOpts) ->
         false -> {ok, C}
     end.
 
+%% Media requests bypass the KV cache and the flat-token-list
+%% machinery; the session / cache-resume / speculation options make
+%% no sense with them and are rejected loudly.
+check_media_exclusive(#{media := _} = O) ->
+    Conflicts = [session_id, parent_key, expect_committed, speculative, prefix_checkpoint_len],
+    case [K || K <- Conflicts, maps:is_key(K, O)] of
+        [] -> {ok, O};
+        [K | _] -> {error, {unsupported_with_media, K}}
+    end;
+check_media_exclusive(O) ->
+    {ok, O}.
+
 check_backend(#{backend := B} = C) when is_atom(B) ->
     case code:ensure_loaded(B) of
         {module, B} -> {ok, C};
@@ -237,7 +256,13 @@ is_path(P) when is_list(P) -> io_lib:printable_unicode_list(P) orelse P =:= [];
 is_path(_) -> false.
 
 check_load_types(C) ->
-    Checks = [
+    case check_types(C, base_load_checks() ++ backend_load_checks(), invalid_config) of
+        ok -> check_sub_types(C);
+        Err -> Err
+    end.
+
+base_load_checks() ->
+    [
         {fingerprint, fun(V) -> is_binary(V) andalso byte_size(V) =:= 32 end},
         {fingerprint_mode, fun(V) -> lists:member(V, [safe, gguf_chunked, fast_unsafe]) end},
         {quant_type, fun is_atom/1},
@@ -250,6 +275,16 @@ check_load_types(C) ->
         {chat_template, fun is_binary/1},
         {model_id, fun is_binary/1},
         {progress_to, fun is_pid/1},
+        {model_opts, fun is_map/1},
+        {context_opts, fun is_map/1},
+        {policy, fun is_map/1},
+        {mmproj_path, fun is_path/1},
+        {mmproj_opts, fun mmproj_opts_check/1}
+    ].
+
+%% Stub-backend test knobs.
+backend_load_checks() ->
+    [
         {step_delay_ms, fun non_neg_int/1},
         {thinking_capable, fun is_boolean/1},
         {fail_seq_rm_last, fun is_boolean/1},
@@ -257,14 +292,10 @@ check_load_types(C) ->
         {fail_seq_cp, fun is_boolean/1},
         {spec_draft, fun(V) -> lists:member(V, [perfect, wrong, none]) end},
         {spec_draft_len, fun pos_int/1},
-        {model_opts, fun is_map/1},
-        {context_opts, fun is_map/1},
-        {policy, fun is_map/1}
-    ],
-    case check_types(C, Checks, invalid_config) of
-        ok -> check_sub_types(C);
-        Err -> Err
-    end.
+        {media_caps, fun is_map/1},
+        {media_n_pos, fun pos_int/1},
+        {fail_media_prefill, fun is_boolean/1}
+    ].
 
 check_sub_types(C) ->
     case check_types(maps:get(model_opts, C, #{}), model_opt_checks(), invalid_config) of
@@ -418,7 +449,8 @@ tier_backend(Srv) ->
 request_opts(Opts) when is_map(Opts) ->
     steps(Opts, [
         fun(O) -> unknown(O, ?REQUEST_KEYS) end,
-        fun(O) -> check_types_ok(O, request_checks()) end
+        fun(O) -> check_types_ok(O, request_checks()) end,
+        fun check_media_exclusive/1
     ]);
 request_opts(Other) ->
     {error, {invalid_option, opts, Other}}.
@@ -456,6 +488,18 @@ chat_checks() ->
         end}
     ].
 
+%% `mmproj_opts => #{use_gpu, n_threads, image_min_tokens,
+%% image_max_tokens}` passthrough to mtmd_context_params.
+mmproj_opts_check(V) when is_map(V) ->
+    Known = [use_gpu, n_threads, image_min_tokens, image_max_tokens],
+    lists:all(fun(K) -> lists:member(K, Known) end, maps:keys(V)) andalso
+        is_boolean(maps:get(use_gpu, V, true)) andalso
+        pos_int(maps:get(n_threads, V, 1)) andalso
+        pos_int(maps:get(image_min_tokens, V, 1)) andalso
+        pos_int(maps:get(image_max_tokens, V, 1));
+mmproj_opts_check(_) ->
+    false.
+
 request_checks() ->
     base_request_checks() ++ sampler_checks().
 
@@ -478,8 +522,29 @@ base_request_checks() ->
         {trigger_patterns, fun(V) -> is_list(V) andalso lists:all(fun is_binary/1, V) end},
         {trigger_tokens, fun(V) -> is_list(V) andalso lists:all(fun non_neg_int/1, V) end},
         {grammar_prefill, fun is_binary/1},
-        {speculative, fun speculative_opt/1}
+        {speculative, fun speculative_opt/1},
+        {media, fun media_opt/1}
     ].
+
+%% `media => [#{type := image | audio, data := binary()}]` - encoded
+%% image (jpg/png/bmp/gif) or audio (wav/mp3/flac) bytes; the prompt
+%% must carry one media marker per item. Media requests bypass the
+%% KV cache and are incompatible with the session / cache / spec
+%% options (checked in check_media_exclusive).
+media_opt(V) when is_list(V), V =/= [] ->
+    length(V) =< 64 andalso
+        lists:all(
+            fun
+                (#{type := T, data := D}) ->
+                    (T =:= image orelse T =:= audio) andalso
+                        is_binary(D) andalso D =/= <<>>;
+                (_) ->
+                    false
+            end,
+            V
+        );
+media_opt(_) ->
+    false.
 
 %% `speculative => true | false | #{type => ngram_mod, n_match | n_max
 %% | n_min => pos_int()}`. `true` = ngram_mod with upstream defaults.

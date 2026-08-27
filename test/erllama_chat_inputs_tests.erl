@@ -171,3 +171,55 @@ json_schema_conflicts_with_tools_test() ->
         {error, {invalid_option, json_schema, conflicts_with_tools}},
         erllama_chat:chat(<<"no_such_model">>, [], Opts)
     ).
+
+%% =============================================================================
+%% Media content-part extraction (extract_media/1)
+%% =============================================================================
+
+extract_media_replaces_parts_in_order_test() ->
+    Img1 = <<"img-one">>,
+    Aud = <<"aud-one">>,
+    {Msgs, Media} = erllama_chat:extract_media([
+        #{
+            role => user,
+            content => [
+                #{type => text, text => <<"first ">>},
+                #{type => image, data => Img1},
+                #{type => text, text => <<" then ">>},
+                #{type => audio, data => Aud}
+            ]
+        }
+    ]),
+    ?assertEqual(
+        [#{type => image, data => Img1}, #{type => audio, data => Aud}],
+        Media
+    ),
+    [#{content := Parts}] = Msgs,
+    ?assertEqual(
+        [
+            #{type => text, text => <<"first ">>},
+            #{type => media_marker, text => <<"<__media__>">>},
+            #{type => text, text => <<" then ">>},
+            #{type => media_marker, text => <<"<__media__>">>}
+        ],
+        Parts
+    ).
+
+extract_media_across_messages_keeps_order_test() ->
+    {_, Media} = erllama_chat:extract_media([
+        #{role => user, content => [#{type => image, data => <<"a">>}]},
+        #{role => assistant, content => <<"seen">>},
+        #{role => user, content => [#{type => image, data => <<"b">>}]}
+    ]),
+    ?assertEqual([<<"a">>, <<"b">>], [D || #{data := D} <- Media]).
+
+extract_media_no_media_is_identity_test() ->
+    Msgs = [
+        #{role => system, content => <<"sys">>},
+        #{role => user, content => [#{type => text, text => <<"hi">>}]}
+    ],
+    ?assertEqual({Msgs, []}, erllama_chat:extract_media(Msgs)).
+
+extract_media_binary_content_untouched_test() ->
+    Msgs = [#{role => user, content => <<"plain">>}],
+    ?assertEqual({Msgs, []}, erllama_chat:extract_media(Msgs)).

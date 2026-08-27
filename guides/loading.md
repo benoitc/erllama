@@ -268,6 +268,16 @@ repository.
 {ok, M} = erllama:load_model(#{model_path => Path, chat_template => Tmpl}).
 ```
 
+### `mmproj_path` and `mmproj_opts`
+
+Multimodal projector GGUF for vision / audio input (libmtmd). The
+projector is the companion `mmproj-*.gguf` shipped alongside
+vision/audio models; with it loaded, chat messages accept image and
+audio content parts and `stream/complete` accept the `media` option.
+`mmproj_opts` tunes it: `use_gpu` (default true), `n_threads`,
+`image_min_tokens`, `image_max_tokens`. `model_info/1` reports the
+modalities under `mmproj`. See [multimodal](multimodal.md).
+
 ### `model_id`
 
 Explicit id for `load_model/1`; the same as calling `load_model/2`.

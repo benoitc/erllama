@@ -33,5 +33,5 @@ Checks: >
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -performance-enum-size
 WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*'
-HeaderFilterRegex: '^.*/c_src/(erllama_nif|erllama_nif_int|erllama_nif_util|erllama_safe|erllama_resources|erllama_chat_nif|erllama_spec_nif|crc32c)\.(h|hpp)$'
+HeaderFilterRegex: '^.*/c_src/(erllama_nif|erllama_nif_int|erllama_nif_util|erllama_safe|erllama_resources|erllama_chat_nif|erllama_spec_nif|erllama_mtmd_nif|crc32c)\.(h|hpp)$'
 FormatStyle: none

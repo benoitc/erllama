@@ -85,6 +85,13 @@ typedef struct {
     int32_t next_pos;
 } erllama_per_seq_t;
 
+/* per_seq.last_logits_idx sentinel meaning "sample at llama logits
+ * index -1" (the last row of the previous decode). Set by
+ * nif_media_prefill: the mtmd chunk eval leaves logits on the final
+ * prompt position but does not expose which row of its last internal
+ * batch that is. nif_step's decode pre-sample maps this to -1. */
+#define ERLLAMA_LOGITS_LAST (-2)
+
 #define ERLLAMA_GRAMMAR_CACHE_N 4
 
 /* One cached compiled grammar. `bytes` is an owned copy of the GBNF used
@@ -347,6 +354,7 @@ ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 ERL_NIF_TERM nif_embed(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_forward_with_argmax(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_spec_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_media_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 
 /* erllama_nif_sampler.c */
 ERL_NIF_TERM nif_configure_sampler(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);

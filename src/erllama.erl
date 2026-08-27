@@ -70,6 +70,7 @@ handle for every other call; a pid works too. The cache subsystem is
     counters/0,
     vram_info/0,
     list_devices/0,
+    media_marker/0,
     pressure/0,
     pressure_sources/0,
     requests/0,
@@ -438,6 +439,8 @@ Config map for `load_model/1,2`.
   `ctx_params_hash`, `context_size`: cache-key inputs; see the loading
   guide.
 - `tier`, `tier_srv`: cache tier for this model's saves (default RAM).
+- `mmproj_path`, `mmproj_opts`: multimodal projector GGUF for
+  vision / audio input (see the multimodal guide).
 - `policy`: cache policy overrides (`min_tokens`, `cold_min_tokens`, ...).
 - `thinking_markers`: `#{start := binary(), 'end' := binary()}`.
 - `chat_template`: Jinja source that replaces the template stored in
@@ -506,6 +509,13 @@ Options for `complete/3`, `stream/3` and `continue/3`.
   checkpoint.
 - `to`: process receiving the stream events (`stream/3`, `continue/3`).
 - `middleware`: per-call middleware chain (see `erllama_middleware`).
+- `media`: `[#{type := image | audio, data := binary()}]` - encoded
+  media evaluated through the model's mmproj projector (see the
+  multimodal guide). The prompt must be a binary carrying one
+  `media_marker/0` per item. Media requests bypass the KV cache and
+  reject `session_id` / `parent_key` / `expect_committed` /
+  `speculative` / `prefix_checkpoint_len`. Stats gain
+  `media => #{items, n_tokens, n_pos}`.
 - `speculative`: `true` or `#{n_match | n_max | n_min => pos_integer()}`
   (defaults 24/64/48) enables draft-model-free ngram speculation: a
   per-model hash table over previously seen tokens drafts likely
@@ -557,6 +567,7 @@ Options for `complete/3`, `stream/3` and `continue/3`.
     infill => boolean(),
     logprobs => non_neg_integer(),
     speculative => boolean() | map(),
+    media => [#{type := image | audio, data := binary()}],
     prefix_checkpoint_len => non_neg_integer(),
     to => pid(),
     expect_committed => [token_id()],
@@ -850,6 +861,15 @@ stream(Model, Prompt, Opts) when is_binary(Prompt), is_map(Opts); is_list(Prompt
         stream, Model, Opts, fun erllama_opts:request_opts/1, #{prompt => Prompt}, fun do_stream/1
     ).
 
+do_stream(#{model := Model, args := #{prompt := Prompt, opts := #{media := _} = Opts}}) when
+    is_binary(Prompt)
+->
+    %% Media-bearing request: the prompt (with one media marker per
+    %% item) is evaluated whole by the backend; no facade tokenize.
+    {To, Params} = take_to(Opts),
+    erllama_model:infer(Model, Prompt, Params, To);
+do_stream(#{args := #{prompt := Tokens, opts := #{media := _}}}) when is_list(Tokens) ->
+    {error, {invalid_option, media, requires_binary_prompt}};
 do_stream(#{model := Model, args := #{prompt := Prompt, opts := Opts}}) when is_binary(Prompt) ->
     case erllama_model:tokenize(Model, Prompt) of
         {ok, Tokens} -> do_stream_tokens(Model, Tokens, Opts);
@@ -889,6 +909,14 @@ ignored. Events are those of `stream/3`; `Stats.cache_hit_kind` is
 -spec continue(model(), [token_id()], request_opts()) ->
     {ok, reference()} | {error, error_reason()}.
 continue(Model, SuffixTokens, Opts) when is_list(SuffixTokens), is_map(Opts) ->
+    case maps:is_key(media, Opts) of
+        true ->
+            {error, {unsupported_with_media, continue}};
+        false ->
+            do_continue(Model, SuffixTokens, Opts)
+    end.
+
+do_continue(Model, SuffixTokens, Opts) ->
     case maps:is_key(session_id, Opts) of
         false ->
             {error, {missing_option, session_id}};
@@ -1312,6 +1340,16 @@ what the `devices` and `tensor_buft_overrides` model options accept.
 -spec list_devices() -> {ok, [map()]} | {error, error_reason()}.
 list_devices() ->
     erllama_nif:list_devices().
+
+-doc """
+The media marker placed in a prompt where a media item's tokens are
+injected: one marker per entry in the `media` request option. The
+chat path inserts markers for you; raw `stream/3` / `complete/3`
+prompts carry them explicitly.
+""".
+-spec media_marker() -> binary().
+media_marker() ->
+    <<"<__media__>">>.
 
 -doc """
 Host or accelerator memory pressure from the scheduler's configured

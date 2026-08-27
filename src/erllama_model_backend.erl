@@ -234,6 +234,25 @@ inference, etc.) can plug in via this same surface.
     {ok, {spec, Committed :: [erllama:token_id()], Eog :: 0 | 1, NAcc :: non_neg_integer()}}
     | {error, term()}.
 
+%% Multimodal (libmtmd) support. media_caps/1 reports the loaded
+%% projector's modalities (`undefined` when the model has none);
+%% media_prefill/4 evaluates a whole rendered prompt (text plus one
+%% media marker per item) into the sequence in one call, leaving the
+%% sequence decode-ready with logits on the final position. NPos is
+%% KV positions consumed (differs from NTokens on M-RoPE models).
+%% The scheduler only calls it when the request is the sole active
+%% one; media requests bypass the KV cache entirely.
+-callback media_caps(state()) -> #{vision := boolean(), audio := boolean()} | undefined.
+
+-callback media_prefill(
+    state(),
+    Prompt :: binary(),
+    Media :: [{image | audio, binary()}],
+    Opts :: #{seq_id := seq_id(), add_special := boolean()}
+) ->
+    {ok, NTokens :: non_neg_integer(), NPos :: non_neg_integer()}
+    | {error, term()}.
+
 %% Recreate the inference context in place after a wedged/aborted
 %% decode, keeping the model loaded. Drops all live KV state; the
 %% caller resets its per-seq bookkeeping and the next admission is
@@ -277,6 +296,8 @@ inference, etc.) can plug in via this same surface.
     spec_accept/4,
     spec_free/2,
     spec_step/4,
+    media_caps/1,
+    media_prefill/4,
     thinking_signature/3,
     reset_context/1,
     abort_handle/1

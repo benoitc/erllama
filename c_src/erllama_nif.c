@@ -24,6 +24,7 @@
 #include <erl_nif.h>
 #include "erllama_chat_nif.h"
 #include "erllama_spec_nif.h"
+#include "erllama_mtmd_nif.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -101,13 +102,18 @@ ErlNifResourceType *SAMPLER_RT;
  * frees any adapter that wasn't explicitly freed; if we freed the
  * model with an adapter wrapper still holding a (now dangling)
  * llama_adapter_lora* the next adapter_dtor would crash. */
+/* True when nothing borrows the model any more; caller holds m->mu. */
+static int model_unreferenced(const erllama_model_t *m) {
+    return m->active_contexts == 0 && m->active_adapters == 0 &&
+           m->active_mtmd == 0;
+}
+
 void context_drops_model(erllama_model_t *m) {
     pthread_mutex_lock(&m->mu);
     if (m->active_contexts > 0) {
         m->active_contexts--;
     }
-    if (m->release_pending && m->active_contexts == 0
-        && m->active_adapters == 0 && m->model) {
+    if (m->release_pending && model_unreferenced(m) && m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
         m->release_pending = 0;
@@ -120,8 +126,22 @@ static void model_drops_adapter(erllama_model_t *m) {
     if (m->active_adapters > 0) {
         m->active_adapters--;
     }
-    if (m->release_pending && m->active_contexts == 0
-        && m->active_adapters == 0 && m->model) {
+    if (m->release_pending && model_unreferenced(m) && m->model) {
+        (void) erllama_safe_model_free(m->model);
+        m->model = NULL;
+        m->release_pending = 0;
+    }
+    pthread_mutex_unlock(&m->mu);
+}
+
+/* Same gating for the multimodal projector (called from the mtmd
+ * resource destructor in erllama_mtmd_nif.cpp). */
+void model_drops_mtmd(erllama_model_t *m) {
+    pthread_mutex_lock(&m->mu);
+    if (m->active_mtmd > 0) {
+        m->active_mtmd--;
+    }
+    if (m->release_pending && model_unreferenced(m) && m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
         m->release_pending = 0;
@@ -327,6 +347,12 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
         return -1;
     }
 
+    /* Register the multimodal projector resource (defined in
+     * erllama_mtmd_nif.cpp). */
+    if (mtmd_nif_load(env) != 0) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -495,7 +521,12 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_spec_draft",  4, nif_spec_draft,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_spec_accept", 3, nif_spec_accept, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_spec_free",   1, nif_spec_free,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_spec_step",   4, nif_spec_step,   ERL_NIF_DIRTY_JOB_CPU_BOUND}
+    {"nif_spec_step",   4, nif_spec_step,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtmd_init",      3, nif_mtmd_init,      ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_mtmd_free",      1, nif_mtmd_free,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtmd_caps",      1, nif_mtmd_caps,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtmd_caps_file", 1, nif_mtmd_caps_file, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_media_prefill",  6, nif_media_prefill,  ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)

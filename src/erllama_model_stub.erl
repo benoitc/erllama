@@ -91,7 +91,11 @@ paths).
     spec_free/2,
     spec_step/4,
     spec_accept_calls/0,
-    reset_spec_accept_calls/0
+    reset_spec_accept_calls/0,
+    %% Multimodal: enabled with the `media_caps' load knob; prefill
+    %% is deterministic (media_n_pos positions per item).
+    media_caps/1,
+    media_prefill/4
 ]).
 
 %% Stub state.
@@ -136,7 +140,14 @@ paths).
     %% miss on the first token, or none), `spec_draft_len' its
     %% length.
     spec_draft = perfect :: perfect | wrong | none,
-    spec_draft_len = 4 :: pos_integer()
+    spec_draft_len = 4 :: pos_integer(),
+    %% Multimodal knobs: `media_caps' enables the media callbacks
+    %% (#{vision, audio}); `media_n_pos' is the deterministic KV
+    %% position count per media item; `fail_media_prefill' makes
+    %% media_prefill fail (error-path testing).
+    media_caps = undefined :: map() | undefined,
+    media_n_pos = 4 :: pos_integer(),
+    fail_media_prefill = false :: boolean()
 }).
 
 init(Config) ->
@@ -147,8 +158,23 @@ init(Config) ->
         fail_kv_unpack = bool_opt(fail_kv_unpack, Config),
         fail_seq_cp = bool_opt(fail_seq_cp, Config),
         spec_draft = spec_draft_opt(Config),
-        spec_draft_len = spec_draft_len_opt(Config)
+        spec_draft_len = spec_draft_len_opt(Config),
+        media_caps = media_caps_opt(Config),
+        media_n_pos = media_n_pos_opt(Config),
+        fail_media_prefill = bool_opt(fail_media_prefill, Config)
     }}.
+
+media_caps_opt(Config) ->
+    case maps:get(media_caps, Config, undefined) of
+        M when is_map(M) -> M;
+        _ -> undefined
+    end.
+
+media_n_pos_opt(Config) ->
+    case maps:get(media_n_pos, Config, 4) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> 4
+    end.
 
 spec_draft_opt(Config) ->
     case maps:get(spec_draft, Config, perfect) of
@@ -420,6 +446,29 @@ spec_accept_calls() ->
 reset_spec_accept_calls() ->
     persistent_term:put({?MODULE, spec_accept_calls}, []),
     ok.
+
+%% -----------------------------------------------------------------
+%% Multimodal (deterministic)
+%% -----------------------------------------------------------------
+
+media_caps(#stub{media_caps = Caps}) ->
+    Caps.
+
+media_prefill(#stub{media_caps = undefined}, _Prompt, _Media, _Opts) ->
+    {error, no_mmproj};
+media_prefill(#stub{fail_media_prefill = true}, _Prompt, _Media, _Opts) ->
+    {error, media_decode_failed};
+media_prefill(
+    #stub{media_n_pos = PerItem, step_delay_ms = D} = S, Prompt, Media, _Opts
+) ->
+    _ =
+        case D > 0 of
+            true -> timer:sleep(D);
+            false -> ok
+        end,
+    TextTokens = length(tokenize(S, Prompt)),
+    N = TextTokens + PerItem * length(Media),
+    {ok, N, N}.
 
 %% Deterministic per-seq stub signature. The stub ignores `Bytes`
 %% and hashes the seq_id; real backends derive their signature from

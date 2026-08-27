@@ -29,7 +29,7 @@ curl -fsSL "$URL" | tar -xz -C "$WORK"
 SRC="$WORK/llama.cpp-${TAG}"
 
 # Paths we vendor wholesale.
-KEEP="cmake CMakeLists.txt common ggml include src LICENSE vendor"
+KEEP="cmake CMakeLists.txt common ggml include src LICENSE vendor tools/mtmd"
 
 # ggml backends we do not build (see c_src/CMakeLists.txt).
 PRUNE_GGML="ggml-cann ggml-et ggml-hexagon ggml-hip ggml-musa ggml-opencl \
@@ -43,6 +43,7 @@ PRUNE_VENDOR=""
 rm -rf "$DEST"
 mkdir -p "$DEST"
 for p in $KEEP; do
+    mkdir -p "$(dirname "$DEST/$p")"
     cp -R "$SRC/$p" "$DEST/$p"
 done
 for d in $PRUNE_GGML; do

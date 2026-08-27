@@ -102,6 +102,14 @@ prompts render and replies parse; use `temperature => 0.0` so runs
 are reproducible. From escripts, exit with `init:stop()` rather than
 `halt()` so the GPU backend tears down cleanly.
 
+erllama's own multimodal suite gates the same way on a model pair:
+`LLAMA_TEST_VISION_MODEL` + `LLAMA_TEST_MMPROJ` (SmolVLM-256M and
+its mmproj are the smallest practical pair), plus optional
+`LLAMA_TEST_AUDIO_MODEL` + `LLAMA_TEST_AUDIO_MMPROJ` for
+audio-capable projectors. For stub-based media tests, the stub
+backend takes `media_caps => #{vision => true, audio => false}`,
+`media_n_pos => N` and `fail_media_prefill => true` load knobs.
+
 ## Notes
 
 - The stub needs no `model_path` but accepts every other load key,

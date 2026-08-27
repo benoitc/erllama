@@ -105,19 +105,22 @@ two-model variant (needs a draft-model registry; the KV cache layer
 is largely orthogonal since verifications run on the target
 context).
 
-### Vision / LLaVA
+### Multimodal (vision + audio input) - shipped
 
-`llama.cpp` supports the LLaVA family via `llava_init_from_*` and
-`llava_eval_image_embed`. The Erlang surface needs an
-`apply_image/2` callback on the backend, an embed-cache integration
-(so re-uploaded images don't re-tokenize), and chat-template
-extensions for multi-modal messages.
+Shipped via libmtmd (`tools/mtmd` vendored, `mmproj_path` load
+option, image/audio chat content parts, `media` request option).
+Remaining follow-ups: media KV caching (digest-embedded markers +
+mtmd chunk save/load), sessions and sticky seqs with media,
+co-batched media prefill, video/webp (needs the ffmpeg subprocess
+path), and mtmd's experimental TTS.
 
-### Audio (Whisper)
+### Transcription API (whisper.cpp)
 
-A different model class than the GGUF chat models 0.1 targets;
-`whisper.cpp` has its own context shape. Could be a sister
-application (`erllama_whisper`) sharing the cache subsystem.
+Distinct from the mtmd audio INPUT shipped above (which feeds audio
+to multimodal LLMs): a dedicated ASR surface for plain Whisper
+GGUFs with timestamps and segments. `whisper.cpp` is its own
+runtime with its own context shape; likely a sister application
+(`erllama_whisper`) sharing the cache subsystem.
 
 ### Non-GGUF model loading
 

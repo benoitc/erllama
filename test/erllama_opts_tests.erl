@@ -212,6 +212,36 @@ request_accepts_known_keys_test() ->
     },
     ?assertEqual({ok, Opts}, ?M:request_opts(Opts)).
 
+%% `media` cannot ride in the all-keys map above: it is mutually
+%% exclusive with the session / cache-resume / speculation keys.
+request_accepts_media_test() ->
+    Opts = #{
+        response_tokens => 8,
+        media => [
+            #{type => image, data => <<"img">>},
+            #{type => audio, data => <<"wav">>}
+        ],
+        stop_sequences => [<<"\n">>],
+        temperature => 0.0
+    },
+    ?assertEqual({ok, Opts}, ?M:request_opts(Opts)).
+
+request_media_exclusive_test_() ->
+    Media = [#{type => image, data => <<"img">>}],
+    [
+        ?_assertEqual(
+            {error, {unsupported_with_media, K}},
+            ?M:request_opts(#{media => Media, K => V})
+        )
+     || {K, V} <- [
+            {session_id, s},
+            {parent_key, binary:copy(<<1>>, 32)},
+            {expect_committed, [1]},
+            {speculative, true},
+            {prefix_checkpoint_len, 4}
+        ]
+    ].
+
 request_rejects_unknown_key_test() ->
     ?assertEqual({error, {unknown_option, max_tokens}}, ?M:request_opts(#{max_tokens => 5})).
 
@@ -244,6 +274,8 @@ request_type_checks_test_() ->
         {infill, maybe_},
         {logprobs, 33},
         {speculative, #{type => draft_model}},
+        {media, []},
+        {media, [#{type => video, data => <<"x">>}]},
         {temperature, hot},
         {seed, -1}
     ],

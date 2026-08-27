@@ -41,6 +41,12 @@ option(ENABLE_CLANG_TIDY "Run clang-tidy on erllama_nif sources" OFF)
 set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS  OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS  OFF CACHE BOOL "" FORCE)
+# Multimodal: build tools/mtmd standalone (the upstream hook made for
+# language bindings; LLAMA_BUILD_TOOLS stays OFF). MTMD_VIDEO would
+# fork ffmpeg via a subprocess at request time - not acceptable from
+# a BEAM NIF - so it is forced off (cost: no video input, no webp).
+set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
+set(MTMD_VIDEO OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 
@@ -131,6 +137,7 @@ add_library(erllama_nif SHARED
     erllama_safe.cpp
     erllama_chat_nif.cpp
     erllama_spec_nif.cpp
+    erllama_mtmd_nif.cpp
     crc32c.c
 )
 
@@ -188,6 +195,7 @@ find_package(Threads REQUIRED)
 
 target_link_libraries(erllama_nif PRIVATE
     llama-common
+    mtmd
     Threads::Threads
 )
 
