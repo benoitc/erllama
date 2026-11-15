@@ -135,6 +135,12 @@ different params as different cache namespaces.
 CtxHash = crypto:hash(sha256, term_to_binary({Nctx, Nbatch})).
 ```
 
+With the llama.cpp backend you don't have to cover the KV layout
+yourself: the backend mixes the llama.cpp build and the `n_ctx`,
+`n_seq_max`, `type_k`, `type_v` and `flash_attn` context options
+into your hash. `erllama_model:cache_key_meta/1` returns the value
+actually used in keys.
+
 ### `context_size`
 
 Plain integer copy of `n_ctx`. The cache uses it for bounds checks.

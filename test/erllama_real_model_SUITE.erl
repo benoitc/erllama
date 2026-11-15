@@ -56,7 +56,9 @@
     continue_multi_turn_cache_delta/1,
     tokenize_large_input/1,
     apply_chat_template_large_input/1,
-    tokenize_over_text_cap/1
+    tokenize_over_text_cap/1,
+    rejected_unpack_clears_seq/1,
+    ctx_params_hash_carries_engine_namespace/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -99,7 +101,9 @@ all() ->
         continue_multi_turn_cache_delta,
         tokenize_large_input,
         apply_chat_template_large_input,
-        tokenize_over_text_cap
+        tokenize_over_text_cap,
+        rejected_unpack_clears_seq,
+        ctx_params_hash_carries_engine_namespace
     ].
 
 init_per_suite(Config) ->
@@ -757,3 +761,41 @@ big_text(Sz) ->
 file_sha256(Path) ->
     {ok, Bin} = file:read_file(Path),
     crypto:hash(sha256, Bin).
+
+%% A truncated payload is rejected and leaves the seq empty, so the
+%% cold path that follows prefills from position 0 and produces the
+%% same KV state as the first prefill.
+rejected_unpack_clears_seq(Config) ->
+    {ok, M} = erllama_nif:load_model(?config(model_path, Config), #{n_gpu_layers => 0}),
+    {ok, C} = erllama_nif:new_context(M, #{n_ctx => 2048, n_batch => 512}),
+    try
+        Tokens = erllama_nif:tokenize(M, ?LONG_PROMPT, #{add_special => true}),
+        N = length(Tokens),
+        ok = erllama_nif:prefill(C, Tokens),
+        Bin1 = erllama_nif:kv_pack(C, Tokens, N),
+        ?assert(is_binary(Bin1)),
+        Truncated = binary:part(Bin1, 0, byte_size(Bin1) div 2),
+        ?assertEqual({error, unpack_failed}, erllama_nif:kv_unpack(C, Truncated, 0)),
+        ok = erllama_nif:prefill(C, Tokens),
+        Bin2 = erllama_nif:kv_pack(C, Tokens, N),
+        ?assertEqual(byte_size(Bin1), byte_size(Bin2))
+    after
+        erllama_nif:free_context(C),
+        erllama_nif:free_model(M)
+    end,
+    ok.
+
+%% The llama backend folds the engine build and KV layout into the
+%% caller's ctx_params_hash, so rows from another engine build or
+%% context shape never match.
+ctx_params_hash_carries_engine_namespace(Config) ->
+    Model = ?config(model, Config),
+    Cfg = model_config(?config(model_path, Config), ?config(disk_srv, Config)),
+    CallerHash = maps:get(ctx_params_hash, Cfg),
+    #{ctx_params_hash := Effective} = erllama_model:cache_key_meta(Model),
+    Expected = crypto:hash(sha256, [
+        CallerHash, erllama_model_llama:kv_namespace(maps:get(context_opts, Cfg))
+    ]),
+    ?assertEqual(Expected, Effective),
+    ?assertNotEqual(CallerHash, Effective),
+    ok.

@@ -51,6 +51,7 @@
     sampler_new/2,
     sampler_free/1,
     vram_info/0,
+    engine_info/0,
     model_size/1,
     model_n_layer/1,
     forward_with_argmax/2
@@ -345,6 +346,15 @@ sampler_free(Sampler) ->
 vram_info() ->
     nif_vram_info().
 
+%% Identify the engine that produces `kv_pack` payloads: the vendored
+%% llama.cpp tag and its `LLAMA_STATE_SEQ_VERSION`. The raw payload
+%% carries no version of its own, so backends fold this into the
+%% cache namespace to keep payloads from another engine out of reach.
+-spec engine_info() ->
+    #{state_seq_version := non_neg_integer(), llama_pin := binary()}.
+engine_info() ->
+    nif_engine_info().
+
 %% Total byte size of the loaded model on disk. Used to derive
 %% vram_estimate_b for list_models metadata. 0 on exception.
 -spec model_size(model_ref()) -> non_neg_integer() | {error, atom()}.
@@ -378,6 +388,7 @@ forward_with_argmax(Ctx, Tokens) when is_list(Tokens) ->
 %% =============================================================================
 
 nif_crc32c(_Data) -> erlang:nif_error(nif_not_loaded).
+nif_engine_info() -> erlang:nif_error(nif_not_loaded).
 nif_fsync_dir(_Path) -> erlang:nif_error(nif_not_loaded).
 nif_load_model(_Path, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_free_model(_Model) -> erlang:nif_error(nif_not_loaded).

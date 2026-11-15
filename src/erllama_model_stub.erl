@@ -48,6 +48,10 @@
     %% simulating a wedged/aborted decode so recovery can be tested
     %% without a real backend.
     wedge_next_step/1,
+    %% Test helper: force the next kv_unpack to return
+    %% {error, unpack_failed}, simulating a payload the engine cannot
+    %% restore (another llama.cpp build, a different KV layout).
+    reject_next_unpack/0,
     %% Test helpers: read / clear the list of cfgs passed to
     %% sampler_new/2 since the last reset.
     sampler_new_cfgs/0,
@@ -128,10 +132,19 @@ kv_pack(_S, Tokens, _SeqId) ->
     erllama_cache_key:encode_tokens(Tokens).
 
 kv_unpack(_S, _Bin) ->
-    ok.
+    take_unpack_result().
 
 kv_unpack(_S, _Bin, _SeqId) ->
-    ok.
+    take_unpack_result().
+
+take_unpack_result() ->
+    case persistent_term:get({?MODULE, reject_unpack}, false) of
+        false ->
+            ok;
+        true ->
+            persistent_term:erase({?MODULE, reject_unpack}),
+            {error, unpack_failed}
+    end.
 
 %% Drops the per-seq phase counter when the scheduler releases a
 %% seq's KV. Without this, a subsequent admission to the same
@@ -271,6 +284,11 @@ abort_handle(_S) ->
 %% Test knob: arm the next step/2 to return {error, Reason} once.
 wedge_next_step(Reason) ->
     persistent_term:put({?MODULE, wedge}, Reason),
+    ok.
+
+%% Test knob: arm the next kv_unpack to fail once.
+reject_next_unpack() ->
+    persistent_term:put({?MODULE, reject_unpack}, true),
     ok.
 
 %% Test helper: cfgs passed to sampler_new/2 since the last reset.

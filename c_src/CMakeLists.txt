@@ -116,6 +116,14 @@ target_compile_options(erllama_nif PRIVATE
     -O2 -g -Wall -Wextra -Wpedantic -fPIC
 )
 
+# Tag of the vendored llama.cpp (see UPDATE_LLAMA.md). Exposed through
+# erllama_nif:engine_info/0 and folded into cache keys, so bump it with
+# every vendor update.
+set(ERLLAMA_LLAMA_PIN "b9222")
+target_compile_definitions(erllama_nif PRIVATE
+    ERLLAMA_LLAMA_PIN="${ERLLAMA_LLAMA_PIN}"
+)
+
 if(ENABLE_ASAN)
     message(STATUS "AddressSanitizer enabled on erllama_nif")
     target_compile_options(erllama_nif PRIVATE

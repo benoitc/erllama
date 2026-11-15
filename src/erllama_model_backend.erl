@@ -188,6 +188,14 @@ inference, etc.) can plug in via this same surface.
 %% alone.
 -callback abort_handle(state()) -> {ok, term()} | undefined.
 
+%% Bytes identifying what, outside the cache key, decides whether a
+%% `kv_pack` payload can be restored: the engine build and the KV
+%% layout options of the context. The engine mixes them into
+%% `ctx_params_hash` at init, so payloads from another engine build
+%% or context shape never match a lookup. Backends whose payloads do
+%% not depend on the engine (the stub) leave it out.
+-callback cache_namespace(state()) -> binary().
+
 -optional_callbacks([
     kv_pack/3,
     kv_unpack/3,
@@ -210,7 +218,8 @@ inference, etc.) can plug in via this same surface.
     verify/4,
     thinking_signature/3,
     reset_context/1,
-    abort_handle/1
+    abort_handle/1,
+    cache_namespace/1
 ]).
 
 -type sampler_opts() :: #{

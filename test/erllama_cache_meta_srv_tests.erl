@@ -477,6 +477,42 @@ gc_evicts_unreferenced_rows_test() ->
         ?assertEqual(miss, erllama_cache_meta_srv:lookup_exact(key(2)))
     end).
 
+invalidate_drops_available_row_test() ->
+    with_srv(fun() ->
+        ok = erllama_cache_counters:init(),
+        erllama_cache_counters:reset(),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),
+        ok = erllama_cache_meta_srv:insert_available(key(2), ram, 200, <<"H2">>, {ram}),
+        ?assertEqual(ok, erllama_cache_meta_srv:invalidate(key(1))),
+        ?assertEqual(miss, erllama_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(miss, erllama_cache_meta_srv:dump(key(1))),
+        %% Only the named row goes.
+        ?assertMatch({ok, _}, erllama_cache_meta_srv:lookup_exact(key(2))),
+        ?assertEqual(1, maps:get(evictions, erllama_cache:get_counters())),
+        %% The LRU index no longer references the dropped key, so a
+        %% later gc only sees the remaining row.
+        ?assertEqual({evicted, 1}, erllama_cache_meta_srv:gc())
+    end).
+
+invalidate_skips_checked_out_row_test() ->
+    with_srv(fun() ->
+        ok = erllama_cache_counters:init(),
+        erllama_cache_counters:reset(),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),
+        {ok, Ref, _, _, _, _} = erllama_cache_meta_srv:checkout(key(1), self()),
+        ?assertEqual(skip, erllama_cache_meta_srv:invalidate(key(1))),
+        ?assertMatch({ok, _}, erllama_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(0, maps:get(evictions, erllama_cache:get_counters())),
+        ok = erllama_cache_meta_srv:checkin(Ref),
+        ?assertEqual(ok, erllama_cache_meta_srv:invalidate(key(1))),
+        ?assertEqual(miss, erllama_cache_meta_srv:lookup_exact(key(1)))
+    end).
+
+invalidate_missing_row_test() ->
+    with_srv(fun() ->
+        ?assertEqual(miss, erllama_cache_meta_srv:invalidate(key(999)))
+    end).
+
 gc_skips_referenced_rows_test() ->
     with_srv(fun() ->
         ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),

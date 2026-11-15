@@ -968,7 +968,9 @@ build_init_data(ModelId, Config, Backend, BState) ->
         fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
         quant_type = maps:get(quant_type, Config, f16),
         quant_bits = maps:get(quant_bits, Config, 16),
-        ctx_params_hash = maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
+        ctx_params_hash = effective_ctx_params_hash(
+            maps:get(ctx_params_hash, Config, default_ctx_params_hash()), Backend, BState
+        ),
         context_size = maps:get(context_size, Config, 4096),
         policy = resolve_policy(Config, NBatch),
         backend = Backend,
@@ -1052,6 +1054,15 @@ default_fingerprint() ->
 %% production.
 default_ctx_params_hash() ->
     binary:copy(<<0>>, 32).
+
+%% Fold the backend's cache namespace (engine build + KV layout) into
+%% the caller's hash so a payload is only ever offered to a context
+%% that can restore it.
+effective_ctx_params_hash(CallerHash, Backend, BState) ->
+    case erlang:function_exported(Backend, cache_namespace, 1) of
+        true -> crypto:hash(sha256, [CallerHash, Backend:cache_namespace(BState)]);
+        false -> CallerHash
+    end.
 
 %% =============================================================================
 %% State: idle
@@ -3175,29 +3186,28 @@ try_session_resume(PromptTokens, ParentKey, Req, Data) ->
 
 %% checkout the row, load + unpack the payload under the pin (into
 %% the request's seq_id), then checkin. Returns the row's stored
-%% token list on success or `miss` if the row was evicted between
-%% the prior lookup and our checkout.
+%% token list on success, or `miss` if the row was evicted between
+%% the prior lookup and our checkout or the backend rejected the
+%% payload. A rejected payload (another engine build, a different
+%% KV layout) is counted as corrupt, its seq cells are dropped and
+%% the row is invalidated so the next lookup does not retry it.
 pin_and_load(Key, SeqId, Data) ->
     T0 = erlang:monotonic_time(nanosecond),
     Result =
         case erllama_cache_meta_srv:checkout(Key, self()) of
             {ok, HolderRef, Tier, Loc, _Header, TokensBin} ->
-                try
-                    Bin = load_payload(Tier, Loc, Key, Data),
-                    case Bin of
-                        <<>> ->
-                            miss;
-                        _ ->
-                            ok = backend_kv_unpack(Bin, SeqId, Data),
-                            Tokens =
-                                case TokensBin of
-                                    undefined -> [];
-                                    _ -> erllama_cache_key:decode_tokens(TokensBin)
-                                end,
-                            {ok, Tokens}
-                    end
-                after
-                    ok = erllama_cache_meta_srv:checkin(HolderRef)
+                Loaded =
+                    try
+                        load_and_unpack(Tier, Loc, Key, SeqId, TokensBin, Data)
+                    after
+                        ok = erllama_cache_meta_srv:checkin(HolderRef)
+                    end,
+                case Loaded of
+                    {unpack_failed, _Reason} ->
+                        drop_unusable_row(Key, SeqId, Data),
+                        miss;
+                    _ ->
+                        Loaded
                 end;
             {error, busy} ->
                 miss;
@@ -3207,6 +3217,26 @@ pin_and_load(Key, SeqId, Data) ->
     Elapsed = erlang:monotonic_time(nanosecond) - T0,
     erllama_cache_counters:add(?C_LOAD_TOTAL_NS, max(Elapsed, 0)),
     Result.
+
+load_and_unpack(Tier, Loc, Key, SeqId, TokensBin, Data) ->
+    case load_payload(Tier, Loc, Key, Data) of
+        <<>> ->
+            miss;
+        Bin ->
+            case backend_kv_unpack(Bin, SeqId, Data) of
+                ok -> {ok, decode_row_tokens(TokensBin)};
+                {error, Reason} -> {unpack_failed, Reason}
+            end
+    end.
+
+decode_row_tokens(undefined) -> [];
+decode_row_tokens(TokensBin) -> erllama_cache_key:decode_tokens(TokensBin).
+
+drop_unusable_row(Key, SeqId, Data) ->
+    erllama_cache_counters:incr(?C_CORRUPT_FILES),
+    ok = backend_seq_clear(SeqId, Data),
+    _ = erllama_cache_meta_srv:invalidate(Key),
+    ok.
 
 load_payload(ram, _Loc, Key, _Data) ->
     case erllama_cache_ram:load(Key) of

@@ -25,6 +25,8 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
 -export([
     init/1,
     terminate/1,
+    cache_namespace/1,
+    kv_namespace/1,
     tokenize/2,
     detokenize/2,
     prefill/2,
@@ -132,6 +134,23 @@ build_state(Model, Ctx, Config, MOpts) ->
         tool_call_payload_start_ids = PayStart,
         tool_call_payload_end_ids = PayEnd
     }.
+
+%% Context options that change the layout of a `kv_pack` payload:
+%% cell capacity, stream count, K/V types and V transposition (flash
+%% attention). Listed in a fixed order so the namespace does not
+%% depend on map iteration order; absent keys hash as `default`.
+-define(KV_SHAPE_OPTS, [n_ctx, n_seq_max, type_k, type_v, flash_attn]).
+
+cache_namespace(#s{context_opts = COpts}) ->
+    kv_namespace(COpts).
+
+%% Namespace bytes for a context opened with `COpts` on this engine
+%% build. Split from cache_namespace/1 so it can be computed without
+%% a loaded model.
+-spec kv_namespace(map()) -> binary().
+kv_namespace(COpts) when is_map(COpts) ->
+    Shape = [{K, maps:get(K, COpts, default)} || K <- ?KV_SHAPE_OPTS],
+    term_to_binary({erllama_nif:engine_info(), Shape}, [deterministic]).
 
 safe_uint(N) when is_integer(N), N >= 0 -> N;
 safe_uint(_) -> 0.

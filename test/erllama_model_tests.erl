@@ -498,6 +498,47 @@ complete_cache_delta_exact_warm_test() ->
         ?assertEqual(Generated, maps:get(created, Delta))
     end).
 
+%% A payload the backend cannot restore (another engine build, a
+%% different KV layout) must not crash the model: the request falls
+%% back to cold, the row is counted corrupt and dropped, and the
+%% cold save that follows republishes a usable row.
+rejected_unpack_falls_back_to_cold_test() ->
+    with_model(#{}, fun(Cfg) ->
+        Tokens = prompt_tokens(long_prompt()),
+        ColdKey = key_for_tokens(Tokens, Cfg),
+        {ok, _} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 4}
+        ),
+        {ok, _} = wait_for_key(ColdKey, 1000),
+        Pid = erllama_registry:whereis_name(<<"test_model">>),
+        Before = erllama_cache:get_counters(),
+        ok = erllama_model_stub:reject_next_unpack(),
+        try
+            {ok, R2} = erllama_model:complete(
+                <<"test_model">>, long_prompt(), #{response_tokens => 4}
+            ),
+            ?assertEqual(cold, maps:get(cache_hit_kind, R2)),
+            ?assertEqual(0, maps:get(read, maps:get(cache_delta, R2))),
+            {ok, _} = wait_for_key(ColdKey, 1000),
+            After = erllama_cache:get_counters(),
+            ?assertEqual(1, maps:get(corrupt_files, After) - maps:get(corrupt_files, Before)),
+            ?assertEqual(1, maps:get(evictions, After) - maps:get(evictions, Before)),
+            ?assertEqual(
+                maps:get(hits_exact, Before), maps:get(hits_exact, After)
+            ),
+            ?assert(maps:get(saves_cold, After) > maps:get(saves_cold, Before)),
+            ?assertEqual(Pid, erllama_registry:whereis_name(<<"test_model">>)),
+            ?assert(is_process_alive(Pid)),
+            %% The republished row restores normally.
+            {ok, R3} = erllama_model:complete(
+                <<"test_model">>, long_prompt(), #{response_tokens => 4}
+            ),
+            ?assertEqual(exact, maps:get(cache_hit_kind, R3))
+        after
+            persistent_term:erase({erllama_model_stub, reject_unpack})
+        end
+    end).
+
 complete_cache_delta_finish_suppressed_test() ->
     with_model(#{min_tokens => 10_000}, fun(_Cfg) ->
         {ok, Result} = erllama_model:complete(

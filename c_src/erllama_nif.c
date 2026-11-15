@@ -885,6 +885,28 @@ static ERL_NIF_TERM nif_vram_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     return enif_make_tuple2(env, atom_ok, map);
 }
 
+/* Identifies the engine that produces kv_pack payloads. The raw
+ * llama_state_seq_* buffer carries no format version, so the cache
+ * key must change whenever the vendored llama.cpp changes. */
+#ifndef ERLLAMA_LLAMA_PIN
+#error "ERLLAMA_LLAMA_PIN must be defined by c_src/CMakeLists.txt"
+#endif
+
+static ERL_NIF_TERM nif_engine_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    const char *pin = ERLLAMA_LLAMA_PIN;
+    size_t pin_len = strlen(pin);
+    ERL_NIF_TERM pin_bin;
+    unsigned char *buf = enif_make_new_binary(env, pin_len, &pin_bin);
+    memcpy(buf, pin, pin_len);
+    ERL_NIF_TERM map = enif_make_new_map(env);
+    enif_make_map_put(env, map, enif_make_atom(env, "state_seq_version"),
+                      enif_make_uint(env, LLAMA_STATE_SEQ_VERSION), &map);
+    enif_make_map_put(env, map, enif_make_atom(env, "llama_pin"), pin_bin, &map);
+    return map;
+}
+
 /* =========================================================================
  * Model
  * ========================================================================= */
@@ -1459,6 +1481,13 @@ static ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     }
     size_t consumed = erllama_safe_state_seq_set_data(
         c->ctx, in.data, in.size, seq_id);
+    if (consumed == 0 || consumed != in.size) {
+        /* A rejected or short restore can leave a partial set of cells
+         * in seq_id (the vendored llama.cpp does not always clean up
+         * after a failed restore). Drop them so the caller's cold path
+         * starts from an empty seq. */
+        (void) erllama_safe_memory_seq_rm(c->ctx, seq_id, 0, -1);
+    }
     /* kv_unpack only restores KV cells, not the per-context logits
      * buffer; the model layer must drop the last cell and re-prefill
      * it before the next sample. Mark the context as not ready until
@@ -3420,6 +3449,7 @@ static ERL_NIF_TERM nif_sampler_free(ErlNifEnv *env, int argc,
 static ErlNifFunc nif_funcs[] = {
     {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_vram_info",    0, nif_vram_info,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_engine_info",  0, nif_engine_info,  0},
     {"nif_model_size",   1, nif_model_size,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_n_layer",1, nif_model_n_layer,ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_forward_with_argmax", 2, nif_forward_with_argmax,

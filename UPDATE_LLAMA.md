@@ -87,8 +87,9 @@ rebar3 compile
 rebar3 fmt --check && rebar3 lint && rebar3 xref \
     && rebar3 eunit && rebar3 proper && rebar3 ct
 
-# 4. Update the pin reference in this file and in
-#    c_src/llama.cpp/.version (if present).
+# 4. Update the pin reference in this file and ERLLAMA_LLAMA_PIN in
+#    c_src/CMakeLists.txt. The pin is part of every cache key, so a
+#    bump keeps payloads from the old build out of reach.
 
 # 5. Commit with a message naming the new tag.
 ```

@@ -561,3 +561,11 @@ bad_content(Path) ->
     after
         ok = erllama_nif:free_model(Model)
     end.
+
+%% engine_info/0 tags kv_pack payloads with the engine that produced
+%% them; both fields feed the cache namespace.
+engine_info_shape_test() ->
+    #{state_seq_version := V, llama_pin := Pin} = Info = erllama_nif:engine_info(),
+    ?assertEqual(2, map_size(Info)),
+    ?assert(is_integer(V) andalso V > 0),
+    ?assert(is_binary(Pin) andalso byte_size(Pin) > 0).

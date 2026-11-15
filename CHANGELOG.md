@@ -6,6 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- A cached KV state that the engine cannot restore no longer crashes
+  the model. This happened when the context settings changed (for
+  example the KV cache type or context size) while the cache was kept,
+  or when cached files came from another llama.cpp build. The request
+  now runs cold, the unusable entry is dropped and counted under
+  `corrupt_files`, and the next save replaces it.
+
+### Changed
+
+- With the llama.cpp backend, the cache key now also covers the
+  llama.cpp build and the context settings that shape the KV state.
+  Existing cache entries written by the llama.cpp backend are not
+  reused after upgrading; they are rebuilt on first use and old files
+  age out through normal eviction.
+
 ## [0.8.0] - 2026-05-23
 
 Engine-robustness release covering the `erllama_server` hardening
