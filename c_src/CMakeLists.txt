@@ -145,6 +145,15 @@ target_compile_options(erllama_nif PRIVATE
     -O2 -g -Wall -Wextra -Wpedantic -fPIC
 )
 
+# The vendored tag is part of the KV cache key (see nif_kv_format).
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/.version")
+    message(FATAL_ERROR "c_src/llama.cpp/.version is missing; re-run scripts/vendor_llama.sh")
+endif()
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/.version" ERLLAMA_LLAMA_TAG LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/.version")
+target_compile_definitions(erllama_nif PRIVATE ERLLAMA_LLAMA_TAG="${ERLLAMA_LLAMA_TAG}")
+
 if(ENABLE_ASAN)
     message(STATUS "AddressSanitizer enabled on erllama_nif")
     target_compile_options(erllama_nif PRIVATE

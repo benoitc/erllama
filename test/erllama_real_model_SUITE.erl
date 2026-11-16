@@ -38,6 +38,7 @@
 -export([log/2]).
 -export([
     load_unload/1,
+    kv_format_in_cache_key/1,
     tokenize_decode_one/1,
     pack_unpack_round_trip/1,
     cold_then_warm_complete/1,
@@ -98,6 +99,7 @@
 all() ->
     [
         load_unload,
+        kv_format_in_cache_key,
         tokenize_decode_one,
         pack_unpack_round_trip,
         cold_then_warm_complete,
@@ -224,6 +226,18 @@ load_unload(Config) ->
     %% is the wrong lookup.
     Model = ?config(model, Config),
     ?assert(is_pid(erllama_registry:whereis_name(Model))),
+    ok.
+
+%% The llama backend folds its KV layout into the configured
+%% ctx_params_hash, so rows written by another llama.cpp build never
+%% reach kv_unpack.
+kv_format_in_cache_key(Config) ->
+    Model = ?config(model, Config),
+    Fmt = erllama_nif:kv_format(),
+    ?assertMatch(<<"llama.cpp/", _/binary>>, Fmt),
+    Configured = crypto:hash(sha256, term_to_binary({2048, 512})),
+    #{ctx_params_hash := Hash} = erllama_model:cache_key_meta(Model),
+    ?assertEqual(erllama_cache_key:with_kv_format(Configured, Fmt), Hash),
     ok.
 
 tokenize_decode_one(Config) ->

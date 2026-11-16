@@ -440,6 +440,8 @@
     fingerprint_mode :: safe | gguf_chunked | fast_unsafe,
     quant_type :: erllama_cache_key:quant_type(),
     quant_bits :: non_neg_integer(),
+    %% Configured hash with the backend's kv_format folded in
+    %% (erllama_cache_key:with_kv_format/2).
     ctx_params_hash :: <<_:256>>,
     context_size :: non_neg_integer(),
     policy :: erllama_cache_policy:config(),
@@ -1044,7 +1046,10 @@ build_init_data(ModelId, Config, Backend, BState) ->
         ),
         quant_type = maps:get(quant_type, Config, f16),
         quant_bits = maps:get(quant_bits, Config, 16),
-        ctx_params_hash = maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
+        ctx_params_hash = erllama_cache_key:with_kv_format(
+            maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
+            maps:get(kv_format, Meta, undefined)
+        ),
         context_size = maps:get(context_size, Config, 4096),
         policy = resolve_policy(Config, NBatch),
         backend = Backend,
