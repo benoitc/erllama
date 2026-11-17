@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         otp: ['28']
 
     steps:
@@ -96,7 +96,7 @@ jobs:
           # action errors out on that runner unless we override. Set
           # the right ImageOS for every runner so the override stays
           # explicit.
-          ImageOS: ${{ fromJSON('{"ubuntu-24.04":"ubuntu24","ubuntu-24.04-arm":"ubuntu24","macos-14":"macos14","macos-15":"macos15"}')[matrix.os] }}
+          ImageOS: ${{ fromJSON('{"ubuntu-24.04":"ubuntu24","ubuntu-24.04-arm":"ubuntu24","macos-15":"macos15"}')[matrix.os] }}
         with:
           otp-version: ${{ matrix.otp }}
           rebar3-version: '3.25.0'
@@ -124,7 +124,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         otp: ['28']
 
     steps:
@@ -138,7 +138,7 @@ jobs:
           # action errors out on that runner unless we override. Set
           # the right ImageOS for every runner so the override stays
           # explicit.
-          ImageOS: ${{ fromJSON('{"ubuntu-24.04":"ubuntu24","ubuntu-24.04-arm":"ubuntu24","macos-14":"macos14","macos-15":"macos15"}')[matrix.os] }}
+          ImageOS: ${{ fromJSON('{"ubuntu-24.04":"ubuntu24","ubuntu-24.04-arm":"ubuntu24","macos-15":"macos15"}')[matrix.os] }}
         with:
           otp-version: ${{ matrix.otp }}
           rebar3-version: '3.25.0'
