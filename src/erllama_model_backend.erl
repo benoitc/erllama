@@ -171,13 +171,16 @@ inference, etc.) can plug in via this same surface.
 %% the model-family map probed at load (arch, n_ctx_train, n_params,
 %% recurrent, hybrid, ...). erllama_model uses these to compute
 %% `vram_estimate_b` and to extend `model_info/1` with the family
-%% keys.
+%% keys. `kv_format` names the layout of the backend's kv_pack
+%% payload; erllama_model folds it into the cache key so rows saved
+%% under another layout are never restored.
 -callback extra_metadata(state()) ->
     #{
         model_size_bytes => non_neg_integer(),
         total_layers => non_neg_integer(),
         n_gpu_layers => integer(),
-        family => map()
+        family => map(),
+        kv_format => binary()
     }.
 
 %% Speculative-decoding verifier. Runs PrefixTokens ++ Candidates

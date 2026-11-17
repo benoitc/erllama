@@ -583,7 +583,7 @@ sampler_checks() ->
         {dry_base, fun is_number/1},
         {dry_allowed_length, fun is_integer/1},
         {dry_penalty_last_n, fun is_integer/1},
-        {dry_sequence_breakers, fun(V) -> is_list(V) andalso lists:all(fun is_binary/1, V) end},
+        {dry_sequence_breakers, fun dry_breakers/1},
         {mirostat, fun(V) -> lists:member(V, [0, 1, 2]) end},
         {mirostat_tau, fun is_number/1},
         {mirostat_eta, fun is_number/1},
@@ -594,6 +594,13 @@ sampler_checks() ->
         {temperature, fun is_number/1},
         {seed, fun non_neg_int/1}
     ].
+
+%% llama.cpp keeps at most LLAMA_DRY_MAX_SEQ_BREAKERS (64) and drops
+%% the rest silently; each one costs a full vocabulary scan.
+dry_breakers(V) when is_list(V) ->
+    length(V) =< 64 andalso lists:all(fun is_binary/1, V);
+dry_breakers(_) ->
+    false.
 
 logit_bias_list(V) when is_list(V) ->
     lists:all(

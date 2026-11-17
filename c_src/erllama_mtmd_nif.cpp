@@ -298,7 +298,8 @@ extern "C" int erllama_mtmd_prefill_run(
         bitmaps.reserve(n_items);
         for (size_t i = 0; i < n_items; i++) {
             mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_buf(
-                h->mtmd, items[i].data, items[i].len, false);
+                h->mtmd, items[i].data, items[i].len, false,
+                mtmd_helper_init_opt_default());
             if (!w.bitmap) {
                 return -1;
             }

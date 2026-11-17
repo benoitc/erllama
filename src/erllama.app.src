@@ -86,13 +86,9 @@
         "scripts",
         "c_src/CMakeLists.txt",
         "c_src/CMake",
-        "c_src/erllama_nif.c",
-        "c_src/erllama_safe.cpp",
-        "c_src/erllama_chat_nif.cpp",
-        "c_src/erllama_chat_nif.h",
-        "c_src/erllama_resources.h",
-        "c_src/crc32c.c",
-        "c_src/crc32c.h",
+        "c_src/*.c",
+        "c_src/*.cpp",
+        "c_src/*.h",
         "c_src/llama.cpp"
     ]}
 ]}.

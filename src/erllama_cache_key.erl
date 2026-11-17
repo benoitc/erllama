@@ -13,6 +13,11 @@
 %% A byte-prefix of the new prompt that matches a stored checkpoint's
 %% bytes is a hit; lookup is the longest such prefix.
 %%
+%% The ctx_params_hash a model uses already has the backend's KV
+%% layout folded in (`with_kv_format/2`): a payload saved by another
+%% llama.cpp build lands in a different key space and is never
+%% restored.
+%%
 %% The quant byte is a stable cache-internal enumeration of
 %% quantisation types. It is intentionally decoupled from llama.cpp's
 %% GGUF tensor type IDs so we can add new entries without depending
@@ -25,6 +30,7 @@
     make/1,
     make_text/4,
     namespace/3,
+    with_kv_format/2,
     effective_fingerprint/2,
     quant_byte/1,
     quant_atom/1,
@@ -127,6 +133,21 @@ namespace(Fp, QT, CtxHash) when
 ->
     QuantByte = quant_byte(QT),
     crypto:hash(sha256, [Fp, <<QuantByte:8>>, CtxHash]).
+
+-doc """
+Fold the backend's KV payload layout (`erllama_nif:kv_format/0`) into
+a configured `ctx_params_hash`. `undefined` (a backend that does not
+report a layout, such as the stub) returns the hash unchanged.
+""".
+-spec with_kv_format(<<_:256>>, binary() | undefined) -> <<_:256>>.
+with_kv_format(CtxHash, undefined) when
+    is_binary(CtxHash), byte_size(CtxHash) =:= 32
+->
+    CtxHash;
+with_kv_format(CtxHash, Fmt) when
+    is_binary(CtxHash), byte_size(CtxHash) =:= 32, is_binary(Fmt)
+->
+    crypto:hash(sha256, [CtxHash, Fmt]).
 
 -doc """
 Compute an effective fingerprint from a base model fingerprint and a

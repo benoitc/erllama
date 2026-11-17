@@ -266,7 +266,7 @@ extern "C" ERL_NIF_TERM nif_spec_draft(ErlNifEnv *env, int argc,
                                                 (llama_seq_id) seq);
         dp.drafting = true;
         dp.n_max = -1; /* the Erlang side truncates to its own caps */
-        dp.n_past = (llama_pos) h->prompts[seq].size();
+        dp.pos0 = (llama_pos) h->prompts[seq].size();
         dp.id_last = (llama_token) id_last;
         dp.prompt = &h->prompts[seq];
         dp.result = &h->results[seq];

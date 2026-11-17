@@ -826,7 +826,7 @@ const char *erllama_safe_ffn_exps_regex(void) noexcept {
 int erllama_safe_ffn_exps_block_regex(int idx, char *buf,
                                       size_t cap) noexcept {
     try {
-        std::string pat = llm_ffn_exps_block_regex(idx);
+        std::string pat = llm_ffn_block_regex(idx, LLM_FFN_EXPS_REGEX);
         if (pat.size() + 1 > cap) return -1;
         std::copy(pat.begin(), pat.end(), buf);
         buf[pat.size()] = '\0';
@@ -855,7 +855,7 @@ int erllama_safe_fit_params(const char *path,
     int rc;
     try {
         common_params_fit_status st = common_fit_params(
-            path, mp, cp, ts_buf, tbo_buf,
+            {std::string(path)}, mp, cp, ts_buf, tbo_buf,
             const_cast<size_t *>(margins), n_ctx_min,
             /* extra = */ nullptr, GGML_LOG_LEVEL_INFO);
         switch (st) {

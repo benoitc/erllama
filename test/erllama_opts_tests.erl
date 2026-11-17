@@ -268,6 +268,7 @@ request_type_checks_test_() ->
         {min_keep, 0},
         {penalty_last_n, 1.5},
         {dry_sequence_breakers, ["\n"]},
+        {dry_sequence_breakers, lists:duplicate(65, <<"x">>)},
         {mirostat, 3},
         {logit_bias, [{-1, 1.0}]},
         {ignore_eos, 1},
@@ -339,3 +340,7 @@ existing_file() ->
     Path = filename:join(Dir, "model.gguf"),
     ok = file:write_file(Path, <<"GGUF">>),
     Path.
+
+dry_sequence_breakers_cap_test() ->
+    Max = lists:duplicate(64, <<"x">>),
+    ?assertMatch({ok, _}, ?M:request_opts(#{dry_sequence_breakers => Max})).

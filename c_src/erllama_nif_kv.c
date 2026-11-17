@@ -7,7 +7,32 @@
 #include "erllama_safe.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
+
+#ifndef ERLLAMA_LLAMA_TAG
+#error "ERLLAMA_LLAMA_TAG must be set from c_src/llama.cpp/.version"
+#endif
+
+/* Identifies the byte layout kv_pack produces: the vendored llama.cpp
+ * tag plus its state-seq format version. The cache folds it into
+ * ctx_params_hash so rows saved by another llama.cpp never reach
+ * kv_unpack; the tag is included because upstream does not always
+ * bump LLAMA_STATE_SEQ_VERSION when the layout changes. */
+ERL_NIF_TERM nif_kv_format(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "llama.cpp/%s/seq-v%d",
+                     ERLLAMA_LLAMA_TAG, (int) LLAMA_STATE_SEQ_VERSION);
+    if (n < 0 || (size_t) n >= sizeof(buf)) {
+        return enif_make_badarg(env);
+    }
+    ERL_NIF_TERM bin;
+    unsigned char *p = enif_make_new_binary(env, (size_t) n, &bin);
+    memcpy(p, buf, (size_t) n);
+    return bin;
+}
 
 /* =========================================================================
  * KV pack / unpack

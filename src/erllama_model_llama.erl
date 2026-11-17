@@ -569,7 +569,8 @@ extra_metadata(
         model_size_bytes => SB,
         total_layers => TL,
         n_gpu_layers => NL,
-        family => Family
+        family => Family,
+        kv_format => erllama_nif:kv_format()
     },
     Meta1 =
         case FitInfo of

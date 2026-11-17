@@ -78,6 +78,17 @@ namespace_distinct_for_quant_and_fp_test() ->
     ?assertNotEqual(A, B),
     ?assertNotEqual(A, C).
 
+with_kv_format_undefined_is_identity_test() ->
+    ?assertEqual(ctx(), erllama_cache_key:with_kv_format(ctx(), undefined)).
+
+with_kv_format_separates_layouts_test() ->
+    A = erllama_cache_key:with_kv_format(ctx(), <<"llama.cpp/b10593/seq-v2">>),
+    B = erllama_cache_key:with_kv_format(ctx(), <<"llama.cpp/v1.0.0/seq-v4">>),
+    ?assertEqual(32, byte_size(A)),
+    ?assertNotEqual(ctx(), A),
+    ?assertNotEqual(A, B),
+    ?assertEqual(A, erllama_cache_key:with_kv_format(ctx(), <<"llama.cpp/b10593/seq-v2">>)).
+
 make_distinct_for_quant_change_test() ->
     A = erllama_cache_key:make(#{
         fingerprint => fp(),

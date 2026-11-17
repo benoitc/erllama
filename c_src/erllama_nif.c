@@ -480,6 +480,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_grammar_cache_stats", 1, nif_grammar_cache_stats, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_forward_with_argmax", 2, nif_forward_with_argmax,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_kv_format",    0, nif_kv_format,    0},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      4, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_unpack",    3, nif_kv_unpack,    ERL_NIF_DIRTY_JOB_CPU_BOUND},

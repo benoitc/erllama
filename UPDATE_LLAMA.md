@@ -2,7 +2,7 @@
 
 erllama vendors a pinned, unmodified copy of llama.cpp under
 `c_src/llama.cpp/`. The pinned tag is in `c_src/llama.cpp/.version`
-(currently **b10593**). You need this page when you bump that pin.
+(currently **v1.0.0**). You need this page when you bump that pin.
 
 Why pin: reproducible builds, no network access at install time (the hex
 package ships the source), and control over when new model
@@ -36,13 +36,14 @@ code is compiled without TLS and no OpenSSL dependency is pulled in.
 
 ## Bump the pin
 
-Pick a tag from <https://github.com/ggml-org/llama.cpp/tags>. Check the
+Pick a tag from <https://github.com/ggml-org/llama.cpp/tags>. Both the
+release tags (`v1.0.0`) and the build tags (`b12359`) work. Check the
 release notes for changes to the C API the NIF wraps
 (`c_src/erllama_safe.cpp` lists every `llama_*` / `ggml_*` symbol) and to
 `common/chat.h`.
 
 ```sh
-scripts/vendor_llama.sh b10068          # replace with the new tag
+scripts/vendor_llama.sh v1.0.0          # replace with the new tag
 rm -rf _build
 rebar3 compile
 rebar3 xref && rebar3 dialyzer && rebar3 fmt --check && rebar3 lint
@@ -74,3 +75,6 @@ ERLLAMA_BUILDOPTS="-j 4"                # limit build parallelism
   `GGML_*=OFF` line in `c_src/CMakeLists.txt`.
 - The cache layer depends on `llama_state_seq_*`; bumps that change those
   signatures show up as NIF compile errors in `erllama_safe.cpp`.
+- The tag in `.version` is part of the KV cache key (`nif_kv_format` in
+  `c_src/erllama_nif_kv.c`), so every bump starts the cache cold: rows
+  saved by the previous build are never restored.

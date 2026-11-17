@@ -8,6 +8,19 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Vendored llama.cpp bumped from b10593 to v1.0.0. This brings
+  upstream fixes for a stack overflow on deeply recursive grammars, a
+  CPU and memory blowup with many DRY sequence breakers, an abort on
+  malformed grammar triggers, an integer overflow when reading GGUF
+  files, cleanup after a failed KV restore, and many Metal and CUDA
+  out-of-bounds and leak fixes.
+- KV cache entries are now tied to the llama.cpp build that wrote
+  them. After this upgrade, and after every later llama.cpp bump, the
+  cache starts cold once: entries saved by the previous build are
+  ignored instead of being restored into a newer KV format.
+- `dry_sequence_breakers` accepts at most 64 entries. A longer list is
+  rejected with `invalid_option` instead of being cut short silently.
+
 - Internal: `c_src/erllama_nif.c` split into per-concern files
   (`erllama_nif_{model,context,kv,tokens,decode,sampler,
   chat_template,adapter}.c` plus the shared `erllama_nif_int.h` /

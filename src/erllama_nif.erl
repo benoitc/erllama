@@ -38,6 +38,7 @@
     prefill/2,
     decode_one/1,
     step/2,
+    kv_format/0,
     kv_pack/3,
     kv_pack/4,
     kv_unpack/3,
@@ -288,6 +289,12 @@ log-softmax logprob plus the top-N ids/logprobs, descending.
     ]}
     | {error, atom() | {decode_failed, integer()}}.
 step(Ctx, Ops) when is_list(Ops) -> nif_step(Ctx, Ops).
+
+%% Identifier of the KV state layout kv_pack produces: the vendored
+%% llama.cpp tag and its state-seq format version, for example
+%% `<<"llama.cpp/v1.0.0/seq-v4">>'.
+-spec kv_format() -> binary().
+kv_format() -> nif_kv_format().
 
 -spec kv_pack(context_ref(), [token_id()], non_neg_integer()) ->
     binary() | {error, atom()}.
@@ -683,6 +690,7 @@ nif_detokenize(_Model, _Tokens, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_prefill(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_decode_one(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_step(_Ctx, _Ops) -> erlang:nif_error(nif_not_loaded).
+nif_kv_format() -> erlang:nif_error(nif_not_loaded).
 nif_kv_pack(_Ctx, _Tokens, _NTokens) -> erlang:nif_error(nif_not_loaded).
 nif_kv_pack(_Ctx, _Tokens, _NTokens, _SeqId) -> erlang:nif_error(nif_not_loaded).
 nif_kv_unpack(_Ctx, _Bin, _SeqId) -> erlang:nif_error(nif_not_loaded).

@@ -498,7 +498,7 @@ ERL_NIF_TERM render_map(ErlNifEnv *env, const common_chat_params &params) {
         enif_make_atom(env, "thinking_end_tags"),
     };
     ERL_NIF_TERM vals[11] = {
-        mk_string_bin(env, params.prompt),
+        mk_string_bin(env, params.prompt.str()),
         mk_string_bin(env, common_chat_format_name(params.format)),
         mk_string_bin(env, params.grammar),
         mk_bool(env, params.grammar_lazy),
@@ -589,12 +589,14 @@ extern "C" ERL_NIF_TERM nif_chat_parse(
 
     try {
         common_chat_parser_params parser_params(ph->params);
-        parser_params.parser.load(ph->params.parser);
+        parser_params.parser = ph->params.parser;
 
         std::string input_str(
             reinterpret_cast<const char *>(input.data), input.size);
         common_chat_msg msg =
-            common_chat_parse(input_str, is_partial, parser_params);
+            common_chat_parse(
+                common_chat_input(std::move(input_str)), is_partial,
+                parser_params);
 
         return enif_make_tuple2(env, mk_atom(env, "ok"), marshal_msg(env, msg));
     } catch (const std::exception &e) {

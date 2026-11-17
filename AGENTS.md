@@ -83,7 +83,9 @@ save announce) go through `erllama_cache_meta_srv` via
 ### Save pipeline correctness invariants (do not change without review)
 
 - Cache hits are byte-exact by construction. The cache key is SHA-256
-  over model fingerprint, quant byte, ctx hash, and the **rendered
+  over model fingerprint, quant byte, ctx hash (with the vendored
+  llama.cpp tag and state-seq version folded in, see
+  `with_kv_format/2` in `erllama_cache_key`), and the **rendered
   prompt bytes** (`detokenize(tokens)`, ds4-style), not the token-id
   list — so a prompt that retokenises across turns still hits. The
   exact tokens travel in the checkpoint payload for KV resume.

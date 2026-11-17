@@ -4,7 +4,7 @@
 #
 # Vendor an upstream llama.cpp release tag into c_src/llama.cpp.
 #
-#   scripts/vendor_llama.sh b10068
+#   scripts/vendor_llama.sh v1.0.0
 #
 # The vendored tree is upstream, unmodified. Only whole directories are
 # removed (backends we never build, unused vendor libs, repo dotfiles);
@@ -14,7 +14,7 @@ set -euo pipefail
 
 TAG="${1:-}"
 if [ -z "$TAG" ]; then
-    echo "usage: $0 <llama.cpp tag, e.g. b10068>" >&2
+    echo "usage: $0 <llama.cpp tag, e.g. v1.0.0 or b12359>" >&2
     exit 2
 fi
 
@@ -26,7 +26,8 @@ trap 'rm -rf "$WORK"' EXIT
 URL="https://github.com/ggml-org/llama.cpp/archive/refs/tags/${TAG}.tar.gz"
 echo "fetching $URL"
 curl -fsSL "$URL" | tar -xz -C "$WORK"
-SRC="$WORK/llama.cpp-${TAG}"
+# GitHub drops the leading `v' of a semver tag in the tarball's top dir.
+SRC="$WORK/llama.cpp-${TAG#v}"
 
 # Paths we vendor wholesale.
 KEEP="cmake CMakeLists.txt common ggml include src LICENSE vendor tools/mtmd"
