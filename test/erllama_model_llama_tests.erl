@@ -96,6 +96,11 @@ kv_format_flash_attn_aliases_name_one_layout_test() ->
         erllama_model_llama:kv_format(#{flash_attn => disabled})
     ).
 
+kv_format_auto_is_the_default_layout_test() ->
+    Default = erllama_model_llama:kv_format(#{}),
+    ?assertEqual(Default, erllama_model_llama:kv_format(#{type_k => auto, type_v => auto})),
+    ?assertEqual(Default, erllama_model_llama:kv_format(#{flash_attn => auto})).
+
 kv_format_starts_with_engine_build_test() ->
     Engine = erllama_nif:kv_format(),
     Fmt = erllama_model_llama:kv_format(#{}),

@@ -35,6 +35,7 @@
     quant_byte/1,
     quant_atom/1,
     quant_tag/2,
+    from_ftype/1,
     encode_tokens/1,
     decode_tokens/1
 ]).
@@ -73,6 +74,15 @@
     | iq3_m
     | iq4_nl
     | iq4_xs
+    | q2_k_s
+    | tq1_0
+    | tq2_0
+    | mxfp4_moe
+    | nvfp4
+    | q1_0
+    | q2_0
+    | f8_e4m3
+    | unknown
     | atom().
 
 -type components() :: #{
@@ -213,10 +223,19 @@ quant_byte(iq1_m) -> 26;
 quant_byte(iq4_nl) -> 27;
 quant_byte(iq4_xs) -> 28;
 quant_byte(bf16) -> 29;
+quant_byte(q2_k_s) -> 30;
+quant_byte(tq1_0) -> 31;
+quant_byte(tq2_0) -> 32;
+quant_byte(mxfp4_moe) -> 33;
+quant_byte(nvfp4) -> 34;
+quant_byte(q1_0) -> 35;
+quant_byte(q2_0) -> 36;
+quant_byte(f8_e4m3) -> 37;
 %% Catch-all: any future or unknown quant atom maps to byte 255 so the
 %% cache key derivation never crashes. Cache buckets are already
 %% differentiated by the model fingerprint, so conflating several
-%% unknown labels into byte 255 is harmless.
+%% unknown labels into byte 255 is harmless; quant_atom/1 reads it
+%% back as `unknown`.
 quant_byte(_) -> 255.
 
 -spec quant_atom(0..255) -> {ok, quant_type()} | {error, unknown_quant}.
@@ -250,7 +269,68 @@ quant_atom(26) -> {ok, iq1_m};
 quant_atom(27) -> {ok, iq4_nl};
 quant_atom(28) -> {ok, iq4_xs};
 quant_atom(29) -> {ok, bf16};
+quant_atom(30) -> {ok, q2_k_s};
+quant_atom(31) -> {ok, tq1_0};
+quant_atom(32) -> {ok, tq2_0};
+quant_atom(33) -> {ok, mxfp4_moe};
+quant_atom(34) -> {ok, nvfp4};
+quant_atom(35) -> {ok, q1_0};
+quant_atom(36) -> {ok, q2_0};
+quant_atom(37) -> {ok, f8_e4m3};
+%% Byte 255 is what quant_byte/1 writes for a label it does not know;
+%% reading it back must succeed or the file it was saved in is lost.
+quant_atom(255) -> {ok, unknown};
 quant_atom(_) -> {error, unknown_quant}.
+
+%% Quant type and nominal bits per weight for a llama.cpp `llama_ftype`
+%% value (as `erllama_nif:model_family/1` reports it), or `undefined`
+%% when the value is unknown. The LLAMA_FTYPE_GUESSED flag (1024) is
+%% ignored. Values follow `enum llama_ftype` in the vendored llama.h;
+%% the gaps (4-6, 33-35) are types upstream removed.
+-spec from_ftype(integer()) -> {quant_type(), pos_integer()} | undefined.
+from_ftype(FType) when is_integer(FType), FType >= 0 ->
+    ftype_quant(FType band (bnot 1024));
+from_ftype(_) ->
+    undefined.
+
+ftype_quant(0) -> {f32, 32};
+ftype_quant(1) -> {f16, 16};
+ftype_quant(2) -> {q4_0, 4};
+ftype_quant(3) -> {q4_1, 4};
+ftype_quant(7) -> {q8_0, 8};
+ftype_quant(8) -> {q5_0, 5};
+ftype_quant(9) -> {q5_1, 5};
+ftype_quant(10) -> {q2_k, 2};
+ftype_quant(11) -> {q3_k_s, 3};
+ftype_quant(12) -> {q3_k_m, 3};
+ftype_quant(13) -> {q3_k_l, 3};
+ftype_quant(14) -> {q4_k_s, 4};
+ftype_quant(15) -> {q4_k_m, 4};
+ftype_quant(16) -> {q5_k_s, 5};
+ftype_quant(17) -> {q5_k_m, 5};
+ftype_quant(18) -> {q6_k, 6};
+ftype_quant(19) -> {iq2_xxs, 2};
+ftype_quant(20) -> {iq2_xs, 2};
+ftype_quant(21) -> {q2_k_s, 2};
+ftype_quant(22) -> {iq3_xs, 3};
+ftype_quant(23) -> {iq3_xxs, 3};
+ftype_quant(24) -> {iq1_s, 1};
+ftype_quant(25) -> {iq4_nl, 4};
+ftype_quant(26) -> {iq3_s, 3};
+ftype_quant(27) -> {iq3_m, 3};
+ftype_quant(28) -> {iq2_s, 2};
+ftype_quant(29) -> {iq2_m, 2};
+ftype_quant(30) -> {iq4_xs, 4};
+ftype_quant(31) -> {iq1_m, 1};
+ftype_quant(32) -> {bf16, 16};
+ftype_quant(36) -> {tq1_0, 1};
+ftype_quant(37) -> {tq2_0, 2};
+ftype_quant(38) -> {mxfp4_moe, 4};
+ftype_quant(39) -> {nvfp4, 4};
+ftype_quant(40) -> {q1_0, 1};
+ftype_quant(41) -> {q2_0, 2};
+ftype_quant(42) -> {f8_e4m3, 8};
+ftype_quant(_) -> undefined.
 
 %% Human-readable quant tag in llama.cpp's GGUF naming convention.
 %% Used by erllama_model:list_models to emit a cluster-friendly

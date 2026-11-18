@@ -176,17 +176,55 @@ quant_byte_round_trip_test() ->
         iq3_s,
         iq3_m,
         iq4_nl,
-        iq4_xs
+        iq4_xs,
+        q2_k_s,
+        tq1_0,
+        tq2_0,
+        mxfp4_moe,
+        nvfp4,
+        q1_0,
+        q2_0,
+        f8_e4m3
     ],
     [
         ?assertEqual(
             {ok, Q}, erllama_cache_key:quant_atom(erllama_cache_key:quant_byte(Q))
         )
      || Q <- Quants
-    ].
+    ],
+    %% Distinct bytes, none of them the 255 catch-all.
+    Bytes = [erllama_cache_key:quant_byte(Q) || Q <- Quants],
+    ?assertEqual(length(Bytes), length(lists:usort(Bytes))),
+    ?assertNot(lists:member(255, Bytes)).
 
 quant_atom_unknown_test() ->
     ?assertEqual({error, unknown_quant}, erllama_cache_key:quant_atom(254)).
+
+quant_atom_reads_back_the_catch_all_byte_test() ->
+    %% quant_byte/1 writes 255 for a label it does not know; a file
+    %% carrying that byte must stay readable.
+    ?assertEqual(
+        {ok, unknown}, erllama_cache_key:quant_atom(erllama_cache_key:quant_byte(future_q9_x))
+    ).
+
+from_ftype_maps_llama_ftypes_test() ->
+    ?assertEqual({f32, 32}, erllama_cache_key:from_ftype(0)),
+    ?assertEqual({f16, 16}, erllama_cache_key:from_ftype(1)),
+    ?assertEqual({q8_0, 8}, erllama_cache_key:from_ftype(7)),
+    ?assertEqual({q4_k_m, 4}, erllama_cache_key:from_ftype(15)),
+    ?assertEqual({bf16, 16}, erllama_cache_key:from_ftype(32)),
+    ?assertEqual({f8_e4m3, 8}, erllama_cache_key:from_ftype(42)),
+    %% The GUESSED flag does not change the type.
+    ?assertEqual({q4_k_m, 4}, erllama_cache_key:from_ftype(15 bor 1024)),
+    %% Removed upstream values, out of range and "unavailable" (-1).
+    [?assertEqual(undefined, erllama_cache_key:from_ftype(F)) || F <- [4, 5, 6, 33, 43, -1]].
+
+from_ftype_types_have_a_quant_byte_test() ->
+    Detected = [erllama_cache_key:from_ftype(F) || F <- lists:seq(0, 42)],
+    [
+        ?assertNotEqual(255, erllama_cache_key:quant_byte(QT))
+     || {QT, _Bits} <- Detected
+    ].
 
 quant_byte_unknown_atom_test() ->
     %% Catch-all clause maps any unknown atom to byte 255 so cache

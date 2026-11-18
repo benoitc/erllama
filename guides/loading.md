@@ -202,6 +202,11 @@ How aggressively the cache trusts the fingerprint:
 Identifies the quantisation byte-for-byte. Two models with the same
 weights but different quant schemes have different cache rows.
 
+You can leave both out with the llama.cpp backend: they are read from
+the model file (`q4_k_m` and 4 for a Q4_K_M GGUF, for example) and
+reported by `erllama:model_info/1`. A `quant_type` you pass wins over
+the detected one.
+
 ### `ctx_params_hash`
 
 A SHA-256 over the parts of `context_opts` that change KV layout -

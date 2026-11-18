@@ -39,6 +39,8 @@
 -export([
     load_unload/1,
     kv_format_in_cache_key/1,
+    context_opt_values_open/1,
+    quant_type_detected_from_model/1,
     tokenize_decode_one/1,
     pack_unpack_round_trip/1,
     cold_then_warm_complete/1,
@@ -100,6 +102,8 @@ all() ->
     [
         load_unload,
         kv_format_in_cache_key,
+        context_opt_values_open,
+        quant_type_detected_from_model,
         tokenize_decode_one,
         pack_unpack_round_trip,
         cold_then_warm_complete,
@@ -252,6 +256,52 @@ kv_format_in_cache_key(Config) ->
     after
         catch erllama_model:stop(Other)
     end,
+    ok.
+
+%% Every context option value erllama_opts accepts must open a
+%% context: `enabled` / `disabled` flash attention, `auto` KV types
+%% (llama.cpp's default) and the FP8 KV cache.
+context_opt_values_open(Config) ->
+    {ok, M} = erllama_nif:load_model(?config(model_path, Config), #{n_gpu_layers => 0}),
+    try
+        [
+            begin
+                {ok, C} = erllama_nif:new_context(M, Opts#{n_ctx => 256}),
+                erllama_nif:free_context(C)
+            end
+         || Opts <- [
+                #{flash_attn => enabled},
+                #{flash_attn => disabled},
+                #{type_k => auto, type_v => auto},
+                #{type_k => f8_e4m3}
+            ]
+        ],
+        ?assertError(badarg, erllama_nif:new_context(M, #{type_k => bogus}))
+    after
+        erllama_nif:free_model(M)
+    end,
+    ok.
+
+%% Without a configured quant_type the model reports the one in the
+%% GGUF; a configured one wins.
+quant_type_detected_from_model(Config) ->
+    Cfg = model_config(?config(model_path, Config), ?config(disk_srv, Config)),
+    {ok, M} = erllama_nif:load_model(?config(model_path, Config), #{n_gpu_layers => 0}),
+    #{ftype := FType} = erllama_nif:model_family(M),
+    erllama_nif:free_model(M),
+    {QT, Bits} = erllama_cache_key:from_ftype(FType),
+    Detected = <<"quant_detected">>,
+    {ok, _} = erllama_model:start_link(Detected, maps:without([quant_type, quant_bits], Cfg)),
+    try
+        Info = erllama_model:model_info(Detected),
+        ?assertEqual(QT, maps:get(quant_type, Info)),
+        ?assertEqual(Bits, maps:get(quant_bits, Info)),
+        ?assertEqual(QT, maps:get(quant_type, erllama_model:cache_key_meta(Detected)))
+    after
+        catch erllama_model:stop(Detected)
+    end,
+    %% init_per_testcase's model passes quant_type => f16 explicitly.
+    ?assertEqual(f16, maps:get(quant_type, erllama_model:model_info(?config(model, Config)))),
     ok.
 
 tokenize_decode_one(Config) ->

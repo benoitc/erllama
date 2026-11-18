@@ -13,6 +13,15 @@ this project adheres to [Semantic Versioning](https://semver.org).
   fresh save was dropped as a duplicate. The prompt never got a warm
   start again until the entry was evicted. Such an entry is now
   removed, and the next save replaces it.
+- Loading a model with `flash_attn => enabled` or `disabled`, or with
+  `type_k` / `type_v` set to `auto`, failed when the context was
+  created, although the options were accepted. These values now work;
+  `auto` keeps llama.cpp's default KV type.
+- With a `quant_type` that erllama did not know (for example
+  `mxfp4_moe`), cache files were written but could not be read back,
+  so the disk cache never warmed for such models. Every llama.cpp
+  quantisation now has its own identifier, and files saved under an
+  unknown label are readable.
 
 ### Changed
 
@@ -44,6 +53,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- FP8 KV cache: `type_k` / `type_v` accept `f8_e4m3`.
+- `quant_type` and `quant_bits` are read from the model file when you
+  don't pass them, and reported by `model_info/1`. Before, they
+  defaulted to `f16` / 16 whatever the model was.
 - Vision and audio input via libmtmd (`tools/mtmd` now vendored,
   built through the upstream `LLAMA_BUILD_MTMD` standalone hook):
   load an `mmproj_path` projector alongside the model, send
