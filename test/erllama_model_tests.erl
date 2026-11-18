@@ -714,6 +714,35 @@ warm_unpack_failure_falls_back_cold_test() ->
         )
     end).
 
+unrestorable_row_is_replaced_test() ->
+    %% A row whose payload fails to restore is dropped, so the cold
+    %% run that follows republishes it instead of having its save
+    %% refused as already_present. Left in place, every later request
+    %% for the prompt would fail the restore again.
+    with_model(#{}, #{fail_kv_unpack => true}, fun(Cfg) ->
+        Key = key_for_tokens(prompt_tokens(long_prompt()), Cfg),
+        {ok, _R1} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        {ok, _} = wait_for_key(Key, 1000),
+        Before = erllama_cache:get_counters(),
+        {ok, R2} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        ?assertEqual(cold, maps:get(cache_hit_kind, R2)),
+        {ok, _} = wait_for_key(Key, 1000),
+        After = erllama_cache:get_counters(),
+        Delta = fun(K) -> maps:get(K, After) - maps:get(K, Before) end,
+        ?assert(Delta(restore_failed) >= 1),
+        %% Every failed restore dropped its row.
+        ?assertEqual(Delta(restore_failed), Delta(evictions)),
+        ?assert(Delta(saves_cold) >= 1),
+        %% The row under Key is the one the second run wrote: the old
+        %% row was checked out (hit count >= 1), a fresh row starts at 0.
+        {ok, Row} = erllama_cache_meta_srv:dump(Key),
+        ?assertEqual(0, element(?POS_HITS, Row))
+    end).
+
 warm_partial_hit_prefills_suffix_without_primer_test() ->
     %% A partial hit resumes on freshly unpacked KV that holds exactly
     %% the checkpoint prefix; prefilling the suffix regenerates the

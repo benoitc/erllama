@@ -26,6 +26,7 @@
 -export([
     init/1,
     terminate/1,
+    kv_format/1,
     tokenize/2,
     tokenize/3,
     detokenize/2,
@@ -562,7 +563,8 @@ extra_metadata(
         total_layers = TL,
         n_gpu_layers = NL,
         family = Family,
-        fit_info = FitInfo
+        fit_info = FitInfo,
+        context_opts = COpts
     } = S
 ) ->
     Meta = #{
@@ -570,7 +572,7 @@ extra_metadata(
         total_layers => TL,
         n_gpu_layers => NL,
         family => Family,
-        kv_format => erllama_nif:kv_format()
+        kv_format => kv_format(COpts)
     },
     Meta1 =
         case FitInfo of
@@ -581,6 +583,42 @@ extra_metadata(
         undefined -> Meta1;
         Caps -> Meta1#{mmproj => Caps}
     end.
+
+%% Context options that decide whether a kv_pack payload restores
+%% into a context: the K/V cache types, V transposition (flash
+%% attention) and the stream layout (n_seq_max unless kv_unified).
+%% n_ctx is left out on purpose: a payload restores into a larger
+%% context, and one too large for a smaller context fails once and is
+%% replaced.
+-define(KV_LAYOUT_OPTS, [
+    {type_k, <<"k">>},
+    {type_v, <<"v">>},
+    {flash_attn, <<"fa">>},
+    {n_seq_max, <<"seq">>},
+    {kv_unified, <<"unified">>}
+]).
+
+%% Name the layout of the `kv_pack` payload a context opened with
+%% `COpts` produces: the engine build (`erllama_nif:kv_format/0`)
+%% followed by the layout options, for example
+%% `<<"llama.cpp/v1.0.0/seq-v4/k=f16,v=f16,fa=default,seq=1,unified=default">>`.
+%% Absent options read `default`. The model layer folds it into the
+%% cache key, so a payload is only offered to a context that can
+%% restore it.
+-spec kv_format(map()) -> binary().
+kv_format(COpts) when is_map(COpts) ->
+    Layout = [
+        [Tag, $=, layout_value(K, maps:get(K, COpts, default))]
+     || {K, Tag} <- ?KV_LAYOUT_OPTS
+    ],
+    iolist_to_binary([erllama_nif:kv_format(), $/ | lists:join($,, Layout)]).
+
+%% `true` / `enabled` (and `false` / `disabled`) select the same
+%% flash-attention mode, so they must name the same layout.
+layout_value(flash_attn, true) -> <<"enabled">>;
+layout_value(flash_attn, false) -> <<"disabled">>;
+layout_value(_K, V) when is_atom(V) -> atom_to_binary(V);
+layout_value(_K, V) when is_integer(V) -> integer_to_binary(V).
 
 %% Speculative-decoding verifier. Snapshot+restore protocol so
 %% the caller's KV view is unchanged after the call. Empty prefix

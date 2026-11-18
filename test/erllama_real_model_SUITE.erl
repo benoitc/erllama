@@ -233,11 +233,23 @@ load_unload(Config) ->
 %% reach kv_unpack.
 kv_format_in_cache_key(Config) ->
     Model = ?config(model, Config),
-    Fmt = erllama_nif:kv_format(),
-    ?assertMatch(<<"llama.cpp/", _/binary>>, Fmt),
-    Configured = crypto:hash(sha256, term_to_binary({2048, 512})),
+    ?assertMatch(<<"llama.cpp/", _/binary>>, erllama_nif:kv_format()),
+    Cfg = model_config(?config(model_path, Config), ?config(disk_srv, Config)),
+    COpts = maps:get(context_opts, Cfg),
+    Fmt = erllama_model_llama:kv_format(COpts),
+    Configured = maps:get(ctx_params_hash, Cfg),
     #{ctx_params_hash := Hash} = erllama_model:cache_key_meta(Model),
     ?assertEqual(erllama_cache_key:with_kv_format(Configured, Fmt), Hash),
+    %% Same model and configured hash, different K cache type: rows
+    %% saved by one context must not be offered to the other.
+    Other = <<"kv_format_other_type_k">>,
+    {ok, _} = erllama_model:start_link(Other, Cfg#{context_opts => COpts#{type_k => q8_0}}),
+    try
+        #{ctx_params_hash := OtherHash} = erllama_model:cache_key_meta(Other),
+        ?assertNotEqual(Hash, OtherHash)
+    after
+        catch erllama_model:stop(Other)
+    end,
     ok.
 
 tokenize_decode_one(Config) ->

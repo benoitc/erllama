@@ -55,3 +55,50 @@ thinking_signature_empty_key_treated_as_unset_test() ->
     after
         application:unset_env(erllama, thinking_signing_key)
     end.
+
+%% kv_format/1 decides which cache rows a context may restore: it must
+%% change with every option that changes the KV payload layout, ignore
+%% the others, and not depend on map construction order.
+
+kv_format_changes_with_kv_layout_test() ->
+    Base = #{type_k => f16, type_v => f16, flash_attn => auto, n_seq_max => 1},
+    Fmt = erllama_model_llama:kv_format(Base),
+    [
+        ?assertNotEqual(Fmt, erllama_model_llama:kv_format(maps:put(K, V, Base)))
+     || {K, V} <- [
+            {type_k, q8_0},
+            {type_v, q8_0},
+            {flash_attn, enabled},
+            {n_seq_max, 4},
+            {kv_unified, true}
+        ]
+    ].
+
+kv_format_ignores_other_opts_test() ->
+    Base = #{type_k => q8_0},
+    ?assertEqual(
+        erllama_model_llama:kv_format(Base),
+        erllama_model_llama:kv_format(Base#{n_ctx => 8192, n_threads => 8, decode_budget_ms => 100})
+    ).
+
+kv_format_is_order_independent_test() ->
+    A = maps:from_list([{type_k, q8_0}, {n_seq_max, 2}, {flash_attn, auto}]),
+    B = maps:from_list([{flash_attn, auto}, {n_seq_max, 2}, {type_k, q8_0}]),
+    ?assertEqual(erllama_model_llama:kv_format(A), erllama_model_llama:kv_format(B)).
+
+kv_format_flash_attn_aliases_name_one_layout_test() ->
+    ?assertEqual(
+        erllama_model_llama:kv_format(#{flash_attn => true}),
+        erllama_model_llama:kv_format(#{flash_attn => enabled})
+    ),
+    ?assertEqual(
+        erllama_model_llama:kv_format(#{flash_attn => false}),
+        erllama_model_llama:kv_format(#{flash_attn => disabled})
+    ).
+
+kv_format_starts_with_engine_build_test() ->
+    Engine = erllama_nif:kv_format(),
+    Fmt = erllama_model_llama:kv_format(#{}),
+    ?assertEqual(
+        <<Engine/binary, "/k=default,v=default,fa=default,seq=default,unified=default">>, Fmt
+    ).

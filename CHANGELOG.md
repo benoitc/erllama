@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- A cache entry that could not be restored stayed in place, so every
+  later request for the same prompt tried it again, ran cold, and its
+  fresh save was dropped as a duplicate. The prompt never got a warm
+  start again until the entry was evicted. Such an entry is now
+  removed, and the next save replaces it.
+
 ### Changed
 
 - Vendored llama.cpp bumped from b10593 to v1.0.0. This brings
@@ -15,9 +23,11 @@ this project adheres to [Semantic Versioning](https://semver.org).
   files, cleanup after a failed KV restore, and many Metal and CUDA
   out-of-bounds and leak fixes.
 - KV cache entries are now tied to the llama.cpp build that wrote
-  them. After this upgrade, and after every later llama.cpp bump, the
-  cache starts cold once: entries saved by the previous build are
-  ignored instead of being restored into a newer KV format.
+  them and to the context settings that shape the KV state (KV cache
+  types, flash attention, sequence count and unified KV). After this
+  upgrade, after every later llama.cpp bump, and when you change one
+  of those settings, the cache starts cold once instead of trying to
+  restore entries the context cannot read.
 - `dry_sequence_breakers` accepts at most 64 entries. A longer list is
   rejected with `invalid_option` instead of being cut short silently.
 
