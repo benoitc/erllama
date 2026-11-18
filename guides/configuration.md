@@ -149,6 +149,9 @@ Passed to `erllama:load_model/1,2`:
     type_k          => f16,      %% KV type for keys: auto | f16 | f32 | bf16
                                  %% | q4_0 | q5_0 | q5_1 | q8_0 | f8_e4m3
     type_v          => f16,      %% KV type for values, same set
+    moe_cache_size  => 0,        %% device cache (bytes) for host-resident
+                                 %% MoE experts; 0 disables [experimental]
+    moe_cache_cpu_share => 0.0,  %% share of cache misses run on the CPU
     decode_budget_ms => 30000    %% per-step decode budget; 0 disables
   },
   fingerprint       => <<32 bytes>>,

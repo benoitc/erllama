@@ -126,6 +126,22 @@ tensors in host memory:
 }).
 ```
 
+With the experts in host memory, `moe_cache_size` in `context_opts`
+keeps the recently used ones in a device buffer of that many bytes,
+split across devices like the layers. `moe_cache_cpu_share` (0.0 to
+1.0, default 0) computes that share of the cache misses on the CPU
+instead of uploading the experts. Both are experimental in llama.cpp.
+The cache needs a MoE model, a GPU backend and room for the experts
+of one token; otherwise the load fails with `{error, context_failed}`.
+
+```erlang
+{ok, M} = erllama:load_model(<<"big-moe">>, #{
+    model_path => Path,
+    model_opts => #{devices => [<<"MTL0">>], cpu_moe => true},
+    context_opts => #{moe_cache_size => 8 * 1024 * 1024 * 1024}
+}).
+```
+
 `fit => true` measures the model against the free memory on each
 device (leaving a 1 GiB margin by default, `margin_mib` to change
 it) and picks `n_gpu_layers`, the multi-GPU `tensor_split`, and

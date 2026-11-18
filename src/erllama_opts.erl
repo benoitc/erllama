@@ -75,6 +75,8 @@
     flash_attn,
     type_k,
     type_v,
+    moe_cache_size,
+    moe_cache_cpu_share,
     decode_budget_ms
 ]).
 
@@ -403,6 +405,8 @@ context_opt_checks() ->
         {flash_attn, fun(V) -> lists:member(V, [auto, true, false, enabled, disabled]) end},
         {type_k, fun(V) -> lists:member(V, ?KV_TYPES) end},
         {type_v, fun(V) -> lists:member(V, ?KV_TYPES) end},
+        {moe_cache_size, fun non_neg_int/1},
+        {moe_cache_cpu_share, fun(V) -> is_number(V) andalso V >= 0 andalso V =< 1 end},
         {decode_budget_ms, fun pos_int/1}
     ].
 
