@@ -240,10 +240,12 @@ kv_format_in_cache_key(Config) ->
     Configured = maps:get(ctx_params_hash, Cfg),
     #{ctx_params_hash := Hash} = erllama_model:cache_key_meta(Model),
     ?assertEqual(erllama_cache_key:with_kv_format(Configured, Fmt), Hash),
-    %% Same model and configured hash, different K cache type: rows
-    %% saved by one context must not be offered to the other.
-    Other = <<"kv_format_other_type_k">>,
-    {ok, _} = erllama_model:start_link(Other, Cfg#{context_opts => COpts#{type_k => q8_0}}),
+    %% Same model and configured hash, different KV stream layout:
+    %% rows saved by one context must not be offered to the other.
+    %% (n_seq_max rather than a quantized type_k, which small models
+    %% with odd head sizes cannot open.)
+    Other = <<"kv_format_other_layout">>,
+    {ok, _} = erllama_model:start_link(Other, Cfg#{context_opts => COpts#{n_seq_max => 2}}),
     try
         #{ctx_params_hash := OtherHash} = erllama_model:cache_key_meta(Other),
         ?assertNotEqual(Hash, OtherHash)
