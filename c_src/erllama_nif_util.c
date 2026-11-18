@@ -297,10 +297,16 @@ erllama_tok_status_t erllama_tokenize_grow(
 static const erllama_atom_enum_pair_t FLASH_ATTN_TABLE[] = {
     /* booleans-as-atoms map to the matching enum tristate. `auto`
      * lets llama.cpp pick based on the build / model. */
-    {"true",  LLAMA_FLASH_ATTN_TYPE_ENABLED},
-    {"false", LLAMA_FLASH_ATTN_TYPE_DISABLED},
-    {"auto",  LLAMA_FLASH_ATTN_TYPE_AUTO},
+    {"true",     LLAMA_FLASH_ATTN_TYPE_ENABLED},
+    {"false",    LLAMA_FLASH_ATTN_TYPE_DISABLED},
+    {"enabled",  LLAMA_FLASH_ATTN_TYPE_ENABLED},
+    {"disabled", LLAMA_FLASH_ATTN_TYPE_DISABLED},
+    {"auto",     LLAMA_FLASH_ATTN_TYPE_AUTO},
 };
+
+/* `auto` for type_k / type_v keeps llama.cpp's default KV type. Real
+ * ggml types are >= 0, so -1 cannot collide with one. */
+#define ERLLAMA_KV_TYPE_DEFAULT (-1)
 
 static const erllama_atom_enum_pair_t GGML_TYPE_TABLE[] = {
     {"f16",  GGML_TYPE_F16},
@@ -310,6 +316,8 @@ static const erllama_atom_enum_pair_t GGML_TYPE_TABLE[] = {
     {"q5_0", GGML_TYPE_Q5_0},
     {"q5_1", GGML_TYPE_Q5_1},
     {"q8_0", GGML_TYPE_Q8_0},
+    {"f8_e4m3", GGML_TYPE_F8_E4M3},
+    {"auto", ERLLAMA_KV_TYPE_DEFAULT},
 };
 
 int erllama_parse_cparams(ErlNifEnv *env, ERL_NIF_TERM map,
@@ -375,7 +383,9 @@ int erllama_parse_cparams(ErlNifEnv *env, ERL_NIF_TERM map,
         &enum_v
     );
     if (tk_rc < 0) return 0;
-    if (tk_rc > 0) params->type_k = (enum ggml_type) enum_v;
+    if (tk_rc > 0 && enum_v != ERLLAMA_KV_TYPE_DEFAULT) {
+        params->type_k = (enum ggml_type) enum_v;
+    }
 
     int tv_rc = get_map_atom_enum(
         env, map, "type_v",
@@ -383,7 +393,9 @@ int erllama_parse_cparams(ErlNifEnv *env, ERL_NIF_TERM map,
         &enum_v
     );
     if (tv_rc < 0) return 0;
-    if (tv_rc > 0) params->type_v = (enum ggml_type) enum_v;
+    if (tv_rc > 0 && enum_v != ERLLAMA_KV_TYPE_DEFAULT) {
+        params->type_v = (enum ggml_type) enum_v;
+    }
     return 1;
 }
 

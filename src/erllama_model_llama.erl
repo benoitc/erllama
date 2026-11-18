@@ -613,10 +613,14 @@ kv_format(COpts) when is_map(COpts) ->
     ],
     iolist_to_binary([erllama_nif:kv_format(), $/ | lists:join($,, Layout)]).
 
-%% `true` / `enabled` (and `false` / `disabled`) select the same
-%% flash-attention mode, so they must name the same layout.
+%% Values that select the same layout must name it the same way:
+%% `true` / `enabled` and `false` / `disabled` are one flash-attention
+%% mode each, and `auto` keeps llama.cpp's default exactly like an
+%% absent key does (default KV types, flash attention picked by
+%% llama.cpp).
 layout_value(flash_attn, true) -> <<"enabled">>;
 layout_value(flash_attn, false) -> <<"disabled">>;
+layout_value(_K, auto) -> <<"default">>;
 layout_value(_K, V) when is_atom(V) -> atom_to_binary(V);
 layout_value(_K, V) when is_integer(V) -> integer_to_binary(V).
 

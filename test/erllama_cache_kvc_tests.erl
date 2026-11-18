@@ -37,6 +37,16 @@ key_for(Meta) ->
 %% Round-trip
 %% =============================================================================
 
+unmapped_quant_type_round_trips_test() ->
+    %% A quant label without its own byte is written as the 255
+    %% catch-all; the file must still parse (it used to fail with
+    %% unknown_quant_byte, losing every disk save for such models).
+    Meta = (base_meta())#{quant_type => future_q9_x},
+    Payload = <<"payload">>,
+    {ok, Prefix} = erllama_cache_kvc:build(Meta, Payload),
+    {ok, Info, Payload} = erllama_cache_kvc:parse(<<Prefix/binary, Payload/binary>>, key_for(Meta)),
+    ?assertEqual(unknown, maps:get(quant_type, Info)).
+
 build_then_parse_round_trip_test() ->
     Meta = base_meta(),
     Payload = <<"this is the kv state payload">>,

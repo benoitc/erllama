@@ -1036,6 +1036,7 @@ build_init_data(ModelId, Config, Backend, BState) ->
     NSeqMax = maps:get(n_seq_max, CtxOpts, 1),
     NBatch = maps:get(n_batch, CtxOpts, 512),
     Meta = backend_extra_metadata(Backend, BState),
+    {QuantType, QuantBits} = configured_quant(Config, Meta),
     #data{
         model_id = ModelId,
         tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
@@ -1044,8 +1045,8 @@ build_init_data(ModelId, Config, Backend, BState) ->
         fingerprint_mode = maps:get(
             fingerprint_mode, Config, application:get_env(erllama, fingerprint_mode, safe)
         ),
-        quant_type = maps:get(quant_type, Config, f16),
-        quant_bits = maps:get(quant_bits, Config, 16),
+        quant_type = QuantType,
+        quant_bits = QuantBits,
         ctx_params_hash = erllama_cache_key:with_kv_format(
             maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
             maps:get(kv_format, Meta, undefined)
@@ -1067,6 +1068,21 @@ build_init_data(ModelId, Config, Backend, BState) ->
         n_seq_max = NSeqMax,
         total_batch_budget = max(1, NBatch)
     }.
+
+%% Quant type and bits for cache keys and model_info. A configured
+%% `quant_type` wins (with `quant_bits` defaulting to 16 as before);
+%% otherwise both come from the model file's ftype, falling back to
+%% f16 / 16 for backends that report none (the stub).
+configured_quant(#{quant_type := QT} = Config, _Meta) ->
+    {QT, maps:get(quant_bits, Config, 16)};
+configured_quant(Config, Meta) ->
+    FType = maps:get(ftype, maps:get(family, Meta, #{}), -1),
+    {QT, Bits} =
+        case erllama_cache_key:from_ftype(FType) of
+            undefined -> {f16, 16};
+            Detected -> Detected
+        end,
+    {QT, maps:get(quant_bits, Config, Bits)}.
 
 %% Backend-reported load-time metadata (byte size, layer counts,
 %% family map). Backends without the optional callback get #{}.

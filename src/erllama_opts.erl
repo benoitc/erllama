@@ -158,7 +158,7 @@
 
 -define(PREFILL_KEYS, [parent_key, session_id, on_full, prefix_checkpoint_len, middleware]).
 
--define(KV_TYPES, [auto, f16, f32, bf16, q4_0, q5_0, q5_1, q8_0]).
+-define(KV_TYPES, [auto, f16, f32, bf16, q4_0, q5_0, q5_1, q8_0, f8_e4m3]).
 
 %% -----------------------------------------------------------------------------
 %% load_model config

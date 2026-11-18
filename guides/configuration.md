@@ -145,9 +145,10 @@ Passed to `erllama:load_model/1,2`:
     n_ctx           => 4096,
     n_batch         => 512,
     n_seq_max       => 1,        %% > 1 enables the multi-tenant scheduler
-    flash_attn      => auto,     %% boolean() | auto
-    type_k          => f16,      %% KV element type for keys
-    type_v          => f16,      %% KV element type for values
+    flash_attn      => auto,     %% auto | boolean() | enabled | disabled
+    type_k          => f16,      %% KV type for keys: auto | f16 | f32 | bf16
+                                 %% | q4_0 | q5_0 | q5_1 | q8_0 | f8_e4m3
+    type_v          => f16,      %% KV type for values, same set
     decode_budget_ms => 30000    %% per-step decode budget; 0 disables
   },
   fingerprint       => <<32 bytes>>,
