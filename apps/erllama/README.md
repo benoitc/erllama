@@ -87,7 +87,7 @@ Then start the application before loading models:
 ```
 
 The first compile builds the vendored `llama.cpp`. See
-[Building](guides/building.md) for platform notes and CUDA/Metal options.
+[Building](../../guides/building.md) for platform notes and CUDA/Metal options.
 
 ## API overview
 
@@ -148,7 +148,7 @@ Tools = [#{name => <<"weather">>,
 
 ### Agent loop
 
-`examples/agent_loop` is a complete tool-calling agent on `chat/3`: tools
+`examples/agent_loop` (at the repository root) is a complete tool-calling agent on `chat/3`: tools
 as Erlang maps, results fed back as `tool` messages, one session pinned
 across rounds so each round only prefills the new suffix.
 
@@ -224,25 +224,25 @@ ok = erllama:unload(<<"tiny">>).
 
 | Need | Read |
 |---|---|
-| Load a model | [Loading a model](guides/loading.md) |
-| Generate text: complete, stream, options, logprobs | [Generating text](guides/generation.md) |
-| Multi-turn state: sessions, continue, fork | [Sessions](guides/sessions.md) |
-| Run chat turns and tool calls | [Tool calls](guides/tool-calls.md) |
-| Send images and audio to multimodal models | [Vision and audio input](guides/multimodal.md) |
-| Tokenize, detokenize, special tokens, FIM | [Tokens and vocabulary](guides/tokens.md) |
-| Compute embeddings | [Embeddings](guides/embeddings.md) |
-| Attach LoRA adapters | [Adapters](guides/adapters.md) |
-| Configure cache tiers and save policy | [Caching](guides/caching.md) |
-| Monitor models, cache, memory, logs | [Observability](guides/observability.md) |
-| Test your code without a model | [Testing](guides/testing.md) |
-| Configure `sys.config` and per-model options | [Configuration](guides/configuration.md) |
-| Build from source | [Building](guides/building.md) |
-| Copy working snippets | [Examples](guides/examples.md) |
-| Observe or wrap every call | [Middleware](guides/middleware.md) |
-| Understand cache design tradeoffs | [Cache design](internals/cache-design.md) |
-| Understand crash-safe save publication | [Publish protocol](internals/publish-protocol.md) |
-| Understand request admission and decode flow | [Request lifecycle](internals/request-lifecycle.md) |
-| Understand NIF lifetime safety | [NIF safety](internals/nif-safety.md) |
+| Load a model | [Loading a model](../../guides/loading.md) |
+| Generate text: complete, stream, options, logprobs | [Generating text](../../guides/generation.md) |
+| Multi-turn state: sessions, continue, fork | [Sessions](../../guides/sessions.md) |
+| Run chat turns and tool calls | [Tool calls](../../guides/tool-calls.md) |
+| Send images and audio to multimodal models | [Vision and audio input](../../guides/multimodal.md) |
+| Tokenize, detokenize, special tokens, FIM | [Tokens and vocabulary](../../guides/tokens.md) |
+| Compute embeddings | [Embeddings](../../guides/embeddings.md) |
+| Attach LoRA adapters | [Adapters](../../guides/adapters.md) |
+| Configure cache tiers and save policy | [Caching](../../guides/caching.md) |
+| Monitor models, cache, memory, logs | [Observability](../../guides/observability.md) |
+| Test your code without a model | [Testing](../../guides/testing.md) |
+| Configure `sys.config` and per-model options | [Configuration](../../guides/configuration.md) |
+| Build from source | [Building](../../guides/building.md) |
+| Copy working snippets | [Examples](../../guides/examples.md) |
+| Observe or wrap every call | [Middleware](../../guides/middleware.md) |
+| Understand cache design tradeoffs | [Cache design](../../internals/cache-design.md) |
+| Understand crash-safe save publication | [Publish protocol](../../internals/publish-protocol.md) |
+| Understand request admission and decode flow | [Request lifecycle](../../internals/request-lifecycle.md) |
+| Understand NIF lifetime safety | [NIF safety](../../internals/nif-safety.md) |
 
 The API reference (`erllama`, `erllama_cache`, `erllama_middleware`,
 `erllama_scheduler`, and the `erllama_model_backend` / `erllama_pressure`
@@ -300,7 +300,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Contributing
 
-The contributor guide is [AGENTS.md](AGENTS.md). The short version:
+The contributor guide is [AGENTS.md](../../AGENTS.md). The short version:
 
 ```bash
 rebar3 fmt
@@ -317,7 +317,7 @@ Run the real-model suite when you have a GGUF available:
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
-    rebar3 ct --suite=test/erllama_real_model_SUITE
+    rebar3 ct --dir apps/erllama/test --suite erllama_real_model_SUITE
 ```
 
 Bumping the vendored `llama.cpp` is covered in

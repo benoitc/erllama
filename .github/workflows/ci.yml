@@ -21,8 +21,9 @@ jobs:
         with:
           path: |
             _build
+            apps/erllama/_build
             ~/.cache/rebar3
-          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
+          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'apps/erllama/c_src/llama.cpp/CMakeLists.txt', 'apps/erllama/c_src/llama.cpp/.version') }}
           restore-keys: |
             build-ubuntu-24.04-otp-28-
       - name: Run XRef
@@ -109,8 +110,9 @@ jobs:
         with:
           path: |
             _build
+            apps/erllama/_build
             ~/.cache/rebar3
-          key: build-${{ matrix.os }}-otp-${{ matrix.otp }}-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
+          key: build-${{ matrix.os }}-otp-${{ matrix.otp }}-${{ hashFiles('rebar.lock', 'apps/erllama/c_src/llama.cpp/CMakeLists.txt', 'apps/erllama/c_src/llama.cpp/.version') }}
           restore-keys: |
             build-${{ matrix.os }}-otp-${{ matrix.otp }}-
 
@@ -151,8 +153,9 @@ jobs:
         with:
           path: |
             _build
+            apps/erllama/_build
             ~/.cache/rebar3
-          key: build-${{ matrix.os }}-otp-${{ matrix.otp }}-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
+          key: build-${{ matrix.os }}-otp-${{ matrix.otp }}-${{ hashFiles('rebar.lock', 'apps/erllama/c_src/llama.cpp/CMakeLists.txt', 'apps/erllama/c_src/llama.cpp/.version') }}
           restore-keys: |
             build-${{ matrix.os }}-otp-${{ matrix.otp }}-
 
@@ -173,8 +176,9 @@ jobs:
         with:
           path: |
             _build
+            apps/erllama/_build
             ~/.cache/rebar3
-          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
+          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'apps/erllama/c_src/llama.cpp/CMakeLists.txt', 'apps/erllama/c_src/llama.cpp/.version') }}
           restore-keys: |
             build-ubuntu-24.04-otp-28-
       - name: Run PropEr
@@ -194,8 +198,9 @@ jobs:
         with:
           path: |
             _build
+            apps/erllama/_build
             ~/.cache/rebar3
-          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
+          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'apps/erllama/c_src/llama.cpp/CMakeLists.txt', 'apps/erllama/c_src/llama.cpp/.version') }}
           restore-keys: |
             build-ubuntu-24.04-otp-28-
       - name: Run Common Test
@@ -235,7 +240,7 @@ jobs:
           curl -L --fail --retry 3 -o "$MODEL_PATH" "$MODEL_URL"
       - name: Build with ASan + UBSan
         run: |
-          rm -rf _build
+          rm -rf _build apps/erllama/_build
           rebar3 compile
       - name: Run EUnit under sanitizers
         env:
@@ -266,7 +271,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang-tidy cmake
       - name: Build with clang-tidy
         run: |
-          rm -rf _build
+          rm -rf _build apps/erllama/_build
           rebar3 compile
 
   scan-build:
@@ -284,7 +289,7 @@ jobs:
       - name: Configure
         run: |
           mkdir -p _build/scan
-          cmake -S c_src -B _build/scan -DCMAKE_BUILD_TYPE=Debug
+          cmake -S apps/erllama/c_src -B _build/scan -DCMAKE_BUILD_TYPE=Debug
       - name: Pre-build vendored llama.cpp without scan-build
         # scan-build's --exclude only filters HTML reports; --status-bugs
         # still trips on the analyzer warnings emitted while compiling
@@ -297,7 +302,7 @@ jobs:
         run: |
           # Touch our sources so cmake recompiles them under the wrapper
           # even when an earlier cache hit left .o files in place.
-          touch c_src/erllama_nif*.c c_src/erllama_safe.cpp c_src/erllama_chat_nif.cpp c_src/erllama_spec_nif.cpp c_src/erllama_mtmd_nif.cpp c_src/crc32c.c
+          touch apps/erllama/c_src/erllama_nif*.c apps/erllama/c_src/erllama_safe.cpp apps/erllama/c_src/erllama_chat_nif.cpp apps/erllama/c_src/erllama_spec_nif.cpp apps/erllama/c_src/erllama_mtmd_nif.cpp apps/erllama/c_src/crc32c.c
           scan-build --status-bugs -o /tmp/scan-reports \
               cmake --build _build/scan --target erllama_nif -- -j $(nproc)
       - name: Upload scan-build reports on failure

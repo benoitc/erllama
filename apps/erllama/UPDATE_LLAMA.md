@@ -3,6 +3,8 @@
 erllama vendors a pinned, unmodified copy of llama.cpp under
 `c_src/llama.cpp/`. The pinned tag is in `c_src/llama.cpp/.version`
 (currently **v1.0.0**). You need this page when you bump that pin.
+Paths on this page are relative to `apps/erllama/`; run the commands
+from the repository root.
 
 Why pin: reproducible builds, no network access at install time (the hex
 package ships the source), and control over when new model
@@ -43,8 +45,8 @@ release notes for changes to the C API the NIF wraps
 `common/chat.h`.
 
 ```sh
-scripts/vendor_llama.sh v1.0.0          # replace with the new tag
-rm -rf _build
+apps/erllama/scripts/vendor_llama.sh v1.0.0   # replace with the new tag
+rm -rf _build apps/erllama/_build
 rebar3 compile
 rebar3 xref && rebar3 dialyzer && rebar3 fmt --check && rebar3 lint
 rebar3 eunit && rebar3 proper

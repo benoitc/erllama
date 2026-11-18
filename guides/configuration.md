@@ -1,13 +1,15 @@
 # Configuration reference
 
 erllama configuration lives in two places: the OTP application
-environment (`config/sys.config`) and the per-model option map
+environment (`sys.config`; `apps/erllama/config/sys.config` is the
+example used by `rebar3 shell`) and the per-model option map
 passed to `erllama:load_model/1,2`. This page is the full set.
 
 ## Application environment
 
 Every key with its default; all of them are declared in
-`src/erllama.app.src`.
+`src/erllama.app.src` (`apps/erllama/src/erllama.app.src` in this
+repository).
 
 ```erlang
 {erllama, [
