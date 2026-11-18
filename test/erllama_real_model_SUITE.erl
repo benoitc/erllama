@@ -40,6 +40,7 @@
     load_unload/1,
     kv_format_in_cache_key/1,
     context_opt_values_open/1,
+    moe_cache_opts_reach_llama/1,
     quant_type_detected_from_model/1,
     tokenize_decode_one/1,
     pack_unpack_round_trip/1,
@@ -103,6 +104,7 @@ all() ->
         load_unload,
         kv_format_in_cache_key,
         context_opt_values_open,
+        moe_cache_opts_reach_llama,
         quant_type_detected_from_model,
         tokenize_decode_one,
         pack_unpack_round_trip,
@@ -277,6 +279,25 @@ context_opt_values_open(Config) ->
             ]
         ],
         ?assertError(badarg, erllama_nif:new_context(M, #{type_k => bogus}))
+    after
+        erllama_nif:free_model(M)
+    end,
+    ok.
+
+%% The MoE expert cache options reach llama.cpp: on a dense test
+%% model the cache is refused (it needs a MoE model on a GPU backend)
+%% and the load fails cleanly instead of being ignored. An out of
+%% range share is rejected by the NIF itself.
+moe_cache_opts_reach_llama(Config) ->
+    {ok, M} = erllama_nif:load_model(?config(model_path, Config), #{n_gpu_layers => 0}),
+    try
+        ?assertEqual(
+            {error, context_failed},
+            erllama_nif:new_context(M, #{n_ctx => 256, moe_cache_size => 64 * 1024 * 1024})
+        ),
+        ?assertError(badarg, erllama_nif:new_context(M, #{moe_cache_cpu_share => 2.0})),
+        {ok, C} = erllama_nif:new_context(M, #{n_ctx => 256, moe_cache_cpu_share => 0.5}),
+        erllama_nif:free_context(C)
     after
         erllama_nif:free_model(M)
     end,

@@ -8,6 +8,7 @@
 #include "erllama_nif_int.h"
 #include "erllama_safe.h"
 
+#include <stdint.h>
 #include <string.h>
 
 int copy_path(ErlNifEnv *env, ERL_NIF_TERM term, char *out, size_t cap) {
@@ -45,6 +46,19 @@ int get_map_uint(
     ERL_NIF_TERM k = enif_make_atom(env, key);
     if (!enif_get_map_value(env, map, k, &v)) return 0;
     return enif_get_uint(env, v, out);
+}
+
+/* 64-bit unsigned getter for byte counts that can exceed 4 GiB. */
+int get_map_uint64(
+    ErlNifEnv *env, ERL_NIF_TERM map, const char *key, uint64_t *out
+) {
+    ERL_NIF_TERM v;
+    ERL_NIF_TERM k = enif_make_atom(env, key);
+    if (!enif_get_map_value(env, map, k, &v)) return 0;
+    ErlNifUInt64 u;
+    if (!enif_get_uint64(env, v, &u)) return 0;
+    *out = (uint64_t) u;
+    return 1;
 }
 
 /* Read a number from a map either as a float (`enif_get_double`) or as
@@ -364,6 +378,20 @@ int erllama_parse_cparams(ErlNifEnv *env, ERL_NIF_TERM map,
      * per-request context. */
     if (get_map_bool(env, map, "kv_unified", &b)) {
         params->kv_unified = b ? true : false;
+    }
+    /* Device cache for the experts of MoE layers kept in host memory
+     * (cpu_moe / tensor_buft_overrides) [EXPERIMENTAL upstream]. */
+    uint64_t u64;
+    if (get_map_uint64(env, map, "moe_cache_size", &u64)) {
+#if SIZE_MAX < UINT64_MAX
+        if (u64 > SIZE_MAX) return 0;
+#endif
+        params->moe_cache_size = (size_t) u64;
+    }
+    double d;
+    if (get_map_double(env, map, "moe_cache_cpu_share", &d)) {
+        if (!(d >= 0.0 && d <= 1.0)) return 0;
+        params->moe_cache_cpu_share = (float) d;
     }
 
     int enum_v;

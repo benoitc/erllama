@@ -74,6 +74,10 @@ int get_map_uint(
     ErlNifEnv *env, ERL_NIF_TERM map, const char *key, unsigned int *out
 );
 
+int get_map_uint64(
+    ErlNifEnv *env, ERL_NIF_TERM map, const char *key, uint64_t *out
+);
+
 int get_map_double(
     ErlNifEnv *env, ERL_NIF_TERM map, const char *key, double *out
 );

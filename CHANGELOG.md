@@ -54,6 +54,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
 ### Added
 
 - FP8 KV cache: `type_k` / `type_v` accept `f8_e4m3`.
+- MoE expert cache (experimental in llama.cpp): with the experts of a
+  MoE model kept in host memory, `moe_cache_size` holds the recently
+  used ones in a device buffer, and `moe_cache_cpu_share` runs part of
+  the cache misses on the CPU instead of uploading them.
 - `quant_type` and `quant_bits` are read from the model file when you
   don't pass them, and reported by `model_info/1`. Before, they
   defaulted to `f16` / 16 whatever the model was.

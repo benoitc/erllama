@@ -89,6 +89,15 @@ load_sub_type_checks_test_() ->
         {{error, {invalid_config, use_mmap, 1}}, Base#{model_opts => #{use_mmap => 1}}},
         {{error, {invalid_config, load_mode, lazy}}, Base#{model_opts => #{load_mode => lazy}}},
         {{error, {invalid_config, n_rs_seq, -1}}, Base#{context_opts => #{n_rs_seq => -1}}},
+        {{error, {invalid_config, moe_cache_size, -1}}, Base#{
+            context_opts => #{moe_cache_size => -1}
+        }},
+        {{error, {invalid_config, moe_cache_cpu_share, 1.5}}, Base#{
+            context_opts => #{moe_cache_cpu_share => 1.5}
+        }},
+        {{error, {invalid_config, moe_cache_cpu_share, half}}, Base#{
+            context_opts => #{moe_cache_cpu_share => half}
+        }},
         {{error, {invalid_config, fail_seq_rm_last, 1}}, Base#{fail_seq_rm_last => 1}},
         {{error, {invalid_config, fail_kv_unpack, maybe_}}, Base#{fail_kv_unpack => maybe_}},
         {{error, {invalid_config, fail_seq_cp, 1}}, Base#{fail_seq_cp => 1}},
@@ -141,7 +150,9 @@ load_sub_type_checks_test_() ->
         }
     },
     Good2 = Base#{
-        context_opts => #{n_rs_seq => 1},
+        context_opts => #{
+            n_rs_seq => 1, moe_cache_size => 8 * 1024 * 1024 * 1024, moe_cache_cpu_share => 0
+        },
         model_opts => #{
             split_mode => tensor,
             devices => [<<"CUDA0">>, <<"CUDA1">>],

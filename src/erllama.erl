@@ -434,7 +434,8 @@ Config map for `load_model/1,2`.
   placement keys).
 - `context_opts`: `n_ctx`, `n_batch`, `n_ubatch`, `n_seq_max`,
   `n_threads`, `n_threads_batch`, `embeddings`, `offload_kqv`,
-  `kv_unified`, `flash_attn`, `type_k`, `type_v`, `decode_budget_ms`.
+  `kv_unified`, `flash_attn`, `type_k`, `type_v`, `moe_cache_size`,
+  `moe_cache_cpu_share`, `decode_budget_ms`.
 - `fingerprint`, `fingerprint_mode`, `quant_type`, `quant_bits`,
   `ctx_params_hash`, `context_size`: cache-key inputs; see the loading
   guide.
