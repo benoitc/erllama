@@ -4153,20 +4153,31 @@ resume_session_or_fallthrough(PromptTokens, PromptBytes, ParentTokens, Req, Data
 
 %% checkout the row, load + unpack the payload under the pin (into
 %% the request's seq_id), then checkin. Returns the row's stored
-%% token list on success or `miss` if the row was evicted between
-%% the prior lookup and our checkout.
+%% token list on success, or `miss` if the row was evicted between
+%% the prior lookup and our checkout or its payload failed to
+%% restore. A row that failed to restore is dropped once checked in:
+%% left in place it would keep failing, and the save that follows
+%% would be refused as `already_present`.
 pin_and_load(Key, SeqId, Data) ->
     T0 = erlang:monotonic_time(nanosecond),
     Result =
         case erllama_cache_meta_srv:checkout(Key, self()) of
             {ok, HolderRef, Tier, Loc, _Header, TokensBin} ->
-                try
-                    case load_payload(Tier, Loc, Key, Data) of
-                        <<>> -> miss;
-                        Bin -> unpack_row(Bin, TokensBin, SeqId, Data)
-                    end
-                after
-                    ok = erllama_cache_meta_srv:checkin(HolderRef)
+                Loaded =
+                    try
+                        case load_payload(Tier, Loc, Key, Data) of
+                            <<>> -> miss;
+                            Bin -> unpack_row(Bin, TokensBin, SeqId, Data)
+                        end
+                    after
+                        ok = erllama_cache_meta_srv:checkin(HolderRef)
+                    end,
+                case Loaded of
+                    restore_failed ->
+                        _ = erllama_cache_meta_srv:invalidate(Key),
+                        miss;
+                    _ ->
+                        Loaded
                 end;
             {error, busy} ->
                 miss;
@@ -4178,8 +4189,9 @@ pin_and_load(Key, SeqId, Data) ->
     Result.
 
 %% Restore a loaded payload into the seq. A failed restore can leave
-%% partial cells behind; drop the seq and treat the row as a miss so
-%% admission falls through (prefix scan, then cold).
+%% partial cells behind; drop the seq and report `restore_failed` so
+%% pin_and_load/3 drops the row and admission falls through (prefix
+%% scan, then cold).
 unpack_row(Bin, TokensBin, SeqId, Data) ->
     case backend_kv_unpack(Bin, SeqId, Data) of
         ok ->
@@ -4192,7 +4204,7 @@ unpack_row(Bin, TokensBin, SeqId, Data) ->
         {error, _} ->
             erllama_cache_counters:incr(?C_RESTORE_FAILED),
             ok = backend_seq_clear(SeqId, Data),
-            miss
+            restore_failed
     end.
 
 load_payload(ram, _Loc, Key, _Data) ->

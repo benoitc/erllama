@@ -589,6 +589,41 @@ wait_replies_when_save_publishes_test() ->
 %% Eviction
 %% =============================================================================
 
+invalidate_drops_available_row_test() ->
+    with_srv(fun() ->
+        ok = erllama_cache_counters:init(),
+        erllama_cache_counters:reset(),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),
+        ok = erllama_cache_meta_srv:insert_available(key(2), ram, 200, <<"H2">>, {ram}),
+        ?assertEqual(ok, erllama_cache_meta_srv:invalidate(key(1))),
+        ?assertEqual(miss, erllama_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(miss, erllama_cache_meta_srv:dump(key(1))),
+        ?assertMatch({ok, _}, erllama_cache_meta_srv:lookup_exact(key(2))),
+        ?assertEqual(1, erllama_cache_counters:get(?C_EVICTIONS)),
+        %% The LRU index no longer holds the dropped key: gc only
+        %% finds the remaining row.
+        ?assertEqual({evicted, 1}, erllama_cache_meta_srv:gc())
+    end).
+
+invalidate_skips_checked_out_row_test() ->
+    with_srv(fun() ->
+        ok = erllama_cache_counters:init(),
+        erllama_cache_counters:reset(),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),
+        {ok, Ref, _, _, _, _} = erllama_cache_meta_srv:checkout(key(1), self()),
+        ?assertEqual(skip, erllama_cache_meta_srv:invalidate(key(1))),
+        ?assertMatch({ok, _}, erllama_cache_meta_srv:lookup_exact(key(1))),
+        ?assertEqual(0, erllama_cache_counters:get(?C_EVICTIONS)),
+        ok = erllama_cache_meta_srv:checkin(Ref),
+        ?assertEqual(ok, erllama_cache_meta_srv:invalidate(key(1))),
+        ?assertEqual(miss, erllama_cache_meta_srv:lookup_exact(key(1)))
+    end).
+
+invalidate_missing_row_test() ->
+    with_srv(fun() ->
+        ?assertEqual(miss, erllama_cache_meta_srv:invalidate(key(999)))
+    end).
+
 gc_evicts_unreferenced_rows_test() ->
     with_srv(fun() ->
         ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),

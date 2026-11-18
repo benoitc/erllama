@@ -57,6 +57,7 @@
     gc/0,
     evict_bytes/1,
     evict_bytes/2,
+    invalidate/1,
     dump/0,
     dump/1,
     insert_available/5,
@@ -322,6 +323,18 @@ otherwise it must be a list drawn from `[ram, ram_file, disk]`.
 evict_bytes(TargetBytes, Tiers) when is_integer(TargetBytes), TargetBytes >= 0 ->
     gen_server:call(?SERVER, {evict_bytes, TargetBytes, Tiers}).
 
+-doc """
+Drop one row whose payload the backend could not restore, so the next
+save under the same key replaces it instead of being refused with
+`already_present`. Deletes the tier copy and the meta row and counts an
+eviction; a pinned row is dropped too (it could never be restored).
+Returns `skip` while the row is checked out or not yet published, and
+`miss` when it is already gone.
+""".
+-spec invalidate(erllama_cache:cache_key()) -> ok | skip | miss.
+invalidate(Key) ->
+    gen_server:call(?SERVER, {invalidate, Key}).
+
 -spec dump() -> [tuple()].
 dump() ->
     ets:tab2list(?TBL_META).
@@ -457,6 +470,19 @@ handle_call({evict_bytes, 0, _Tiers}, _From, S) ->
 handle_call({evict_bytes, Target, Tiers}, _From, S) when Target > 0 ->
     {N, Bytes} = run_eviction_bytes(Target, tier_pred(Tiers), S#state.live_key),
     {reply, {evicted, N, Bytes}, S};
+handle_call({invalidate, Key}, _From, S) ->
+    Reply =
+        case ets:lookup(?TBL_META, Key) of
+            [Row] ->
+                LruKey = {element(?POS_LAST_USED, Row), Key},
+                case try_evict_one(LruKey, Key, fun(_) -> true end, undefined, allow) of
+                    {ok, _Bytes} -> ok;
+                    _ -> skip
+                end;
+            [] ->
+                miss
+        end,
+    {reply, Reply, S};
 handle_call(_Msg, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
