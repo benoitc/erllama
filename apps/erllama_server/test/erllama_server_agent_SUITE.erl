@@ -24,6 +24,10 @@
     interrupt_kills_the_shell/1,
     background_job/1,
     stop_frees_the_conversation/1,
+    generator_crash_fails_the_turn/1,
+    stop_kills_background_jobs/1,
+    time_budget_interrupts/1,
+    token_budget_caps_generation/1,
     real_model_reads_a_file/1
 ]).
 
@@ -38,6 +42,10 @@ all() ->
         interrupt_kills_the_shell,
         background_job,
         stop_frees_the_conversation,
+        generator_crash_fails_the_turn,
+        stop_kills_background_jobs,
+        time_budget_interrupts,
+        token_budget_caps_generation,
         real_model_reads_a_file
     ].
 
@@ -382,6 +390,74 @@ stop_frees_the_conversation(Config) ->
         R
      || #{role := R} <- First
     ]).
+
+%% A round that dies without reporting fails its turn; the session
+%% stays usable.
+generator_crash_fails_the_turn(Config) ->
+    {Id, _} = start(Config, [{hang, <<"thinking">>}, #{text => <<"back">>}]),
+    ok = erllama_server_api:agent_send(Id, <<"go">>),
+    ok = wait(fun() -> is_pid(erllama_server_agent_script:generator(Id)) end),
+    exit(erllama_server_agent_script:generator(Id), kill),
+    Events = collect_turn(Id),
+    ?assertEqual(#{error => {generator_exited, killed}}, done_reason(Events)),
+    ?assertEqual(stop, done_reason(turn(Id, <<"again">>))).
+
+%% Ending a session stops its background commands, whole process group
+%% included, before they can do anything more.
+stop_kills_background_jobs(Config) ->
+    Ws = ?config(ws, Config),
+    Late = filename:join(Ws, "late.txt"),
+    Script = [
+        #{
+            calls => [
+                {<<"j1">>, <<"shell">>, #{
+                    <<"command">> =>
+                        <<"(sleep 1; echo child > child.txt) & sleep 1; echo late > late.txt">>,
+                    <<"background">> => true
+                }}
+            ]
+        },
+        #{text => <<"started">>}
+    ],
+    {Id, _} = start(Config, Script, #{policy => yes}),
+    _ = turn(Id, <<"start it">>),
+    [{<<"shell">>, Started}] = last_tool_results(Id),
+    ?assertMatch(<<"started background job ", _/binary>>, Started),
+    ok = erllama_server_api:agent_stop(Id),
+    timer:sleep(2000),
+    ct:log("files: ~p", [file:list_dir(Ws)]),
+    ?assertNot(filelib:is_file(Late)),
+    ?assertNot(filelib:is_file(filename:join(Ws, "child.txt"))).
+
+%% The time budget ends a turn while it runs, not only between rounds.
+time_budget_interrupts(Config) ->
+    {Id, _} = start(Config, [{hang, <<"slow">>}], #{budgets => #{max_elapsed_ms => 50}}),
+    T0 = erlang:monotonic_time(millisecond),
+    Events = turn(Id, <<"go">>),
+    ?assertEqual(#{budget => time}, done_reason(Events)),
+    ?assert(erlang:monotonic_time(millisecond) - T0 < 1000),
+    %% While a tool runs, too: the running command is stopped.
+    {Id2, _} = start(
+        Config,
+        [#{calls => [{<<"t1">>, <<"shell">>, #{<<"command">> => <<"sleep 5">>}}]}],
+        #{policy => yes, budgets => #{max_elapsed_ms => 300}}
+    ),
+    T1 = erlang:monotonic_time(millisecond),
+    ?assertEqual(#{budget => time}, done_reason(turn(Id2, <<"go">>))),
+    ?assert(erlang:monotonic_time(millisecond) - T1 < 2000).
+
+%% The token budget bounds what the model may generate (the real
+%% generator on erllama's stub backend).
+token_budget_caps_generation(_Config) ->
+    {ok, #{agent_id := Id}} = erllama_server_api:agent_start(#{
+        model => <<"stub">>,
+        workspace => ?config(ws, _Config),
+        budgets => #{max_tokens => 1}
+    }),
+    Events = turn(Id, <<"tell me a long story">>),
+    #{data := #{tokens := Tokens} = Done} = lists:last(Events),
+    ?assert(Tokens =< 1),
+    ?assertEqual(#{budget => tokens}, maps:get(reason, Done)).
 
 %% Gated: a real tool-capable model reads a file to answer.
 real_model_reads_a_file(Config) ->

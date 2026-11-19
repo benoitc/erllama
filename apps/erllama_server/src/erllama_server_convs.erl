@@ -12,6 +12,7 @@
 -behaviour(gen_server).
 
 -export([start_link/0, begin_run/3, end_run/4, append/4, release/2, get/1, list/0]).
+-export([fork/1, delete/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(TAB, ?MODULE).
@@ -51,6 +52,16 @@ append(ConvId, Owner, Messages, FinishKey) ->
 release(ConvId, RunId) ->
     gen_server:call(?MODULE, {release, ConvId, RunId}).
 
+%% A new conversation with a copy of `ConvId''s history and cache key:
+%% what is later added to either one never shows in the other.
+-spec fork(binary()) -> {ok, binary()} | {error, not_found}.
+fork(ConvId) ->
+    gen_server:call(?MODULE, {fork, ConvId}).
+
+-spec delete(binary()) -> ok.
+delete(ConvId) ->
+    gen_server:call(?MODULE, {delete, ConvId}).
+
 -spec get(binary()) -> {ok, map()} | {error, not_found}.
 get(ConvId) ->
     case ets:lookup(?TAB, ConvId) of
@@ -73,18 +84,7 @@ init([]) ->
 handle_call({begin_run, ConvId0, Model, RunId}, _From, S) ->
     {reply, reserve(ConvId0, Model, RunId), S};
 handle_call({end_run, ConvId, RunId, New, FinishKey}, _From, S) ->
-    case ets:lookup(?TAB, ConvId) of
-        [{_, #{active_run := RunId, messages := Msgs} = C}] ->
-            C1 = C#{
-                active_run := undefined,
-                messages := Msgs ++ New,
-                last_finish_key := FinishKey,
-                updated_at := now_ms()
-            },
-            true = ets:insert(?TAB, {ConvId, C1});
-        _ ->
-            ok
-    end,
+    ok = do_end_run(ConvId, RunId, New, FinishKey),
     {reply, ok, S};
 handle_call({append, ConvId, Owner, New, FinishKey}, _From, S) ->
     ok = do_append(ConvId, Owner, New, FinishKey),
@@ -97,6 +97,11 @@ handle_call({release, ConvId, RunId}, _From, S) ->
             ok
     end,
     {reply, ok, S};
+handle_call({fork, ConvId}, _From, S) ->
+    {reply, do_fork(ConvId), S};
+handle_call({delete, ConvId}, _From, S) ->
+    true = ets:delete(?TAB, ConvId),
+    {reply, ok, S};
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
@@ -105,6 +110,35 @@ handle_cast(_Msg, S) ->
 
 handle_info(_Msg, S) ->
     {noreply, S}.
+
+do_end_run(ConvId, RunId, New, FinishKey) ->
+    case ets:lookup(?TAB, ConvId) of
+        [{_, #{active_run := RunId, messages := Msgs} = C}] ->
+            C1 = C#{
+                active_run := undefined,
+                messages := Msgs ++ New,
+                last_finish_key := FinishKey,
+                updated_at := now_ms()
+            },
+            true = ets:insert(?TAB, {ConvId, C1}),
+            ok;
+        _ ->
+            ok
+    end.
+
+do_fork(ConvId) ->
+    case ets:lookup(?TAB, ConvId) of
+        [{_, C}] ->
+            New = erllama_server_ids:conversation(),
+            Now = now_ms(),
+            true = ets:insert(
+                ?TAB,
+                {New, C#{id := New, active_run := undefined, created_at := Now, updated_at := Now}}
+            ),
+            {ok, New};
+        [] ->
+            {error, not_found}
+    end.
 
 reserve(undefined, Model, RunId) ->
     reserve(erllama_server_ids:conversation(), Model, RunId);

@@ -49,6 +49,9 @@ you> /quit
 
 - Paths resolve inside the workspace. `..` and symbolic links that
   lead outside are refused.
+- `list_dir` and `search` never follow a symbolic link to a directory
+  (`list_dir` shows it as `name@`); `search` reads a linked file only
+  when it resolves inside the workspace.
 - A tool that fails returns an error to the model, which can correct
   itself, instead of stopping the turn.
 
@@ -89,6 +92,14 @@ Through the service API, `policy` can also be a map of tool name to
 | `max_tokens` | 32768 generated tokens per turn |
 | `max_elapsed_ms` | 10 minutes per turn |
 
+- Each generation may produce at most the tokens left in the turn.
+- When the time runs out, the turn ends where it is: a generation is
+  cancelled, running tools are stopped, and a pending approval is
+  dropped. The time counts from the start of the turn, waiting for
+  approvals included.
+- A generation that dies without answering ends the turn with an
+  error; the session stays ready for the next input.
+
 Input you send during a turn waits and starts the next one.
 
 ## Interrupting
@@ -99,8 +110,9 @@ Interrupting a turn (`agent_interrupt`) stops it at once:
   group is killed, including what it started in the background;
 - unfinished calls are recorded as interrupted.
 
-The session stays, ready for the next input. Ending the session also
-stops its background jobs.
+The session stays, ready for the next input. Ending the session, or
+stopping the release, also stops its background jobs, whole process
+groups included, before the session goes.
 
 ## Tools from HTTP clients
 

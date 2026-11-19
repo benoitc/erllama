@@ -4,14 +4,16 @@
 -module(erllama_server_responses).
 -moduledoc false.
 %% Stored OpenAI Responses (`store: true'): the response object a client
-%% can read back, and the conversation it belongs to, so a request with
-%% `previous_response_id' continues that conversation (history and KV
-%% cache warmth). Kept in memory; durable storage comes with the
-%% persistent conversations.
+%% can read back, and a snapshot of its conversation as it stood when
+%% the response was made (history and the KV cache key). A request with
+%% `previous_response_id' continues from a copy of that snapshot, so
+%% two requests continuing the same response are independent branches.
+%% Kept in memory; durable storage comes with the persistent
+%% conversations.
 
 -behaviour(gen_server).
 
--export([start_link/0, put/3, get/1, delete/1]).
+-export([start_link/0, put/3, get/1, continue/1, delete/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 -compile({no_auto_import, [put/2, get/1]}).
 
@@ -24,11 +26,23 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--spec put(binary(), map(), binary() | none) -> ok.
+%% Store `Response' with a snapshot of `Conv' as it stands now.
+-spec put(binary(), map(), binary()) -> ok | {error, not_found}.
 put(Id, Response, Conv) ->
-    gen_server:call(?MODULE, {put, Id, Response, Conv}).
+    case erllama_server_convs:fork(Conv) of
+        {ok, Snapshot} -> gen_server:call(?MODULE, {put, Id, Response, Snapshot});
+        {error, _} = E -> E
+    end.
 
--spec get(binary()) -> {ok, map(), binary() | none} | {error, not_found}.
+%% A new conversation to continue response `Id' from.
+-spec continue(binary()) -> {ok, binary()} | {error, not_found}.
+continue(Id) ->
+    case get(Id) of
+        {ok, _, Snapshot} -> erllama_server_convs:fork(Snapshot);
+        {error, _} = E -> E
+    end.
+
+-spec get(binary()) -> {ok, map(), binary()} | {error, not_found}.
 get(Id) ->
     case ets:lookup(?TAB, Id) of
         [{Id, Response, Conv}] -> {ok, Response, Conv};
@@ -49,8 +63,11 @@ handle_call({put, Id, Response, Conv}, _From, S) ->
     {reply, ok, S};
 handle_call({delete, Id}, _From, S) ->
     case ets:take(?TAB, Id) of
-        [_] -> {reply, ok, S};
-        [] -> {reply, {error, not_found}, S}
+        [{_, _, Snapshot}] ->
+            ok = erllama_server_convs:delete(Snapshot),
+            {reply, ok, S};
+        [] ->
+            {reply, {error, not_found}, S}
     end;
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.

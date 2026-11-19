@@ -13,7 +13,7 @@
 %% @end
 -module(erllama_server_agent_script).
 
--export([start/4, set/2, rounds/1, tools/1]).
+-export([start/4, set/2, rounds/1, tools/1, generator/1]).
 
 -define(TAB, ?MODULE).
 
@@ -33,6 +33,13 @@ rounds(AgentId) ->
 tools(AgentId) ->
     [{_, T}] = ets:lookup(?TAB, {tools, AgentId}),
     lists:reverse(T).
+
+%% The process of the session's current (or last) round.
+generator(AgentId) ->
+    case ets:lookup(?TAB, {gen, AgentId}) of
+        [{_, Pid}] -> Pid;
+        [] -> undefined
+    end.
 
 ensure_table() ->
     case ets:whereis(?TAB) of
@@ -59,7 +66,9 @@ round(Session, Id, Messages, Opts) ->
     [{_, Rounds}] = ets:lookup(?TAB, {rounds, Id}),
     [{_, Tools}] = ets:lookup(?TAB, {tools, Id}),
     Names = [N || #{name := N} <- maps:get(tools, Opts, [])],
-    true = ets:insert(?TAB, [{{rounds, Id}, [Messages | Rounds]}, {{tools, Id}, [Names | Tools]}]),
+    true = ets:insert(?TAB, [
+        {{rounds, Id}, [Messages | Rounds]}, {{tools, Id}, [Names | Tools]}, {{gen, Id}, self()}
+    ]),
     case ets:lookup(?TAB, {script, Id}) of
         [{_, [Reply | Rest]}] ->
             true = ets:insert(?TAB, {{script, Id}, Rest}),

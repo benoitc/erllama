@@ -9,6 +9,8 @@
 
 -export([read_file/2, list_dir/2, search/2, write_file/2, edit_file/2]).
 
+-include_lib("kernel/include/file.hrl").
+
 -define(READ_LINES, 400).
 -define(READ_BYTES, 65536).
 -define(LINE_CHARS, 2000).
@@ -21,7 +23,7 @@
 read_file(Ws, #{<<"path">> := P} = Args) ->
     with_path(Ws, P, fun(Path) ->
         case file:read_file_info(Path) of
-            {ok, Info} when element(2, Info) > ?MAX_FILE ->
+            {ok, #file_info{size = Size}} when Size > ?MAX_FILE ->
                 {error, <<"the file is larger than 10 MiB; use search to find the part you need">>};
             {ok, _} ->
                 case file:read_file(Path) of
@@ -102,12 +104,14 @@ entries(Dir, Depth, Ws) ->
                 fun(Name) ->
                     Full = filename:join(Dir, Name),
                     Rel = erllama_server_workspace:relative(Ws, unicode:characters_to_binary(Full)),
-                    case filelib:is_dir(Full) of
-                        true when Depth > 1, hd(Name) =/= $. ->
+                    case kind(Full) of
+                        dir when Depth > 1, hd(Name) =/= $. ->
                             [<<Rel/binary, "/">> | entries(Full, Depth - 1, Ws)];
-                        true ->
+                        dir ->
                             [<<Rel/binary, "/">>];
-                        false ->
+                        link ->
+                            [<<Rel/binary, "@">>];
+                        _ ->
                             [Rel]
                     end
                 end,
@@ -127,7 +131,7 @@ search(Ws, #{<<"pattern">> := Pattern} = Args) ->
             P = maps:get(<<"path">>, Args, <<".">>),
             Glob = glob(maps:get(<<"glob">>, Args, undefined)),
             with_path(Ws, P, fun(Path) ->
-                Files = files(Path, Glob),
+                Files = files(Ws, Path, Glob),
                 {Matches, Truncated} = scan(Files, Re, Ws, [], 0),
                 Body =
                     case Matches of
@@ -156,13 +160,31 @@ glob(G) ->
     {ok, Re} = re:compile(<<"^", Q/binary, "$">>),
     Re.
 
-files(Path, Glob) ->
+files(Ws, Path, Glob) ->
     case filelib:is_dir(Path) of
-        true -> walk(Path, Glob);
+        true -> walk(Ws, Path, Glob);
         false -> [Path]
     end.
 
-walk(Dir, Glob) ->
+%% What a directory entry is, without following it: a directory, a
+%% file, or a symbolic link. Walks never descend a link (it may lead
+%% outside the workspace, or back into itself).
+kind(Full) ->
+    case file:read_link_info(Full) of
+        {ok, #file_info{type = directory}} -> dir;
+        {ok, #file_info{type = symlink}} -> link;
+        {ok, #file_info{type = regular}} -> file;
+        _ -> other
+    end.
+
+%% A linked file is searched only when it resolves inside the workspace.
+linked_file(Ws, Full) ->
+    case erllama_server_workspace:resolve(Ws, Full) of
+        {ok, Real} -> [Real || filelib:is_regular(Real)];
+        {error, _} -> []
+    end.
+
+walk(Ws, Dir, Glob) ->
     case file:list_dir(Dir) of
         {ok, Names} ->
             lists:flatmap(
@@ -171,9 +193,11 @@ walk(Dir, Glob) ->
                         [];
                     (Name) ->
                         Full = filename:join(Dir, Name),
-                        case filelib:is_dir(Full) of
-                            true -> walk(Full, Glob);
-                            false -> [Full || matches_glob(Name, Glob)]
+                        case kind(Full) of
+                            dir -> walk(Ws, Full, Glob);
+                            file -> [Full || matches_glob(Name, Glob)];
+                            link -> [F || matches_glob(Name, Glob), F <- linked_file(Ws, Full)];
+                            other -> []
                         end
                 end,
                 lists:sort(Names)

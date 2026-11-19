@@ -168,10 +168,19 @@ handle_event(info, {ack, Sub, Seq}, _State, #d{events = Ev} = D) when is_integer
     {keep_state, D#d{events = erllama_server_events:ack(Sub, Seq, Ev)}};
 handle_event(info, {'DOWN', Mon, process, Pid, Reason}, State, D) ->
     down(Mon, Pid, Reason, State, D);
+handle_event(info, {'EXIT', Gen, Reason}, generating, #d{gen = Gen} = D) when is_pid(Gen) ->
+    %% The round died without reporting (a crash, or killed from
+    %% outside): the turn fails, and its model hold is released.
+    end_turn({error, {generator_exited, Reason}}, D#d{gen = undefined}, []);
 handle_event(info, {'EXIT', _Pid, _Reason}, _State, _D) ->
     %% Linked generators, workers and shell jobs: their outcome comes
     %% through their own messages or monitors.
     keep_state_and_data;
+handle_event(info, {turn_deadline, Ref}, State, #d{turn = #{deadline_ref := Ref}} = D) when
+    State =:= generating; State =:= tools; State =:= approving
+->
+    D1 = interrupt(State, <<"the turn ran out of time">>, D),
+    end_turn({budget, time}, D1, []);
 handle_event(info, expire, stopped, _D) ->
     stop;
 %% --- stopped ----------------------------------------------------------------
@@ -214,8 +223,10 @@ handle_event(info, {tool_done, Worker, Index, Result}, tools, D) ->
 handle_event(_Type, _Msg, _State, _D) ->
     keep_state_and_data.
 
-terminate(_Reason, _State, #d{} = D) ->
-    _ = shutdown(D),
+terminate(_Reason, State, #d{} = D) ->
+    %% Running tools are stopped here, not left to whoever kills this
+    %% process's workers next.
+    _ = shutdown(interrupt(State, D)),
     ok.
 
 status(stopped) -> done;
@@ -228,7 +239,9 @@ status(_) -> running.
 start_turn(Text, #d{budgets = #{max_elapsed_ms := Ms}} = D) ->
     User = #{role => <<"user">>, content => Text},
     D1 = record([User], D),
-    Turn = #{rounds => 0, tokens => 0, deadline => now_ms() + Ms},
+    Ref = make_ref(),
+    _ = erlang:send_after(Ms, self(), {turn_deadline, Ref}),
+    Turn = #{rounds => 0, tokens => 0, deadline => now_ms() + Ms, deadline_ref => Ref},
     generate(emit(turn_started, #{input => Text}, D1#d{turn = Turn})).
 
 generate(#d{generator = G, model = M, transcript = T, turn = Turn, id = Id} = D0) ->
@@ -243,7 +256,9 @@ generate(#d{generator = G, model = M, transcript = T, turn = Turn, id = Id} = D0
      || #{name := N} = E <- lists:sort(maps:values(D#d.mcp)),
         policy(N, D) =/= deny
     ],
-    Opts = #{tools => Native ++ Mcp},
+    %% The round may generate at most what is left of the turn's tokens.
+    Left = max(1, maps:get(max_tokens, D#d.budgets) - maps:get(tokens, Turn)),
+    Opts = #{tools => Native ++ Mcp, response_tokens => Left},
     Opts1 =
         case D#d.finish_key of
             undefined -> Opts;
@@ -259,8 +274,13 @@ after_generation(Result, #d{turn = Turn} = D) ->
     Reply = erllama_server_generate:reply_message(Result),
     D1 = record([Reply], D#d{turn = Turn1, finish_key = maps:get(finish_key, Result, undefined)}),
     case maps:get(tool_calls, Reply, []) of
-        [] -> end_turn(stop, D1, []);
-        Calls -> plan_calls(Calls, D1)
+        [] ->
+            case budget_left(D1) of
+                {exceeded, tokens} -> end_turn({budget, tokens}, D1, []);
+                _ -> end_turn(stop, D1, [])
+            end;
+        Calls ->
+            plan_calls(Calls, D1)
     end.
 
 mcp_snapshot() ->
@@ -506,12 +526,15 @@ reason(R) -> R.
 
 %% Stop what the turn is doing. Unfinished tool calls get an
 %% "interrupted" result, so the transcript stays well formed.
-interrupt(generating, #d{gen = Gen} = D) when is_pid(Gen) ->
+interrupt(State, D) ->
+    interrupt(State, <<"interrupted by the user">>, D).
+
+interrupt(generating, _Why, #d{gen = Gen} = D) when is_pid(Gen) ->
     unlink(Gen),
     exit(Gen, kill),
     D#d{gen = undefined};
-interrupt(State, #d{calls = Calls} = D) when State =:= tools; State =:= approving ->
-    [kill_worker(W) || #call{worker = W} <- Calls, W =/= undefined],
+interrupt(State, Why, #d{calls = Calls} = D) when State =:= tools; State =:= approving ->
+    [kill_worker(C) || #call{worker = W} = C <- Calls, W =/= undefined],
     Closed = [
         case C of
             #call{status = done} ->
@@ -519,7 +542,7 @@ interrupt(State, #d{calls = Calls} = D) when State =:= tools; State =:= approvin
             _ ->
                 C#call{
                     status = done,
-                    result = {error, <<"interrupted by the user">>},
+                    result = {error, Why},
                     worker = undefined
                 }
         end
@@ -527,10 +550,17 @@ interrupt(State, #d{calls = Calls} = D) when State =:= tools; State =:= approvin
     ],
     Results = [tool_message(C) || C <- lists:keysort(#call.index, Closed)],
     record(Results, D#d{calls = []});
-interrupt(_State, D) ->
+interrupt(_State, _Why, D) ->
     D.
 
-kill_worker({Pid, Mon}) ->
+%% A running command is stopped through its job first: killing the
+%% worker alone leaves the group's cleanup to happen later, or never if
+%% the release is stopping.
+kill_worker(#call{name = <<"shell">>, worker = {Pid, Mon}}) ->
+    erlang:demonitor(Mon, [flush]),
+    ok = erllama_server_tool_shell:stop_run(Pid),
+    exit(Pid, kill);
+kill_worker(#call{worker = {Pid, Mon}}) ->
     erlang:demonitor(Mon, [flush]),
     exit(Pid, kill).
 
@@ -538,7 +568,7 @@ kill_worker({Pid, Mon}) ->
 shutdown(#d{closed = true} = D) ->
     D;
 shutdown(#d{jobs = Jobs, conv = Conv, id = Id} = D) ->
-    [exit(J, kill) || _ := J <- Jobs],
+    ok = erllama_server_tool_shell:stop_jobs(maps:values(Jobs)),
     _ = erllama_server_convs:release(Conv, Id),
     ok = erllama_server_runs:set_status(Id, done),
     _ = erlang:send_after(D#d.retention, self(), expire),

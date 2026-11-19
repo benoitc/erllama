@@ -14,7 +14,7 @@
 %% `run/3' runs a command to its end; `start/3' starts a background job
 %% that `status/1' and `kill/1' address.
 
--export([run/3, start/4, status/1, kill/1, format/1]).
+-export([run/3, start/4, status/1, kill/1, stop_jobs/1, stop_run/1, format/1]).
 -export([init/4]).
 
 -define(HEAD, 16384).
@@ -39,6 +39,12 @@ run(Dir, Cmd, TimeoutMs) ->
             erlang:demonitor(Mon, [flush]),
             unlink(Pid),
             Result;
+        {stop_shell, From, Ref} ->
+            %% The session interrupts this call: stop the command's group
+            %% before this process is killed, so it cannot outlive it.
+            Result = stopped(kill(Pid)),
+            From ! {Ref, stopped},
+            Result;
         {'DOWN', Mon, process, Pid, Reason} ->
             died(Reason)
     after TimeoutMs + 3 * ?GRACE_MS ->
@@ -47,6 +53,23 @@ run(Dir, Cmd, TimeoutMs) ->
         exit(Pid, kill),
         died(no_answer)
     end.
+
+stopped({done, R}) -> R;
+stopped({error, gone}) -> died(gone).
+
+%% Stop the command a `run/3' in process `Runner' is waiting for, and
+%% wait (bounded) until its process group has been dealt with.
+-spec stop_run(pid()) -> ok.
+stop_run(Runner) ->
+    Mon = erlang:monitor(process, Runner),
+    Runner ! {stop_shell, self(), Mon},
+    receive
+        {Mon, stopped} -> ok;
+        {'DOWN', Mon, process, Runner, _} -> ok
+    after 2 * ?GRACE_MS + 1000 -> ok
+    end,
+    erlang:demonitor(Mon, [flush]),
+    ok.
 
 died(Reason) ->
     #{
@@ -70,6 +93,31 @@ status(Job) -> ask(Job, status).
 
 -spec kill(pid()) -> {done, result()} | {error, gone}.
 kill(Job) -> ask(Job, kill).
+
+%% Stop background jobs (a session ending): each kills its command's
+%% process group, all at once. Never `exit(Job, kill)' first: that
+%% would skip the group, and the command would outlive the session.
+-spec stop_jobs([pid()]) -> ok.
+stop_jobs(Jobs) ->
+    Asked = [ask_kill(J) || J <- Jobs],
+    Deadline = erlang:monotonic_time(millisecond) + 2 * ?GRACE_MS,
+    lists:foreach(fun({J, Mon}) -> await_stop(J, Mon, Deadline) end, Asked).
+
+ask_kill(Job) ->
+    Mon = erlang:monitor(process, Job),
+    Job ! {kill, self(), Mon},
+    {Job, Mon}.
+
+await_stop(Job, Mon, Deadline) ->
+    Left = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {Mon, _} -> erlang:demonitor(Mon, [flush]);
+        {'DOWN', Mon, process, Job, _} -> ok
+    after Left ->
+        %% The group has had TERM; the job itself stopped answering.
+        erlang:demonitor(Mon, [flush]),
+        exit(Job, kill)
+    end.
 
 ask(Job, What) ->
     Mon = erlang:monitor(process, Job),
@@ -165,12 +213,24 @@ loop(#job{port = Port, owner = Owner} = J) ->
             loop(stop(timeout, J));
         {Req, From, Ref} when Req =:= status; Req =:= kill ->
             loop(request(Req, From, Ref, J));
+        {'EXIT', Owner, _} when J#job.result =/= undefined ->
+            exit(normal);
         {'EXIT', Owner, _} ->
             _ = stop(killed, J),
-            exit(normal);
+            await_exit(Port);
         _ ->
             loop(J)
     after Idle ->
+        exit(normal)
+    end.
+
+%% The owner is gone and the group signalled: wait (bounded) for the
+%% shell to exit, so its port is not closed under a dying command.
+await_exit(Port) ->
+    receive
+        {Port, {exit_status, _}} -> exit(normal);
+        {Port, _} -> await_exit(Port)
+    after 2 * ?GRACE_MS + 1000 ->
         exit(normal)
     end.
 
@@ -183,6 +243,9 @@ request(_Req, From, Ref, #job{result = R} = J) ->
     From ! {Ref, {done, R}},
     J.
 
+%% A finished job's group is never signalled again.
+stop(_Why, #job{result = R} = J) when R =/= undefined ->
+    J;
 stop(Why, J) ->
     stop_group(J),
     J#job{exit_as = Why}.
@@ -228,11 +291,15 @@ finish(Status, #job{owner = Owner, waiting = W, exit_as = As} = J) ->
     _ = [From ! {Ref, {done, Result}} || {From, Ref} <- W],
     loop(J#job{result = Result, waiting = []}).
 
-%% TERM to the whole group, then KILL after a grace period.
+%% TERM to the whole group, then KILL after a grace period. The KILL
+%% is left to a detached shell, not an Erlang process: one that would
+%% be stopped with the application (its processes are killed when it
+%% stops) and leave the group running.
 stop_group(#job{pgid = Pgid}) ->
-    _ = os:cmd("kill -TERM -" ++ Pgid ++ " 2>/dev/null"),
-    _ = spawn(fun() ->
-        timer:sleep(?GRACE_MS),
-        os:cmd("kill -KILL -" ++ Pgid ++ " 2>/dev/null")
-    end),
+    G = "-" ++ Pgid,
+    Grace = integer_to_list(max(1, ?GRACE_MS div 1000)),
+    _ = os:cmd(
+        "kill -TERM " ++ G ++ " 2>/dev/null; (sleep " ++ Grace ++ "; kill -KILL " ++ G ++
+            " 2>/dev/null) </dev/null >/dev/null 2>&1 &"
+    ),
     ok.

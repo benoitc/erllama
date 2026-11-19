@@ -25,7 +25,8 @@
     corrupt_blob_is_rejected/1,
     cancel_then_resume/1,
     registry_survives_restart/1,
-    remove_deletes_unused_blob/1
+    remove_deletes_unused_blob/1,
+    reused_blob_is_verified/1
 ]).
 
 all() ->
@@ -41,7 +42,8 @@ all() ->
         corrupt_blob_is_rejected,
         cancel_then_resume,
         registry_survives_restart,
-        remove_deletes_unused_blob
+        remove_deletes_unused_blob,
+        reused_blob_is_verified
     ].
 
 init_per_suite(Config) ->
@@ -245,6 +247,27 @@ remove_deletes_unused_blob(Config) ->
     ok = erllama_server_api:remove(<<"tiny:copy">>),
     ?assertNot(filelib:is_regular(Path)),
     ?assertEqual([], filelib:wildcard("*.gguf", blobs(Config))).
+
+%% A blob already on disk is reused only when its sha256 matches: an
+%% intact one is not fetched again, a damaged one of the right size is.
+reused_blob_is_verified(_Config) ->
+    {#{type := done, data := #{model := #{path := Path}}}, _} = pull(<<"tiny:1b">>),
+    BlobFetches = fun() ->
+        length([S || #{path := P} = S <- erllama_server_fake_registry:seen(), is_model_blob(P)])
+    end,
+    Before = BlobFetches(),
+    {#{type := done}, _} = pull(<<"tiny:1b">>, #{name => <<"tiny:twice">>}),
+    ?assertEqual(Before, BlobFetches()),
+    %% Damage one byte, keep the size.
+    {ok, Bin} = file:read_file(Path),
+    <<First, Rest/binary>> = Bin,
+    ok = file:write_file(Path, <<(First bxor 16#ff), Rest/binary>>),
+    {#{type := done, data := #{model := M}}, _} = pull(<<"tiny:1b">>, #{name => <<"tiny:thrice">>}),
+    ?assert(BlobFetches() > Before),
+    ?assertEqual(blob_sha(model), file_sha(maps:get(path, M))),
+    ?assertEqual(blob_sha(model), file_sha(Path)).
+
+is_model_blob(P) -> binary:match(P, blob_sha(model)) =/= nomatch.
 
 %% -----------------------------------------------------------------------------
 

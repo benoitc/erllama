@@ -130,6 +130,8 @@ Validation (OTP 28.3.1, local):
 | HTTP callers' tools | done | never executed: HTTP runs only stream calls back to the client |
 | CLI | done | `agent MODEL --workspace PATH [--yes \| --read-only]`, `agents`, `agent-stop` |
 
+Review fixes (2026-11-19): recursive search and listing no longer follow symbolic links out of the workspace; a model being evicted or unloaded is never handed to a new run (acquisitions wait and reload); a generation that dies ends its turn instead of leaving the session stuck; stopping a session or the release stops running and background commands through their process groups; the time budget ends a turn while it runs and the token budget caps each generation; two requests continuing the same stored response are independent branches; a blob already on disk is reused only after its sha256 checks out. Each has a regression case (`erllama_server_tools_tests`, `erllama_server_models_SUITE`, `erllama_server_agent_SUITE`, `erllama_server_http_SUITE`, `erllama_server_pull_SUITE`).
+
 Validation: `erllama_server_agent_SUITE` (9 cases with a scripted model: plain answers, ordering, approvals, unknown tools and outside paths, round budget, queued input, interrupt killing a shell and its descendants, background jobs, stopping and continuing a conversation), `erllama_server_tools_tests` (workspace confinement including symlinks, paging, listing, search, write and edit), and the gated real-model case on Qwen2.5 1.5B (the model reads a file with its tools to answer).
 
 ## Phase 5: barrel_mcp bridge (implemented)

@@ -84,6 +84,35 @@ list_and_search_test() ->
         )
     end).
 
+%% Recursive search and listing never follow a link out of the
+%% workspace, whatever the depth.
+walks_stay_inside_test() ->
+    with_ws(fun(Ws) ->
+        Outside = filename:join(
+            filename:dirname(Ws), <<"outside-", (filename:basename(Ws))/binary>>
+        ),
+        ok = filelib:ensure_path(Outside),
+        try
+            ok = file:write_file(filename:join(Outside, "secret.txt"), <<"MARKER outside\n">>),
+            write(Ws, "src/a.txt", <<"MARKER inside\n">>),
+            ok = file:make_symlink(Outside, filename:join([Ws, "src", "linkdir"])),
+            ok = file:make_symlink(
+                filename:join(Outside, "secret.txt"), filename:join([Ws, "src", "linkfile"])
+            ),
+            ok = file:make_symlink(
+                filename:join([Ws, "src", "a.txt"]), filename:join([Ws, "src", "inlink"])
+            ),
+            {ok, Found} = ?FS:search(Ws, #{<<"pattern">> => <<"MARKER">>}),
+            ?assertEqual(nomatch, binary:match(Found, <<"outside">>)),
+            ?assertNotEqual(nomatch, binary:match(Found, <<"src/a.txt:1: MARKER inside">>)),
+            {ok, Listed} = ?FS:list_dir(Ws, #{<<"depth">> => 3}),
+            ?assertEqual(nomatch, binary:match(Listed, <<"secret">>)),
+            ?assertNotEqual(nomatch, binary:match(Listed, <<"src/linkdir@">>))
+        after
+            file:del_dir_r(Outside)
+        end
+    end).
+
 write_and_edit_test() ->
     with_ws(fun(Ws) ->
         {ok, _} = ?FS:write_file(Ws, #{<<"path">> => <<"d/x.txt">>, <<"content">> => <<"a a b\n">>}),

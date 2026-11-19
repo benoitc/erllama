@@ -135,12 +135,13 @@ meta(Body) ->
         )
     }.
 
-%% The conversation to continue: the previous response's, a new one
-%% when this response is stored, none for a stateless request.
+%% The conversation to continue: a copy of the previous response's
+%% (a branch of its own), a new one when this response is stored, none
+%% for a stateless request.
 previous(#{<<"previous_response_id">> := Prev}) when is_binary(Prev) ->
-    case erllama_server_responses:get(Prev) of
-        {ok, _, Conv} when is_binary(Conv) -> {ok, Conv};
-        _ -> bad([<<"previous response not found: ">>, Prev], <<"previous_response_id">>)
+    case erllama_server_responses:continue(Prev) of
+        {ok, Conv} -> {ok, Conv};
+        {error, _} -> bad([<<"previous response not found: ">>, Prev], <<"previous_response_id">>)
     end;
 previous(Body) ->
     case maps:get(<<"store">>, Body, true) of
@@ -357,8 +358,11 @@ complete(#{run := Run} = Ctx) ->
             erllama_server_http_kit:err(openai, 499, <<"client closed the request">>)
     end.
 
-keep(#{store := true, id := Id, conv := Conv}, Obj) -> erllama_server_responses:put(Id, Obj, Conv);
-keep(_, _) -> ok.
+keep(#{store := true, id := Id, conv := Conv}, Obj) when is_binary(Conv) ->
+    _ = erllama_server_responses:put(Id, Obj, Conv),
+    ok;
+keep(_, _) ->
+    ok.
 
 response_object(Ctx, R) ->
     Base = base_object(Ctx, completed),

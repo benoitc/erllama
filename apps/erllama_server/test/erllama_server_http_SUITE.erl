@@ -40,6 +40,7 @@
     anthropic_stream/1,
     anthropic_errors_and_count/1,
     responses_chain/1,
+    responses_branch/1,
     responses_stream/1,
     ollama_chat_and_generate/1,
     ollama_models/1,
@@ -75,6 +76,7 @@ all() ->
         anthropic_stream,
         anthropic_errors_and_count,
         responses_chain,
+        responses_branch,
         responses_stream,
         ollama_chat_and_generate,
         ollama_models,
@@ -738,6 +740,35 @@ responses_chain(Config) ->
     }),
     #{<<"id">> := Id3} = decode(B3),
     {404, _} = get(Config, <<"/v1/responses/", Id3/binary>>).
+
+%% Two requests continuing the same response are separate branches.
+responses_branch(Config) ->
+    Post = fun(Input, Prev) ->
+        Base = #{<<"model">> => <<"stub">>, <<"input">> => Input, <<"max_output_tokens">> => 2},
+        Body =
+            case Prev of
+                undefined -> Base;
+                _ -> Base#{<<"previous_response_id">> => Prev}
+            end,
+        {200, B} = post(Config, <<"/v1/responses">>, Body),
+        #{<<"id">> := Id} = decode(B),
+        Id
+    end,
+    UserInputs = fun(RespId) ->
+        <<"resp_", Hex/binary>> = RespId,
+        {ok, #{conversation_id := Conv}} = erllama_server_api:run(<<"run_", Hex/binary>>),
+        {ok, #{messages := Msgs}} = erllama_server_api:conversation(Conv),
+        [C || #{role := <<"user">>, content := C} <- Msgs]
+    end,
+    R = Post(<<"FIRST">>, undefined),
+    A = Post(<<"BRANCH_A">>, R),
+    B = Post(<<"BRANCH_B">>, R),
+    ?assertEqual([<<"FIRST">>, <<"BRANCH_A">>], UserInputs(A)),
+    ?assertEqual([<<"FIRST">>, <<"BRANCH_B">>], UserInputs(B)),
+    %% Continuing a branch again extends that branch only.
+    A2 = Post(<<"A_AGAIN">>, A),
+    ?assertEqual([<<"FIRST">>, <<"BRANCH_A">>, <<"A_AGAIN">>], UserInputs(A2)),
+    ?assertEqual([<<"FIRST">>, <<"BRANCH_B">>], UserInputs(B)).
 
 responses_stream(Config) ->
     {200, Body} = post(Config, <<"/v1/responses">>, #{

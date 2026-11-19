@@ -22,7 +22,8 @@
     evictor_unloads_least_recently_used/1,
     unload_then_run_reloads/1,
     two_models_at_once/1,
-    load_failure_reaches_every_waiter/1
+    load_failure_reaches_every_waiter/1,
+    acquire_waits_for_eviction/1
 ]).
 
 all() ->
@@ -35,7 +36,8 @@ all() ->
         evictor_unloads_least_recently_used,
         unload_then_run_reloads,
         two_models_at_once,
-        load_failure_reaches_every_waiter
+        load_failure_reaches_every_waiter,
+        acquire_waits_for_eviction
     ].
 
 init_per_testcase(TC, Config) ->
@@ -210,3 +212,41 @@ load_failure_reaches_every_waiter(Config) ->
     ?assert(lists:all(fun(R) -> element(1, R) =:= error end, Results)),
     Run = run(<<"broken">>, #{}),
     ?assertMatch(#{status := error}, wait_done(Run)).
+
+%% The evictor picked a model and is unloading it: an acquisition in that
+%% window waits for the unload, then gets a freshly loaded model, never
+%% one about to go. The interleaving is forced by driving the evictor's
+%% two steps by hand.
+acquire_waits_for_eviction(Config) ->
+    M = add_model(Config, <<"evicted">>),
+    {ok, Id} = erllama_server_models:acquire(M, self(), undefined),
+    ok = erllama_server_models:release(Id, self()),
+    {ok, Id} = gen_server:call(erllama_server_models, pick_evictable),
+    Parent = self(),
+    Holder = spawn(fun() ->
+        Parent ! {acquired, erllama_server_models:acquire(M, self(), undefined)},
+        receive
+            stop -> ok
+        end
+    end),
+    receive
+        {acquired, Early} -> ct:fail({granted_during_unload, Early})
+    after 300 -> ok
+    end,
+    %% A second unload while the first is in progress joins it.
+    {UPid, _} =
+        Unloader = spawn_monitor(fun() -> exit({unload, erllama_server_models:unload(Id)}) end),
+    wait(fun() -> process_info(UPid, current_function) =:= {current_function, {gen, do_call, 4}} end),
+    _ = erllama:unload(Id),
+    gen_server:cast(erllama_server_models, {unloaded, Id}),
+    receive
+        {acquired, Got} -> ?assertEqual({ok, Id}, Got)
+    after 5000 -> ct:fail(acquire_never_answered)
+    end,
+    {_, UMon} = Unloader,
+    receive
+        {'DOWN', UMon, process, _, {unload, R}} -> ?assertEqual(ok, R)
+    after 5000 -> ct:fail(unload_never_answered)
+    end,
+    ?assert(loaded(Id)),
+    Holder ! stop.
