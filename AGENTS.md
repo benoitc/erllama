@@ -21,6 +21,9 @@ apps/erllama/          the library (published to Hex)
   rebar.config         NIF build hooks, Hex and ex_doc config
 apps/erllama_server/   the server release (in progress) and the CLI
                        (erllama_server_cli, built as the `erllama` escript)
+apps/erllama_wasi_nn/  wasi:nn backend for erlang_wasm (one module, no
+                       process); depends on erlang_wasm by git, so it is
+                       not published to Hex
 config/                release sys.config and vm.args.src
 rel/erllama            CLI launcher copied into the release's bin/
 scripts/               check_library_package.sh: erllama standalone from Hex
