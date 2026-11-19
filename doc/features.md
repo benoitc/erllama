@@ -101,6 +101,21 @@ Known limits:
 | multimodal | done | base64 `image_url` and `input_audio` for registry models whose projector covers the modality (400 otherwise); library option `media_add_special` added so the streamed chat prompt keeps a single BOS token |
 | ops | done | `/health`, `/ready` (engine, registry, model manager), `/metrics` (Livery HTTP metrics, erllama counters, server gauges) |
 
-## Phases 3c to 7
+## Phase 3c: Responses, Anthropic, Ollama (implemented)
+
+| Feature | State | Notes |
+|---|---|---|
+| OpenAI Responses | done | `/v1/responses` (items, instructions, function tools and outputs, text formats, reasoning effort), typed SSE events with sequence numbers, `GET`/`DELETE`; stored responses continue their conversation through `previous_response_id` (in memory until Phase 6) |
+| Anthropic Messages | done | `/v1/messages` (system, text, image, `tool_use`, `tool_result`, tools and tool choice, thinking), the typed SSE protocol, `count_tokens`, Anthropic error shape |
+| Ollama | done | `/api/chat`, `/api/generate` (raw, load and unload with an empty prompt), `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/ps`, `/api/pull` (status lines from the download job), `/api/delete`, `/api/copy`, `/api/version`, `/`; `/api/create` and `/api/push` answer 501 |
+| compatibility matrix | done | `guides/server/http.md`: every endpoint and field, supported, informational or refused |
+
+Validation (OTP 28.3.1, local):
+- full gate: eunit 646/646, proper 14/14, ct 76 passed / 77 skipped (gated real-model cases), lint, dialyzer, xref and fmt clean;
+- `erllama_server_http_SUITE`: 26 cases on stub models over a real socket (every endpoint's shapes, streaming, strict fields, errors, keys, limits, disconnect cancelling the run, load on demand, unload during a stream, concurrent requests, ops endpoints, Ollama pull through a local registry stand-in);
+- gated real-model cases run on Qwen2.5 1.5B: streamed tool calls with no call syntax in content, logprobs, an Anthropic `tool_use` round trip, a Responses function-call chain; on SmolVLM 256M: an image chat (streamed and not); TinyLlama skips the tool cases (its template has no tool grammar);
+- official SDKs against the server (Python `openai`, `anthropic`, `ollama`, in a throwaway uv environment): chat, streaming with usage, a tool call and its answer, embeddings, a Responses chain and its streaming helper, Anthropic messages, its streaming helper and token counting, Ollama chat, streamed chat, list and embed.
+
+## Phases 4 to 7
 
 Not started.

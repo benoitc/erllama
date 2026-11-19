@@ -35,7 +35,17 @@
     real_model_tool_call/1,
     real_model_logprobs/1,
     image_needs_a_projector/1,
-    real_model_image_chat/1
+    real_model_image_chat/1,
+    anthropic_message/1,
+    anthropic_stream/1,
+    anthropic_errors_and_count/1,
+    responses_chain/1,
+    responses_stream/1,
+    ollama_chat_and_generate/1,
+    ollama_models/1,
+    ollama_pull/1,
+    real_model_anthropic_tools/1,
+    real_model_responses_tools/1
 ]).
 
 all() ->
@@ -60,7 +70,17 @@ all() ->
         real_model_tool_call,
         real_model_logprobs,
         image_needs_a_projector,
-        real_model_image_chat
+        real_model_image_chat,
+        anthropic_message,
+        anthropic_stream,
+        anthropic_errors_and_count,
+        responses_chain,
+        responses_stream,
+        ollama_chat_and_generate,
+        ollama_models,
+        ollama_pull,
+        real_model_anthropic_tools,
+        real_model_responses_tools
     ].
 
 -define(ENV, [data_dir, http, api_keys, max_body_bytes, max_http_requests, max_active_runs]).
@@ -611,3 +631,341 @@ real_model_image_chat(Config) ->
         _ ->
             {skip, "set LLAMA_TEST_VISION_MODEL and LLAMA_TEST_MMPROJ to run the image case"}
     end.
+
+%% -----------------------------------------------------------------------------
+%% Anthropic Messages
+%% -----------------------------------------------------------------------------
+
+anthropic(Extra) ->
+    maps:merge(
+        #{
+            <<"model">> => <<"stub">>,
+            <<"max_tokens">> => 4,
+            <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
+        },
+        Extra
+    ).
+
+%% Named SSE events: [{Event, Data}].
+events(Body) ->
+    [
+        {E, decode(D)}
+     || Frame <- binary:split(Body, <<"\n\n">>, [global]),
+        [<<"event: ", E/binary>>, <<"data: ", D/binary>>] <- [binary:split(Frame, <<"\n">>)]
+    ].
+
+anthropic_message(Config) ->
+    {200, Body} = post(Config, <<"/v1/messages">>, anthropic(#{<<"system">> => <<"be brief">>})),
+    #{
+        <<"id">> := <<"msg_", _/binary>>,
+        <<"type">> := <<"message">>,
+        <<"role">> := <<"assistant">>,
+        <<"content">> := [#{<<"type">> := <<"text">>, <<"text">> := T}],
+        <<"stop_reason">> := <<"max_tokens">>,
+        <<"usage">> := #{<<"input_tokens">> := In, <<"output_tokens">> := 4}
+    } = decode(Body),
+    ?assert(byte_size(T) > 0 andalso In > 0).
+
+anthropic_stream(Config) ->
+    {200, Body} = post(Config, <<"/v1/messages">>, anthropic(#{<<"stream">> => true})),
+    Names = [E || {E, _} <- events(Body)],
+    ?assertMatch([<<"message_start">>, <<"content_block_start">> | _], Names),
+    ?assertEqual(
+        [<<"content_block_stop">>, <<"message_delta">>, <<"message_stop">>],
+        lists:nthtail(length(Names) - 3, Names)
+    ),
+    [{_, #{<<"delta">> := #{<<"stop_reason">> := <<"max_tokens">>}}}] = [
+        X
+     || {<<"message_delta">>, _} = X <- events(Body)
+    ],
+    ?assertEqual(4, length([D || {<<"content_block_delta">>, D} <- events(Body)])).
+
+anthropic_errors_and_count(Config) ->
+    {400, Body} = post(Config, <<"/v1/messages">>, maps:remove(<<"max_tokens">>, anthropic(#{}))),
+    ?assertMatch(
+        #{<<"type">> := <<"error">>, <<"error">> := #{<<"type">> := <<"invalid_request_error">>}},
+        decode(Body)
+    ),
+    {404, NotFound} = post(Config, <<"/v1/messages">>, anthropic(#{<<"model">> => <<"nope">>})),
+    ?assertMatch(#{<<"error">> := #{<<"type">> := <<"not_found_error">>}}, decode(NotFound)),
+    {200, Count} = post(
+        Config, <<"/v1/messages/count_tokens">>, maps:remove(<<"max_tokens">>, anthropic(#{}))
+    ),
+    ?assertMatch(#{<<"input_tokens">> := N} when N > 0, decode(Count)).
+
+%% -----------------------------------------------------------------------------
+%% OpenAI Responses
+%% -----------------------------------------------------------------------------
+
+responses_chain(Config) ->
+    {200, B1} = post(Config, <<"/v1/responses">>, #{
+        <<"model">> => <<"stub">>, <<"input">> => <<"hi">>, <<"max_output_tokens">> => 3
+    }),
+    #{
+        <<"id">> := Id1,
+        <<"object">> := <<"response">>,
+        <<"output">> := [#{<<"type">> := <<"message">>}],
+        <<"usage">> := #{<<"input_tokens">> := In1}
+    } =
+        decode(B1),
+    {200, B2} = post(Config, <<"/v1/responses">>, #{
+        <<"model">> => <<"stub">>,
+        <<"input">> => <<"again">>,
+        <<"previous_response_id">> => Id1,
+        <<"max_output_tokens">> => 3
+    }),
+    #{<<"previous_response_id">> := Id1, <<"usage">> := #{<<"input_tokens">> := In2}} = decode(B2),
+    %% The second turn is prompted with the first.
+    ?assert(In2 > In1),
+    {200, Got} = get(Config, <<"/v1/responses/", Id1/binary>>),
+    ?assertMatch(#{<<"id">> := Id1}, decode(Got)),
+    {ok, Resp} = livery_client:request(
+        client(), delete, <<(?config(base, Config))/binary, "/v1/responses/", Id1/binary>>, #{}
+    ),
+    ?assertEqual(200, livery_client:status(Resp)),
+    {404, _} = get(Config, <<"/v1/responses/", Id1/binary>>),
+    {400, _} = post(Config, <<"/v1/responses">>, #{
+        <<"model">> => <<"stub">>,
+        <<"input">> => <<"x">>,
+        <<"previous_response_id">> => <<"resp_none">>
+    }),
+    %% Not stored: nothing to read back.
+    {200, B3} = post(Config, <<"/v1/responses">>, #{
+        <<"model">> => <<"stub">>,
+        <<"input">> => <<"x">>,
+        <<"store">> => false,
+        <<"max_output_tokens">> => 2
+    }),
+    #{<<"id">> := Id3} = decode(B3),
+    {404, _} = get(Config, <<"/v1/responses/", Id3/binary>>).
+
+responses_stream(Config) ->
+    {200, Body} = post(Config, <<"/v1/responses">>, #{
+        <<"model">> => <<"stub">>,
+        <<"input">> => <<"hi">>,
+        <<"max_output_tokens">> => 2,
+        <<"stream">> => true
+    }),
+    Evs = events(Body),
+    ?assertEqual(
+        [
+            <<"response.created">>,
+            <<"response.in_progress">>,
+            <<"response.output_item.added">>,
+            <<"response.content_part.added">>,
+            <<"response.output_text.delta">>,
+            <<"response.output_text.delta">>,
+            <<"response.output_text.done">>,
+            <<"response.content_part.done">>,
+            <<"response.output_item.done">>,
+            <<"response.completed">>
+        ],
+        [E || {E, _} <- Evs]
+    ),
+    ?assertEqual(lists:seq(0, length(Evs) - 1), [N || {_, #{<<"sequence_number">> := N}} <- Evs]).
+
+%% -----------------------------------------------------------------------------
+%% Ollama
+%% -----------------------------------------------------------------------------
+
+ndjson(Body) -> [decode(L) || L <- binary:split(Body, <<"\n">>, [global, trim_all])].
+
+ollama_chat_and_generate(Config) ->
+    Chat = #{
+        <<"model">> => <<"stub">>,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}],
+        <<"options">> => #{<<"num_predict">> => 3}
+    },
+    {200, Stream} = post(Config, <<"/api/chat">>, Chat),
+    Lines = ndjson(Stream),
+    ?assertEqual(4, length(Lines)),
+    ?assertMatch(
+        #{<<"done">> := true, <<"done_reason">> := <<"length">>, <<"eval_count">> := 3},
+        lists:last(Lines)
+    ),
+    {200, Whole} = post(Config, <<"/api/chat">>, Chat#{<<"stream">> => false}),
+    ?assertMatch(
+        #{<<"done">> := true, <<"message">> := #{<<"role">> := <<"assistant">>, <<"content">> := C}} when
+            byte_size(C) > 0,
+        decode(Whole)
+    ),
+    {200, Gen} = post(Config, <<"/api/generate">>, #{
+        <<"model">> => <<"stub">>,
+        <<"prompt">> => <<"once">>,
+        <<"stream">> => false,
+        <<"options">> => #{<<"num_predict">> => 2}
+    }),
+    ?assertMatch(#{<<"done">> := true, <<"response">> := R} when byte_size(R) > 0, decode(Gen)),
+    {400, Bad} = post(Config, <<"/api/chat">>, Chat#{<<"options">> => #{<<"num_gpu">> => 1}}),
+    ?assertMatch(#{<<"error">> := _}, decode(Bad)),
+    {200, Emb} = post(Config, <<"/api/embed">>, #{
+        <<"model">> => <<"stub">>, <<"input">> => [<<"a">>, <<"b">>]
+    }),
+    ?assertMatch(#{<<"embeddings">> := [_, _]}, decode(Emb)).
+
+ollama_models(Config) ->
+    Path = filename:join(?config(dir, Config), "local.gguf"),
+    ok = file:write_file(Path, erllama_server_fake_registry:gguf(4096)),
+    {ok, _} = erllama_server_api:register_model(Path, #{
+        name => <<"local">>, backend => erllama_model_stub
+    }),
+    {200, Tags} = get(Config, <<"/api/tags">>),
+    ?assertMatch(
+        #{
+            <<"models">> := [
+                #{
+                    <<"name">> := <<"local:latest">>,
+                    <<"details">> := #{<<"format">> := <<"gguf">>, <<"family">> := <<"llama">>}
+                }
+            ]
+        },
+        decode(Tags)
+    ),
+    {200, Show} = post(Config, <<"/api/show">>, #{<<"model">> => <<"local">>}),
+    ?assertMatch(
+        #{
+            <<"capabilities">> := [<<"completion">>],
+            <<"model_info">> := #{<<"general.architecture">> := <<"llama">>}
+        },
+        decode(Show)
+    ),
+    {200, _} = post(Config, <<"/api/copy">>, #{
+        <<"source">> => <<"local">>, <<"destination">> => <<"local:two">>
+    }),
+    {ok, Del} = livery_client:request(
+        client(), delete, <<(?config(base, Config))/binary, "/api/delete">>, #{
+            body => json:encode(#{<<"model">> => <<"local:two">>})
+        }
+    ),
+    ?assertEqual(200, livery_client:status(Del)),
+    {200, PsBody} = get(Config, <<"/api/ps">>),
+    ?assertMatch(#{<<"models">> := [_ | _]}, decode(PsBody)),
+    {200, V} = get(Config, <<"/api/version">>),
+    ?assertMatch(#{<<"version">> := _}, decode(V)),
+    {501, _} = post(Config, <<"/api/create">>, #{}).
+
+ollama_pull(Config) ->
+    {ok, Fake} = erllama_server_fake_registry:start(),
+    try
+        ok = application:set_env(erllama_server, ollama_base_url, maps:get(base, Fake)),
+        {200, Body} = post(Config, <<"/api/pull">>, #{<<"model">> => <<"tiny:1b">>}),
+        Lines = ndjson(Body),
+        ?assertMatch(#{<<"status">> := <<"pulling manifest">>}, hd(Lines)),
+        ?assertMatch(#{<<"status">> := <<"success">>}, lists:last(Lines)),
+        ?assert(lists:any(fun(#{<<"status">> := S}) -> S =:= <<"pulling model">> end, Lines)),
+        {ok, #{name := <<"tiny:1b">>}} = erllama_server_registry:resolve(<<"tiny:1b">>)
+    after
+        application:unset_env(erllama_server, ollama_base_url),
+        erllama_server_fake_registry:stop(Fake)
+    end.
+
+%% -----------------------------------------------------------------------------
+%% Gated: tool round trips on a tool-capable model
+%% -----------------------------------------------------------------------------
+
+real_model_anthropic_tools(Config) ->
+    with_real_model(<<"real_anthropic">>, fun(Id) ->
+        Tool = #{
+            <<"name">> => <<"get_weather">>,
+            <<"description">> => <<"Current weather for a city">>,
+            <<"input_schema">> => #{
+                <<"type">> => <<"object">>,
+                <<"properties">> => #{<<"city">> => #{<<"type">> => <<"string">>}},
+                <<"required">> => [<<"city">>]
+            }
+        },
+        Ask = #{
+            <<"role">> => <<"user">>,
+            <<"content">> => <<"What is the weather in Paris? Use the tool.">>
+        },
+        Req = #{
+            <<"model">> => Id,
+            <<"max_tokens">> => 128,
+            <<"tools">> => [Tool],
+            <<"tool_choice">> => #{<<"type">> => <<"any">>},
+            <<"messages">> => [Ask]
+        },
+        {200, B1} = post(Config, <<"/v1/messages">>, Req),
+        case decode(B1) of
+            #{<<"stop_reason">> := <<"tool_use">>, <<"content">> := Content} ->
+                [#{<<"id">> := UseId, <<"input">> := #{<<"city">> := _}} = Use] = [
+                    C
+                 || #{<<"type">> := <<"tool_use">>} = C <- Content
+                ],
+                Result = #{
+                    <<"role">> => <<"user">>,
+                    <<"content">> => [
+                        #{
+                            <<"type">> => <<"tool_result">>,
+                            <<"tool_use_id">> => UseId,
+                            <<"content">> => <<"21 C and sunny">>
+                        }
+                    ]
+                },
+                Req2 = Req#{
+                    <<"tool_choice">> => #{<<"type">> => <<"none">>},
+                    <<"messages">> => [
+                        Ask, #{<<"role">> => <<"assistant">>, <<"content">> => [Use]}, Result
+                    ]
+                },
+                {200, B2} = post(Config, <<"/v1/messages">>, Req2),
+                #{<<"content">> := [#{<<"type">> := <<"text">>, <<"text">> := Answer} | _]} = decode(
+                    B2
+                ),
+                ct:log("answer: ~ts", [Answer]),
+                ?assert(byte_size(Answer) > 0);
+            Other ->
+                ct:log("no tool use: ~p", [Other]),
+                {skip, "the model's template synthesizes no tool grammar"}
+        end
+    end).
+
+real_model_responses_tools(Config) ->
+    with_real_model(<<"real_responses">>, fun(Id) ->
+        Tool = #{
+            <<"type">> => <<"function">>,
+            <<"name">> => <<"get_weather">>,
+            <<"parameters">> => #{
+                <<"type">> => <<"object">>,
+                <<"properties">> => #{<<"city">> => #{<<"type">> => <<"string">>}},
+                <<"required">> => [<<"city">>]
+            }
+        },
+        Req = #{
+            <<"model">> => Id,
+            <<"input">> => <<"What is the weather in Paris? Use the tool.">>,
+            <<"tools">> => [Tool],
+            <<"tool_choice">> => <<"required">>,
+            <<"max_output_tokens">> => 128
+        },
+        {200, B1} = post(Config, <<"/v1/responses">>, Req),
+        #{<<"id">> := Id1, <<"output">> := Output} = decode(B1),
+        case [O || #{<<"type">> := <<"function_call">>} = O <- Output] of
+            [#{<<"call_id">> := CallId, <<"name">> := <<"get_weather">>} | _] ->
+                Next = #{
+                    <<"model">> => Id,
+                    <<"previous_response_id">> => Id1,
+                    <<"input">> => [
+                        #{
+                            <<"type">> => <<"function_call_output">>,
+                            <<"call_id">> => CallId,
+                            <<"output">> => <<"21 C and sunny">>
+                        }
+                    ],
+                    <<"tools">> => [Tool],
+                    <<"tool_choice">> => <<"none">>,
+                    <<"max_output_tokens">> => 64
+                },
+                {200, B2} = post(Config, <<"/v1/responses">>, Next),
+                #{
+                    <<"output">> := [
+                        #{<<"type">> := <<"message">>, <<"content">> := [#{<<"text">> := Answer}]}
+                        | _
+                    ]
+                } = decode(B2),
+                ct:log("answer: ~ts", [Answer]),
+                ?assert(byte_size(Answer) > 0);
+            [] ->
+                {skip, "the model's template synthesizes no tool grammar"}
+        end
+    end).

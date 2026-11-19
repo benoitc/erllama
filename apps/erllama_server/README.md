@@ -58,9 +58,10 @@ registry, keep-alive and memory pressure.
 
 ## Serve the HTTP APIs
 
-The release listens on `127.0.0.1:8080` and answers OpenAI-compatible
-requests (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
-`/v1/models`) plus `/health`, `/ready` and `/metrics`. See
+The release listens on `127.0.0.1:8080` and answers OpenAI
+(`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+`/v1/models`, `/v1/responses`), Anthropic (`/v1/messages`) and Ollama
+(`/api/...`) requests, plus `/health`, `/ready` and `/metrics`. See
 [The HTTP APIs](../../guides/server/http.md) for every supported field,
 API keys and limits.
 
@@ -109,7 +110,11 @@ see the [configuration guide](../../guides/configuration.md).
 | `erllama_server_http` | the Livery listener: routes and the middleware stack |
 | `erllama_server_http_kit` | shared HTTP plumbing: JSON bodies, protocol error shapes, driving a run from a handler |
 | `erllama_server_http_auth` | API keys |
-| `erllama_server_openai` | the OpenAI endpoints |
+| `erllama_server_openai`, `erllama_server_openai_req` | the OpenAI chat, completion, embedding and model endpoints, and their request translation |
+| `erllama_server_openai_responses`, `..._stream` | the OpenAI Responses API and its event stream |
+| `erllama_server_responses` | stored responses and their conversations |
+| `erllama_server_anthropic` | the Anthropic Messages API |
+| `erllama_server_ollama`, `erllama_server_ollama_models` | the Ollama generation and model-management endpoints |
 | `erllama_server_http_ops` | health, readiness, metrics |
 | `erllama_server_convs` | conversations: history, last cache key, one active run each |
 | `erllama_server_generate` | renders chat or prompt requests into an erllama stream and parses the result |

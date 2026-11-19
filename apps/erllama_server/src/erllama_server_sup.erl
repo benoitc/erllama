@@ -26,6 +26,7 @@ init([]) ->
         worker(erllama_server_models),
         worker(erllama_server_runs),
         worker(erllama_server_convs),
+        worker(erllama_server_responses),
         supervisor(erllama_server_run_sup),
         supervisor(erllama_server_pull_sup),
         worker(erllama_server_http)

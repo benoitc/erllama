@@ -1,7 +1,7 @@
 # The HTTP APIs
 
-The release serves OpenAI-compatible HTTP endpoints, so existing SDKs
-and tools can use the models it holds. You need this page to point a
+The release serves OpenAI-, Anthropic- and Ollama-compatible HTTP
+endpoints, so existing SDKs and tools can use the models it holds. You need this page to point a
 client at the release, to secure the listener, and to know exactly
 which request fields are honoured.
 
@@ -110,10 +110,77 @@ evaluated whole and do not reuse the KV cache.
   token arrays) and `encoding_format` (`float` or `base64`).
   `dimensions` is refused.
 
+## OpenAI Responses
+
+| Endpoint | Streaming |
+|---|---|
+| `POST /v1/responses` | SSE typed events: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`/`.done`, `response.function_call_arguments.delta`/`.done`, `response.output_item.done`, `response.completed` (or `response.failed`), each with `sequence_number` |
+| `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` | no |
+
+| Field | Support |
+|---|---|
+| `input` | a string, or items: messages (roles `user`, `assistant`, `system`, `developer`; parts `input_text`, `output_text`, `input_image` as a base64 `data:` URL), `function_call`, `function_call_output`; `reasoning` items are skipped |
+| `instructions` | added as a system message to this turn |
+| `previous_response_id` | continues that response's conversation, with its history and KV cache warmth |
+| `store` | default `true`: the response can be read back and continued; `false` without `previous_response_id` is stateless |
+| `tools`, `tool_choice`, `parallel_tool_calls` | function tools; `auto`, `none`, `required`, or a named function |
+| `text.format` | `text`, `json_object`, `json_schema` |
+| `reasoning.effort` | `none` turns thinking off; any other value turns it on |
+| `max_output_tokens`, `temperature`, `top_p`, `stream` | supported |
+| `truncation` | only `disabled` |
+| `metadata`, `user`, `service_tier` | accepted and not used |
+| anything else (`background`, `include`, built-in tools, ...) | refused with `400` |
+
+Stored responses live in memory: a restart forgets them.
+
+## Anthropic Messages
+
+| Endpoint | Streaming |
+|---|---|
+| `POST /v1/messages` | SSE: `message_start`, `content_block_start`/`_delta`/`_stop` (`text_delta`, `thinking_delta`, `input_json_delta`), `message_delta` with the stop reason and usage, `message_stop` |
+| `POST /v1/messages/count_tokens` | no |
+
+| Field | Support |
+|---|---|
+| `model`, `max_tokens` (required), `messages` | supported; content as a string or blocks: `text`, `image` (base64 source), `tool_use`, `tool_result` (`is_error` prefixes the result with `Error:`) |
+| `system` | a string or text blocks |
+| `tools`, `tool_choice` | `auto`, `any`, `tool` (named), `none`; `disable_parallel_tool_use` |
+| `thinking` | `enabled` or `disabled`; the budget is not applied |
+| `stop_sequences`, `temperature`, `top_p`, `top_k`, `stream` | supported |
+| `metadata`, `service_tier` | accepted and not used |
+| anything else | refused with `400` |
+
+`x-api-key` and `Authorization: Bearer` both carry the key; the
+`anthropic-version` header is accepted and not checked. `stop_reason`
+is `end_turn`, `max_tokens`, `stop_sequence` or `tool_use`. A
+`tool_use` block is sent whole once its arguments are known, after the
+text.
+
+## Ollama
+
+| Endpoint | Notes |
+|---|---|
+| `POST /api/chat` | NDJSON stream by default, one object with `"stream": false`; `messages` with `images` (base64), `tool_calls`, and `tool` results (matched to the calls in order); `tools`, `format` (`"json"` or a schema), `options`, `think`, `keep_alive` |
+| `POST /api/generate` | as chat for one prompt (`system`, `images`); `raw: true` sends the prompt without the template; an empty prompt loads the model (`keep_alive: 0` unloads it) |
+| `POST /api/embed`, `POST /api/embeddings` | `input` (a string or strings), `prompt` (legacy) |
+| `GET /api/tags`, `POST /api/show`, `GET /api/ps` | the registry, one model's metadata and template, the loaded models |
+| `POST /api/pull` | a registry name (`llama3.2:1b`) or `hf.co/ORG/REPO[:QUANT]`; NDJSON status lines (`pulling manifest`, `pulling model` with `completed`/`total`, `success`) |
+| `DELETE /api/delete`, `POST /api/copy`, `GET /api/version`, `GET /` | as Ollama |
+| `POST /api/create`, `POST /api/push` | `501`: models come from pulls or GGUF files |
+
+`options` accepts `num_predict`, `temperature`, `top_p`, `top_k`,
+`min_p`, `seed`, `stop`, `repeat_penalty`, `repeat_last_n`,
+`frequency_penalty` and `presence_penalty`. `num_ctx` is accepted but
+not applied: the context size is the model entry's. Any other option is
+refused with `400`. `suffix`, `template` and `context` on generate are
+refused.
+
 ## Errors
 
-Errors use OpenAI's shape:
-`{"error": {"message", "type", "param", "code"}}`. The status tells
+Errors use the protocol's own shape:
+- OpenAI: `{"error": {"message", "type", "param", "code"}}`;
+- Anthropic: `{"type": "error", "error": {"type", "message"}}`;
+- Ollama: `{"error": "message"}`. The status tells
 you the kind:
 - `400`: an invalid or unsupported field, with `param` naming it;
 - `401`: no valid key;

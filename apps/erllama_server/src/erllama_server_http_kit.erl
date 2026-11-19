@@ -13,7 +13,7 @@
 %% outlives its client.
 
 -export([read_json/2, json/2, err/3, err/4, crash/3, api_error/2]).
--export([drive/3, start_run/2, now_s/0, id/2]).
+-export([drive/3, start_run/2, now_s/0, id/2, sender/1]).
 
 -define(ACK_EVERY, 16).
 
@@ -268,6 +268,17 @@ gone(Run, Acc) ->
     {gone, Acc}.
 
 terminal(#{type := T}) -> lists:member(T, [done, cancelled, error]).
+
+%% A `Send(Obj, Acc)' for drive/3 callbacks over a Livery `Emit':
+%% `{stop, Acc}' once the client is gone.
+-spec sender(fun((term()) -> ok | {error, term()})) -> fun((term(), term()) -> {ok | stop, term()}).
+sender(Emit) ->
+    fun(Obj, Acc) ->
+        case Emit(Obj) of
+            ok -> {ok, Acc};
+            {error, _} -> {stop, Acc}
+        end
+    end.
 
 -spec now_s() -> integer().
 now_s() -> erlang:system_time(second).

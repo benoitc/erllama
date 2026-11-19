@@ -5,7 +5,15 @@
     {description, "erllama server release: models, conversations, agent runs and APIs"},
     {vsn, "0.1.0"},
     {registered, [
-        erllama_server_sup, erllama_server_runs, erllama_server_convs, erllama_server_run_sup
+        erllama_server_sup,
+        erllama_server_registry,
+        erllama_server_models,
+        erllama_server_runs,
+        erllama_server_convs,
+        erllama_server_responses,
+        erllama_server_run_sup,
+        erllama_server_pull_sup,
+        erllama_server_http
     ]},
     {mod, {erllama_server_app, []}},
     {applications, [
