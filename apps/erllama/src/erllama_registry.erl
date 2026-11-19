@@ -42,22 +42,34 @@
 %% via API
 %% =============================================================================
 
+%% Called by gen from inside the process being registered, so the
+%% monitor that removes the name when the process dies has to be taken
+%% by this module's server (a process monitoring itself never gets its
+%% own DOWN). A name still held by a dead process is taken over.
 -spec register_name(model_id(), pid()) -> yes | no.
 register_name(Name, Pid) when is_binary(Name), is_pid(Pid) ->
-    case ets:insert_new(?TABLE, {Name, Pid, monitor(process, Pid)}) of
-        true -> yes;
-        false -> no
+    case ets:insert_new(?TABLE, {Name, Pid, undefined}) of
+        true ->
+            gen_server:cast(?MODULE, {monitor, Name, Pid}),
+            yes;
+        false ->
+            case ets:lookup(?TABLE, Name) of
+                [{Name, Old, _} = Stale] when Old =/= Pid ->
+                    case is_process_alive(Old) of
+                        true ->
+                            no;
+                        false ->
+                            true = ets:delete_object(?TABLE, Stale),
+                            register_name(Name, Pid)
+                    end;
+                _ ->
+                    no
+            end
     end.
 
 -spec unregister_name(model_id()) -> model_id().
 unregister_name(Name) when is_binary(Name) ->
-    case ets:lookup(?TABLE, Name) of
-        [{Name, _Pid, MonRef}] ->
-            demonitor(MonRef, [flush]),
-            ets:delete(?TABLE, Name);
-        [] ->
-            ok
-    end,
+    _ = ets:delete(?TABLE, Name),
     Name.
 
 -spec whereis_name(model_id()) -> pid() | undefined.
@@ -110,11 +122,18 @@ init([]) ->
     {ok, #{}}.
 
 handle_call(_, _, S) -> {reply, {error, unknown_call}, S}.
-handle_cast(_, S) -> {noreply, S}.
+handle_cast({monitor, Name, Pid}, S) ->
+    Ref = monitor(process, Pid),
+    case ets:lookup(?TABLE, Name) of
+        [{Name, Pid, _}] -> true = ets:update_element(?TABLE, Name, {3, Ref});
+        _ -> demonitor(Ref, [flush])
+    end,
+    {noreply, S};
+handle_cast(_, S) ->
+    {noreply, S}.
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason}, S) ->
-    Entries = ets:match_object(?TABLE, {'_', Pid, '_'}),
-    lists:foreach(fun({Name, _, _}) -> ets:delete(?TABLE, Name) end, Entries),
+    _ = ets:match_delete(?TABLE, {'_', Pid, '_'}),
     {noreply, S};
 handle_info(_, S) ->
     {noreply, S}.

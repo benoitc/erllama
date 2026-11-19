@@ -12,6 +12,9 @@ this project adheres to [Semantic Versioning](https://semver.org).
   process receiving its events exited, holding a sequence and compute
   that nobody would use. erllama now watches the receiver of every
   stream and cancels the request when it exits.
+- A model unloaded with `unload/1` could not be loaded again under the
+  same id: `load_model/2` answered `already_loaded` for a model that no
+  longer ran, because the id was never released.
 
 ## [0.12.0] - 2026-11-19
 

@@ -351,3 +351,31 @@ finished_stream_drops_its_receiver_watch_test() ->
             R =:= #{} andalso W =:= #{}
         end)
     end).
+
+%% =============================================================================
+%% An unloaded id can be loaded again
+%% =============================================================================
+
+reload_same_id_after_unload_test() ->
+    erllama_test_helpers:with_app(fun() ->
+        {ok, <<"again">>} = erllama:load_model(<<"again">>, minimal_config()),
+        ok = erllama:unload(<<"again">>),
+        ?assertEqual({error, not_loaded}, erllama:whereis(<<"again">>)),
+        ?assertEqual({ok, <<"again">>}, erllama:load_model(<<"again">>, minimal_config())),
+        ?assertMatch({ok, _}, erllama:whereis(<<"again">>)),
+        ok = erllama:unload(<<"again">>)
+    end).
+
+%% A crashed model releases its id too.
+reload_same_id_after_crash_test() ->
+    erllama_test_helpers:with_app(fun() ->
+        {ok, Id} = erllama:load_model(<<"crashy">>, minimal_config()),
+        {ok, Pid} = erllama:whereis(Id),
+        Mon = monitor(process, Pid),
+        exit(Pid, kill),
+        receive
+            {'DOWN', Mon, process, Pid, _} -> ok
+        end,
+        ?assertEqual({ok, Id}, erllama:load_model(Id, minimal_config())),
+        ok = erllama:unload(Id)
+    end).
