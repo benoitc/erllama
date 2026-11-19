@@ -54,7 +54,11 @@ from `NextSeq`.
     agent_approve/3,
     agent_interrupt/1,
     agent_stop/1,
-    agents/0
+    agents/0,
+    mcp/0,
+    mcp_tools/0,
+    mcp_resources/1,
+    mcp_read/2
 ]).
 
 -include("erllama_server_api.hrl").
@@ -496,6 +500,7 @@ start_agent(Spec, Model, Ws) ->
                 history => [M || #{role := R} = M <- History, R =/= <<"system">>],
                 parent_key => PK,
                 policy => agent_policy(maps:get(policy, Spec, #{})),
+                mode => agent_mode(maps:get(policy, Spec, #{})),
                 budgets => maps:with(
                     [max_rounds, max_tokens, max_elapsed_ms], maps:get(budgets, Spec, #{})
                 )
@@ -511,6 +516,9 @@ start_agent(Spec, Model, Ws) ->
         {error, _} = E ->
             E
     end.
+
+agent_mode(P) when P =:= yes; P =:= read_only -> P;
+agent_mode(_) -> default.
 
 agent_policy(yes) ->
     maps:from_list([{N, auto} || N <- erllama_server_tools:names()]);
@@ -563,3 +571,34 @@ with_agent(Id, Fun) ->
         {ok, _} -> {error, not_an_agent};
         {error, _} = E -> E
     end.
+
+%% -----------------------------------------------------------------------------
+%% MCP servers
+%% -----------------------------------------------------------------------------
+
+-doc """
+The configured MCP servers: `name`, `transport`, `status` (`connecting`,
+`ready` or `down`), the number of `tools`, and the last `error`.
+""".
+-spec mcp() -> {ok, [map()]}.
+mcp() ->
+    {ok, erllama_server_mcp:status()}.
+
+-doc """
+The MCP tools agent sessions are offered now, by their namespaced name,
+with the server, the server's own name for the tool, the policy, and
+`class` (`read` when the server marks the tool read-only).
+""".
+-spec mcp_tools() -> {ok, [map()]}.
+mcp_tools() ->
+    {ok, [maps:without([parameters], T) || T <- erllama_server_mcp:catalog()]}.
+
+-doc "The resources an MCP server lists, one per line.".
+-spec mcp_resources(binary()) -> {ok, binary()} | {error, binary()}.
+mcp_resources(Server) ->
+    erllama_server_mcp:resources(Server).
+
+-doc "The text of a resource of an MCP server.".
+-spec mcp_read(binary(), binary()) -> {ok, binary()} | {error, binary()}.
+mcp_read(Server, Uri) ->
+    erllama_server_mcp:read_resource(Server, Uri).

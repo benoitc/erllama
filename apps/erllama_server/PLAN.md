@@ -258,8 +258,10 @@ A bad value makes `start_link` fail.
 - **`edit_file(path, old, new, replace_all)`:** exact match, refused
   when the text is absent or ambiguous.
 - **`shell(command, timeout_ms, background)`:**
-  - runs `/bin/sh` in the workspace, in its own process group
-    (`set -m`);
+  - runs `/bin/sh` in the workspace, as the leader of its own process
+    group (the emulator starts port programs that way; `set -m` was
+    dropped because Linux `/bin/sh` turns job control off without a
+    terminal);
   - keeps the first and last 16 KiB of output;
   - on timeout or interrupt, sends TERM to the group, then KILL;
   - `background` returns a job id at once.
@@ -276,3 +278,61 @@ A bad value makes `start_link` fail.
 - **CLI:** `erllama agent MODEL --workspace PATH [--yes | --read-only]`
   runs a line loop. It prints tool activity, asks for approvals, and
   exits without stopping the session, which `erllama agents` lists.
+
+---
+
+# Phase 5: barrel_mcp bridge (design)
+
+## Shape
+
+- **`erllama_server_mcp`**, a gen_server after `erllama_server_agent_sup`
+  in the rest_for_one tree (its restart never stops a session). One
+  `barrel_mcp_client` per `mcp_servers` entry, linked (a restart never
+  leaves a second stdio process), monitored, reconnected with backoff
+  (1 s doubling to 60 s). The tool list is fetched from a helper
+  process, never inside the gen_server, and refreshed every 30 s; a
+  client still in its handshake (`not_ready`) is asked again shortly.
+- **Catalog entries** `#{name, server, remote, description, parameters,
+  class, policy}`. `name` is `server__tool` with anything outside
+  `[A-Za-z0-9_-]` replaced, cut to 64 bytes, suffixed on a collision.
+  `class` is `read` when the tool's `readOnlyHint` is true, else
+  `write`. No atom is made from a server's names.
+- **Calls** run in the session's tool worker: the client is looked up
+  (an unavailable server is an error result), the call has
+  `mcp_timeout_ms`, exits are caught. `render/1` turns a result into
+  text: text blocks, structured content as JSON, media described,
+  embedded text resources shown, `isError` as an error result.
+
+## Sessions
+
+- `generate/1` takes a catalog snapshot (`#d.mcp`), offers the native
+  tools plus the snapshot's tools not denied, and the round's calls
+  are planned and dispatched against that snapshot.
+- Policy for an MCP tool: a server set to `deny` wins; then the
+  session's per-tool policy; then the session mode (`yes`: `auto`,
+  `read_only`: deny `write` tools); then the server's policy.
+- Dispatch: the call's context carries the catalog entry, and
+  `erllama_server_tools:execute/3` sends it to the server.
+
+## Endpoint
+
+- `mcp_endpoint => true` mounts `livery_mcp:handler/1` at `/mcp` on the
+  HTTP listener, behind the same middleware (API keys included), and
+  registers `erllama_models` and `erllama_chat` in barrel_mcp's
+  registry. A chat is a stateless run through `start_run/1`; a guard
+  process cancels it if the tool handler is stopped.
+
+## API, CLI, config
+
+- `mcp/0` (status), `mcp_tools/0`, `mcp_resources/1`, `mcp_read/2`;
+  `erllama mcp [tools | resources SERVER | read SERVER URI]`.
+- `mcp_servers` (validated: names, transports, policies, unique names),
+  `mcp_timeout_ms`, `mcp_endpoint`.
+
+## Tests
+
+- CT `erllama_server_mcp_SUITE` against real servers: Streamable HTTP
+  through livery_mcp in the test node, stdio through an `erl`
+  subprocess running `barrel_mcp:start_stdio/0`.
+- eunit `erllama_server_mcp_tests`: names, rendering, configuration.
+

@@ -132,8 +132,12 @@ default_policy(N) ->
 %% Run one tool. `Ctx': `workspace', `owner' (the session, which owns
 %% background jobs) and `jobs' (`#{JobId => pid()}'). Returns the text for the model,
 %% as a result or as an error it can act on, and any new job.
+%% With `mcp' (the catalog entry of an MCP tool), the call goes to its
+%% server.
 -spec execute(binary(), map(), map()) ->
     {ok | error, binary()} | {ok, binary(), {job, binary(), pid()}}.
+execute(_Name, Args, #{mcp := #{server := Server, remote := Tool}}) when is_map(Args) ->
+    erllama_server_mcp:call(Server, Tool, Args, erllama_server_config:get(mcp_timeout_ms));
 execute(Name, Args, #{workspace := Ws} = Ctx) when is_map(Args) ->
     case Name of
         <<"read_file">> -> erllama_server_tool_fs:read_file(Ws, Args);

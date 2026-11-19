@@ -7,7 +7,8 @@
 %% present (`#{port => 8080}', on 127.0.0.1 unless `ip' says otherwise).
 %% Every request goes through one middleware stack (request ids, access
 %% log, API keys, body size, concurrency limit, metrics, crash
-%% handling) and then to the adapter of its protocol.
+%% handling) and then to the adapter of its protocol, or to the MCP
+%% endpoint when `mcp_endpoint' is on.
 
 -export([start_link/0, port/0, routes/0, middleware/0]).
 
@@ -22,7 +23,7 @@ start_link() ->
             Listen = #{ip => maps:get(ip, Http, {127, 0, 0, 1}), port => port(Http)},
             Opts = #{
                 http => Listen,
-                router => livery_router:compile(routes()),
+                router => livery_router:compile(routes() ++ mcp_routes()),
                 middleware => middleware()
             },
             case livery:start_service(Opts) of
@@ -32,6 +33,16 @@ start_link() ->
                 {error, _} = E ->
                     E
             end
+    end.
+
+%% The MCP endpoint, when `mcp_endpoint' turns it on.
+mcp_routes() ->
+    case erllama_server_config:get(mcp_endpoint) of
+        true ->
+            ok = erllama_server_mcp_endpoint:register_tools(),
+            erllama_server_mcp_endpoint:routes();
+        false ->
+            []
     end.
 
 %% `ERLLAMA_HTTP_PORT' overrides the configured port.

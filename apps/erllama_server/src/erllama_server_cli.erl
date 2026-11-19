@@ -41,6 +41,8 @@
     "                                /quit leaves the session running, /stop ends it\n",
     "  agents                        list the agent sessions\n",
     "  agent-stop AGENT              end an agent session\n",
+    "  mcp [tools | resources SERVER | read SERVER URI]\n",
+    "                                the MCP servers agent sessions use\n",
     "  runs                          list the runs and downloads the release holds\n",
     "  attach JOB [--from SEQ]       follow a run or download from an event sequence\n",
     "  cancel JOB                    cancel a run or download\n",
@@ -131,6 +133,8 @@ command("agents") ->
     {[], fun erllama_server_cli_agent:agents/4};
 command("agent-stop") ->
     {[], fun erllama_server_cli_agent:stop/4};
+command("mcp") ->
+    {[], fun erllama_server_cli_mcp:mcp/4};
 command("runs") ->
     {[], fun runs/4};
 command("attach") ->

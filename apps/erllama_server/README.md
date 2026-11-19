@@ -75,6 +75,9 @@ The model reads, searches and edits files in the workspace and runs
 commands there, asking before it changes anything. See
 [Agent sessions](../../guides/server/agent.md).
 
+Sessions can also use the tools of MCP servers, and the release can
+serve its models at `/mcp`. See [MCP servers](../../guides/server/mcp.md).
+
 ## Configuration
 
 The `erllama_server` application environment (`config/sys.config` in
@@ -101,6 +104,9 @@ the release). A bad value stops the release from starting.
 | `max_body_bytes` | `33554432` | HTTP request body limit |
 | `max_http_requests` | `64` | HTTP requests in flight |
 | `max_agents` | `16` | agent sessions at once |
+| `mcp_servers` | `[]` | MCP servers whose tools agent sessions use (see [MCP servers](../../guides/server/mcp.md)) |
+| `mcp_timeout_ms` | `60000` | the longest an MCP call may take |
+| `mcp_endpoint` | `false` | serve the release's models at `/mcp` on the HTTP listener |
 
 The library's own settings (cache tiers, scheduler) go under `erllama`;
 see the [configuration guide](../../guides/configuration.md).
@@ -130,7 +136,9 @@ see the [configuration guide](../../guides/configuration.md).
 | `erllama_server_agent_gen` | one generation round of a session |
 | `erllama_server_tools`, `_tool_fs`, `_tool_shell` | the native tools, their policies, file tools and shell jobs |
 | `erllama_server_workspace` | keeps tool paths inside the workspace |
-| `erllama_server_cli_agent`, `erllama_server_cli_format` | the CLI's agent commands and its output formatting |
+| `erllama_server_mcp` | the MCP clients: connections, tool catalog, calls and their results |
+| `erllama_server_mcp_endpoint` | the opt-in `/mcp` endpoint and its tools |
+| `erllama_server_cli_agent`, `erllama_server_cli_mcp`, `erllama_server_cli_format` | the CLI's agent and MCP commands and its output formatting |
 | `erllama_server_http_ops` | health, readiness, metrics |
 | `erllama_server_convs` | conversations: history, last cache key, one active run each |
 | `erllama_server_generate` | renders chat or prompt requests into an erllama stream and parses the result |
@@ -145,4 +153,6 @@ downloads from a local stand-in for Hugging Face and Ollama
 `test/erllama_server_models_SUITE.erl` covers loading, keep-alive and
 eviction; `test/erllama_server_http_SUITE.erl` drives the HTTP APIs over
 a socket; `test/erllama_server_agent_SUITE.erl` drives agent sessions
-with a scripted model (`test/erllama_server_agent_script.erl`).
+with a scripted model (`test/erllama_server_agent_script.erl`);
+`test/erllama_server_mcp_SUITE.erl` connects sessions to real MCP
+servers over HTTP and stdio.

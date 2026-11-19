@@ -124,7 +124,7 @@ Validation (OTP 28.3.1, local):
 | loop | done | generate, approve, run tools, append results, generate again; a generator behaviour (`erllama_server_agent_gen`, scripted in tests); the model is held for each turn and loaded on demand |
 | tools | done | `read_file` (paginated), `list_dir`, `search`, `write_file` (create only), `edit_file` (exact match), `shell` (timeout, head and tail output, background jobs), `shell_status`, `shell_kill`; paths confined to the workspace, symlinks included |
 | execution order | done | reads run together; a write waits for the calls before it and holds back the ones after; results in call order; tool failures and crashes become error results |
-| process groups | done | every command in its own group (`set -m`); timeout, interrupt, kill or the session's end kill the whole group, also before the group is known |
+| process groups | done | every command leads its own process group (the emulator starts port programs that way, on Linux and macOS); timeout, interrupt, kill or the session's end kill the whole group |
 | policy and approvals | done | `auto`, `ask`, `deny` per tool, `yes` and `read_only` presets; `approval_request` events; allow, deny, always |
 | budgets, queue, interrupt | done | rounds, tokens, time per turn; input during a turn queued; interrupt cancels generation and tools and records unfinished calls as interrupted |
 | HTTP callers' tools | done | never executed: HTTP runs only stream calls back to the client |
@@ -132,6 +132,19 @@ Validation (OTP 28.3.1, local):
 
 Validation: `erllama_server_agent_SUITE` (9 cases with a scripted model: plain answers, ordering, approvals, unknown tools and outside paths, round budget, queued input, interrupt killing a shell and its descendants, background jobs, stopping and continuing a conversation), `erllama_server_tools_tests` (workspace confinement including symlinks, paging, listing, search, write and edit), and the gated real-model case on Qwen2.5 1.5B (the model reads a file with its tools to answer).
 
-## Phases 5 to 7
+## Phase 5: barrel_mcp bridge (implemented)
+
+| Feature | State | Notes |
+|---|---|---|
+| clients | done | `erllama_server_mcp`: one barrel_mcp client per configured server (stdio or Streamable HTTP), started in the background, reconnected with backoff, tool list refreshed every 30 s; a server that is down never blocks the release or a session |
+| catalog | done | tools namespaced `server__tool` (sanitised, at most 64 bytes, suffixed on a collision); a snapshot per generation round; `readOnlyHint` tools run with reads, others are ordered like writes |
+| results | done | text, structured content as JSON, media described, embedded text resources shown; tool errors, timeouts and lost servers become error results |
+| policy | done | per server (`ask` by default, `auto`, `deny`); a denied server stays denied; `--yes` and `--read-only` apply to MCP tools; per-tool overrides through the service API |
+| endpoint | done | opt-in `mcp_endpoint`: `/mcp` on the HTTP listener behind the API keys, tools `erllama_models` and `erllama_chat` (a stateless run, cancelled when the caller gives up) |
+| API and CLI | done | `mcp/0`, `mcp_tools/0`, `mcp_resources/1`, `mcp_read/2`; `erllama mcp [tools \| resources SERVER \| read SERVER URI]` |
+
+Validation: `erllama_server_mcp_SUITE` (6 cases against real servers: Streamable HTTP through livery_mcp in the test node and stdio through an `erl` subprocess; namespaced tools offered and called, media rendering, server and session policies with approvals, tool errors and timeouts, an unreachable server, a server going away and coming back, the release's own endpoint with API keys) and `erllama_server_mcp_tests` (names, rendering, configuration).
+
+## Phases 6 and 7
 
 Not started.

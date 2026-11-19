@@ -17,7 +17,8 @@ start_link() ->
 %% models (holders are runs), the job table and the conversation store
 %% (they hold the pids and locks of the jobs), then the jobs. When one
 %% restarts, everything after it restarts too, so nothing points at a
-%% stale process. The HTTP listener comes last: it only takes requests
+%% stale process. The MCP clients come after the agent sessions, so a
+%% restart of theirs never stops a session. The HTTP listener comes last: it only takes requests
 %% once everything it calls is up.
 init([]) ->
     SupFlags = #{strategy => rest_for_one, intensity => 5, period => 30},
@@ -30,6 +31,7 @@ init([]) ->
         supervisor(erllama_server_run_sup),
         supervisor(erllama_server_pull_sup),
         supervisor(erllama_server_agent_sup),
+        worker(erllama_server_mcp),
         worker(erllama_server_http)
     ],
     {ok, {SupFlags, Children}}.

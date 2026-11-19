@@ -33,7 +33,12 @@ defaults() ->
         api_keys => [],
         allow_unauthenticated => false,
         max_body_bytes => 33554432,
-        max_http_requests => 64
+        max_http_requests => 64,
+        %% MCP: servers whose tools agent sessions may use, and the opt-in
+        %% endpoint exposing the release to MCP clients.
+        mcp_servers => [],
+        mcp_timeout_ms => 60000,
+        mcp_endpoint => false
     }.
 
 -spec validate() -> ok | {error, term()}.
@@ -76,19 +81,43 @@ valid(ollama_base_url, V) ->
     is_url(V);
 valid(models, V) ->
     is_list(V) andalso lists:all(fun valid_model/1, V);
-valid(http, undefined) ->
-    true;
-valid(http, #{port := P} = H) ->
-    is_integer(P) andalso P >= 0 andalso P < 65536 andalso
-        valid_ip(maps:get(ip, H, {127, 0, 0, 1}));
-valid(http, _) ->
-    false;
+valid(http, V) ->
+    valid_http(V);
 valid(api_keys, V) ->
     is_list(V) andalso lists:all(fun is_name/1, V);
 valid(allow_unauthenticated, V) ->
     is_boolean(V);
+valid(mcp_servers, V) ->
+    is_list(V) andalso lists:all(fun valid_mcp/1, V) andalso unique_names(V);
+valid(mcp_endpoint, V) ->
+    is_boolean(V);
 valid(_, V) ->
     is_integer(V) andalso V > 0.
+
+valid_http(undefined) ->
+    true;
+valid_http(#{port := P} = H) ->
+    is_integer(P) andalso P >= 0 andalso P < 65536 andalso
+        valid_ip(maps:get(ip, H, {127, 0, 0, 1}));
+valid_http(_) ->
+    false.
+
+%% An MCP server: a name (letters, digits, `_', `-') and a transport.
+valid_mcp(#{name := N, transport := stdio, command := C} = S) ->
+    mcp_name(N) andalso is_path(C) andalso mcp_policy(S);
+valid_mcp(#{name := N, transport := http, url := U} = S) ->
+    mcp_name(N) andalso is_url(U) andalso mcp_policy(S);
+valid_mcp(_) ->
+    false.
+
+mcp_name(N) ->
+    is_name(N) andalso re:run(unicode:characters_to_binary(N), <<"^[A-Za-z0-9_-]+$">>) =/= nomatch.
+
+mcp_policy(S) -> lists:member(maps:get(policy, S, ask), [auto, ask, deny]).
+
+unique_names(Servers) ->
+    Names = [unicode:characters_to_binary(N) || #{name := N} <- Servers],
+    length(Names) =:= length(lists:usort(Names)).
 
 %% A model registered at boot: `#{name, path}' plus load options.
 valid_model(#{name := N, path := P}) -> is_name(N) andalso is_path(P);

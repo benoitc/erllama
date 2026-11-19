@@ -107,5 +107,5 @@ stops its background jobs.
 Tools declared in an HTTP request (`tools` in OpenAI, Anthropic or
 Ollama requests) are never run by the server: the model's calls go back
 to the client, which runs them. Only agent sessions run tools, and only
-the tools listed here (and the MCP servers the release is configured
-with).
+the tools listed here and those of the MCP servers the release is
+configured with (see [MCP servers](mcp.md)).
