@@ -4,7 +4,7 @@
 {application, erllama, [
     {description,
         "Native Erlang/OTP wrapper around llama.cpp with token-exact tiered KV cache; cache more warm state than fits in RAM"},
-    {vsn, "0.11.0"},
+    {vsn, "0.12.0"},
     {registered, [
         erllama_sup,
         erllama_registry,
@@ -31,6 +31,10 @@
         %% is #{name, backend => disk | ram_file, root}. The RAM tier
         %% is always on.
         {tiers, []},
+        %% Byte budget of the RAM tier: a byte count, {fraction, F} of
+        %% total system memory, or 0 to turn RAM saves off. The oldest
+        %% RAM rows are evicted to make room for new saves.
+        {ram_tier_budget, {fraction, 0.25}},
         %% Cache policy defaults; every key can be overridden per model
         %% in the `policy' load config map.
         {min_tokens, 512},
@@ -42,8 +46,11 @@
         {session_resume_wait_ms, 500},
         %% Bound for the synchronous evict / shutdown saves.
         {evict_save_timeout_ms, 30000},
-        %% Default model fingerprint mode: safe | gguf_chunked | fast_unsafe.
-        {fingerprint_mode, safe},
+        %% How a model's fingerprint is derived from its GGUF file when
+        %% the load config gives none: gguf_chunked (size + first 64 MiB
+        %% + last 4 MiB), safe (whole-file SHA-256) or fast_unsafe
+        %% (path, size, mtime).
+        {fingerprint_mode, gguf_chunked},
         %% Concurrent cache writers (default: 2 * schedulers + 1).
         %% {writer_max_concurrent, 9},
         %% LRU size of the per-model chat template cache.

@@ -69,8 +69,9 @@
 %% `step_tick/1` enforces total tokens ≤ `total_batch_budget` (mirrors
 %% `context_opts.n_batch`, default 512). If `total_batch_budget` is
 %% smaller than the number of in-flight decoders, the gen_statem
-%% crashes deliberately so the supervisor restarts and the operator
-%% fixes `n_batch` / `n_seq_max`. Otherwise prefill rows are sliced
+%% crashes deliberately so the operator fixes `n_batch` /
+%% `n_seq_max`. Models are temporary children of erllama_model_sup:
+%% a crashed model stays down until it is loaded again. Otherwise prefill rows are sliced
 %% head-first to fit; truncated tails resume next tick.
 %%
 %% ## Chunked prefill
@@ -802,9 +803,10 @@ evict(Model) ->
     call(Model, evict, save_timeout()).
 
 -doc """
-Fire a `shutdown` save synchronously and return. Called from the
-application's `prep_stop` hook so live state survives a graceful
-restart.
+Fire a `shutdown` save of the live context of every in-flight request
+and return; the requests keep running. `erllama:unload/1` and the
+application's `prep_stop` hook call it so that work survives an
+unload or a graceful stop.
 """.
 -spec shutdown(model()) -> ok | {error, not_loaded | timeout}.
 shutdown(Model) ->
@@ -1031,11 +1033,14 @@ init([ModelId, Config0]) ->
     end.
 
 build_init_data(ModelId, Config, Backend, BState) ->
-    Fp = maps:get(fingerprint, Config, default_fingerprint()),
     CtxOpts = maps:get(context_opts, Config, #{}),
     NSeqMax = maps:get(n_seq_max, CtxOpts, 1),
     NBatch = maps:get(n_batch, CtxOpts, 512),
     Meta = backend_extra_metadata(Backend, BState),
+    %% A configured fingerprint wins; otherwise the one the backend
+    %% derived from the model file. Only a backend with no file (the
+    %% stub) falls back to the shared zero default.
+    Fp = maps:get(fingerprint, Config, maps:get(fingerprint, Meta, default_fingerprint())),
     {QuantType, QuantBits} = configured_quant(Config, Meta),
     #data{
         model_id = ModelId,
@@ -1043,7 +1048,7 @@ build_init_data(ModelId, Config, Backend, BState) ->
         tier = maps:get(tier, Config, ram),
         fingerprint = Fp,
         fingerprint_mode = maps:get(
-            fingerprint_mode, Config, application:get_env(erllama, fingerprint_mode, safe)
+            fingerprint_mode, Config, application:get_env(erllama, fingerprint_mode, gguf_chunked)
         ),
         quant_type = QuantType,
         quant_bits = QuantBits,
@@ -1131,7 +1136,8 @@ resolve_policy(Config, NBatch) ->
     },
     maps:merge(Defaults, maps:get(policy, Config, #{})).
 
-terminate(_Reason, _State, #data{model_id = ModelId, backend = B, backend_state = S} = Data) ->
+terminate(Reason, _State, #data{model_id = ModelId, backend = B, backend_state = S} = Data) ->
+    ok = fail_callers_on_stop(Reason, Data),
     _ = erllama_inflight:obs_delete(ModelId),
     _ = erllama_inflight:delete_abort_handle(self()),
     _ =
@@ -1148,6 +1154,18 @@ terminate(_Reason, _State, #data{model_id = ModelId, backend = B, backend_state 
     B:terminate(S),
     ok;
 terminate(_Reason, _State, _Data) ->
+    ok.
+
+%% A clean stop (unload/1, application stop) would otherwise leave
+%% streaming callers and queued admits waiting until their own
+%% timeout: tell them the model is gone. Crash paths notify their
+%% callers before stopping, so they are left alone here.
+fail_callers_on_stop(Reason, Data) when
+    Reason =:= normal; Reason =:= shutdown; element(1, Reason) =:= shutdown
+->
+    ok = fail_all_requests(Data, not_loaded),
+    fail_pending_admits(Data, {error, not_loaded});
+fail_callers_on_stop(_Reason, _Data) ->
     ok.
 
 %% Placeholder fingerprint when none supplied.
@@ -4266,12 +4284,6 @@ fire_finish_save_for_req(LiveTokens, Req, Data) ->
     end.
 
 fire_save_if(false, _Reason, _Tokens, _Req, _Data) ->
-    not_fired;
-fire_save_if(true, _Reason, _Tokens, _Req, #data{tier = Tier}) when
-    Tier =/= disk, Tier =/= ram_file
-->
-    %% RAM-only or unknown tier: no persistent writer. The slab lives
-    %% in the in-memory tier until the request finishes; nothing to save.
     not_fired;
 fire_save_if(true, Reason, Tokens, Req, Data) ->
     BuildMeta = build_meta_for(Reason, Tokens, Req, Data),

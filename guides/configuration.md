@@ -17,6 +17,8 @@ Every key with its default; all of them are declared in
     #{name => kv_disk, backend => disk,     root => "/var/lib/erllama/kvc"},
     #{name => kv_shm,  backend => ram_file, root => "/dev/shm/erllama"}
   ]},
+  %% Byte budget of the RAM tier: bytes, {fraction, F} of system memory, or 0.
+  {ram_tier_budget, {fraction, 0.25}},
 
   %% --------------- Save-policy gates -----------------------------
   {min_tokens,             512},
@@ -63,6 +65,24 @@ with `tier_srv => name` and `tier => backend`. The same can be done at
 runtime with `erllama_cache:add_tier/1`; `erllama_cache:list_tiers/0`
 shows what is running.
 
+### `ram_tier_budget`
+
+How much memory the RAM tier may hold. Models on the default `tier =>
+ram` save there, so this is what bounds the cache when you configure
+no other tier.
+
+- `{fraction, F}` (default `{fraction, 0.25}`): `F` of the total
+  system memory, read at startup. Without os_mon's memory data it
+  falls back to `F` of 4 GiB.
+- A byte count, for a fixed budget.
+- `0`: RAM saves are off; requests on the `ram` tier always run cold.
+
+When a save would exceed the budget, the least recently and least
+often used RAM rows are evicted first. A save larger than the whole
+budget, or one that cannot fit because every row is in use, is
+dropped and counted in `saves_dropped`. An invalid value stops the
+application at startup.
+
 ### Save-policy gates
 
 See the [caching guide](caching.md#save-policy-gates) for what each
@@ -84,13 +104,16 @@ multi-turn cold misses on slow storage.
 
 ### `fingerprint_mode`
 
-How to verify the model fingerprint at load:
+How a model's fingerprint is derived from its GGUF file when the load
+config has no `fingerprint` (default `gguf_chunked`):
 
-- `safe` - full SHA-256 over the file. Slow on multi-GB GGUFs.
-- `gguf_chunked` - fingerprint metadata + first weights tensor.
-  Catches accidental corruption, not malicious tampering.
-- `fast_unsafe` - trust the supplied fingerprint blindly. Use only
-  when you fingerprint upstream and pass the digest through.
+- `gguf_chunked`: file size plus the first 64 MiB and the last 4 MiB.
+  Constant cost.
+- `safe`: SHA-256 of the whole file, about half a second per GB.
+- `fast_unsafe`: absolute path, size and modification time.
+
+See [Loading a model](loading.md#fingerprint_mode) for when to pick
+which.
 
 ### `writer_max_concurrent`
 

@@ -14,9 +14,9 @@ token-id list (the model layer detokenises before keying). This is
 the ds4 model: content-addressed by the surface text, no session id.
 
 Why bytes and not tokens? Across agent turns the *same* logical
-prompt routinely retokenises — chat-template wrapping, tool
+prompt routinely retokenises (chat-template wrapping, tool
 rendering, the assistant's generated ids vs the re-tokenised
-assistant text. Keying on tokens makes those turns miss and re-cold-
+assistant text). Keying on tokens makes those turns miss and re-cold-
 prefill every time. Keying on the rendered bytes makes the leading
 system + tools + history (stable text) hit even when the
 tokenisation drifts. The exact tokens still travel in the checkpoint
@@ -50,7 +50,8 @@ tokenize(byte_suffix)`); the token boundaries at the seam then differ
 from a fresh full tokenisation, but the byte stream is identical, so
 the resume is sound (ds4's contract). The recomputed key folds in
 the current model's `fp/quant/ctx`, so rows from another
-model/quant/context never match — no separate namespace fields.
+model/quant/context never match; there are no separate namespace
+fields.
 
 Old token-keyed cache files (KVC format v1) are not adopted: the
 format version was bumped to v2 and v1 files are rejected on the
@@ -62,18 +63,21 @@ old key scheme; the cache simply refills under the byte scheme.
 We ship three tiers because no single layer is the right answer
 across deployments:
 
-- **`ram`** (ETS slabs) — lowest latency, smallest budget. ETS reads
-  are sub-µs hot-path-friendly; writes are funnelled through one
-  owner process per table.
-- **`ram_file`** (`/dev/shm`) — fast and effectively unlimited by
+- **`ram`** (ETS slabs): lowest latency, smallest budget, and the
+  default tier. ETS reads are sub-µs and hot-path-friendly; stores go
+  through `erllama_cache_ram`, which enforces `ram_tier_budget` by
+  evicting the least used RAM rows before inserting.
+- **`ram_file`** (`/dev/shm`): fast and effectively unlimited by
   process address space. Survives a model-supervisor restart but
   not a node restart.
-- **`disk`** — survives everything. The cheap tier; deploy with the
+- **`disk`**: survives everything. The cheap tier; deploy with the
   largest quota of the three.
 
-Each tier is independently supervised, has its own byte budget, and
-its own LRU. A save written to one tier never moves; the disk tier
-is intentionally not a "promotion target" of the RAM tier — that
+Each tier is independently supervised. The RAM tier has a byte
+budget (`ram_tier_budget`); the file tiers are bounded by their
+storage and emptied by eviction (lowest frecency first). A save
+written to one tier never moves; the disk tier
+is intentionally not a "promotion target" of the RAM tier: that
 would force every saved row to be re-encoded twice.
 
 Why is the disk tier first-class instead of a "fallback"? Because
@@ -88,13 +92,13 @@ enough to keep restore cost in the millisecond range.
 
 The meta server (`erllama_cache_meta_srv`) is the only process that
 mutates the meta ETS, the LRU, and the reservation table. Every
-write — claim, release, evict, save announce — goes through a
+write (claim, release, evict, save announce) goes through a
 gen_server call. Reads stay on ETS directly via `ets:lookup/2`.
 
 The split is deliberate: hot-path reads must not contend on a
 gen_server message queue, but writes must serialise so we never
 race two reservations for the same key. `ets:select_replace/2` was
-considered for in-place atomic updates but rejected — the
+considered for in-place atomic updates but rejected: the
 reservation state machine is rich enough that single-row CAS would
 not be enough, and we'd need a lock anyway.
 
@@ -102,17 +106,20 @@ not be enough, and we'd need a lock anyway.
 
 Five reasons, each with distinct semantics:
 
-| Reason | Sync? | Trigger | Why it's a separate reason |
-|---|---|---|---|
-| `cold` | async | After a cold prefill, at trimmed-prefix boundary | First save for this prefix; we want it on stable storage as soon as possible. |
-| `continued` | async | Every `continued_interval` tokens during generation | Keeps the cache useful even if generation is interrupted. |
-| `finish` | async | End of generation, captures prompt+reply | Multi-turn flows resume from this row. |
-| `evict` | sync | Holder asked to release | Pressure-driven; must complete before the slab returns to the pool. |
-| `shutdown` | sync | `prep_stop` or `unload/1` | Best-effort save before the model dies; capped by `evict_save_timeout_ms`. |
+| Reason | Trigger | Why it's a separate reason |
+|---|---|---|
+| `cold` | After a cold prefill, at the trimmed-prefix boundary | First save for this prefix; we want it stored as soon as possible. |
+| `continued` | Every `continued_interval` tokens during generation | Keeps the cache useful even if generation is interrupted. |
+| `finish` | End of generation, captures prompt+reply | Multi-turn flows resume from this row. |
+| `agent_prefix` | At `prefix_checkpoint_len` | A static prefix shared by many requests; pinned against eviction. |
+| `evict` | `erllama:evict/1` | Saves the live context of in-flight requests on demand. |
+| `shutdown` | `erllama:shutdown/1`, `unload/1`, application stop | Best-effort save of in-flight work before the model goes away; capped by `evict_save_timeout_ms`. |
 
-The async/sync distinction is load-bearing. `cold` and `continued`
-must not block the request path; `evict` and `shutdown` must block
-because the holder is going away.
+Every save runs in the model process, on the request path: the KV
+state is packed and written before the model takes its next step,
+so a save delays every request co-batched on that model. That cost
+is why the save policy gates exist, and why file saves that find the
+writer pool full are dropped (`saves_dropped`) instead of waiting.
 
 ## What the cache is not
 

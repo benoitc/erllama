@@ -35,7 +35,12 @@ ram_file  Files on /dev/shm. Fast, capped only by tmpfs size.
 disk      Files on persistent storage. Survives restarts.
 ```
 
-The RAM tier is always on. Add `ram_file` and `disk` tiers with
+The RAM tier is always on and is where models save by default
+(`tier => ram`). Its size is bounded by `ram_tier_budget` (25% of
+system memory by default; see the
+[configuration reference](configuration.md#ram_tier_budget)); when a
+new save does not fit, the least used RAM rows are evicted first.
+Add `ram_file` and `disk` tiers with
 `erllama_cache:add_tier/1` or the `tiers` application environment key;
 each one is a supervised server rooted at a directory. A save is
 written to the tier the model is configured with (`tier` + `tier_srv`
@@ -60,37 +65,47 @@ milliseconds when a hit comes in.
 
 ## When does a save happen?
 
-The per-model `gen_statem` fires saves at five well-defined moments,
-each with its own `save_reason`:
+The model process saves at these moments, each with its own
+`save_reason`:
 
-| Reason | When | Sync? |
-|---|---|---|
-| `cold` | Right after a cold prefill, at the trimmed-prefix boundary. Async - the writer pool does the work. |
-| `continued` | Every `continued_interval` tokens during generation. Async. |
-| `finish` | At the end of a completion, capturing prompt + reply. Async. |
-| `evict` | When a holder is asked to release its slab. Sync (pause decode, pack, release). |
-| `shutdown` | On `prep_stop` or `unload/1`. Sync, capped by `evict_save_timeout_ms`. |
+| Reason | When |
+|---|---|
+| `cold` | Right after a cold prefill, at the trimmed-prefix boundary. |
+| `continued` | Every `continued_interval` tokens during generation. |
+| `finish` | At the end of a completion, capturing prompt + reply. |
+| `agent_prefix` | When a request sets `prefix_checkpoint_len`, at that boundary. The row is pinned so eviction keeps it. |
+| `evict` | When you call `erllama:evict/1`. |
+| `shutdown` | When you call `erllama:shutdown/1` or `unload/1`, and when the erllama application stops. |
 
-Async saves go through `erllama_cache_writer` - a pool of dirty-IO
-workers. Sync saves block the calling process until the file is on
-stable storage.
+`evict` and `shutdown` save the live context of every in-flight
+request and are capped by `evict_save_timeout_ms`; the others follow
+the save policy gates below.
+
+A save runs in the model process: it packs the KV state and writes it
+to the model's tier before the model moves on. RAM saves are a memory
+copy. File saves (`ram_file`, `disk`) also take a slot in the writer
+pool (`writer_max_concurrent`); when every slot is busy, the save is
+dropped and counted in `saves_dropped` rather than waited for.
 
 ## When does a hit happen?
 
-Three lookup paths, in order of preference:
+Every request tries three lookups, in this order:
 
-1. **Exact key.** Caller passes the exact `parent_key` from the
-   previous turn. Cheapest. Used by Erlang-native multi-turn flows.
-2. **Resume.** Caller passes a `parent_key` from an earlier turn,
-   and the new prompt strictly extends the cached prefix.
-3. **Longest-prefix walk.** No `parent_key` supplied. The cache
-   walks the new prompt's tokens backward by the configured stride
-   (`boundary_align_tokens`) and probes the index for each
-   alignment. The longest cached prefix wins.
+1. **Exact key.** The key of the whole rendered prompt. Hits when the
+   same prompt was saved before.
+2. **Resume.** Only when you pass `parent_key` (the `finish_key` of
+   an earlier turn) and the new prompt extends that row's text. If
+   the earlier turn's save is still being written, erllama waits up
+   to `session_resume_wait_ms` for it.
+3. **Longest saved prefix.** erllama checks the saved rows of this
+   model from the longest prefix of the prompt down and resumes from
+   the longest one it finds. Each check is an exact key match on that
+   prefix.
 
-For stateless callers - OpenAI/Anthropic-shaped HTTP APIs that
-resend the full conversation each turn - option 3 is what you want.
-You don't have to do anything; just call `erllama:complete/2`.
+Stateless callers (OpenAI/Anthropic-shaped HTTP APIs that resend the
+full conversation each turn) are served by lookup 3 without doing
+anything; `parent_key` only saves the prefix scan when you already
+track turns.
 
 A warm restore can still fail mid-flight: recurrent / hybrid models
 (Mamba, RWKV, Jamba, ...) refuse the 1-token removal the exact-hit
@@ -114,7 +129,7 @@ behind a few thresholds, all overridable per-model.
 | `cold_max_tokens` | 30 000 | Cap on cold-save size. Protects against pathological prompts. |
 | `continued_interval` | 2048 | Fire a `continued` save every N generated tokens. |
 | `boundary_trim_tokens` | 32 | Drop the last N tokens before saving. Mid-token, mid-sentence boundaries make poor resume points; trim to a safe alignment. |
-| `boundary_align_tokens` | 2048 | Round trim down to a multiple of this. Sets the longest-prefix walk's stride. |
+| `boundary_align_tokens` | 2048 | Round the cold-save point down to a multiple of this, so cold saves of similar prompts land on the same boundary. |
 | `session_resume_wait_ms` | 500 | When a `parent_key` is supplied and the cache sees an in-flight finish save, wait up to this long for it to publish before falling through to a fresh prefill. |
 | `prefill_chunk_size` | `max(64, n_batch div 4)` | Per-tick cap on how many tokens a single prefill row contributes. Not a save gate - lives in the same `policy` map but caps the scheduler's per-tick slice so a long prompt never monopolises the batch. `infinity` to disable. |
 
@@ -167,7 +182,7 @@ erllama_cache:info().
 %% Synchronous full eviction pass: returns {evicted, N}.
 erllama_cache:gc().
 
-%% Free at least N bytes, oldest LRU first: returns {evicted, N, BytesFreed}.
+%% Free at least N bytes, least used rows first: returns {evicted, N, BytesFreed}.
 erllama_cache:evict_bytes(256 * 1024 * 1024).
 erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 ```
@@ -176,18 +191,17 @@ The counter keys are listed on `erllama_cache:get_counters/0`.
 
 ## Disabling the cache
 
-For benchmarking or sanity checks: load the model with `tier => ram`
-and a tiny `min_tokens` to bypass saves entirely, or set the
-application env to disable all saves at the policy level:
+For benchmarking or sanity checks, turn RAM saves off and keep the
+model on the `ram` tier:
 
 ```erlang
 {erllama, [
-  {min_tokens, infinity}       %% nothing ever clears the gate
+  {ram_tier_budget, 0}       %% no RAM saves; ram-tier requests run cold
 ]}.
 ```
 
-There is no global "off switch" - disabling was an explicit
-non-goal. The cache is the product.
+Models on a `disk` or `ram_file` tier still save; leave those tiers
+out of the load config to keep the whole node cold.
 
 ## See also
 

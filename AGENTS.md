@@ -51,7 +51,7 @@ rebar3 shell                                      # Boot the app
 rebar3 eunit                                      # All EUnit tests
 rebar3 eunit --module=erllama_cache_kvc_tests     # Specific test module
 rebar3 proper                                     # All PropEr property-based tests
-rebar3 ct --suite=erllama_cache_meta_SUITE        # Specific Common Test suite
+rebar3 ct --suite=erllama_SUITE                   # Specific Common Test suite
 rebar3 fmt                                        # Auto-format (erlfmt)
 rebar3 fmt --check                                # Format check, no writes
 rebar3 lint                                       # Elvis linter
@@ -65,14 +65,21 @@ rebar3 ex_doc                                     # Generate docs
 ### Cache subsystem (`erllama_cache_*` modules)
 
 ```
-erllama_cache_sup
-├── erllama_cache_meta_srv     sole writer for meta + LRU + reservations
-├── erllama_cache_ram          RAM tier (ETS slab store)
-├── erllama_cache_ramfile_sup
-│   └── erllama_cache_ramfile_srv  per ram_file root dir
-├── erllama_cache_disk_sup
-│   └── erllama_cache_disk_srv     per disk root dir (plain read/write)
-└── erllama_cache_writer       dirty-IO save workers
+erllama_sup                        (src/erllama_sup.erl)
+├── erllama_cache_sup              (src/erllama_cache_sup.erl)
+│   ├── erllama_cache_meta_srv     sole writer for meta + LRU + reservations
+│   ├── erllama_cache_ram          RAM tier (ETS slab store, byte budget)
+│   ├── erllama_cache_writer       save orchestration, file-tier writer slots
+│   ├── erllama_cache_tier_sup     one erllama_cache_disk_srv per disk or
+│   │                              ram_file root (simple_one_for_one)
+│   └── erllama_cache_tiers_boot   starts the tiers from the `tiers` env
+├── erllama_registry               model id registry
+├── erllama_inflight               streaming refs, model state, abort handles
+├── erllama_chat_cache             per-model chat template handles
+├── erllama_log                    native llama.cpp logs into logger
+├── erllama_model_sup              one erllama_model per loaded model
+│                                  (temporary: a crashed model is not restarted)
+└── erllama_scheduler              memory-pressure cache eviction
 ```
 
 Public API lives in `erllama_cache.erl` (a stateless facade). Hot-path
@@ -88,7 +95,7 @@ save announce) go through `erllama_cache_meta_srv` via
   options folded in, see `with_kv_format/2` in `erllama_cache_key`
   and `kv_format/1` in `erllama_model_llama`), and the **rendered
   prompt bytes** (`detokenize(tokens)`, ds4-style), not the token-id
-  list — so a prompt that retokenises across turns still hits. The
+  list, so a prompt that retokenises across turns still hits. The
   exact tokens travel in the checkpoint payload for KV resume.
   Approximate / semantic match is **not** allowed at this layer; the
   longest-byte-prefix lookup is still an exact SHA-256 match.
@@ -155,10 +162,12 @@ The atom naming regex allows `_SUITE` suffix for CT suites:
   No magic, no DSL wrappers.
 - ETS reads are hot-path; ETS writes are funnelled through one owner
   process per table.
-- NIFs run on dirty schedulers (CPU or IO as appropriate). No NIF
-  performs file I/O directly; framing and validation live in Erlang
-  code that calls a small set of pure-data NIFs (`kv_pack`,
-  `kv_unpack`, `crc32c`).
+- NIFs run on dirty schedulers (CPU or IO as appropriate), except a
+  few cheap or latency-critical ones (`kv_format`, the native log
+  receiver, `request_abort`). The cache path does no file I/O in a
+  NIF: framing and validation live in Erlang code that calls a small
+  set of pure-data NIFs (`kv_pack`, `kv_unpack`, `crc32c`). Model and
+  projector loads do read files natively.
 - Configuration validation runs at supervisor `init/1`; misconfig is
   a hard `start_link` error, not a runtime warning.
 
@@ -179,7 +188,7 @@ The atom naming regex allows `_SUITE` suffix for CT suites:
 
 ## When in doubt
 
-Re-read the test suite for the area you're touching — every
+Re-read the test suite for the area you're touching: every
 non-obvious invariant in the cache publish protocol, the
 reservation state machine, the warm-restore logits primer, and the
 NIF safety wrappers has a dedicated case. Surface tension with

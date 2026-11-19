@@ -12,8 +12,12 @@ The stub backend runs the whole API without a GGUF or a NIF. From
 
 ```erlang
 1> {ok, _} = application:ensure_all_started(erllama).
-2> {ok, M} = erllama:load_model(#{backend => erllama_model_stub}).
-3> {ok, #{reply := R, finish_key := K}} =
+2> {ok, M} = erllama:load_model(#{
+       backend => erllama_model_stub,
+       policy => #{min_tokens => 1, cold_min_tokens => 1,
+                   boundary_trim_tokens => 0, boundary_align_tokens => 1}
+   }).
+3> {ok, #{cache_hit_kind := cold}} =
        erllama:complete(M, <<"one two three four">>, #{response_tokens => 4}).
 4> {ok, #{cache_hit_kind := exact}} =
        erllama:complete(M, <<"one two three four">>, #{response_tokens => 4}).
@@ -22,7 +26,8 @@ The stub backend runs the whole API without a GGUF or a NIF. From
 ```
 
 The second completion is a byte-exact cache hit on the first one's
-finish save. Nothing touches llama.cpp: `llama_backend_init` never
+cold save, restored from the RAM tier. The small `policy` lets a
+four-word prompt be saved; the defaults only save from 512 tokens. Nothing touches llama.cpp: `llama_backend_init` never
 runs, so there is no Metal/CUDA discovery cost.
 
 ## 1. Load a model and run a one-shot completion
@@ -257,7 +262,7 @@ back the last `(max_stop_len - 1)` bytes of each chunk so a match
 crossing a chunk boundary is still detected, then flushes the tail
 on terminal end when no match fired.
 
-## 10. Extended thinking (`thinking_delta` / `thinking_end`)
+## 10. Extended thinking (`thinking` / `thinking_end`)
 
 Some LLMs emit a "thinking" phase before their actual answer -
 typically text wrapped in template-defined markers like
@@ -278,10 +283,9 @@ erllama:load_model(<<"qwen3-thinking">>, #{
     backend => erllama_model_llama,
     model_path => "/models/qwen3-7b.gguf",
     context_size => 8192,
-    policy => default_policy(),
     thinking_markers => #{
         start => <<"<think>">>,
-        end   => <<"</think>">>
+        'end' => <<"</think>">>
     }
 }).
 ```
@@ -312,8 +316,9 @@ documented "no signature" path - the downstream forwards no
 {ok, Ref} = erllama:stream(<<"qwen3-thinking">>, Tokens,
                           #{response_tokens => 256,
                             thinking => enabled}),
+Result = loop(Ref, <<>>, <<>>, <<>>).
 
-loop(Ref, _Thinking = <<>>, _Answer = <<>>, _Sig = <<>>) ->
+loop(Ref, Thinking, Answer, Sig) ->
     receive
         {erllama, Ref, {thinking, Bin}} ->
             loop(Ref, <<Thinking/binary, Bin/binary>>, Answer, Sig);
@@ -330,7 +335,7 @@ loop(Ref, _Thinking = <<>>, _Answer = <<>>, _Sig = <<>>) ->
 
 Anthropic's API takes a `thinking.budget_tokens` hint that caps
 the thinking phase. erllama honours it as the maximum number of
-`{thinking_delta, _}` payloads to deliver. Once the budget is
+`{thinking, _}` payloads to deliver. Once the budget is
 reached, the scheduler synthesises the `{thinking_end, Sig}`
 close immediately and routes any further model-emitted thinking
 tokens through the normal post-thinking pipeline so generation

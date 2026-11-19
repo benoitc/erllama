@@ -45,6 +45,8 @@
     tokenize_decode_one/1,
     pack_unpack_round_trip/1,
     cold_then_warm_complete/1,
+    ram_tier_cold_then_warm/1,
+    fingerprint_derived_without_config/1,
     warm_faster_than_cold/1,
     longest_prefix_resume_without_parent_key/1,
     apply_chat_template_renders/1,
@@ -109,6 +111,8 @@ all() ->
         tokenize_decode_one,
         pack_unpack_round_trip,
         cold_then_warm_complete,
+        ram_tier_cold_then_warm,
+        fingerprint_derived_without_config,
         warm_faster_than_cold,
         longest_prefix_resume_without_parent_key,
         apply_chat_template_renders,
@@ -395,6 +399,54 @@ cold_then_warm_complete(Config) ->
             (maps:get(hits_resume, After) - maps:get(hits_resume, Mid)) +
             (maps:get(hits_longest_prefix, After) - maps:get(hits_longest_prefix, Mid)),
     ?assert(Warm >= 1),
+    ok.
+
+%% The default `ram` tier saves and restores on a real model, with no
+%% file tier involved.
+ram_tier_cold_then_warm(Config) ->
+    Cfg = model_config(?config(model_path, Config), ?config(disk_srv, Config)),
+    Model = <<"ram_tier_model">>,
+    {ok, _} = erllama_model:start_link(Model, Cfg#{tier => ram, tier_srv => erllama_cache_ram}),
+    try
+        Before = erllama_cache:get_counters(),
+        {ok, _} = erllama_model:complete(Model, ?LONG_PROMPT, #{response_tokens => 4}),
+        timer:sleep(300),
+        Mid = erllama_cache:get_counters(),
+        ?assert(maps:get(saves_cold, Mid) - maps:get(saves_cold, Before) >= 1),
+        ?assert(erllama_cache_ram:size_bytes() > 0),
+        {ok, _} = erllama_model:complete(Model, ?LONG_PROMPT, #{response_tokens => 4}),
+        After = erllama_cache:get_counters(),
+        Warm =
+            (maps:get(hits_exact, After) - maps:get(hits_exact, Mid)) +
+                (maps:get(hits_resume, After) - maps:get(hits_resume, Mid)) +
+                (maps:get(hits_longest_prefix, After) - maps:get(hits_longest_prefix, Mid)),
+        ?assert(Warm >= 1)
+    after
+        catch erllama_model:stop(Model)
+    end,
+    ok.
+
+%% Without `fingerprint` the model derives one from its file: the same
+%% file gives the same value, never the shared zero default, and
+%% `safe` is the plain SHA-256 of the file.
+fingerprint_derived_without_config(Config) ->
+    Path = ?config(model_path, Config),
+    Base = maps:without(
+        [fingerprint], model_config(Path, ?config(disk_srv, Config))
+    ),
+    Fp = fun(Id, Extra) ->
+        {ok, _} = erllama_model:start_link(Id, maps:merge(Base, Extra)),
+        try
+            maps:get(fingerprint, erllama_model:cache_key_meta(Id))
+        after
+            catch erllama_model:stop(Id)
+        end
+    end,
+    A = Fp(<<"fp_a">>, #{}),
+    B = Fp(<<"fp_b">>, #{}),
+    ?assertEqual(A, B),
+    ?assertNotEqual(binary:copy(<<0>>, 32), A),
+    ?assertEqual(file_sha256(Path), Fp(<<"fp_safe">>, #{fingerprint_mode => safe})),
     ok.
 
 warm_faster_than_cold(Config) ->

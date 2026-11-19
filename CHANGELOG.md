@@ -6,7 +6,36 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-19
+
 ### Fixed
+
+- Models on the default `ram` tier never saved anything, so with the
+  default configuration the KV cache never warmed and every request
+  ran cold. RAM saves now work, bounded by the new `ram_tier_budget`
+  setting (25% of system memory by default, `0` to turn them off):
+  the least used rows are evicted to make room.
+- Models loaded without a `fingerprint` all shared one cache
+  namespace, so two different models could restore each other's KV
+  state. erllama now derives the fingerprint from the GGUF file when
+  you don't pass one. The new default `fingerprint_mode` is
+  `gguf_chunked` (file size plus the start and end of the file, a few
+  tens of milliseconds at load); `safe` hashes the whole file. Cache
+  entries saved without a fingerprint are not reused.
+- `unload/1` and stopping the application did not save anything,
+  although the docs said they did. They now save the live context of
+  in-flight requests before the model goes away, bounded by
+  `evict_save_timeout_ms`.
+- A stream running on a model that was unloaded or stopped never got
+  a final event, so its caller waited until its own timeout. It now
+  ends with `{error, not_loaded}`, and requests queued on that model
+  get the same error.
+- The `evict/1` docs said it released the model's live KV state; it
+  only saves it, and the docs now say so.
+- Several docs described behaviour the code does not have. The
+  caching guide now gives the real lookup order and when saves
+  happen, the README quick taste shows real cache hits, and the
+  examples' smoke test and thinking snippets run as written.
 
 - A cache entry that could not be restored stayed in place, so every
   later request for the same prompt tried it again, ran cold, and its
@@ -40,17 +69,6 @@ this project adheres to [Semantic Versioning](https://semver.org).
 - `dry_sequence_breakers` accepts at most 64 entries. A longer list is
   rejected with `invalid_option` instead of being cut short silently.
 
-- Internal: `c_src/erllama_nif.c` split into per-concern files
-  (`erllama_nif_{model,context,kv,tokens,decode,sampler,
-  chat_template,adapter}.c` plus the shared `erllama_nif_int.h` /
-  `erllama_safe.h` headers). Pure code motion; no API or behavior
-  change.
-- Internal: shared C utility layer (`erllama_nif_util.{h,c}`):
-  error/binary/map term builders, lock + liveness guards, vocab
-  access and token-bounds validation, and the tokenize grow-retry
-  loop now have one canonical implementation each, reused across
-  the NIF C files and the C++ chat NIF. No API or behavior change.
-
 ### Added
 
 - FP8 KV cache: `type_k` / `type_v` accept `f8_e4m3`.
@@ -61,9 +79,8 @@ this project adheres to [Semantic Versioning](https://semver.org).
 - `quant_type` and `quant_bits` are read from the model file when you
   don't pass them, and reported by `model_info/1`. Before, they
   defaulted to `f16` / 16 whatever the model was.
-- Vision and audio input via libmtmd (`tools/mtmd` now vendored,
-  built through the upstream `LLAMA_BUILD_MTMD` standalone hook):
-  load an `mmproj_path` projector alongside the model, send
+- Vision and audio input: load an `mmproj_path` projector alongside
+  the model, send
   `#{type => image | audio, data => Bytes}` chat content parts or
   the `media` request option on `stream/3` / `complete/3` (one
   `media_marker/0` per item in the prompt). Formats: jpg/png/bmp/gif
@@ -78,21 +95,17 @@ this project adheres to [Semantic Versioning](https://semver.org).
   `model_opts` gains `devices` (`[NameBin] | none`), `cpu_moe`
   (`true | N`, expert tensors to CPU), `tensor_buft_overrides`
   (`[{RegexBin, cpu | DeviceNameBin}]`), and `fit` (`true | map()`,
-  llama.cpp `common_fit_params` picking n_gpu_layers / tensor_split
-  / overrides from measured memory; result on `model_info/1` under
-  `fit`). New `erllama:list_devices/0` device probe. Negative
+  picking n_gpu_layers / tensor_split / overrides from measured
+  memory; result on `model_info/1` under `fit`). New `erllama:list_devices/0` device probe. Negative
   `n_gpu_layers` is now honoured (all layers); an explicit 0 no
   longer counts as full VRAM in `vram_estimate_b`.
 - `speculative` request option: draft-model-free ngram speculation
-  (llama.cpp `common_speculative` NGRAM_MOD) on `stream/3`,
-  `complete/3` and `continue/3`. Output is byte-identical to
+  on `stream/3`, `complete/3` and `continue/3`. Output is byte-identical to
   non-speculative decoding (including seeded sampling); drafts are
   verified in one batched decode and rejected tokens rolled back.
   Pauses under concurrent requests; disabled on recurrent/hybrid
   models, with `thinking`, or with `logprobs`. Stats gain
-  `speculative => #{drafted, accepted}`. New NIFs: the
-  `erllama_spec_nif` speculator shim and `nif_spec_step`.
-
+  `speculative => #{drafted, accepted}`.
 - Guides: generating text, sessions, tokens and vocabulary,
   embeddings, LoRA adapters, observability, and testing with the stub
   backend; the tool-calls guide now walks the full tool round trip.

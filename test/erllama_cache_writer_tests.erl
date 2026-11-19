@@ -69,6 +69,55 @@ save_publishes_via_reservation_protocol_test() ->
         ?assertEqual(Payload, P)
     end).
 
+%% =============================================================================
+%% RAM tier
+%% =============================================================================
+
+ram_save_publishes_row_with_tokens_and_text_test() ->
+    with_writer(4, fun(_Dir) ->
+        Tokens = [1, 2, 3],
+        Meta = base_meta(Tokens),
+        Payload = <<"ram payload">>,
+        {ok, Key} = erllama_cache_writer:save(erllama_cache_ram, ram, Meta, Payload),
+        ?assertEqual(Key, key_for(Meta)),
+        {ok, Row} = erllama_cache_meta_srv:lookup_exact(Key),
+        ?assertEqual(ram, element(?POS_TIER, Row)),
+        ?assertEqual({ram}, element(?POS_LOCATION, Row)),
+        ?assertEqual(byte_size(Payload), element(?POS_SIZE, Row)),
+        ?assertEqual(erllama_cache_key:encode_tokens(Tokens), element(?POS_TOKENS_REF, Row)),
+        ?assertEqual(byte_size(maps:get(prompt_text, Meta)), element(?POS_TEXT_BYTES, Row)),
+        ?assertEqual({ok, Payload}, erllama_cache_ram:load(Key)),
+        %% No writer slot is taken for a RAM save.
+        ?assertEqual(0, erllama_cache_writer:current())
+    end).
+
+ram_save_already_present_returns_error_test() ->
+    with_writer(4, fun(_Dir) ->
+        Meta = base_meta([4, 5, 6]),
+        {ok, _} = erllama_cache_writer:save(erllama_cache_ram, ram, Meta, <<"a">>),
+        ?assertEqual(
+            {error, already_present},
+            erllama_cache_writer:save(erllama_cache_ram, ram, Meta, <<"b">>)
+        ),
+        ?assertMatch({ok, <<"a">>}, erllama_cache_ram:load(key_for(Meta)))
+    end).
+
+ram_save_over_budget_leaves_no_row_test() ->
+    application:set_env(erllama, ram_tier_budget, 4),
+    try
+        with_writer(4, fun(_Dir) ->
+            Meta = base_meta([7, 8, 9]),
+            ?assertEqual(
+                {error, too_large},
+                erllama_cache_writer:save(erllama_cache_ram, ram, Meta, <<"too big">>)
+            ),
+            %% The reservation was cancelled: no placeholder row is left.
+            ?assertEqual(miss, erllama_cache_meta_srv:dump(key_for(Meta)))
+        end)
+    after
+        application:unset_env(erllama, ram_tier_budget)
+    end.
+
 save_already_present_returns_error_test() ->
     with_writer(4, fun(_Dir) ->
         Meta = base_meta([1, 2, 3]),

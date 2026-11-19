@@ -4,13 +4,21 @@ The single NIF (`erllama_nif`) is the only place erllama touches
 unmanaged memory. This document captures the patterns that keep the
 BEAM alive in the face of llama.cpp's quirks.
 
-## One NIF, dirty schedulers only
+## One NIF, dirty schedulers by default
 
 There is exactly one `.so` (`priv/erllama_nif.so`) housing every
 native call: cache pack/unpack, model load, context construction,
-tokenisation, decode, kv-pack, kv-unpack. Every export is marked
-`ERL_NIF_DIRTY_JOB_CPU_BOUND` or `ERL_NIF_DIRTY_JOB_IO_BOUND`. None
-run on the regular scheduler.
+tokenisation, decode, kv-pack, kv-unpack. Exports are marked
+`ERL_NIF_DIRTY_JOB_CPU_BOUND` or `ERL_NIF_DIRTY_JOB_IO_BOUND`, with
+four exceptions that run on the regular scheduler because they do
+constant, tiny work (the `nif_funcs` table in `c_src/erllama_nif.c`):
+
+- `kv_format/0` formats a short version string;
+- `set_log_receiver/2` and `clear_log_receiver/0` swap the native log
+  target;
+- `request_abort/1` sets an atomic flag. It must not be dirty: as a
+  dirty job it could queue behind busy dirty CPU schedulers, the
+  decode it is meant to interrupt among them.
 
 Why one NIF? Because the resource lifetime story is easier when
 every type that participates lives in the same shared library.
@@ -97,7 +105,7 @@ C++ exception cross the boundary.
 `llama_decode_one` calls `llama_get_logits_ith(-1)`, which inside
 llama.cpp asserts `logits != nullptr`. If a caller calls
 `decode_one/1` before any `prefill/2`, that assert fires
-`GGML_ASSERT(...)` and aborts the process — the BEAM dies.
+`GGML_ASSERT(...)` and aborts the process: the BEAM dies.
 
 The Erlang-side guard is `decode_ready` flag on the context_ref:
 set to true on every successful prefill or decode. `decode_one/1`
@@ -130,7 +138,7 @@ The publish protocol calls this after `link(2)` to ensure the
 directory entry is on stable storage; without it, a crash between
 `link` and the next inode flush could lose the linked file.
 
-Path validation rejects embedded NUL bytes — a common footgun on
+Path validation rejects embedded NUL bytes, a common footgun on
 paths constructed from user input.
 
 ## Test surface
@@ -145,4 +153,4 @@ paths constructed from user input.
 
 If any of these flip on a change, the change is wrong. The tests
 exist precisely because the failure modes they cover crash the
-BEAM, not "return an error" — there is no graceful fallback.
+BEAM, not "return an error": there is no graceful fallback.

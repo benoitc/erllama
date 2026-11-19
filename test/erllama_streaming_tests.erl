@@ -510,17 +510,25 @@ queued_requests_drain_in_fifo_order_test() ->
         {ok, R3} = erllama:stream(Id, Tokens, #{response_tokens => 2}),
         ?assertNotEqual(R1, R2),
         ?assertNotEqual(R2, R3),
-        Order = drain_done_in_order(3, 5000),
+        Order = drain_done_in_order([R1, R2, R3], 5000),
         ?assertEqual([R1, R2, R3], Order)
     end).
 
-drain_done_in_order(0, _Timeout) ->
+%% Collect the `done` events of exactly these refs, in arrival order.
+%% Late events of other streams (an earlier test sharing this process)
+%% are left alone.
+drain_done_in_order([], _Timeout) ->
     [];
-drain_done_in_order(N, Timeout) ->
+drain_done_in_order(Refs, Timeout) ->
     receive
-        {erllama, Ref, {done, _}} -> [Ref | drain_done_in_order(N - 1, Timeout)];
+        {erllama, Ref, {done, _}} when is_reference(Ref) ->
+            case lists:member(Ref, Refs) of
+                true -> [Ref | drain_done_in_order(lists:delete(Ref, Refs), Timeout)];
+                false -> drain_done_in_order(Refs, Timeout)
+            end;
         %% Tokens emitted while waiting for done are fine; ignore them.
-        {erllama, _, {token, _}} -> drain_done_in_order(N, Timeout)
+        {erllama, _, {token, _}} ->
+            drain_done_in_order(Refs, Timeout)
     after Timeout -> ?assert(false)
     end.
 

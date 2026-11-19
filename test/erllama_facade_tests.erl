@@ -216,3 +216,73 @@ request_validation_test() ->
             erllama:unload(Id)
         end
     end).
+
+%% =============================================================================
+%% Saves on unload and application stop
+%% =============================================================================
+
+%% Start a slow stub stream and wait for its first token, so the
+%% request has a live context to save.
+in_flight_stream(Model) ->
+    {ok, Ref} = erllama:stream(Model, <<"one two three four five six">>, #{
+        response_tokens => 500
+    }),
+    receive
+        {erllama, Ref, {token, _}} -> Ref
+    after 5000 -> error(no_first_token)
+    end.
+
+slow_model() ->
+    {ok, M} = erllama:load_model((minimal_config())#{step_delay_ms => 20}),
+    M.
+
+shutdown_saves() ->
+    maps:get(saves_shutdown, erllama_cache:get_counters()).
+
+%% Consume the stream's events up to its terminal one and return it,
+%% so no late message leaks into a later test sharing this process.
+await_end(Ref) ->
+    receive
+        {erllama, Ref, {error, Reason}} -> {error, Reason};
+        {erllama, Ref, {done, _}} -> done;
+        {erllama, Ref, _} -> await_end(Ref)
+    after 5000 -> error({stream_did_not_end, Ref})
+    end.
+
+unload_saves_in_flight_context_test_() ->
+    {timeout, 30, fun() ->
+        erllama_test_helpers:with_app(fun() ->
+            M = slow_model(),
+            Ref = in_flight_stream(M),
+            Before = shutdown_saves(),
+            ?assertEqual(ok, erllama:unload(M)),
+            %% The interrupted stream ends with an error, not silence.
+            ?assertEqual({error, not_loaded}, await_end(Ref)),
+            ?assertEqual(Before + 1, shutdown_saves()),
+            ?assertEqual({error, not_loaded}, erllama:unload(M))
+        end)
+    end}.
+
+unload_idle_model_saves_nothing_test() ->
+    erllama_test_helpers:with_app(fun() ->
+        M = slow_model(),
+        Before = shutdown_saves(),
+        ?assertEqual(ok, erllama:unload(M)),
+        ?assertEqual(Before, shutdown_saves())
+    end).
+
+app_stop_saves_in_flight_context_test_() ->
+    {timeout, 30, fun() ->
+        {ok, Started} = application:ensure_all_started(erllama),
+        try
+            M = slow_model(),
+            Ref = in_flight_stream(M),
+            Before = shutdown_saves(),
+            ok = application:stop(erllama),
+            ?assertEqual({error, not_loaded}, await_end(Ref)),
+            %% The counters outlive the application.
+            ?assertEqual(Before + 1, shutdown_saves())
+        after
+            [application:stop(A) || A <- lists:reverse(Started)]
+        end
+    end}.

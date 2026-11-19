@@ -5,7 +5,9 @@
 -moduledoc false.
 -behaviour(application).
 
--export([start/2, stop/1]).
+-export([start/2, prep_stop/1, stop/1]).
+
+-define(STOP_SLACK_MS, 1000).
 
 start(_StartType, _StartArgs) ->
     ok = erllama_cache_counters:init(),
@@ -19,5 +21,42 @@ start(_StartType, _StartArgs) ->
     _ = erlang:system_flag(scheduler_wall_time, true),
     erllama_sup:start_link().
 
+%% Before the supervision tree goes down, fire a `shutdown` save on
+%% every loaded model so the live context of in-flight requests
+%% survives a graceful stop, then stop the model cleanly so its
+%% callers are told (the supervisor's own shutdown kills models
+%% without running terminate/3). Models are handled in parallel, all
+%% bounded by `evict_save_timeout_ms`.
+prep_stop(State) ->
+    save_live_state(erllama_registry:all()),
+    State.
+
 stop(_State) ->
     ok.
+
+save_live_state(Models) ->
+    Timeout = application:get_env(erllama, evict_save_timeout_ms, 30000),
+    Savers = [
+        spawn_monitor(fun() ->
+            _ = erllama_model:shutdown(Pid),
+            try
+                erllama_model:stop(Pid)
+            catch
+                _:_ -> ok
+            end
+        end)
+     || {_Id, Pid} <- Models
+    ],
+    Deadline = erlang:monotonic_time(millisecond) + Timeout + ?STOP_SLACK_MS,
+    await_savers(Savers, Deadline).
+
+await_savers([], _Deadline) ->
+    ok;
+await_savers([{Pid, Ref} | Rest], Deadline) ->
+    Left = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {'DOWN', Ref, process, Pid, _} -> await_savers(Rest, Deadline)
+    after Left ->
+        [exit(P, kill) || {P, _} <- [{Pid, Ref} | Rest]],
+        ok
+    end.

@@ -589,6 +589,37 @@ wait_replies_when_save_publishes_test() ->
 %% Eviction
 %% =============================================================================
 
+ram_writer_down_before_announce_drops_slab_test() ->
+    with_srv(fun() ->
+        Key = key(42),
+        Self = self(),
+        %% A writer that reserves, stores its slab, then dies before
+        %% announcing must not leave the slab behind.
+        {Pid, MRef} = spawn_monitor(fun() ->
+            {ok, _Token} = erllama_cache_meta_srv:reserve_save(Key, ram, self()),
+            ok = erllama_cache_ram:store(Key, <<"orphan">>),
+            Self ! stored,
+            receive
+                never -> ok
+            end
+        end),
+        receive
+            stored -> ok
+        after 5000 -> error(writer_did_not_store)
+        end,
+        ?assertMatch({ok, _}, erllama_cache_ram:load(Key)),
+        exit(Pid, kill),
+        receive
+            {'DOWN', MRef, process, Pid, _} -> ok
+        end,
+        %% The DOWN reaches the meta server asynchronously; any call
+        %% after it is processed in order.
+        _ = erllama_cache_meta_srv:dump(Key),
+        _ = sys:get_state(erllama_cache_meta_srv),
+        ?assertEqual(miss, erllama_cache_ram:load(Key)),
+        ?assertEqual(miss, erllama_cache_meta_srv:dump(Key))
+    end).
+
 invalidate_drops_available_row_test() ->
     with_srv(fun() ->
         ok = erllama_cache_counters:init(),
