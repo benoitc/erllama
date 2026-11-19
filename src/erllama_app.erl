@@ -23,8 +23,10 @@ start(_StartType, _StartArgs) ->
 
 %% Before the supervision tree goes down, fire a `shutdown` save on
 %% every loaded model so the live context of in-flight requests
-%% survives a graceful stop. Models save in parallel, all bounded by
-%% `evict_save_timeout_ms`.
+%% survives a graceful stop, then stop the model cleanly so its
+%% callers are told (the supervisor's own shutdown kills models
+%% without running terminate/3). Models are handled in parallel, all
+%% bounded by `evict_save_timeout_ms`.
 prep_stop(State) ->
     save_live_state(erllama_registry:all()),
     State.
@@ -35,7 +37,14 @@ stop(_State) ->
 save_live_state(Models) ->
     Timeout = application:get_env(erllama, evict_save_timeout_ms, 30000),
     Savers = [
-        spawn_monitor(fun() -> _ = erllama_model:shutdown(Pid) end)
+        spawn_monitor(fun() ->
+            _ = erllama_model:shutdown(Pid),
+            try
+                erllama_model:stop(Pid)
+            catch
+                _:_ -> ok
+            end
+        end)
      || {_Id, Pid} <- Models
     ],
     Deadline = erlang:monotonic_time(millisecond) + Timeout + ?STOP_SLACK_MS,

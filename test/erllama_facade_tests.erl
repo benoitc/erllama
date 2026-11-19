@@ -239,13 +239,25 @@ slow_model() ->
 shutdown_saves() ->
     maps:get(saves_shutdown, erllama_cache:get_counters()).
 
+%% Consume the stream's events up to its terminal one and return it,
+%% so no late message leaks into a later test sharing this process.
+await_end(Ref) ->
+    receive
+        {erllama, Ref, {error, Reason}} -> {error, Reason};
+        {erllama, Ref, {done, _}} -> done;
+        {erllama, Ref, _} -> await_end(Ref)
+    after 5000 -> error({stream_did_not_end, Ref})
+    end.
+
 unload_saves_in_flight_context_test_() ->
     {timeout, 30, fun() ->
         erllama_test_helpers:with_app(fun() ->
             M = slow_model(),
-            _Ref = in_flight_stream(M),
+            Ref = in_flight_stream(M),
             Before = shutdown_saves(),
             ?assertEqual(ok, erllama:unload(M)),
+            %% The interrupted stream ends with an error, not silence.
+            ?assertEqual({error, not_loaded}, await_end(Ref)),
             ?assertEqual(Before + 1, shutdown_saves()),
             ?assertEqual({error, not_loaded}, erllama:unload(M))
         end)
@@ -264,9 +276,10 @@ app_stop_saves_in_flight_context_test_() ->
         {ok, Started} = application:ensure_all_started(erllama),
         try
             M = slow_model(),
-            _Ref = in_flight_stream(M),
+            Ref = in_flight_stream(M),
             Before = shutdown_saves(),
             ok = application:stop(erllama),
+            ?assertEqual({error, not_loaded}, await_end(Ref)),
             %% The counters outlive the application.
             ?assertEqual(Before + 1, shutdown_saves())
         after

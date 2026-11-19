@@ -701,13 +701,16 @@ unload(Model) ->
     erllama_middleware:run(#{op => unload, model => Model, args => #{}}, fun do_unload/1).
 
 do_unload(#{model := Model}) ->
-    %% Save the live context of in-flight requests before stopping;
-    %% bounded by evict_save_timeout_ms, and a failed save does not
-    %% block the unload.
+    %% Save the live context of in-flight requests (bounded by
+    %% evict_save_timeout_ms; a failed save does not block the unload),
+    %% then stop the model with a clean exit so its terminate/3 runs:
+    %% it fails the interrupted callers and frees the backend. The
+    %% supervisor drops the temporary child on its own.
     _ = erllama_model:shutdown(Model),
-    case erllama_model_sup:stop_model(Model) of
-        ok -> ok;
-        {error, _} -> {error, not_loaded}
+    try erllama_model:stop(Model) of
+        ok -> ok
+    catch
+        _:_ -> {error, not_loaded}
     end.
 
 -doc "Pid of a loaded model, e.g. to `erlang:monitor/2` it.".

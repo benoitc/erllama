@@ -69,8 +69,9 @@
 %% `step_tick/1` enforces total tokens ≤ `total_batch_budget` (mirrors
 %% `context_opts.n_batch`, default 512). If `total_batch_budget` is
 %% smaller than the number of in-flight decoders, the gen_statem
-%% crashes deliberately so the supervisor restarts and the operator
-%% fixes `n_batch` / `n_seq_max`. Otherwise prefill rows are sliced
+%% crashes deliberately so the operator fixes `n_batch` /
+%% `n_seq_max`. Models are temporary children of erllama_model_sup:
+%% a crashed model stays down until it is loaded again. Otherwise prefill rows are sliced
 %% head-first to fit; truncated tails resume next tick.
 %%
 %% ## Chunked prefill
@@ -1135,7 +1136,8 @@ resolve_policy(Config, NBatch) ->
     },
     maps:merge(Defaults, maps:get(policy, Config, #{})).
 
-terminate(_Reason, _State, #data{model_id = ModelId, backend = B, backend_state = S} = Data) ->
+terminate(Reason, _State, #data{model_id = ModelId, backend = B, backend_state = S} = Data) ->
+    ok = fail_callers_on_stop(Reason, Data),
     _ = erllama_inflight:obs_delete(ModelId),
     _ = erllama_inflight:delete_abort_handle(self()),
     _ =
@@ -1152,6 +1154,18 @@ terminate(_Reason, _State, #data{model_id = ModelId, backend = B, backend_state 
     B:terminate(S),
     ok;
 terminate(_Reason, _State, _Data) ->
+    ok.
+
+%% A clean stop (unload/1, application stop) would otherwise leave
+%% streaming callers and queued admits waiting until their own
+%% timeout: tell them the model is gone. Crash paths notify their
+%% callers before stopping, so they are left alone here.
+fail_callers_on_stop(Reason, Data) when
+    Reason =:= normal; Reason =:= shutdown; element(1, Reason) =:= shutdown
+->
+    ok = fail_all_requests(Data, not_loaded),
+    fail_pending_admits(Data, {error, not_loaded});
+fail_callers_on_stop(_Reason, _Data) ->
     ok.
 
 %% Placeholder fingerprint when none supplied.
