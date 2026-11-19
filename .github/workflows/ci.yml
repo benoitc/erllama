@@ -244,6 +244,7 @@ jobs:
     name: Release and CLI
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - name: Set up Erlang
@@ -269,28 +270,36 @@ jobs:
         run: rebar3 as prod release
       - name: Start, reach with the CLI, stop
         run: |
+          set -x
           R=_build/prod/rel/erllama_server
-          $R/bin/erllama_server daemon
+          T="timeout 60"
+          # relx reads the cookie before starting the node; without one,
+          # `daemon` waits forever for a node it cannot reach.
+          [ -f ~/.erlang.cookie ] || { head -c 24 /dev/urandom | base64 | tr -dc A-Za-z0-9 > ~/.erlang.cookie; chmod 400 ~/.erlang.cookie; }
+          $T $R/bin/erllama_server daemon
           for i in 1 2 3 4 5 6 7 8 9 10; do
             $R/bin/erllama_server ping && break
             sleep 2
           done
-          $R/bin/erllama --version
-          $R/bin/erllama ping
-          $R/bin/erllama_server eval 'erllama:load_model(<<"stub">>, #{backend => erllama_model_stub, step_delay_ms => 20}).'
-          $R/bin/erllama status
-          $R/bin/erllama run stub --max-tokens 8 hello there
-          RUN=$($R/bin/erllama run stub --max-tokens 500 --detach a long one)
-          $R/bin/erllama cancel "$RUN"
-          if OUT=$($R/bin/erllama attach "$RUN"); then
+          $T $R/bin/erllama --version
+          $T $R/bin/erllama ping
+          $T $R/bin/erllama_server eval 'erllama:load_model(<<"stub">>, #{backend => erllama_model_stub, step_delay_ms => 20}).'
+          $T $R/bin/erllama status
+          $T $R/bin/erllama run stub --max-tokens 8 hello there
+          RUN=$($T $R/bin/erllama run stub --max-tokens 500 --detach a long one)
+          $T $R/bin/erllama cancel "$RUN"
+          if OUT=$($T $R/bin/erllama attach "$RUN"); then
             echo "attach should report the cancelled run"; exit 1
           fi
           echo "$OUT" | grep -q '\[cancelled\]'
-          $R/bin/erllama result "$RUN" | grep -q cancelled
-          curl -sf http://127.0.0.1:8080/health
-          curl -sf http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+          $T $R/bin/erllama result "$RUN" | grep -q cancelled
+          $T curl -sf http://127.0.0.1:8080/health
+          $T curl -sf http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
             -d '{"model":"stub","messages":[{"role":"user","content":"hi"}],"max_tokens":4}' | grep -q chat.completion
-          $R/bin/erllama_server stop
+          $T $R/bin/erllama_server stop
+      - name: Release log
+        if: always()
+        run: tail -100 _build/prod/rel/erllama_server/log/erlang.log.* || true
 
   sanitizers:
     name: ASan + UBSan

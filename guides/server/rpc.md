@@ -82,7 +82,15 @@ the release>`. Hidden means it does not appear in the release's
 `nodes()` and is not connected to the release's other nodes.
 
 The release node uses the cookie in `~/.erlang.cookie` of the user that
-starts it. Run the CLI as the same user, or set `ERLLAMA_COOKIE` to
+starts it. Create that file before the first `daemon` on a new machine:
+the start script reads the cookie before the node exists, and without
+one it waits forever for a node it cannot reach.
+
+```bash
+head -c 24 /dev/urandom | base64 | tr -dc A-Za-z0-9 > ~/.erlang.cookie
+chmod 400 ~/.erlang.cookie
+```
+ Run the CLI as the same user, or set `ERLLAMA_COOKIE` to
 that cookie. `RELX_COOKIE` only changes the cookie of the release's own
 control commands (`ping`, `stop`, `eval`), not the node's.
 
