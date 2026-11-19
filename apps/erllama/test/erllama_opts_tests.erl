@@ -355,3 +355,8 @@ existing_file() ->
 dry_sequence_breakers_cap_test() ->
     Max = lists:duplicate(64, <<"x">>),
     ?assertMatch({ok, _}, ?M:request_opts(#{dry_sequence_breakers => Max})).
+
+media_add_special_is_a_boolean_test() ->
+    Media = [#{type => image, data => <<1, 2, 3>>}],
+    ?assertMatch({ok, _}, erllama_opts:request_opts(#{media => Media, media_add_special => false})),
+    ?assertMatch({error, _}, erllama_opts:request_opts(#{media => Media, media_add_special => no})).

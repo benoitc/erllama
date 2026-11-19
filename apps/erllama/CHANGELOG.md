@@ -6,6 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `media_add_special`, a request option for streams with media: set it
+  to `false` when the prompt comes from a chat template, so the BOS
+  token is not added a second time. `chat/3` already did this; streamed
+  multimodal chat can now do the same.
+
 ### Fixed
 
 - A streaming request kept generating until its token limit when the

@@ -154,7 +154,8 @@
             expect_committed,
             middleware,
             speculative,
-            media
+            media,
+            media_add_special
         ]
 ).
 
@@ -527,7 +528,8 @@ base_request_checks() ->
         {trigger_tokens, fun(V) -> is_list(V) andalso lists:all(fun non_neg_int/1, V) end},
         {grammar_prefill, fun is_binary/1},
         {speculative, fun speculative_opt/1},
-        {media, fun media_opt/1}
+        {media, fun media_opt/1},
+        {media_add_special, fun is_boolean/1}
     ].
 
 %% `media => [#{type := image | audio, data := binary()}]` - encoded
