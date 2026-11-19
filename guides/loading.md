@@ -417,9 +417,11 @@ fingerprint, so they never collide.
 ok = erllama:unload(M).
 ```
 
-Triggers a synchronous `shutdown` save (best-effort: capped by
-`evict_save_timeout_ms`) and terminates the gen_statem. Any
-in-flight cache writes are awaited up to that timeout.
+Saves the live context of every in-flight request (a `shutdown`
+save, capped by `evict_save_timeout_ms`), then stops the model and
+frees its context; those requests fail. Completed turns are already
+saved by their `finish` saves. Stopping the erllama application does
+the same for every loaded model.
 
 ## Common pitfalls
 

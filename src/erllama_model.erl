@@ -802,9 +802,10 @@ evict(Model) ->
     call(Model, evict, save_timeout()).
 
 -doc """
-Fire a `shutdown` save synchronously and return. Called from the
-application's `prep_stop` hook so live state survives a graceful
-restart.
+Fire a `shutdown` save of the live context of every in-flight request
+and return; the requests keep running. `erllama:unload/1` and the
+application's `prep_stop` hook call it so that work survives an
+unload or a graceful stop.
 """.
 -spec shutdown(model()) -> ok | {error, not_loaded | timeout}.
 shutdown(Model) ->

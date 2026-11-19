@@ -65,20 +65,27 @@ milliseconds when a hit comes in.
 
 ## When does a save happen?
 
-The per-model `gen_statem` fires saves at five well-defined moments,
-each with its own `save_reason`:
+The model process saves at these moments, each with its own
+`save_reason`:
 
-| Reason | When | Sync? |
-|---|---|---|
-| `cold` | Right after a cold prefill, at the trimmed-prefix boundary. Async - the writer pool does the work. |
-| `continued` | Every `continued_interval` tokens during generation. Async. |
-| `finish` | At the end of a completion, capturing prompt + reply. Async. |
-| `evict` | When a holder is asked to release its slab. Sync (pause decode, pack, release). |
-| `shutdown` | On `prep_stop` or `unload/1`. Sync, capped by `evict_save_timeout_ms`. |
+| Reason | When |
+|---|---|
+| `cold` | Right after a cold prefill, at the trimmed-prefix boundary. |
+| `continued` | Every `continued_interval` tokens during generation. |
+| `finish` | At the end of a completion, capturing prompt + reply. |
+| `agent_prefix` | When a request sets `prefix_checkpoint_len`, at that boundary. The row is pinned so eviction keeps it. |
+| `evict` | When you call `erllama:evict/1`. |
+| `shutdown` | When you call `erllama:shutdown/1` or `unload/1`, and when the erllama application stops. |
 
-Async saves go through `erllama_cache_writer` - a pool of dirty-IO
-workers. Sync saves block the calling process until the file is on
-stable storage.
+`evict` and `shutdown` save the live context of every in-flight
+request and are capped by `evict_save_timeout_ms`; the others follow
+the save policy gates below.
+
+A save runs in the model process: it packs the KV state and writes it
+to the model's tier before the model moves on. RAM saves are a memory
+copy. File saves (`ram_file`, `disk`) also take a slot in the writer
+pool (`writer_max_concurrent`); when every slot is busy, the save is
+dropped and counted in `saves_dropped` rather than waited for.
 
 ## When does a hit happen?
 

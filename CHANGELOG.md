@@ -20,6 +20,12 @@ this project adheres to [Semantic Versioning](https://semver.org).
   `gguf_chunked` (file size plus the start and end of the file, a few
   tens of milliseconds at load); `safe` hashes the whole file. Cache
   entries saved without a fingerprint are not reused.
+- `unload/1` and stopping the application did not save anything,
+  although the docs said they did. They now save the live context of
+  in-flight requests before the model goes away, bounded by
+  `evict_save_timeout_ms`.
+- The `evict/1` docs said it released the model's live KV state; it
+  only saves it, and the docs now say so.
 
 - A cache entry that could not be restored stayed in place, so every
   later request for the same prompt tried it again, ran cold, and its

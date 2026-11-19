@@ -690,12 +690,21 @@ do_load_model(#{model := ModelId, args := #{config := Config}}) ->
         {error, _} = E -> E
     end.
 
--doc "Unload a model and free its context. `{error, not_loaded}` if it is not running.".
+-doc """
+Unload a model and free its context. The live context of in-flight
+requests is saved first (a `shutdown` save, bounded by
+`evict_save_timeout_ms`); those requests then fail. `{error,
+not_loaded}` if the model is not running.
+""".
 -spec unload(model()) -> ok | {error, not_loaded}.
 unload(Model) ->
     erllama_middleware:run(#{op => unload, model => Model, args => #{}}, fun do_unload/1).
 
 do_unload(#{model := Model}) ->
+    %% Save the live context of in-flight requests before stopping;
+    %% bounded by evict_save_timeout_ms, and a failed save does not
+    %% block the unload.
+    _ = erllama_model:shutdown(Model),
     case erllama_model_sup:stop_model(Model) of
         ok -> ok;
         {error, _} -> {error, not_loaded}
@@ -1005,9 +1014,10 @@ reset_session(Model, SessionId) ->
     erllama_model:reset_session(Model, SessionId).
 
 -doc """
-Fire an `evict` save and release the model's live KV state without
-unloading it. Bounded by the `evict_save_timeout_ms` application
-environment key (default 30 s).
+Fire an `evict` save of the live context of every in-flight request.
+The model and its requests keep running; nothing is released.
+Bounded by the `evict_save_timeout_ms` application environment key
+(default 30 s).
 """.
 -spec evict(model()) -> ok | {error, not_loaded | timeout}.
 evict(Model) ->
