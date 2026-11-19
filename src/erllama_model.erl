@@ -1031,11 +1031,14 @@ init([ModelId, Config0]) ->
     end.
 
 build_init_data(ModelId, Config, Backend, BState) ->
-    Fp = maps:get(fingerprint, Config, default_fingerprint()),
     CtxOpts = maps:get(context_opts, Config, #{}),
     NSeqMax = maps:get(n_seq_max, CtxOpts, 1),
     NBatch = maps:get(n_batch, CtxOpts, 512),
     Meta = backend_extra_metadata(Backend, BState),
+    %% A configured fingerprint wins; otherwise the one the backend
+    %% derived from the model file. Only a backend with no file (the
+    %% stub) falls back to the shared zero default.
+    Fp = maps:get(fingerprint, Config, maps:get(fingerprint, Meta, default_fingerprint())),
     {QuantType, QuantBits} = configured_quant(Config, Meta),
     #data{
         model_id = ModelId,
@@ -1043,7 +1046,7 @@ build_init_data(ModelId, Config, Backend, BState) ->
         tier = maps:get(tier, Config, ram),
         fingerprint = Fp,
         fingerprint_mode = maps:get(
-            fingerprint_mode, Config, application:get_env(erllama, fingerprint_mode, safe)
+            fingerprint_mode, Config, application:get_env(erllama, fingerprint_mode, gguf_chunked)
         ),
         quant_type = QuantType,
         quant_bits = QuantBits,

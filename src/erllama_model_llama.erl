@@ -108,20 +108,44 @@
     %% `undefined` when no mmproj_path was configured. Survives
     %% reset_context (bound to the model, not the context).
     mtmd = undefined :: erllama_nif:mtmd_ref() | undefined,
-    mtmd_caps = undefined :: map() | undefined
+    mtmd_caps = undefined :: map() | undefined,
+    %% Fingerprint derived from the GGUF file when the config gave
+    %% none; `undefined` when the caller passed `fingerprint`.
+    fingerprint = undefined :: binary() | undefined
 }).
 
-init(Config) ->
-    Path = maps:get(model_path, Config),
-    MOpts0 = progress_opts(maps:get(model_opts, Config, #{}), Config),
-    MOpts = fit_opts(MOpts0, Config),
-    case erllama_nif:load_model(Path, MOpts) of
-        {ok, Model} ->
-            post_load(Model, Config, MOpts, undefined);
-        {ok, Model, FitInfo} ->
-            post_load(Model, Config, MOpts, FitInfo);
+init(Config0) ->
+    Path = maps:get(model_path, Config0),
+    case derive_fingerprint(Path, Config0) of
+        {ok, Config} ->
+            MOpts0 = progress_opts(maps:get(model_opts, Config, #{}), Config),
+            MOpts = fit_opts(MOpts0, Config),
+            case erllama_nif:load_model(Path, MOpts) of
+                {ok, Model} ->
+                    post_load(Model, Config, MOpts, undefined);
+                {ok, Model, FitInfo} ->
+                    post_load(Model, Config, MOpts, FitInfo);
+                {error, _} = E ->
+                    E
+            end;
         {error, _} = E ->
             E
+    end.
+
+%% Without an explicit `fingerprint`, derive one from the GGUF file
+%% (erllama_fingerprint, mode `fingerprint_mode`) so the model gets its
+%% own cache key namespace. Runs before the load so a file that cannot
+%% be read fails fast. The value reaches the model layer through
+%% extra_metadata/1.
+derive_fingerprint(_Path, #{fingerprint := _} = Config) ->
+    {ok, Config};
+derive_fingerprint(Path, Config) ->
+    Mode = maps:get(
+        fingerprint_mode, Config, application:get_env(erllama, fingerprint_mode, gguf_chunked)
+    ),
+    case erllama_fingerprint:derive(Path, Mode) of
+        {ok, Fp} -> {ok, Config#{derived_fingerprint => Fp}};
+        {error, Reason} -> {error, {fingerprint, Reason}}
     end.
 
 post_load(Model, Config, MOpts, FitInfo) ->
@@ -284,7 +308,8 @@ build_state(Model, Ctx, Config, MOpts, COpts, Family, FitInfo, Mtmd, MtmdCaps) -
         thinking_start_ids = ThinkStart,
         thinking_end_ids = ThinkEnd,
         family = Family,
-        fit_info = FitInfo
+        fit_info = FitInfo,
+        fingerprint = maps:get(derived_fingerprint, Config, undefined)
     }.
 
 %% The value the VRAM estimate runs on: the fitted layer count when
@@ -564,8 +589,10 @@ extra_metadata(
         n_gpu_layers = NL,
         family = Family,
         fit_info = FitInfo,
-        context_opts = COpts
-    } = S
+        context_opts = COpts,
+        fingerprint = Fp,
+        mtmd_caps = Caps
+    }
 ) ->
     Meta = #{
         model_size_bytes => SB,
@@ -574,15 +601,15 @@ extra_metadata(
         family => Family,
         kv_format => kv_format(COpts)
     },
-    Meta1 =
-        case FitInfo of
-            undefined -> Meta;
-            _ -> Meta#{fit => FitInfo}
-        end,
-    case S#s.mtmd_caps of
-        undefined -> Meta1;
-        Caps -> Meta1#{mmproj => Caps}
-    end.
+    lists:foldl(
+        fun put_defined/2,
+        Meta,
+        [{fingerprint, Fp}, {fit, FitInfo}, {mmproj, Caps}]
+    ).
+
+%% Optional metadata keys are left out rather than set to `undefined`.
+put_defined({_Key, undefined}, Meta) -> Meta;
+put_defined({Key, Value}, Meta) -> Meta#{Key => Value}.
 
 %% Context options that decide whether a kv_pack payload restores
 %% into a context: the K/V cache types, V transposition (flash

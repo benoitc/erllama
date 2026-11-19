@@ -46,6 +46,7 @@
     pack_unpack_round_trip/1,
     cold_then_warm_complete/1,
     ram_tier_cold_then_warm/1,
+    fingerprint_derived_without_config/1,
     warm_faster_than_cold/1,
     longest_prefix_resume_without_parent_key/1,
     apply_chat_template_renders/1,
@@ -111,6 +112,7 @@ all() ->
         pack_unpack_round_trip,
         cold_then_warm_complete,
         ram_tier_cold_then_warm,
+        fingerprint_derived_without_config,
         warm_faster_than_cold,
         longest_prefix_resume_without_parent_key,
         apply_chat_template_renders,
@@ -422,6 +424,29 @@ ram_tier_cold_then_warm(Config) ->
     after
         catch erllama_model:stop(Model)
     end,
+    ok.
+
+%% Without `fingerprint` the model derives one from its file: the same
+%% file gives the same value, never the shared zero default, and
+%% `safe` is the plain SHA-256 of the file.
+fingerprint_derived_without_config(Config) ->
+    Path = ?config(model_path, Config),
+    Base = maps:without(
+        [fingerprint], model_config(Path, ?config(disk_srv, Config))
+    ),
+    Fp = fun(Id, Extra) ->
+        {ok, _} = erllama_model:start_link(Id, maps:merge(Base, Extra)),
+        try
+            maps:get(fingerprint, erllama_model:cache_key_meta(Id))
+        after
+            catch erllama_model:stop(Id)
+        end
+    end,
+    A = Fp(<<"fp_a">>, #{}),
+    B = Fp(<<"fp_b">>, #{}),
+    ?assertEqual(A, B),
+    ?assertNotEqual(binary:copy(<<0>>, 32), A),
+    ?assertEqual(file_sha256(Path), Fp(<<"fp_safe">>, #{fingerprint_mode => safe})),
     ok.
 
 warm_faster_than_cold(Config) ->

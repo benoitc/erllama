@@ -191,27 +191,35 @@ Pass-through to `llama_context_default_params()`.
 
 ### `fingerprint`
 
-A 32-byte SHA-256 over the model file. The cache key includes this
-fingerprint so a hit is bound to the exact GGUF that produced it; if
-you replace the model on disk, old cache rows are no longer
-addressable and will be evicted by LRU.
+A 32-byte value that identifies the model file. Every cache key
+includes it, so a hit is bound to the GGUF that produced it; if you
+replace the model on disk, old cache rows are no longer addressable
+and age out through eviction.
+
+You normally leave it out: erllama derives it from the file at load
+time, as set by `fingerprint_mode`. Pass it yourself when you already
+know the file's hash, for example from your model registry:
 
 ```erlang
 {ok, Bin} = file:read_file(Path),
-Fp = crypto:hash(sha256, Bin).
+Fp = crypto:hash(sha256, Bin).   %% the same value `safe` derives
 ```
 
 ### `fingerprint_mode`
 
-How aggressively the cache trusts the fingerprint:
+How the fingerprint is derived when you don't pass `fingerprint`:
 
-- `safe` - recompute the fingerprint at load time. Slow on multi-GB
-  files but ironclad.
-- `gguf_chunked` - fingerprint the GGUF metadata chunk and the first
-  weights tensor only. Order of magnitude faster; defeats accidental
-  but not malicious tampering.
-- `fast_unsafe` - trust whatever you pass in. Use only if you
-  fingerprint upstream and pass the result through.
+- `gguf_chunked` (default): SHA-256 of the file size, the first
+  64 MiB (GGUF header, metadata, start of the weights) and the last
+  4 MiB. Takes a few tens of milliseconds whatever the file size.
+- `safe`: SHA-256 of the whole file, about half a second per GB.
+  Equal to `crypto:hash(sha256, FileBytes)`.
+- `fast_unsafe`: SHA-256 of the absolute path, size and modification
+  time. No read at all; a file replaced in place with the same size
+  and time keeps its fingerprint.
+
+When you pass `fingerprint`, the mode is only recorded in each cache
+file.
 
 ### `quant_type` and `quant_bits`
 
@@ -415,9 +423,9 @@ in-flight cache writes are awaited up to that timeout.
 
 ## Common pitfalls
 
-- **Forgetting the fingerprint.** Without it the cache key falls back
-  to the path string, which means renaming the file invalidates the
-  cache. Always pass an actual hash.
+- **Passing the same fingerprint for two models.** The fingerprint is
+  the cache namespace, so two models given the same value share cache
+  rows. Leave it out and erllama derives a distinct one per file.
 - **Wrong `n_ctx`.** The cache key includes `ctx_params_hash`. If you
   bump `n_ctx` for a tenant, expect a one-shot cold prefill across
   every cached prefix until the new rows accumulate.

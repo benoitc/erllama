@@ -46,8 +46,11 @@
         {session_resume_wait_ms, 500},
         %% Bound for the synchronous evict / shutdown saves.
         {evict_save_timeout_ms, 30000},
-        %% Default model fingerprint mode: safe | gguf_chunked | fast_unsafe.
-        {fingerprint_mode, safe},
+        %% How a model's fingerprint is derived from its GGUF file when
+        %% the load config gives none: gguf_chunked (size + first 64 MiB
+        %% + last 4 MiB), safe (whole-file SHA-256) or fast_unsafe
+        %% (path, size, mtime).
+        {fingerprint_mode, gguf_chunked},
         %% Concurrent cache writers (default: 2 * schedulers + 1).
         %% {writer_max_concurrent, 9},
         %% LRU size of the per-model chat template cache.

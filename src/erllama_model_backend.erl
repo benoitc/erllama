@@ -173,14 +173,17 @@ inference, etc.) can plug in via this same surface.
 %% `vram_estimate_b` and to extend `model_info/1` with the family
 %% keys. `kv_format` names the layout of the backend's kv_pack
 %% payload; erllama_model folds it into the cache key so rows saved
-%% under another layout are never restored.
+%% under another layout are never restored. `fingerprint` is the model
+%% fingerprint the backend derived from its model file, used when the
+%% load config gives none.
 -callback extra_metadata(state()) ->
     #{
         model_size_bytes => non_neg_integer(),
         total_layers => non_neg_integer(),
         n_gpu_layers => integer(),
         family => map(),
-        kv_format => binary()
+        kv_format => binary(),
+        fingerprint => <<_:256>>
     }.
 
 %% Speculative-decoding verifier. Runs PrefixTokens ++ Candidates

@@ -104,13 +104,16 @@ multi-turn cold misses on slow storage.
 
 ### `fingerprint_mode`
 
-How to verify the model fingerprint at load:
+How a model's fingerprint is derived from its GGUF file when the load
+config has no `fingerprint` (default `gguf_chunked`):
 
-- `safe` - full SHA-256 over the file. Slow on multi-GB GGUFs.
-- `gguf_chunked` - fingerprint metadata + first weights tensor.
-  Catches accidental corruption, not malicious tampering.
-- `fast_unsafe` - trust the supplied fingerprint blindly. Use only
-  when you fingerprint upstream and pass the digest through.
+- `gguf_chunked`: file size plus the first 64 MiB and the last 4 MiB.
+  Constant cost.
+- `safe`: SHA-256 of the whole file, about half a second per GB.
+- `fast_unsafe`: absolute path, size and modification time.
+
+See [Loading a model](loading.md#fingerprint_mode) for when to pick
+which.
 
 ### `writer_max_concurrent`
 

@@ -13,6 +13,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
   ran cold. RAM saves now work, bounded by the new `ram_tier_budget`
   setting (25% of system memory by default, `0` to turn them off):
   the least used rows are evicted to make room.
+- Models loaded without a `fingerprint` all shared one cache
+  namespace, so two different models could restore each other's KV
+  state. erllama now derives the fingerprint from the GGUF file when
+  you don't pass one. The new default `fingerprint_mode` is
+  `gguf_chunked` (file size plus the start and end of the file, a few
+  tens of milliseconds at load); `safe` hashes the whole file. Cache
+  entries saved without a fingerprint are not reused.
 
 - A cache entry that could not be restored stayed in place, so every
   later request for the same prompt tried it again, ran cold, and its
