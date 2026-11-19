@@ -29,6 +29,7 @@ init([]) ->
         worker(erllama_server_responses),
         supervisor(erllama_server_run_sup),
         supervisor(erllama_server_pull_sup),
+        supervisor(erllama_server_agent_sup),
         worker(erllama_server_http)
     ],
     {ok, {SupFlags, Children}}.

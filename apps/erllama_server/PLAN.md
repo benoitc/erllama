@@ -188,3 +188,91 @@ A bad value makes `start_link` fail.
 5. The barrel_mcp bridge.
 6. Durable conversations behind `erllama_server_convs`.
 7. Terminal polish (Ctrl-C cancel, slash commands), the guides and full release validation.
+
+---
+
+# Phase 4: agent runtime and native tools (design)
+
+## Shape
+
+- **`erllama_server_agent`**, one gen_statem per agent session, under
+  `erllama_server_agent_sup` (simple_one_for_one, temporary). A session
+  is a conversation plus a workspace (a directory on the release
+  machine), a model, a tool policy and budgets. It holds its
+  conversation's lock for its whole life, so only it mutates that
+  transcript. Sessions run concurrently.
+- **The session is a job** (`kind => agent` in `erllama_server_runs`):
+  its events go through `erllama_server_events`, so a CLI attaches,
+  detaches and reattaches as with runs. It outlives its clients.
+  - Turn events: `turn_started`, `token`, `thinking`, `tool_call`
+    (announced), `approval_request`, `tool_started`, `tool_output`
+    (shell progress), `tool_result`, `round`, `turn_done` with a
+    reason (`stop`, `cancelled`, `budget`, `error`).
+  - The session's own end is the terminal event.
+- **The loop, as states:**
+  - `idle`: wait for input;
+  - `generating`: stream the model's reply through
+    `erllama_server_generate`, which holds the model for the turn;
+  - `awaiting_approval`: if any tool call needs approval;
+  - `running_tools`: execute the calls;
+  - then back to `generating` with the results appended.
+- **Generation goes through a generator callback.** The default
+  renders the transcript and streams it. Tests supply a scripted one,
+  so the loop is tested deterministically; a gated real-model case
+  checks it end to end.
+- **Input and interruption:**
+  - input that arrives during a turn is queued and becomes the next
+    turn;
+  - `interrupt` cancels the generation or the running tools, kills
+    shell process groups, and ends the turn as `cancelled`.
+- **Budgets per turn:** `max_rounds` (20), `max_tokens` (32768
+  generated tokens) and `max_elapsed_ms` (600000).
+- **Policy:** each tool is `auto`, `ask` or `deny`.
+  - Defaults: reads, listings, search and `shell_status` are `auto`;
+    `write_file`, `edit_file`, `shell` and `shell_kill` are `ask`.
+  - `ask` emits `approval_request` and waits, even with no client
+    attached. `approve(Id, Req, allow | deny | always)` answers it.
+  - A denied call returns an error result to the model.
+- **Execution:**
+  - read-only calls run concurrently in monitored workers;
+  - mutating calls run one after another in call order;
+  - results are appended in call order;
+  - a worker crash or timeout becomes an `Error: ...` tool result the
+    model can act on.
+- **Tool sources:** HTTP adapters never execute tools (runs only
+  stream calls back to the client). Only sessions run tools, and only
+  the native tools and the MCP tools the release is configured with
+  (Phase 5).
+
+## Native tools (`erllama_server_tools`, `_fs`, `_shell`)
+
+- **Paths:** every path resolves inside the workspace; `..` and
+  symlinks that leave it are refused.
+- **`read_file(path, offset, limit)`:** numbered lines, at most 400
+  per call and 64 KiB, with the offset to continue from.
+- **`list_dir(path, depth)`:** at most 500 entries.
+- **`search(pattern, path, glob)`:** regular expression, binary and
+  large files skipped, at most 200 matches.
+- **`write_file(path, content)`:** creates a file; refuses to replace
+  one (use `edit_file`).
+- **`edit_file(path, old, new, replace_all)`:** exact match, refused
+  when the text is absent or ambiguous.
+- **`shell(command, timeout_ms, background)`:**
+  - runs `/bin/sh` in the workspace, in its own process group
+    (`set -m`);
+  - keeps the first and last 16 KiB of output;
+  - on timeout or interrupt, sends TERM to the group, then KILL;
+  - `background` returns a job id at once.
+- **`shell_status(job)` and `shell_kill(job)`:** for background jobs,
+  which end with the session.
+
+## Interfaces
+
+- **Service API:**
+  - `agent_start(#{model, workspace, conversation_id, policy, budgets})`
+    returns `{ok, #{agent_id, conversation_id}}`;
+  - `agent_send/2`, `agent_interrupt/1`, `agent_approve/3`,
+    `agent_stop/1`, `agents/0`.
+- **CLI:** `erllama agent MODEL --workspace PATH [--yes | --read-only]`
+  runs a line loop. It prints tool activity, asks for approvals, and
+  exits without stopping the session, which `erllama agents` lists.

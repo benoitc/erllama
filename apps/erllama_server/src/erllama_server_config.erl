@@ -18,6 +18,7 @@ defaults() ->
         run_retention_ms => 300000,
         max_active_runs => 64,
         max_active_pulls => 4,
+        max_agents => 16,
         pull_idle_timeout_ms => 60000,
         data_dir => undefined,
         default_model => undefined,

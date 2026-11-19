@@ -65,6 +65,16 @@ The release listens on `127.0.0.1:8080` and answers OpenAI
 [The HTTP APIs](../../guides/server/http.md) for every supported field,
 API keys and limits.
 
+## Work with an agent
+
+```bash
+$R/bin/erllama agent qwen --workspace /srv/projects/app
+```
+
+The model reads, searches and edits files in the workspace and runs
+commands there, asking before it changes anything. See
+[Agent sessions](../../guides/server/agent.md).
+
 ## Configuration
 
 The `erllama_server` application environment (`config/sys.config` in
@@ -90,6 +100,7 @@ the release). A bad value stops the release from starting.
 | `allow_unauthenticated` | `false` | allow a public `ip` without keys |
 | `max_body_bytes` | `33554432` | HTTP request body limit |
 | `max_http_requests` | `64` | HTTP requests in flight |
+| `max_agents` | `16` | agent sessions at once |
 
 The library's own settings (cache tiers, scheduler) go under `erllama`;
 see the [configuration guide](../../guides/configuration.md).
@@ -115,6 +126,11 @@ see the [configuration guide](../../guides/configuration.md).
 | `erllama_server_responses` | stored responses and their conversations |
 | `erllama_server_anthropic` | the Anthropic Messages API |
 | `erllama_server_ollama`, `erllama_server_ollama_models` | the Ollama generation and model-management endpoints |
+| `erllama_server_agent` | an agent session: the generate, approve, run tools, continue loop |
+| `erllama_server_agent_gen` | one generation round of a session |
+| `erllama_server_tools`, `_tool_fs`, `_tool_shell` | the native tools, their policies, file tools and shell jobs |
+| `erllama_server_workspace` | keeps tool paths inside the workspace |
+| `erllama_server_cli_agent`, `erllama_server_cli_format` | the CLI's agent commands and its output formatting |
 | `erllama_server_http_ops` | health, readiness, metrics |
 | `erllama_server_convs` | conversations: history, last cache key, one active run each |
 | `erllama_server_generate` | renders chat or prompt requests into an erllama stream and parses the result |
@@ -128,4 +144,5 @@ downloads from a local stand-in for Hugging Face and Ollama
 (`test/erllama_server_fake_registry.erl`); and
 `test/erllama_server_models_SUITE.erl` covers loading, keep-alive and
 eviction; `test/erllama_server_http_SUITE.erl` drives the HTTP APIs over
-a socket.
+a socket; `test/erllama_server_agent_SUITE.erl` drives agent sessions
+with a scripted model (`test/erllama_server_agent_script.erl`).

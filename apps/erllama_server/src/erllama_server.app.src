@@ -13,6 +13,7 @@
         erllama_server_responses,
         erllama_server_run_sup,
         erllama_server_pull_sup,
+        erllama_server_agent_sup,
         erllama_server_http
     ]},
     {mod, {erllama_server_app, []}},

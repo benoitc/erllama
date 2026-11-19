@@ -116,6 +116,22 @@ Validation (OTP 28.3.1, local):
 - gated real-model cases run on Qwen2.5 1.5B: streamed tool calls with no call syntax in content, logprobs, an Anthropic `tool_use` round trip, a Responses function-call chain; on SmolVLM 256M: an image chat (streamed and not); TinyLlama skips the tool cases (its template has no tool grammar);
 - official SDKs against the server (Python `openai`, `anthropic`, `ollama`, in a throwaway uv environment): chat, streaming with usage, a tool call and its answer, embeddings, a Responses chain and its streaming helper, Anthropic messages, its streaming helper and token counting, Ollama chat, streamed chat, list and embed.
 
-## Phases 4 to 7
+## Phase 4: agent runtime and native tools (implemented)
+
+| Feature | State | Notes |
+|---|---|---|
+| sessions | done | `erllama_server_agent`, one gen_statem per conversation (it holds the conversation for its life), a job like runs (attach, detach, reattach), concurrent across conversations, `max_agents` |
+| loop | done | generate, approve, run tools, append results, generate again; a generator behaviour (`erllama_server_agent_gen`, scripted in tests); the model is held for each turn and loaded on demand |
+| tools | done | `read_file` (paginated), `list_dir`, `search`, `write_file` (create only), `edit_file` (exact match), `shell` (timeout, head and tail output, background jobs), `shell_status`, `shell_kill`; paths confined to the workspace, symlinks included |
+| execution order | done | reads run together; a write waits for the calls before it and holds back the ones after; results in call order; tool failures and crashes become error results |
+| process groups | done | every command in its own group (`set -m`); timeout, interrupt, kill or the session's end kill the whole group, also before the group is known |
+| policy and approvals | done | `auto`, `ask`, `deny` per tool, `yes` and `read_only` presets; `approval_request` events; allow, deny, always |
+| budgets, queue, interrupt | done | rounds, tokens, time per turn; input during a turn queued; interrupt cancels generation and tools and records unfinished calls as interrupted |
+| HTTP callers' tools | done | never executed: HTTP runs only stream calls back to the client |
+| CLI | done | `agent MODEL --workspace PATH [--yes \| --read-only]`, `agents`, `agent-stop` |
+
+Validation: `erllama_server_agent_SUITE` (9 cases with a scripted model: plain answers, ordering, approvals, unknown tools and outside paths, round budget, queued input, interrupt killing a shell and its descendants, background jobs, stopping and continuing a conversation), `erllama_server_tools_tests` (workspace confinement including symlinks, paging, listing, search, write and edit), and the gated real-model case on Qwen2.5 1.5B (the model reads a file with its tools to answer).
+
+## Phases 5 to 7
 
 Not started.

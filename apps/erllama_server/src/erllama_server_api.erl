@@ -48,7 +48,13 @@ from `NextSeq`.
     run/1,
     runs/0,
     conversation/1,
-    conversations/0
+    conversations/0,
+    agent_start/1,
+    agent_send/2,
+    agent_approve/3,
+    agent_interrupt/1,
+    agent_stop/1,
+    agents/0
 ]).
 
 -include("erllama_server_api.hrl").
@@ -432,4 +438,128 @@ app_vsn(App) ->
     case application:get_key(App, vsn) of
         {ok, V} -> list_to_binary(V);
         undefined -> <<"unknown">>
+    end.
+
+%% -----------------------------------------------------------------------------
+%% Agent sessions
+%% -----------------------------------------------------------------------------
+
+-doc """
+Start an agent session: a model working with tools in `workspace`, a
+directory on the release machine. `Spec`:
+
+- `model` (registry name or alias; default model when absent) and
+  `workspace` (required);
+- `conversation_id`: continue that conversation (it must be free);
+- `policy`: `yes` (every tool runs without asking), `read_only` (tools
+  that change the workspace are denied), or `#{ToolName => auto | ask |
+  deny}`; by default reading runs and changing asks;
+- `budgets`: `max_rounds`, `max_tokens`, `max_elapsed_ms` per turn;
+- `system`: the system prompt (`WORKSPACE` is replaced by the path).
+
+Returns the session id, which is also its job id for `attach/3`.
+""".
+-spec agent_start(map()) ->
+    {ok, #{agent_id := binary(), conversation_id := binary()}} | {error, term()}.
+agent_start(#{workspace := Dir} = Spec) ->
+    case
+        {
+            erllama_server_models:resolve(maps:get(model, Spec, undefined)),
+            erllama_server_workspace:open(Dir)
+        }
+    of
+        {{ok, Target}, {ok, Ws}} ->
+            Model =
+                case Target of
+                    {registry, #{name := N}} -> N;
+                    {loaded, N} -> N
+                end,
+            start_agent(Spec, Model, Ws);
+        {{error, _} = E, _} ->
+            E;
+        {_, {error, R}} ->
+            {error, {workspace, R}}
+    end;
+agent_start(_Spec) ->
+    {error, {missing, workspace}}.
+
+start_agent(Spec, Model, Ws) ->
+    Id = erllama_server_ids:agent(),
+    case erllama_server_convs:begin_run(maps:get(conversation_id, Spec, undefined), Model, Id) of
+        {ok, #{id := Conv, messages := History, parent_key := PK}} ->
+            AgentSpec0 = #{
+                run_id => Id,
+                kind => agent,
+                model => Model,
+                workspace => Ws,
+                conversation_id => Conv,
+                history => [M || #{role := R} = M <- History, R =/= <<"system">>],
+                parent_key => PK,
+                policy => agent_policy(maps:get(policy, Spec, #{})),
+                budgets => maps:with(
+                    [max_rounds, max_tokens, max_elapsed_ms], maps:get(budgets, Spec, #{})
+                )
+            },
+            AgentSpec = maps:merge(AgentSpec0, maps:with([system, generator], Spec)),
+            case erllama_server_runs:start(AgentSpec) of
+                {ok, _} ->
+                    {ok, #{agent_id => Id, conversation_id => Conv}};
+                {error, _} = E ->
+                    ok = erllama_server_convs:release(Conv, Id),
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+agent_policy(yes) ->
+    maps:from_list([{N, auto} || N <- erllama_server_tools:names()]);
+agent_policy(read_only) ->
+    maps:from_list([
+        {N, deny}
+     || N <- erllama_server_tools:names(), erllama_server_tools:class(N) =:= write
+    ]);
+agent_policy(M) when is_map(M) ->
+    maps:filter(fun(K, V) -> is_binary(K) andalso lists:member(V, [auto, ask, deny]) end, M);
+agent_policy(_) ->
+    #{}.
+
+-doc "Input for a session: starts a turn, or waits for the current one (`{queued, N}`).".
+-spec agent_send(binary(), binary()) -> ok | {queued, pos_integer()} | {error, term()}.
+agent_send(Id, Text) ->
+    with_agent(Id, fun(Pid) ->
+        erllama_server_agent:send(Pid, unicode:characters_to_binary(Text))
+    end).
+
+-doc "Answer an `approval_request`: `allow`, `deny`, or `always` (allow this tool for the session).".
+-spec agent_approve(binary(), binary(), allow | deny | always) -> ok | {error, term()}.
+agent_approve(Id, CallId, Decision) when
+    Decision =:= allow; Decision =:= deny; Decision =:= always
+->
+    with_agent(Id, fun(Pid) -> erllama_server_agent:approve(Pid, CallId, Decision) end).
+
+-doc "Stop the session's current turn (generation and tools). Queued input then runs.".
+-spec agent_interrupt(binary()) -> ok | {error, term()}.
+agent_interrupt(Id) ->
+    with_agent(Id, fun erllama_server_agent:interrupt/1).
+
+-doc "End a session. Its conversation stays and can be continued.".
+-spec agent_stop(binary()) -> ok | {error, term()}.
+agent_stop(Id) ->
+    with_agent(Id, fun erllama_server_agent:stop/1).
+
+-doc "The agent sessions the release holds.".
+-spec agents() -> {ok, [map()]}.
+agents() ->
+    {ok, [
+        S
+     || #{kind := agent, pid := P} <- erllama_server_runs:list(),
+        {ok, S} <- [erllama_server_job:info(P)]
+    ]}.
+
+with_agent(Id, Fun) ->
+    case erllama_server_runs:lookup(Id) of
+        {ok, #{kind := agent, pid := Pid}} -> Fun(Pid);
+        {ok, _} -> {error, not_an_agent};
+        {error, _} = E -> E
     end.

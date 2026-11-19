@@ -17,7 +17,7 @@
 -define(TAB, ?MODULE).
 
 -type status() :: running | done | cancelled | error.
--type kind() :: run | pull.
+-type kind() :: run | pull | agent.
 
 %% Monitor ref of each run process, to its run id.
 -record(state, {mons = #{} :: #{reference() => binary()}}).
@@ -138,7 +138,9 @@ release_conv(ConvId, RunId) ->
     end.
 
 job_sup(run) -> {erllama_server_run_sup, erllama_server_config:get(max_active_runs)};
-job_sup(pull) -> {erllama_server_pull_sup, erllama_server_config:get(max_active_pulls)}.
+job_sup(pull) -> {erllama_server_pull_sup, erllama_server_config:get(max_active_pulls)};
+job_sup(agent) -> {erllama_server_agent_sup, erllama_server_config:get(max_agents)}.
 
 too_many(run) -> too_many_runs;
-too_many(pull) -> too_many_pulls.
+too_many(pull) -> too_many_pulls;
+too_many(agent) -> too_many_agents.

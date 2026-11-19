@@ -11,7 +11,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, begin_run/3, end_run/4, release/2, get/1, list/0]).
+-export([start_link/0, begin_run/3, end_run/4, append/4, release/2, get/1, list/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(TAB, ?MODULE).
@@ -38,6 +38,12 @@ begin_run(ConvId, Model, RunId) ->
 -spec end_run(binary(), binary(), [map()], term()) -> ok.
 end_run(ConvId, RunId, Messages, FinishKey) ->
     gen_server:call(?MODULE, {end_run, ConvId, RunId, Messages, FinishKey}).
+
+%% Record messages while keeping the conversation (an agent session
+%% holds it across turns). A no-op unless `Owner' holds it.
+-spec append(binary(), binary(), [map()], term()) -> ok.
+append(ConvId, Owner, Messages, FinishKey) ->
+    gen_server:call(?MODULE, {append, ConvId, Owner, Messages, FinishKey}).
 
 %% Free the conversation without appending (cancel, error, crash).
 %% A no-op unless `RunId' is the active run.
@@ -80,6 +86,9 @@ handle_call({end_run, ConvId, RunId, New, FinishKey}, _From, S) ->
             ok
     end,
     {reply, ok, S};
+handle_call({append, ConvId, Owner, New, FinishKey}, _From, S) ->
+    ok = do_append(ConvId, Owner, New, FinishKey),
+    {reply, ok, S};
 handle_call({release, ConvId, RunId}, _From, S) ->
     case ets:lookup(?TAB, ConvId) of
         [{_, #{active_run := RunId} = C}] ->
@@ -117,6 +126,25 @@ reserve(ConvId, Model, RunId) ->
                 end,
             true = ets:insert(?TAB, {ConvId, Conv#{active_run := RunId, model := Model}}),
             {ok, #{id => ConvId, messages => Msgs, parent_key => ParentKey}}
+    end.
+
+do_append(ConvId, Owner, New, FinishKey) ->
+    case ets:lookup(?TAB, ConvId) of
+        [{_, #{active_run := Owner, messages := Msgs} = C}] ->
+            Key =
+                case FinishKey of
+                    undefined -> maps:get(last_finish_key, C);
+                    K -> K
+                end,
+            true = ets:insert(
+                ?TAB,
+                {ConvId, C#{
+                    messages := Msgs ++ New, last_finish_key := Key, updated_at := now_ms()
+                }}
+            ),
+            ok;
+        _ ->
+            ok
     end.
 
 new(ConvId, Model) ->
