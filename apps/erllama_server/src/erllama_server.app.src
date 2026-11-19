@@ -12,7 +12,8 @@
         kernel,
         stdlib,
         crypto,
-        erllama
+        erllama,
+        livery
     ]},
     {env, []},
     {modules, []},

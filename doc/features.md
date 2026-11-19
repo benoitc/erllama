@@ -67,6 +67,28 @@ Outstanding and known limits:
 - Ctrl-C quits the CLI without cancelling the run; keyboard interruption comes with the terminal work (Phase 7);
 - the stub backend has no chat parser, so routine tests see unparsed replies; parsing is covered by the real-model case only.
 
-## Phases 3 to 7
+## Phase 3a: model registry, downloads and lifetime (implemented)
+
+| Feature | State | Notes |
+|---|---|---|
+| model registry | done | `erllama_server_registry`, `<data_dir>/registry.json` written atomically; names `family:tag`, aliases, copies, a default model; missing files reported; a corrupt file moved aside |
+| GGUF metadata | done | `erllama_server_gguf` streams the header (large arrays skipped): architecture, context length, quantisation, parameters, chat template, projector modalities |
+| downloads | done | `hf://` (file, or repository plus quantisation, with its mmproj), `ollama://` (model, projector and parameter layers), `https://` (optional sha256); one `erllama_server_pull` job each, followed like a run |
+| resumable, verified transfers | done | `.part` files with a running sha256; `Range` resume after a stall or a cancel; a server ignoring ranges restarts the file; size and sha256 checked; redirects followed by hand, the Hugging Face token kept to its own origin |
+| shared job events | done | the event ring and subscribers moved to `erllama_server_events`; runs and downloads answer the same attach, detach, cancel and result calls |
+| load on demand and keep-alive | done | `erllama_server_models`: one shared load per model, held while used, unloaded after its keep-alive (`0`, ms, `infinity`, per request or per model) |
+| eviction | done | `erllama_server_models` is erllama's `model_evictor`; the release turns the scheduler on |
+| CLI | done | `pull`, `models`, `show`, `ps`, `load` (name or `.gguf` path), `unload`, `cp`, `rm`, `default`; download progress on the terminal |
+| CLI escript | changed | built by `scripts/build_cli.escript` from erllama_server's modules only (22 files); rebar3 escriptize would have packed every server dependency |
+| library fix | done | an unloaded model id can be loaded again (`erllama_registry` monitored the model from inside the model process, so the id was never freed) |
+
+Validation is recorded with the Phase 3 commit.
+
+Known limits:
+- Livery writes a `500` response into an unfinished streamed body when a handler crashes mid-stream (found while testing interrupted downloads; reported upstream, not worked around in the server);
+- split GGUF files are not supported;
+- the registry entry's `backend` option (stub backend) exists for tests.
+
+## Phases 3b to 7
 
 Not started.

@@ -9,11 +9,15 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
--export([all/0, end_per_testcase/2]).
+-export([all/0, init_per_testcase/2, end_per_testcase/2]).
 -export([starts_with_erllama/1, stop_leaves_erllama_running/1]).
 
 all() ->
     [starts_with_erllama, stop_leaves_erllama_running].
+
+init_per_testcase(_TC, Config) ->
+    ok = application:set_env(erllama_server, data_dir, ?config(priv_dir, Config)),
+    Config.
 
 end_per_testcase(_TC, _Config) ->
     _ = application:stop(erllama_server),

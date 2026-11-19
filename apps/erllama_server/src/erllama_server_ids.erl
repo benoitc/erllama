@@ -6,13 +6,16 @@
 %% Run and conversation identifiers: a type prefix and 64 random bits,
 %% hex encoded, e.g. `<<"run_9f2c41d07ab3e655">>'.
 
--export([run/0, conversation/0, tool_call/0]).
+-export([run/0, conversation/0, tool_call/0, pull/0]).
 
 -spec run() -> binary().
 run() -> new(<<"run_">>).
 
 -spec conversation() -> binary().
 conversation() -> new(<<"conv_">>).
+
+-spec pull() -> binary().
+pull() -> new(<<"pull_">>).
 
 -spec tool_call() -> binary().
 tool_call() -> new(<<"call_">>).

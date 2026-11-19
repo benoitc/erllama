@@ -32,6 +32,9 @@ run_over_tls_distribution(Config) ->
     OptFile = ?config(optfile, Config),
     {ok, Rel, RelNode} = start_peer(erllama_server_tls_rel, OptFile, []),
     try
+        ok = peer:call(Rel, application, set_env, [
+            erllama_server, data_dir, ?config(priv_dir, Config)
+        ]),
         {ok, _} = peer:call(Rel, application, ensure_all_started, [erllama_server]),
         {ok, _} = peer:call(Rel, erllama, load_model, [<<"stub">>, #{backend => erllama_model_stub}]),
         {ok, Cli, _} = start_peer(erllama_server_tls_cli, OptFile, ["-hidden"]),

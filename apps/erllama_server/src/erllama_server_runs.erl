@@ -3,32 +3,34 @@
 %%
 -module(erllama_server_runs).
 -moduledoc false.
-%% The table of live runs. Readers go to ETS directly; every write is
-%% made by this process, which also starts the run processes (so the
-%% `max_active_runs' check and the insert are one step) and monitors
-%% them: when a run exits, its row is deleted and any conversation it
-%% still held is released.
+%% The table of live jobs: generation runs and model downloads. Readers
+%% go to ETS directly; every write is made by this process, which also
+%% starts the job processes (so the `max_active_runs' check and the
+%% insert are one step) and monitors them: when a job exits, its row is
+%% deleted and any conversation it still held is released.
 
 -behaviour(gen_server).
 
--export([start_link/0, start/1, lookup/1, list/0, set_status/2, active_count/0]).
+-export([start_link/0, start/1, lookup/1, list/0, set_status/2, active_count/0, active_count/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(TAB, ?MODULE).
 
 -type status() :: running | done | cancelled | error.
+-type kind() :: run | pull.
 
 %% Monitor ref of each run process, to its run id.
 -record(state, {mons = #{} :: #{reference() => binary()}}).
 -type state() :: #state{}.
--export_type([status/0]).
+-export_type([status/0, kind/0]).
 
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-%% Start a run process for `Spec' (it carries run_id, conversation_id
-%% and model). The run is registered before this returns.
+%% Start a job process for `Spec' (it carries run_id, the job's id,
+%% `kind' (default `run'), conversation_id and model; a download's
+%% model is its source). The job is registered before this returns.
 -spec start(map()) -> {ok, pid()} | {error, term()}.
 start(Spec) ->
     gen_server:call(?MODULE, {start, Spec}, 30000).
@@ -53,11 +55,16 @@ set_status(RunId, Status) ->
 
 -spec active_count() -> non_neg_integer().
 active_count() ->
-    ets:select_count(?TAB, [{{'_', '_', '_', '_', '_', running}, [], [true]}]).
+    active_count(run).
 
-to_map({RunId, Pid, ConvId, Model, StartedAt, Status}) ->
+-spec active_count(kind()) -> non_neg_integer().
+active_count(Kind) ->
+    ets:select_count(?TAB, [{{'_', '_', '_', '_', '_', running, Kind}, [], [true]}]).
+
+to_map({RunId, Pid, ConvId, Model, StartedAt, Status, Kind}) ->
     #{
         run_id => RunId,
+        kind => Kind,
         pid => Pid,
         conversation_id => ConvId,
         model => Model,
@@ -71,11 +78,13 @@ init([]) ->
     {ok, #state{}}.
 
 handle_call({start, #{run_id := RunId} = Spec}, _From, #state{mons = Mons} = S) ->
-    case active_count() < erllama_server_config:get(max_active_runs) of
+    Kind = maps:get(kind, Spec, run),
+    {Sup, Limit} = job_sup(Kind),
+    case active_count(Kind) < Limit of
         false ->
-            {reply, {error, too_many_runs}, S};
+            {reply, {error, too_many(Kind)}, S};
         true ->
-            case supervisor:start_child(erllama_server_run_sup, [Spec]) of
+            case supervisor:start_child(Sup, [Spec]) of
                 {ok, Pid} ->
                     Row = {
                         RunId,
@@ -83,7 +92,8 @@ handle_call({start, #{run_id := RunId} = Spec}, _From, #state{mons = Mons} = S) 
                         maps:get(conversation_id, Spec, undefined),
                         maps:get(model, Spec),
                         erlang:system_time(millisecond),
-                        running
+                        running,
+                        Kind
                     },
                     true = ets:insert(?TAB, Row),
                     Mon = erlang:monitor(process, Pid),
@@ -105,7 +115,7 @@ handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{mons = Mons} = S) ->
     case maps:take(Mon, Mons) of
         {RunId, Mons1} ->
             case ets:lookup(?TAB, RunId) of
-                [{_, _, ConvId, _, _, _}] when ConvId =/= undefined ->
+                [{_, _, ConvId, _, _, _, _}] when ConvId =/= undefined ->
                     release_conv(ConvId, RunId);
                 _ ->
                     ok
@@ -126,3 +136,9 @@ release_conv(ConvId, RunId) ->
     catch
         exit:_ -> ok
     end.
+
+job_sup(run) -> {erllama_server_run_sup, erllama_server_config:get(max_active_runs)};
+job_sup(pull) -> {erllama_server_pull_sup, erllama_server_config:get(max_active_pulls)}.
+
+too_many(run) -> too_many_runs;
+too_many(pull) -> too_many_pulls.

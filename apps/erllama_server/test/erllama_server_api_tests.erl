@@ -16,8 +16,8 @@ hello_refuses_other_versions_test() ->
         erllama_server_api:hello(99)
     ).
 
-start_run_needs_a_model_test() ->
-    ?assertEqual({error, {missing, model}}, erllama_server_api:start_run(#{prompt => <<"x">>})).
+start_run_needs_a_map_test() ->
+    ?assertEqual({error, invalid_spec}, erllama_server_api:start_run(prompt)).
 
 server_controlled_options_are_refused_test() ->
     [

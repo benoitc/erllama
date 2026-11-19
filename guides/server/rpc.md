@@ -17,12 +17,12 @@ stops the release.
 rebar3 as prod release
 R=_build/prod/rel/erllama_server
 $R/bin/erllama_server daemon
-$R/bin/erllama load ~/Models/tinyllama-1.1b-chat.gguf --id tiny --n-ctx 2048
+$R/bin/erllama load ~/Models/tinyllama-1.1b-chat.gguf --name tiny --n-ctx 2048
 $R/bin/erllama status
 ```
 
-`load` takes a local GGUF file. It is a stopgap until the model
-registry, which will also download models.
+`load` registers a GGUF file on the release machine and loads it;
+`pull` downloads one. See [Managing models](models.md).
 
 ## Run a chat turn
 

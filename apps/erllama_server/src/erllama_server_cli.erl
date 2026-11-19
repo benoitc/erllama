@@ -16,19 +16,28 @@
     "\n",
     "commands:\n",
     "  ping                          check that the release is running\n",
-    "  status                        versions, loaded models, active runs\n",
-    "  models                        list the loaded models\n",
-    "  load PATH [--id ID] [--n-ctx N] [--gpu-layers N]\n",
-    "                                load a local GGUF file\n",
-    "  unload ID                     unload a model\n",
+    "  status                        versions, loaded models, active jobs\n",
+    "  models                        the registry's models and what is loaded\n",
+    "  pull SOURCE [--name NAME] [--sha256 HEX] [--detach]\n",
+    "                                download a model: hf://ORG/REPO[:QUANT],\n",
+    "                                hf://ORG/REPO/FILE.gguf, https://...gguf,\n",
+    "                                ollama://NAME[:TAG] or NAME[:TAG]\n",
+    "  show MODEL                    a model's entry and GGUF metadata\n",
+    "  ps                            loaded models, holders and keep-alive\n",
+    "  load MODEL|PATH.gguf [--name NAME] [--n-ctx N] [--gpu-layers N] [--mmproj PATH]\n",
+    "                                load a model (registering a file first)\n",
+    "  unload MODEL                  unload a model\n",
+    "  cp SRC DST                    a second name for a model\n",
+    "  rm MODEL                      remove a model (deletes downloaded files)\n",
+    "  default MODEL                 the model used when none is named\n",
     "  run MODEL [--conversation ID] [--max-tokens N] [--detach] PROMPT...\n",
     "                                one chat turn, streamed\n",
     "  chat MODEL [--conversation ID] [--max-tokens N]\n",
     "                                chat line by line (/quit or end of input)\n",
-    "  runs                          list the runs the release holds\n",
-    "  attach RUN [--from SEQ]       stream a run from an event sequence\n",
-    "  cancel RUN                    cancel a run\n",
-    "  result RUN                    print a finished run's result\n",
+    "  runs                          list the runs and downloads the release holds\n",
+    "  attach JOB [--from SEQ]       follow a run or download from an event sequence\n",
+    "  cancel JOB                    cancel a run or download\n",
+    "  result JOB                    print a finished run's or download's result\n",
     "  --version                     print the client version\n",
     "\n",
     "The release node is ERLLAMA_NODE (default erllama_server@127.0.0.1);\n",
@@ -70,9 +79,30 @@ command("models") ->
     {[], fun models/4};
 command("load") ->
     {
-        [{"--id", id, string}, {"--n-ctx", n_ctx, int}, {"--gpu-layers", n_gpu_layers, int}],
+        [
+            {"--name", name, string},
+            {"--id", name, string},
+            {"--n-ctx", n_ctx, int},
+            {"--gpu-layers", n_gpu_layers, int},
+            {"--mmproj", mmproj, string}
+        ],
         fun load/4
     };
+command("pull") ->
+    {
+        [{"--name", name, string}, {"--sha256", sha256, string}, {"--detach", detach, flag}],
+        fun pull/4
+    };
+command("show") ->
+    {[], fun show/4};
+command("ps") ->
+    {[], fun ps/4};
+command("cp") ->
+    {[], fun cp/4};
+command("rm") ->
+    {[], fun rm/4};
+command("default") ->
+    {[], fun default/4};
 command("unload") ->
     {[], fun unload/4};
 command("run") ->
@@ -119,25 +149,71 @@ models(Node, _Info, _Opts, []) ->
 models(_, _, _, _) ->
     usage("models").
 
-load(Node, _Info, Opts, [Path]) ->
+%% An argument ending in `.gguf' is a file on the release machine, to
+%% register and load; anything else is a registry name.
+load(Node, _Info, Opts, [Target]) ->
     LoadOpts = maps:map(
         fun
-            (id, V) -> list_to_binary(V);
+            (K, V) when K =:= name; K =:= mmproj -> list_to_binary(V);
             (_, V) -> V
         end,
         Opts
     ),
-    reply(
-        erllama_server_client:call(Node, load_model, [list_to_binary(Path), LoadOpts]),
-        fun(Id) -> ["loaded ", Id, "\n"] end
-    );
+    Call =
+        case filename:extension(Target) of
+            ".gguf" -> {load_model, [list_to_binary(Target), LoadOpts]};
+            _ -> {load, [list_to_binary(Target), LoadOpts]}
+        end,
+    {F, A} = Call,
+    reply(erllama_server_client:call(Node, F, A), fun(Id) -> ["loaded ", Id, "\n"] end);
 load(_, _, _, _) ->
     usage("load").
 
 unload(Node, _Info, _Opts, [Id]) ->
-    reply(erllama_server_client:call(Node, unload_model, [list_to_binary(Id)]), fun(_) -> "" end);
+    reply(erllama_server_client:call(Node, unload, [list_to_binary(Id)]), fun(_) -> "" end);
 unload(_, _, _, _) ->
     usage("unload").
+
+pull(Node, _Info, Opts, [Source]) ->
+    PullOpts = maps:map(fun(_, V) -> list_to_binary(V) end, maps:with([name, sha256], Opts)),
+    case erllama_server_client:call(Node, pull, [list_to_binary(Source), PullOpts]) of
+        {ok, #{job_id := Id}} when is_map_key(detach, Opts) ->
+            {0, [Id, "\n"]};
+        {ok, #{job_id := Id}} ->
+            follow(Node, Id, 0);
+        {error, Reason} ->
+            fail(Reason)
+    end;
+pull(_, _, _, _) ->
+    usage("pull").
+
+show(Node, _Info, _Opts, [Name]) ->
+    reply(erllama_server_client:call(Node, show, [list_to_binary(Name)]), fun format_show/1);
+show(_, _, _, _) ->
+    usage("show").
+
+ps(Node, _Info, _Opts, []) ->
+    reply(erllama_server_client:call(Node, ps, []), fun format_ps/1);
+ps(_, _, _, _) ->
+    usage("ps").
+
+cp(Node, _Info, _Opts, [Src, Dst]) ->
+    reply(
+        erllama_server_client:call(Node, copy, [list_to_binary(Src), list_to_binary(Dst)]),
+        fun(#{name := N}) -> ["copied to ", N, "\n"] end
+    );
+cp(_, _, _, _) ->
+    usage("cp").
+
+rm(Node, _Info, _Opts, [Name]) ->
+    reply(erllama_server_client:call(Node, remove, [list_to_binary(Name)]), fun(_) -> "" end);
+rm(_, _, _, _) ->
+    usage("rm").
+
+default(Node, _Info, _Opts, [Name]) ->
+    reply(erllama_server_client:call(Node, set_default, [list_to_binary(Name)]), fun(_) -> "" end);
+default(_, _, _, _) ->
+    usage("default").
 
 run_turn(Node, _Info, Opts, [Model | [_ | _] = Words]) ->
     Prompt = unicode:characters_to_binary(lists:join(" ", Words)),
@@ -223,14 +299,24 @@ result(_, _, _, _) ->
 
 follow(Node, RunId, Cursor) ->
     case erllama_server_client:follow(Node, RunId, Cursor, fun print_event/1) of
-        {ok, #{type := done}} -> {0, "\n"};
-        {ok, #{type := cancelled}} -> {1, "\n[cancelled]\n"};
-        {ok, #{type := error, data := #{error := R}}} -> {1, ["\n", format_error({run_failed, R})]};
-        {error, Reason} -> fail(Reason)
+        {ok, #{type := done, data := #{model := #{name := Name}}}} ->
+            {0, ["\npulled ", Name, "\n"]};
+        {ok, #{type := done}} ->
+            {0, "\n"};
+        {ok, #{type := cancelled}} ->
+            {1, "\n[cancelled]\n"};
+        {ok, #{type := error, data := #{error := R}}} ->
+            {1, ["\n", format_error({run_failed, R})]};
+        {error, Reason} ->
+            fail(Reason)
     end.
 
 print_event(#{type := token, data := Bin}) ->
     io:put_chars(Bin);
+print_event(#{type := loading, data := #{model := M}}) ->
+    io:format(standard_error, "[loading ~ts]~n", [M]);
+print_event(#{type := progress, data := #{file := F, done := D, total := T}}) ->
+    io:put_chars(standard_error, ["\r", progress_line(F, D, T)]);
 print_event({gap, Wanted, Oldest}) ->
     io:format(standard_error, "~n[events ~b to ~b are no longer held by the release]~n", [
         Wanted, Oldest - 1
@@ -312,8 +398,92 @@ format_pressure(#{used_b := U, total_b := T, source := Src}) when T > 0 ->
 format_pressure(_) ->
     "".
 
-format_models([]) -> "no model loaded\n";
-format_models(Ms) -> model_lines(Ms).
+format_models([]) ->
+    "no model registered or loaded\n";
+format_models(Ms) ->
+    [
+        io_lib:format("~ts~ts  ~ts  ~ts~ts~n", [
+            maps:get(name, M),
+            case maps:get(default, M, false) of
+                true -> " (default)";
+                false -> ""
+            end,
+            case maps:get(loaded, M, false) of
+                true -> "loaded";
+                false -> "-"
+            end,
+            size_text(maps:get(size, M, undefined)),
+            case maps:get(status, M, ok) of
+                missing -> "  FILE MISSING";
+                _ -> ""
+            end
+        ])
+     || M <- Ms
+    ].
+
+format_ps([]) ->
+    "no model loaded\n";
+format_ps(Ms) ->
+    [
+        io_lib:format("~ts  ~p  ctx ~p  ~ts  ~ts~n", [
+            maps:get(id, M),
+            maps:get(status, M, unknown),
+            maps:get(context_size, M, 0),
+            maps:get(quant_tag, M, <<"-">>),
+            keep_alive_text(M)
+        ])
+     || M <- Ms
+    ].
+
+keep_alive_text(#{managed := true, holders := H}) when H > 0 ->
+    io_lib:format("in use by ~b", [H]);
+keep_alive_text(#{managed := true, expires_at := undefined, keep_alive := infinity}) ->
+    "kept loaded";
+keep_alive_text(#{managed := true, expires_at := E}) when is_integer(E) ->
+    io_lib:format("unloads in ~bs", [max(0, (E - erlang:system_time(millisecond)) div 1000)]);
+keep_alive_text(#{managed := false}) ->
+    "loaded outside the registry";
+keep_alive_text(_) ->
+    "".
+
+format_show(#{name := N} = E) ->
+    Meta = maps:get(metadata, E, #{}),
+    Line = fun(K, V) -> io_lib:format("~-14s ~ts~n", [K, value_text(V)]) end,
+    [
+        Line("name", N),
+        Line("source", maps:get(ref, maps:get(source, E, #{}), <<"-">>)),
+        Line("file", maps:get(path, E, <<"-">>)),
+        Line("size", size_text(maps:get(size, E, undefined))),
+        Line("sha256", maps:get(sha256, E, undefined)),
+        Line("projector", maps:get(mmproj, E, undefined)),
+        Line("architecture", maps:get(architecture, Meta, undefined)),
+        Line("parameters", maps:get(size_label, Meta, undefined)),
+        Line("quantisation", maps:get(file_type, Meta, undefined)),
+        Line("context", maps:get(context_length, Meta, undefined)),
+        Line("chat template", maps:get(chat_template, Meta, undefined) =/= undefined),
+        Line("loaded", maps:get(loaded, E, false))
+    ].
+
+value_text(undefined) -> "-";
+value_text(true) -> "yes";
+value_text(false) -> "no";
+value_text(V) when is_integer(V) -> integer_to_list(V);
+value_text(V) when is_binary(V) -> V;
+value_text(V) when is_list(V) -> V;
+value_text(V) -> io_lib:format("~p", [V]).
+
+size_text(undefined) -> "-";
+size_text(B) when B >= 1 bsl 30 -> io_lib:format("~.1f GiB", [B / (1 bsl 30)]);
+size_text(B) -> io_lib:format("~.1f MiB", [B / (1 bsl 20)]).
+
+progress_line(File, Done, undefined) ->
+    io_lib:format("pulling ~p: ~ts", [File, size_text(Done)]);
+progress_line(File, Done, Total) when Total > 0 ->
+    io_lib:format("pulling ~p: ~b% (~ts of ~ts)", [
+        File, Done * 100 div Total, size_text(Done), size_text(Total)
+    ]);
+progress_line(File, Done, _) ->
+    progress_line(File, Done, undefined).
 
 model_lines(Ms) ->
     [
@@ -330,8 +500,9 @@ format_runs([]) ->
     "no runs\n";
 format_runs(Rs) ->
     [
-        io_lib:format("~s  ~p  ~s  ~s~n", [
+        io_lib:format("~s  ~p  ~p  ~ts  ~ts~n", [
             Id,
+            maps:get(kind, R, run),
             Status,
             Model,
             case Conv of
@@ -339,7 +510,7 @@ format_runs(Rs) ->
                 _ -> Conv
             end
         ])
-     || #{run_id := Id, status := Status, model := Model, conversation_id := Conv} <- Rs
+     || #{run_id := Id, status := Status, model := Model, conversation_id := Conv} = R <- Rs
     ].
 
 format_result(#{status := error, error := R}) ->

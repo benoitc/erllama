@@ -11,11 +11,13 @@ never raises, so a remote caller can tell a refusal from a crash.
 Clients call `hello/1` first with the API version they speak; the
 release refuses any other version.
 
-A run streams its events to the processes attached with `attach/3`
-as `{erllama_server_run, RunId, Event}`. An event is
-`#{seq := N, type := Type, data := Data}` with `Type` one of
-`started`, `token`, `thinking`, `done`, `cancelled` and `error`;
-the last three are terminal. Subscribers ack with
+A job (a run, or a model download started with `pull/2`) streams its
+events to the processes attached with `attach/3` as
+`{erllama_server_run, JobId, Event}`. An event is
+`#{seq := N, type := Type, data := Data}`. A run emits `started`,
+`loading` (when its model is being loaded), `token`, `thinking`; a
+download emits `started` and `progress`; both end with one of the
+terminal `done`, `cancelled` and `error`. Subscribers ack with
 `RunPid ! {ack, self(), Seq}`; one that falls too far behind gets
 `{erllama_server_run, RunId, {dropped, NextSeq}}` and reattaches
 from `NextSeq`.
@@ -26,8 +28,18 @@ from `NextSeq`.
     hello/1,
     status/0,
     models/0,
+    show/1,
+    ps/0,
+    register_model/2,
+    load/2,
     load_model/2,
+    unload/1,
     unload_model/1,
+    alias/2,
+    copy/2,
+    remove/1,
+    set_default/1,
+    pull/2,
     start_run/1,
     attach/3,
     detach/2,
@@ -62,10 +74,9 @@ hello(?API_VSN) ->
 hello(Client) ->
     {error, {incompatible_api, #{server => ?API_VSN, client => Client}}}.
 
--doc "Versions, loaded models, active runs and memory pressure.".
+-doc "Versions, loaded models, active jobs, memory pressure and VRAM.".
 -spec status() -> {ok, map()}.
 status() ->
-    {ok, Models} = models(),
     Pressure =
         case erllama:pressure() of
             {ok, P} -> P;
@@ -76,52 +87,171 @@ status() ->
         server_vsn => app_vsn(erllama_server),
         erllama_vsn => app_vsn(erllama),
         node => node(),
-        models => Models,
-        active_runs => erllama_server_runs:active_count(),
-        pressure => Pressure
+        models => ps_or_empty(),
+        active_runs => erllama_server_runs:active_count(run),
+        active_pulls => erllama_server_runs:active_count(pull),
+        pressure => Pressure,
+        vram => vram()
     }}.
 
--doc "The loaded models.".
--spec models() -> {ok, [map()]}.
-models() ->
-    Keys = [id, status, backend, context_size, quant_tag, tier],
-    {ok, [maps:with(Keys, I) || I <- erllama:list_models()]}.
+ps_or_empty() ->
+    {ok, Ps} = ps(),
+    Ps.
 
--doc """
-Load a local GGUF file. `Opts`: `id` (default: the file name without
-`.gguf`), `n_ctx`, `n_gpu_layers`. Superseded by the model registry.
-""".
--spec load_model(binary() | string(), map()) -> {ok, binary()} | {error, term()}.
-load_model(Path0, Opts) when is_map(Opts) ->
-    Path = unicode:characters_to_binary(Path0),
-    case filelib:is_regular(Path) of
-        false ->
-            {error, {enoent, Path}};
-        true ->
-            Id = maps:get(id, Opts, filename:basename(Path, <<".gguf">>)),
-            Config0 = #{
-                model_path => Path,
-                model_opts => maps:with([n_gpu_layers], Opts),
-                context_opts => maps:with([n_ctx], Opts)
-            },
-            %% `context_size' is the cache's copy of `n_ctx'.
-            Config =
-                case Opts of
-                    #{n_ctx := N} -> Config0#{context_size => N};
-                    _ -> Config0
-                end,
-            erllama:load_model(Id, Config)
+vram() ->
+    try erllama:vram_info() of
+        {ok, V} -> V;
+        _ -> undefined
+    catch
+        _:_ -> undefined
     end.
 
--doc "Unload a model. Its runs end with an error event.".
+-doc """
+The registry's models, with whether each is loaded, plus models loaded
+directly through erllama (`registered => false`).
+""".
+-spec models() -> {ok, [map()]}.
+models() ->
+    Loaded = maps:from_list([{maps:get(id, I), I} || I <- erllama:list_models()]),
+    Registered = [
+        maps:merge(
+            maps:with([name, source, size, sha256, status, default, keep_alive], E),
+            #{
+                registered => true,
+                loaded => is_map_key(Name, Loaded),
+                mmproj => maps:get(mmproj, E, undefined) =/= undefined
+            }
+        )
+     || #{name := Name} = E <- erllama_server_registry:list()
+    ],
+    Names = [N || #{name := N} <- Registered],
+    Direct = [
+        #{name => Id, registered => false, loaded => true, status => ok}
+     || Id := _ <- Loaded, not lists:member(Id, Names)
+    ],
+    {ok, Registered ++ Direct}.
+
+-doc "One model: its registry entry, the GGUF metadata and its load state.".
+-spec show(binary()) -> {ok, map()} | {error, term()}.
+show(Name) ->
+    case erllama_server_registry:resolve(Name) of
+        {ok, #{name := Id, path := Path} = Entry} ->
+            Meta =
+                case erllama_server_gguf:read(Path) of
+                    {ok, H} -> erllama_server_gguf:summary(H);
+                    {error, R} -> #{error => R}
+                end,
+            {ok, Entry#{metadata => Meta, loaded => erllama:whereis(Id) =/= {error, not_loaded}}};
+        {error, _} = E ->
+            case erllama:model_info(Name) of
+                {ok, Info} ->
+                    {ok, #{name => Name, registered => false, info => maps:remove(pid, Info)}};
+                {error, _} ->
+                    E
+            end
+    end.
+
+-doc "Loaded models, with holders and keep-alive for registry models.".
+-spec ps() -> {ok, [map()]}.
+ps() ->
+    {ok, erllama_server_models:ps()}.
+
+-doc """
+Register a GGUF file on the release machine. `Opts`: `name`, `mmproj`,
+`n_ctx`, `n_gpu_layers`, `chat_template`, `keep_alive`.
+""".
+-spec register_model(binary() | string(), map()) -> {ok, map()} | {error, term()}.
+register_model(Path, Opts) when is_map(Opts) ->
+    erllama_server_registry:register_local(Path, Opts).
+
+-doc "Load a registry model now; its keep-alive starts at once.".
+-spec load(binary(), map()) -> {ok, binary()} | {error, term()}.
+load(Name, Opts) when is_map(Opts) ->
+    erllama_server_models:load(Name, maps:get(keep_alive, Opts, undefined)).
+
+-doc """
+Register a local GGUF file (when `Path` is one and not yet registered)
+and load it. `Opts` as for `register_model/2`.
+""".
+-spec load_model(binary() | string(), map()) -> {ok, binary()} | {error, term()}.
+load_model(Path, Opts0) when is_map(Opts0) ->
+    Opts =
+        case maps:take(id, Opts0) of
+            {Id, Rest} -> Rest#{name => Id};
+            error -> Opts0
+        end,
+    case register_model(Path, Opts) of
+        {ok, #{name := Name}} -> load(Name, Opts);
+        {error, _} = E -> E
+    end.
+
+-doc "Unload a model. Runs still using it end with an error event.".
+-spec unload(binary()) -> ok | {error, term()}.
+unload(Name) ->
+    erllama_server_models:unload(Name).
+
+-doc "Same as `unload/1`.".
 -spec unload_model(binary()) -> ok | {error, term()}.
-unload_model(Id) ->
-    erllama:unload(Id).
+unload_model(Name) ->
+    unload(Name).
+
+-doc "Give a model a second name.".
+-spec alias(binary(), binary()) -> ok | {error, term()}.
+alias(Alias, Name) ->
+    erllama_server_registry:alias(Alias, Name).
+
+-doc "Copy a registry entry under a new name (same file).".
+-spec copy(binary(), binary()) -> {ok, map()} | {error, term()}.
+copy(Src, Dst) ->
+    erllama_server_registry:copy(Src, Dst).
+
+-doc """
+Remove a model from the registry (unloading it first). A downloaded file
+no other entry uses is deleted; a registered local file is kept.
+""".
+-spec remove(binary()) -> ok | {error, term()}.
+remove(Name) ->
+    case erllama_server_registry:resolve(Name) of
+        {ok, #{name := Id}} ->
+            _ = erllama_server_models:unload(Id),
+            erllama_server_registry:remove(Id);
+        {error, _} = E ->
+            E
+    end.
+
+-doc "The model used when a request names none.".
+-spec set_default(binary()) -> ok | {error, term()}.
+set_default(Name) ->
+    erllama_server_registry:set_default(Name).
+
+-doc """
+Download a model and register it; returns the job id to follow with
+`attach/3`. `Source`: `hf://ORG/REPO[:QUANT]`, `hf://ORG/REPO/FILE.gguf`,
+`https://...gguf`, `ollama://NAME[:TAG]` or `NAME[:TAG]`. `Opts`:
+`name`, `sha256` (https), `revision` (hf), `n_ctx`, `n_gpu_layers`,
+`keep_alive`.
+""".
+-spec pull(binary() | string(), map()) -> {ok, #{job_id := binary()}} | {error, term()}.
+pull(Source, Opts) when is_map(Opts) ->
+    case erllama_server_source:parse(Source) of
+        {ok, #{ref := Ref} = S} ->
+            Id = erllama_server_ids:pull(),
+            Spec = #{run_id => Id, kind => pull, model => Ref, source => S, opts => Opts},
+            case erllama_server_runs:start(Spec) of
+                {ok, _} -> {ok, #{job_id => Id}};
+                {error, _} = E -> E
+            end;
+        {error, _} = E ->
+            E
+    end.
 
 -doc """
 Start a run and return its id. `Spec`:
 
-- `model` (required): a loaded model id.
+- `model`: a registry name or alias (loaded on demand), a model loaded
+  directly through erllama, or absent for the default model.
+- `keep_alive`: how long the model stays loaded after this run, in ms
+  (or `infinity`); default the model's own.
 - `messages`: the new chat messages of this turn: `#{role, content}`
   with binary content; an assistant message may carry `tool_calls`
   (OpenAI shape, or flat `#{name, arguments, id}` as `result/1` returns
@@ -134,47 +264,64 @@ Start a run and return its id. `Spec`:
 """.
 -spec start_run(map()) ->
     {ok, #{run_id := binary(), conversation_id := binary() | undefined}} | {error, term()}.
-start_run(#{model := Model} = Spec) ->
-    Opts = maps:get(opts, Spec, #{}),
-    case erllama_server_generate:check_opts(Opts) of
+start_run(Spec) when is_map(Spec) ->
+    Opts0 = maps:get(opts, Spec, #{}),
+    case erllama_server_generate:check_opts(Opts0) of
         ok ->
-            case erllama:whereis(Model) of
-                {ok, _} -> start_input(input(Spec), Model, Opts, Spec);
-                {error, not_loaded} -> {error, {model_not_loaded, Model}}
+            case erllama_server_models:resolve(maps:get(model, Spec, undefined)) of
+                {ok, {registry, #{name := Id} = Entry}} ->
+                    Opts = maps:merge(maps:get(defaults, Entry, #{}), Opts0),
+                    start_input(input(Spec), Id, Opts, Spec);
+                {ok, {loaded, Id}} ->
+                    start_input(input(Spec), Id, Opts0, Spec);
+                {error, _} = E ->
+                    E
             end;
         {error, _} = E ->
             E
     end;
 start_run(_Spec) ->
-    {error, {missing, model}}.
+    {error, invalid_spec}.
 
 start_input({error, _} = E, _Model, _Opts, _Spec) ->
     E;
-start_input({prompt, _} = Input, Model, Opts, _Spec) ->
-    RunId = erllama_server_ids:run(),
-    launch(#{run_id => RunId, model => Model, input => Input, opts => Opts});
+start_input({prompt, _} = Input, Model, Opts, Spec) ->
+    launch(base_spec(Input, Model, Opts, Spec));
+start_input({messages, New} = Input, Model, Opts, #{conversation_id := none} = Spec) ->
+    %% A stateless request (HTTP): the messages are the whole prompt.
+    launch((base_spec(Input, Model, Opts, Spec))#{new_messages => New});
 start_input({messages, New}, Model, Opts, Spec) ->
-    RunId = erllama_server_ids:run(),
-    ConvId0 = maps:get(conversation_id, Spec, undefined),
-    case erllama_server_convs:begin_run(ConvId0, Model, RunId) of
+    RunSpec0 = base_spec({messages, New}, Model, Opts, Spec),
+    #{run_id := RunId} = RunSpec0,
+    case erllama_server_convs:begin_run(maps:get(conversation_id, Spec, undefined), Model, RunId) of
         {ok, #{id := ConvId, messages := History, parent_key := PK}} ->
-            RunSpec = #{
-                run_id => RunId,
+            RunSpec = RunSpec0#{
                 conversation_id => ConvId,
-                model => Model,
                 input => {messages, History ++ New},
                 new_messages => New,
-                parent_key => PK,
-                opts => Opts
+                parent_key => PK
             },
-            case launch(RunSpec) of
-                {ok, _} = Ok ->
-                    Ok;
-                {error, _} = E ->
-                    ok = erllama_server_convs:release(ConvId, RunId),
-                    E
-            end;
+            launch_turn(ConvId, RunSpec);
         {error, _} = E ->
+            E
+    end.
+
+base_spec(Input, Model, Opts, Spec) ->
+    #{
+        run_id => erllama_server_ids:run(),
+        model => Model,
+        input => Input,
+        opts => Opts,
+        keep_alive => maps:get(keep_alive, Spec, undefined)
+    }.
+
+%% A turn that fails to start frees its conversation again.
+launch_turn(ConvId, #{run_id := RunId} = RunSpec) ->
+    case launch(RunSpec) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, _} = E ->
+            ok = erllama_server_convs:release(ConvId, RunId),
             E
     end.
 
@@ -231,17 +378,17 @@ buffer: attach again from `Oldest` to accept the loss.
 """.
 -spec attach(binary(), pid(), non_neg_integer()) -> {ok, map()} | {error, term()}.
 attach(RunId, Pid, Cursor) when is_pid(Pid), is_integer(Cursor), Cursor >= 0 ->
-    with_run(RunId, fun(RunPid) -> erllama_server_run:attach(RunPid, Pid, Cursor) end).
+    with_run(RunId, fun(RunPid) -> erllama_server_job:attach(RunPid, Pid, Cursor) end).
 
 -doc "Stop sending a run's events to `Pid`. The run goes on.".
 -spec detach(binary(), pid()) -> ok | {error, term()}.
 detach(RunId, Pid) ->
-    with_run(RunId, fun(RunPid) -> erllama_server_run:detach(RunPid, Pid) end).
+    with_run(RunId, fun(RunPid) -> erllama_server_job:detach(RunPid, Pid) end).
 
 -doc "Cancel a run. Its last event is `cancelled`. Idempotent.".
 -spec cancel(binary()) -> ok | {error, term()}.
 cancel(RunId) ->
-    with_run(RunId, fun erllama_server_run:cancel/1).
+    with_run(RunId, fun erllama_server_job:cancel/1).
 
 -doc """
 The result of a finished run: `status`, `content`, `reasoning`,
@@ -250,12 +397,12 @@ The result of a finished run: `status`, `content`, `reasoning`,
 """.
 -spec result(binary()) -> {ok, map()} | {error, term()}.
 result(RunId) ->
-    with_run(RunId, fun erllama_server_run:result/1).
+    with_run(RunId, fun erllama_server_job:result/1).
 
 -doc "One run's id, conversation, model, status and next sequence.".
 -spec run(binary()) -> {ok, map()} | {error, term()}.
 run(RunId) ->
-    with_run(RunId, fun erllama_server_run:info/1).
+    with_run(RunId, fun erllama_server_job:info/1).
 
 -doc "The runs the release still holds, oldest first.".
 -spec runs() -> {ok, [map()]}.
