@@ -206,6 +206,79 @@ jobs:
       - name: Run Common Test
         run: rebar3 ct
 
+  # ----- erllama as a standalone library, and the release ------------------
+  library-package:
+    name: Library package on ${{ matrix.os }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        env:
+          ImageOS: ${{ fromJSON('{"ubuntu-24.04":"ubuntu24","macos-15":"macos15"}')[matrix.os] }}
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: System deps (Linux only; macOS ships cmake)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Restore build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            _build
+            apps/erllama/_build
+            ~/.cache/rebar3
+          key: build-${{ matrix.os }}-otp-28-${{ hashFiles('rebar.lock', 'apps/erllama/c_src/llama.cpp/CMakeLists.txt', 'apps/erllama/c_src/llama.cpp/.version') }}
+          restore-keys: |
+            build-${{ matrix.os }}-otp-28-
+      - name: Build the Hex package and consume it standalone
+        run: ./scripts/check_library_package.sh
+
+  release:
+    name: Release and CLI
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Restore build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            _build
+            apps/erllama/_build
+            ~/.cache/rebar3
+          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'apps/erllama/c_src/llama.cpp/CMakeLists.txt', 'apps/erllama/c_src/llama.cpp/.version') }}
+          restore-keys: |
+            build-ubuntu-24.04-otp-28-
+      - name: Build the prod release
+        run: rebar3 as prod release
+      - name: Start, reach with the CLI, stop
+        run: |
+          R=_build/prod/rel/erllama_server
+          $R/bin/erllama_server daemon
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            $R/bin/erllama_server ping && break
+            sleep 2
+          done
+          $R/bin/erllama --version
+          $R/bin/erllama ping
+          $R/bin/erllama_server stop
+
   sanitizers:
     name: ASan + UBSan
     needs: [xref, dialyzer, format, lint]
