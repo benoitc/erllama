@@ -428,6 +428,8 @@ the same for every loaded model.
 - **Passing the same fingerprint for two models.** The fingerprint is
   the cache namespace, so two models given the same value share cache
   rows. Leave it out and erllama derives a distinct one per file.
-- **Wrong `n_ctx`.** The cache key includes `ctx_params_hash`. If you
-  bump `n_ctx` for a tenant, expect a one-shot cold prefill across
-  every cached prefix until the new rows accumulate.
+- **Changing the KV layout.** The cache key covers `ctx_params_hash`
+  plus the context options that change the KV layout (`type_k`,
+  `type_v`, `flash_attn`, `n_seq_max`, `kv_unified`). Change one of
+  those and every cached prefix starts cold once. `n_ctx` alone does
+  not change the key: a saved prefix restores into a larger context.

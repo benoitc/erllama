@@ -52,8 +52,8 @@ loop(Ref) ->
     end.
 ```
 
-`stream/3` takes a token list; tokenize your prompt first with
-`erllama:tokenize/2,3`. Events arrive as `{erllama, Ref, Event}`
+`stream/3` takes a binary prompt or a token list (from
+`erllama:tokenize/2,3`). Events arrive as `{erllama, Ref, Event}`
 tuples at the `to` pid (default: the caller):
 
 - `{token, Bin}` - a text fragment (omitted when empty)

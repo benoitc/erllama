@@ -35,32 +35,35 @@ exact tokens, exact cache keys, and OTP supervision around the whole path.
 
 ```erlang
 1> {ok, _} = application:ensure_all_started(erllama).
-2> Path = "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf".
-3> {ok, Bin} = file:read_file(Path).
-4> {ok, Model} = erllama:load_model(#{
-       model_path => Path,
-       fingerprint => crypto:hash(sha256, Bin)
+2> {ok, Model} = erllama:load_model(#{
+       model_path => "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf",
+       %% Save even short prompts; the defaults only save from 512 tokens.
+       policy => #{min_tokens => 1, cold_min_tokens => 1,
+                   boundary_trim_tokens => 0, boundary_align_tokens => 1}
    }).
 {ok, <<"erllama_model_2375">>}
 
-5> {ok, #{reply := Reply, finish_key := Key}} =
+3> {ok, #{reply := Reply, finish_key := Key, cache_hit_kind := cold}} =
        erllama:complete(Model, <<"Once upon a time">>).
-%% First call: cold prefill, async save.
+%% First call: cold prefill; the prompt and the reply are saved.
 
-6> {ok, #{reply := Reply2}} =
+4> {ok, #{cache_hit_kind := exact}} =
        erllama:complete(Model, <<"Once upon a time">>).
-%% Same prompt: KV cache restore.
+%% Same prompt: the KV state is restored instead of recomputed.
 
-7> {ok, #{reply := Reply3}} =
-       erllama:complete(Model,
-                        <<"Once upon a time, in a quiet village">>).
-%% Longer prompt: longest cached prefix wins.
+5> {ok, #{cache_hit_kind := partial}} =
+       erllama:complete(Model, <<"Once upon a time, in a quiet village">>).
+%% Longer prompt: resumes from the longest saved prefix.
 
-8> {ok, #{reply := Reply4}} =
-       erllama:complete(Model, <<"and they lived happily ever after">>,
+6> {ok, #{cache_hit_kind := partial}} =
+       erllama:complete(Model, <<"Once upon a time", Reply/binary, " The end.">>,
                         #{parent_key => Key}).
-%% Stateful resume from the previous finish save.
+%% Next turn: resumes from the previous turn's saved row.
 ```
+
+Saves go to the RAM tier, bounded by `ram_tier_budget` (25% of system
+memory by default). Add a `disk` tier to keep them across restarts;
+see [Caching](guides/caching.md).
 
 `load_model/1` returns a binary model id. Pass it to `complete/2,3`,
 `stream/3`, `chat/3`, `tokenize/2`, `unload/1`, and the rest of the API.
@@ -73,7 +76,7 @@ Add it to `rebar.config`:
 
 ```erlang
 {deps, [
-    {erllama, "~> 0.11"}
+    {erllama, "~> 0.12"}
 ]}.
 ```
 
@@ -173,8 +176,11 @@ handle_completion(ModelId, Prompt) ->
 ### Stateful Erlang session
 
 If your session process already tracks turns, keep the returned
-`finish_key` and pass it as `parent_key` on the next request. That skips
-the longest-prefix walk and resumes directly from the saved row.
+`finish_key` and pass it as `parent_key` on the next request, whose
+prompt extends the previous prompt and reply. When the new prompt has
+no saved row of its own, erllama resumes directly from that row
+instead of scanning saved prefixes, and waits briefly for it if the
+previous turn's save is still being written.
 
 ```erlang
 {ok, #{reply := R1, finish_key := K1}} =
@@ -285,8 +291,9 @@ byte-prefix for a longer prompt, but it never returns an approximate match.
 
 ## Status
 
-erllama is pre-release. The cache, scheduler, and NIF safety wrappers have
-unit, property, and Common Test coverage. The real-model Common Test suite
+erllama is published on Hex. The API may still change before 1.0;
+breaking changes are listed in the [CHANGELOG](CHANGELOG.md). The cache, model process, and NIF safety
+wrappers have unit, property, and Common Test coverage. The real-model Common Test suite
 is gated by `LLAMA_TEST_MODEL` so normal CI can run without a GGUF file.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
