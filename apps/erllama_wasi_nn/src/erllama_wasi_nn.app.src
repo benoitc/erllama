@@ -1,0 +1,18 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
+{application, erllama_wasi_nn, [
+    {description, "wasi:nn backend for erlang_wasm, served by models loaded in erllama"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib,
+        erllama,
+        wasm
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{"GitHub", "https://github.com/benoitc/erllama"}]}
+]}.
