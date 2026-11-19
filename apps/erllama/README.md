@@ -63,7 +63,7 @@ exact tokens, exact cache keys, and OTP supervision around the whole path.
 
 Saves go to the RAM tier, bounded by `ram_tier_budget` (25% of system
 memory by default). Add a `disk` tier to keep them across restarts;
-see [Caching](guides/caching.md).
+see [Caching](../../guides/caching.md).
 
 `load_model/1` returns a binary model id. Pass it to `complete/2,3`,
 `stream/3`, `chat/3`, `tokenize/2`, `unload/1`, and the rest of the API.

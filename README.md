@@ -18,7 +18,9 @@ your own OTP application, or run the server.
 
 ```
 apps/erllama/          the library: Erlang sources, NIF (c_src), tests
-apps/erllama_server/   the server release
+apps/erllama_server/   the server release and the `erllama` CLI
+config/, rel/          release configuration and the CLI launcher
+scripts/               checks, e.g. erllama built standalone from its Hex package
 guides/, internals/    documentation, published with the library
 bench/, examples/      benchmarks and a standalone example project
 rebar.config           shared tooling for both apps
