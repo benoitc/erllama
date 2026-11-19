@@ -1818,7 +1818,7 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
     case sampler_for(Params, Data) of
         {ok, SamplerRef, SamplerCfg, Data0} ->
             Ref = make_ref(),
-            ok = erllama_inflight:register(Ref, self()),
+            ok = erllama_inflight:register(Ref, self(), CallerPid),
             {Stops, StopPat, StopMax} = stop_sequences_from(Params),
             Req = #req{
                 seq_id = SeqId,
@@ -1852,8 +1852,8 @@ start_request({continue, From, Suffix, Opts}, SeqId, {continue, StoredTokens} = 
     case sampler_for(Opts, Data) of
         {ok, SamplerRef, SamplerCfg, Data0} ->
             Ref = make_ref(),
-            ok = erllama_inflight:register(Ref, self()),
             CallerPid = maps:get(caller_pid, Opts),
+            ok = erllama_inflight:register(Ref, self(), CallerPid),
             %% `prompt_tokens` is reported as `Stats.prompt_tokens` at
             %% finish. Use the logical input (stored prefix + new tail)
             %% so HTTP-layer input-token reporting matches `infer/4`
@@ -2676,7 +2676,7 @@ start_media_request2(
     case ModeKind of
         streaming ->
             Ref = make_ref(),
-            ok = erllama_inflight:register(Ref, self()),
+            ok = erllama_inflight:register(Ref, self(), CallerPid),
             Req = Base#req{caller_pid = CallerPid, request_ref = Ref},
             Data1 = put_req(Data0, Req),
             {ok, Data1, [{reply, From, {ok, Ref}}]};

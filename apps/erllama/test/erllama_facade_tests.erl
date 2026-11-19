@@ -286,3 +286,68 @@ app_stop_saves_in_flight_context_test_() ->
             [application:stop(A) || A <- lists:reverse(Started)]
         end
     end}.
+
+%% =============================================================================
+%% A stream whose receiver exits is cancelled
+%% =============================================================================
+
+wait_until(Fun) -> wait_until(Fun, 200).
+wait_until(_Fun, 0) ->
+    error(condition_not_reached);
+wait_until(Fun, N) ->
+    case Fun() of
+        true ->
+            ok;
+        false ->
+            timer:sleep(10),
+            wait_until(Fun, N - 1)
+    end.
+
+in_flight(Ref) -> erllama:request_info(Ref) =/= {error, not_found}.
+
+%% 500 tokens at 20 ms would take 10 s; the cancel lands in a few steps.
+receiver_exit_cancels_the_stream_test_() ->
+    {timeout, 30, fun() ->
+        erllama_test_helpers:with_app(fun() ->
+            M = slow_model(),
+            Receiver = spawn(fun() ->
+                receive
+                    stop -> ok
+                end
+            end),
+            {ok, Ref} = erllama:stream(M, <<"one two three">>, #{
+                response_tokens => 500, to => Receiver
+            }),
+            ok = wait_until(fun() -> erllama:status(M) =:= {ok, generating} end),
+            exit(Receiver, kill),
+            ok = wait_until(fun() -> not in_flight(Ref) end),
+            ok = wait_until(fun() -> erllama:status(M) =:= {ok, idle} end),
+            ?assertEqual(#{}, maps:get(receivers, sys:get_state(erllama_inflight)))
+        end)
+    end}.
+
+dead_receiver_is_cancelled_at_admission_test_() ->
+    {timeout, 30, fun() ->
+        erllama_test_helpers:with_app(fun() ->
+            M = slow_model(),
+            {Dead, Mon} = spawn_monitor(fun() -> ok end),
+            receive
+                {'DOWN', Mon, process, Dead, _} -> ok
+            end,
+            {ok, Ref} = erllama:stream(M, <<"one two three">>, #{response_tokens => 500, to => Dead}),
+            ok = wait_until(fun() -> not in_flight(Ref) end),
+            ok = wait_until(fun() -> erllama:status(M) =:= {ok, idle} end)
+        end)
+    end}.
+
+%% A stream that ends normally leaves no receiver watch behind.
+finished_stream_drops_its_receiver_watch_test() ->
+    erllama_test_helpers:with_app(fun() ->
+        {ok, M} = erllama:load_model(minimal_config()),
+        {ok, Ref} = erllama:stream(M, <<"one two three">>, #{response_tokens => 3}),
+        ?assertEqual(done, await_end(Ref)),
+        ok = wait_until(fun() ->
+            #{receivers := R, watched := W} = sys:get_state(erllama_inflight),
+            R =:= #{} andalso W =:= #{}
+        end)
+    end).

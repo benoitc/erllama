@@ -6,6 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- A streaming request kept generating until its token limit when the
+  process receiving its events exited, holding a sequence and compute
+  that nobody would use. erllama now watches the receiver of every
+  stream and cancels the request when it exits.
+
 ## [0.12.0] - 2026-11-19
 
 ### Fixed

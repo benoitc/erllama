@@ -12,14 +12,17 @@
 %% `{cancel, Ref}` event at it.
 %%
 %% The table is a fixed-name public ETS so lookups are lock-free from
-%% any process. The owning gen_server (this module) is here only to
-%% keep the table alive across releases and to clean up entries when a
-%% model dies unexpectedly.
+%% any process. The owning gen_server (this module) keeps the table
+%% alive across releases, cleans up entries when a model dies
+%% unexpectedly, and watches the process each stream's events go to:
+%% when that receiver exits, the request is cancelled, so no model
+%% keeps generating for nobody.
 -behaviour(gen_server).
 
 -export([
     start_link/0,
     register/2,
+    register/3,
     unregister/1,
     lookup/1,
     all/0,
@@ -45,7 +48,13 @@
 %% =============================================================================
 
 -spec register(reference(), pid()) -> ok.
-register(Ref, ModelPid) when is_reference(Ref), is_pid(ModelPid) ->
+register(Ref, ModelPid) ->
+    register(Ref, ModelPid, undefined).
+
+%% `Receiver' is the process the request's events go to; when it exits
+%% before the request ends, the request is cancelled.
+-spec register(reference(), pid(), pid() | undefined) -> ok.
+register(Ref, ModelPid, Receiver) when is_reference(Ref), is_pid(ModelPid) ->
     %% ets:insert returns true even when the key already existed,
     %% so use ets:insert_new to bump the counter only on the row's
     %% true admission. A duplicate Ref is a programming error
@@ -60,6 +69,7 @@ register(Ref, ModelPid) when is_reference(Ref), is_pid(ModelPid) ->
     %% Monitor the model so a crash purges its inflight entries.
     %% The monitor is held by the gen_server, not by callers.
     gen_server:cast(?MODULE, {monitor_model, ModelPid}),
+    _ = is_pid(Receiver) andalso gen_server:cast(?MODULE, {watch_receiver, Ref, Receiver}),
     ok.
 
 -spec unregister(reference()) -> ok.
@@ -72,6 +82,7 @@ unregister(Ref) when is_reference(Ref) ->
         [_] -> counter_add(-1);
         [] -> ok
     end,
+    gen_server:cast(?MODULE, {unwatch_receiver, Ref}),
     ok.
 
 -spec lookup(reference()) -> {ok, pid()} | {error, not_found}.
@@ -231,7 +242,9 @@ init([]) ->
     %% empty ETS table.
     Counter = counters:new(1, [atomics]),
     persistent_term:put(?COUNTER_KEY, Counter),
-    {ok, #{monitors => #{}}}.
+    %% monitors: model pid => monitor; receivers: request ref =>
+    %% receiver monitor; watched: receiver monitor => request ref.
+    {ok, #{monitors => #{}, receivers => #{}, watched => #{}}}.
 
 handle_call(_, _, S) -> {reply, {error, unknown_call}, S}.
 
@@ -243,9 +256,29 @@ handle_cast({monitor_model, Pid}, S = #{monitors := M}) ->
             Ref = monitor(process, Pid),
             {noreply, S#{monitors := M#{Pid => Ref}}}
     end;
+handle_cast({watch_receiver, Ref, Pid}, S = #{receivers := R, watched := W}) ->
+    %% The request may already be gone (its model died and was swept).
+    case ets:member(?TABLE, Ref) andalso not maps:is_key(Ref, R) of
+        true ->
+            Mon = monitor(process, Pid),
+            {noreply, S#{receivers := R#{Ref => Mon}, watched := W#{Mon => Ref}}};
+        false ->
+            {noreply, S}
+    end;
+handle_cast({unwatch_receiver, Ref}, S) ->
+    {noreply, unwatch(Ref, S)};
 handle_cast(_, S) ->
     {noreply, S}.
 
+handle_info({'DOWN', MonRef, process, _Pid, _Reason}, S = #{watched := W}) when
+    is_map_key(MonRef, W)
+->
+    %% A stream's receiver exited: cancel the request through the
+    %% public path (abort the running decode, then the model's cancel
+    %% event). A request that ended meanwhile is not found: a no-op.
+    Ref = maps:get(MonRef, W),
+    ok = erllama_model:cancel(Ref),
+    {noreply, unwatch(Ref, S)};
 handle_info({'DOWN', _MonRef, process, Pid, _Reason}, S = #{monitors := M}) ->
     %% Sweep all inflight entries owned by this dead model and
     %% decrement the queue-depth counter by the number of rows
@@ -259,8 +292,18 @@ handle_info({'DOWN', _MonRef, process, Pid, _Reason}, S = #{monitors := M}) ->
         _ -> counter_add(-length(Refs))
     end,
     _ = delete_abort_handle(Pid),
-    {noreply, S#{monitors := maps:remove(Pid, M)}};
+    S1 = lists:foldl(fun unwatch/2, S, Refs),
+    {noreply, S1#{monitors := maps:remove(Pid, M)}};
 handle_info(_, S) ->
     {noreply, S}.
 
 terminate(_, _) -> ok.
+
+unwatch(Ref, S = #{receivers := R, watched := W}) ->
+    case maps:take(Ref, R) of
+        {Mon, R1} ->
+            demonitor(Mon, [flush]),
+            S#{receivers := R1, watched := maps:remove(Mon, W)};
+        error ->
+            S
+    end.

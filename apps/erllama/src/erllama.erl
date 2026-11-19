@@ -865,7 +865,8 @@ concurrent request on a pinned session returns `{error, sticky_busy}`;
 when no seq is free. `Stats.generated` in the `done` event is the
 exact generated token list, usable as the suffix for `continue/3`.
 Use `collect/2` to wait for the result without writing the receive
-loop.
+loop. If the receiving process exits before the stream ends, the
+request is cancelled as by `cancel/1`.
 """.
 -spec stream(model(), binary() | [token_id()], request_opts()) ->
     {ok, reference()} | {error, error_reason()}.
