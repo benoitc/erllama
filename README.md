@@ -9,6 +9,7 @@ your own OTP application, or run the server.
 |---|---|
 | Use erllama as a dependency (Hex package `erllama`) | [apps/erllama](apps/erllama/README.md) |
 | Run the server release | [apps/erllama_server](apps/erllama_server/README.md) (in progress) |
+| Serve `wasi:nn` components of erlang_wasm from your models | [apps/erllama_wasi_nn](apps/erllama_wasi_nn/README.md) |
 | Read the usage guides | [guides/](guides/) |
 | Understand the cache, NIF and request design | [internals/](internals/) |
 | Contribute | [AGENTS.md](AGENTS.md) |
@@ -19,6 +20,7 @@ your own OTP application, or run the server.
 ```
 apps/erllama/          the library: Erlang sources, NIF (c_src), tests
 apps/erllama_server/   the server release and the `erllama` CLI
+apps/erllama_wasi_nn/  a wasi:nn backend for erlang_wasm components
 config/, rel/          release configuration and the CLI launcher
 scripts/               checks, e.g. erllama built standalone from its Hex package
 guides/, internals/    documentation, published with the library
