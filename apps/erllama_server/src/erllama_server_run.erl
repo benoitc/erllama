@@ -31,6 +31,9 @@
     ref :: reference() | undefined,
     model_mon :: reference() | undefined,
     parser :: erllama_server_generate:parser(),
+    %% With a parser, tokens go through it and only parsed deltas are
+    %% emitted (content, reasoning, tool calls).
+    sp :: erllama_server_generate:stream_parser() | undefined,
     events :: erllama_server_events:events(),
     status = pending :: pending | erllama_server_runs:status(),
     result :: map() | undefined,
@@ -161,6 +164,7 @@ start_stream(#state{model = Model, input = Input, opts = Opts, parent_key = PK} 
                     St1 = St#state{
                         ref = Ref,
                         parser = Parser,
+                        sp = erllama_server_generate:stream_parser(Parser),
                         model_mon = erlang:monitor(process, MPid),
                         status = running
                     },
@@ -175,8 +179,17 @@ start_stream(#state{model = Model, input = Input, opts = Opts, parent_key = PK} 
 started_data(#state{id = Id, conv = Conv, model = Model}) ->
     #{run_id => Id, conversation_id => Conv, model => Model}.
 
-stream_event({token, Bin}, #state{text = T} = St) ->
+stream_event({token, Bin}, #state{text = T, sp = undefined} = St) ->
     emit(token, Bin, St#state{text = [Bin | T]});
+stream_event({token, Bin}, #state{text = T, sp = Sp} = St) ->
+    {Deltas, Sp1} = erllama_server_generate:feed(Bin, Sp),
+    lists:foldl(
+        fun({Type, Data}, Acc) -> emit(Type, Data, Acc) end,
+        St#state{text = [Bin | T], sp = Sp1},
+        Deltas
+    );
+stream_event({logprobs, Entry}, St) ->
+    emit(logprobs, Entry, St);
 stream_event({thinking, Bin}, #state{thinking = T} = St) ->
     emit(thinking, Bin, St#state{thinking = [Bin | T]});
 stream_event({done, Stats}, St) ->

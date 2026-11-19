@@ -4,7 +4,7 @@
  {<<"h2">>,{pkg,<<"h2">>,<<"0.18.0">>},1},
  {<<"hackney">>,{pkg,<<"hackney">>,<<"4.12.1">>},1},
  {<<"idna">>,{pkg,<<"idna">>,<<"8.0.0">>},2},
- {<<"instrument">>,{pkg,<<"instrument">>,<<"2.0.0">>},1},
+ {<<"instrument">>,{pkg,<<"instrument">>,<<"2.0.0">>},0},
  {<<"livery">>,{pkg,<<"livery">>,<<"0.14.1">>},0},
  {<<"mimerl">>,{pkg,<<"mimerl">>,<<"1.5.0">>},1},
  {<<"parse_trans">>,{pkg,<<"parse_trans">>,<<"3.4.2">>},2},

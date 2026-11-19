@@ -89,6 +89,18 @@ Known limits:
 - split GGUF files are not supported;
 - the registry entry's `backend` option (stub backend) exists for tests.
 
-## Phases 3b to 7
+## Phase 3b: HTTP core and the OpenAI adapters (implemented)
+
+| Feature | State | Notes |
+|---|---|---|
+| listener | done | `erllama_server_http` on Livery, off unless `http` is set (the release sets `127.0.0.1:8080`; `ERLLAMA_HTTP_PORT` overrides) |
+| middleware | done | request ids, access log, API keys (`Bearer` or `x-api-key`, constant-time), body limit (413), concurrency limit (429 with `Retry-After`), metrics, crash handling; a public `ip` without keys refuses to start |
+| one execution path | done | every HTTP request is a stateless run through `erllama_server_api:start_run/1` (`max_active_runs`, visible to `erllama runs`); the handler follows its events and cancels the run on disconnect |
+| streaming parse | done | with a parser, the run re-parses after each token and emits content, reasoning and tool-call deltas (`tool_call` events); call syntax never reaches content |
+| OpenAI | done | `/v1/models`, `/v1/chat/completions` (tools, named tool choice, `response_format`, logprobs, `stream_options.include_usage`, reasoning), `/v1/completions`, `/v1/embeddings` (float, base64); strict fields, 400 naming the field |
+| multimodal | done | base64 `image_url` and `input_audio` for registry models whose projector covers the modality (400 otherwise); library option `media_add_special` added so the streamed chat prompt keeps a single BOS token |
+| ops | done | `/health`, `/ready` (engine, registry, model manager), `/metrics` (Livery HTTP metrics, erllama counters, server gauges) |
+
+## Phases 3c to 7
 
 Not started.

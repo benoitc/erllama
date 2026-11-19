@@ -13,7 +13,8 @@
         stdlib,
         crypto,
         erllama,
-        livery
+        livery,
+        instrument
     ]},
     {env, []},
     {modules, []},

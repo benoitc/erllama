@@ -56,6 +56,14 @@ administration, and what each error means, and
 [Managing models](../../guides/server/models.md) for downloads, the
 registry, keep-alive and memory pressure.
 
+## Serve the HTTP APIs
+
+The release listens on `127.0.0.1:8080` and answers OpenAI-compatible
+requests (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+`/v1/models`) plus `/health`, `/ready` and `/metrics`. See
+[The HTTP APIs](../../guides/server/http.md) for every supported field,
+API keys and limits.
+
 ## Configuration
 
 The `erllama_server` application environment (`config/sys.config` in
@@ -76,6 +84,11 @@ the release). A bad value stops the release from starting.
 | `hf_base_url`, `ollama_base_url` | the public registries | where pulls go (a mirror) |
 | `max_active_pulls` | `4` | downloads at once |
 | `pull_idle_timeout_ms` | `60000` | a transfer silent for this long is resumed |
+| `http` | off (`#{port => 8080}` in the release) | the HTTP listener; `ip` defaults to loopback |
+| `api_keys` | `[]` | HTTP API keys (`Authorization: Bearer` or `x-api-key`) |
+| `allow_unauthenticated` | `false` | allow a public `ip` without keys |
+| `max_body_bytes` | `33554432` | HTTP request body limit |
+| `max_http_requests` | `64` | HTTP requests in flight |
 
 The library's own settings (cache tiers, scheduler) go under `erllama`;
 see the [configuration guide](../../guides/configuration.md).
@@ -93,6 +106,11 @@ see the [configuration guide](../../guides/configuration.md).
 | `erllama_server_pull` | one download: plan, resumable transfer, integrity check, registration |
 | `erllama_server_source` | what `hf://`, `ollama://` and `https://` sources mean and what to fetch |
 | `erllama_server_gguf` | reads GGUF metadata without loading the model |
+| `erllama_server_http` | the Livery listener: routes and the middleware stack |
+| `erllama_server_http_kit` | shared HTTP plumbing: JSON bodies, protocol error shapes, driving a run from a handler |
+| `erllama_server_http_auth` | API keys |
+| `erllama_server_openai` | the OpenAI endpoints |
+| `erllama_server_http_ops` | health, readiness, metrics |
 | `erllama_server_convs` | conversations: history, last cache key, one active run each |
 | `erllama_server_generate` | renders chat or prompt requests into an erllama stream and parses the result |
 | `erllama_server_client` | the client side, used by the CLI (no erllama module) |
@@ -104,4 +122,5 @@ does the same over TLS distribution; `test/erllama_server_pull_SUITE.erl`
 downloads from a local stand-in for Hugging Face and Ollama
 (`test/erllama_server_fake_registry.erl`); and
 `test/erllama_server_models_SUITE.erl` covers loading, keep-alive and
-eviction.
+eviction; `test/erllama_server_http_SUITE.erl` drives the HTTP APIs over
+a socket.

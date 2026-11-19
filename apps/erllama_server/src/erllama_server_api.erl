@@ -352,7 +352,7 @@ go(Pid) ->
 
 input(#{messages := Msgs, prompt := _}) when is_list(Msgs) ->
     {error, {invalid_spec, messages_and_prompt}};
-input(#{prompt := _, conversation_id := _}) ->
+input(#{prompt := _, conversation_id := C}) when C =/= none ->
     {error, {invalid_spec, prompt_with_conversation}};
 input(#{prompt := P}) when is_binary(P), P =/= <<>> ->
     {prompt, P};

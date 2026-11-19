@@ -287,6 +287,9 @@ jobs:
           fi
           echo "$OUT" | grep -q '\[cancelled\]'
           $R/bin/erllama result "$RUN" | grep -q cancelled
+          curl -sf http://127.0.0.1:8080/health
+          curl -sf http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+            -d '{"model":"stub","messages":[{"role":"user","content":"hi"}],"max_tokens":4}' | grep -q chat.completion
           $R/bin/erllama_server stop
 
   sanitizers:
