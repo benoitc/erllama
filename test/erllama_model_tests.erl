@@ -670,6 +670,57 @@ complete_cache_delta_exact_warm_test() ->
         ?assertEqual(Generated, maps:get(created, Delta))
     end).
 
+%% The default `ram` tier saves and restores: a repeated prompt is an
+%% exact hit and an extended one resumes from the saved prefix, with
+%% no disk tier configured.
+ram_tier_saves_and_restores_test() ->
+    with_model(#{}, #{tier => ram, tier_srv => erllama_cache_ram}, fun(Cfg) ->
+        Tokens = prompt_tokens(long_prompt()),
+        Before = erllama_cache:get_counters(),
+        {ok, R1} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 4}
+        ),
+        ?assertEqual(cold, maps:get(cache_hit_kind, R1)),
+        Key = key_for_tokens(Tokens, Cfg),
+        {ok, Row} = wait_for_key(Key, 1000),
+        ?assertEqual(ram, element(?POS_TIER, Row)),
+        ?assertMatch({ok, _}, erllama_cache_ram:load(Key)),
+        {ok, R2} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 4}
+        ),
+        ?assertEqual(exact, maps:get(cache_hit_kind, R2)),
+        Extended = <<(long_prompt())/binary, " 13 14 15">>,
+        {ok, R3} = erllama_model:complete(
+            <<"test_model">>, Extended, #{response_tokens => 4}
+        ),
+        ?assertEqual(partial, maps:get(cache_hit_kind, R3)),
+        After = erllama_cache:get_counters(),
+        ?assert(maps:get(saves_cold, After) > maps:get(saves_cold, Before)),
+        ?assert(erllama_cache_ram:size_bytes() > 0)
+    end).
+
+%% A zero RAM budget turns RAM saves off: requests stay cold and the
+%% dropped saves are counted.
+ram_tier_zero_budget_saves_nothing_test() ->
+    application:set_env(erllama, ram_tier_budget, 0),
+    try
+        with_model(#{}, #{tier => ram, tier_srv => erllama_cache_ram}, fun(_Cfg) ->
+            Before = erllama_cache:get_counters(),
+            {ok, _} = erllama_model:complete(
+                <<"test_model">>, long_prompt(), #{response_tokens => 4}
+            ),
+            {ok, R2} = erllama_model:complete(
+                <<"test_model">>, long_prompt(), #{response_tokens => 4}
+            ),
+            ?assertEqual(cold, maps:get(cache_hit_kind, R2)),
+            After = erllama_cache:get_counters(),
+            ?assert(maps:get(saves_dropped, After) > maps:get(saves_dropped, Before)),
+            ?assertEqual(0, erllama_cache_ram:size_bytes())
+        end)
+    after
+        application:unset_env(erllama, ram_tier_budget)
+    end.
+
 warm_exact_primer_failure_falls_back_cold_test() ->
     %% A recurrent-style backend refuses the exact-hit primer's
     %% 1-token seq_rm: the admission must fall back to cold (full

@@ -62,13 +62,14 @@ old key scheme; the cache simply refills under the byte scheme.
 We ship three tiers because no single layer is the right answer
 across deployments:
 
-- **`ram`** (ETS slabs) — lowest latency, smallest budget. ETS reads
-  are sub-µs hot-path-friendly; writes are funnelled through one
-  owner process per table.
-- **`ram_file`** (`/dev/shm`) — fast and effectively unlimited by
+- **`ram`** (ETS slabs): lowest latency, smallest budget, and the
+  default tier. ETS reads are sub-µs and hot-path-friendly; stores go
+  through `erllama_cache_ram`, which enforces `ram_tier_budget` by
+  evicting the least used RAM rows before inserting.
+- **`ram_file`** (`/dev/shm`): fast and effectively unlimited by
   process address space. Survives a model-supervisor restart but
   not a node restart.
-- **`disk`** — survives everything. The cheap tier; deploy with the
+- **`disk`**: survives everything. The cheap tier; deploy with the
   largest quota of the three.
 
 Each tier is independently supervised, has its own byte budget, and

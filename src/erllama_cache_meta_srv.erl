@@ -666,7 +666,10 @@ cleanup_stale_reservation(Key, Old, S) ->
     erlang:demonitor(Old#reservation.monref, [flush]),
     cleanup_by_stage(Key, Old, S).
 
-cleanup_by_stage(Key, #reservation{stage = pre_link}, S) ->
+cleanup_by_stage(Key, #reservation{stage = pre_link, tier = Tier}, S) ->
+    %% A RAM writer stores its slab before announcing; one that died in
+    %% between would otherwise leave the slab orphaned.
+    _ = Tier =:= ram andalso erllama_cache_ram:delete(Key),
     ets:delete(?TBL_META, Key),
     S#state{reservations = maps:remove(Key, S#state.reservations)};
 cleanup_by_stage(Key, #reservation{stage = post_link, path = Path, tier = Tier}, S) ->

@@ -35,7 +35,12 @@ ram_file  Files on /dev/shm. Fast, capped only by tmpfs size.
 disk      Files on persistent storage. Survives restarts.
 ```
 
-The RAM tier is always on. Add `ram_file` and `disk` tiers with
+The RAM tier is always on and is where models save by default
+(`tier => ram`). Its size is bounded by `ram_tier_budget` (25% of
+system memory by default; see the
+[configuration reference](configuration.md#ram_tier_budget)); when a
+new save does not fit, the least used RAM rows are evicted first.
+Add `ram_file` and `disk` tiers with
 `erllama_cache:add_tier/1` or the `tiers` application environment key;
 each one is a supervised server rooted at a directory. A save is
 written to the tier the model is configured with (`tier` + `tier_srv`

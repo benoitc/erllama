@@ -4267,12 +4267,6 @@ fire_finish_save_for_req(LiveTokens, Req, Data) ->
 
 fire_save_if(false, _Reason, _Tokens, _Req, _Data) ->
     not_fired;
-fire_save_if(true, _Reason, _Tokens, _Req, #data{tier = Tier}) when
-    Tier =/= disk, Tier =/= ram_file
-->
-    %% RAM-only or unknown tier: no persistent writer. The slab lives
-    %% in the in-memory tier until the request finishes; nothing to save.
-    not_fired;
 fire_save_if(true, Reason, Tokens, Req, Data) ->
     BuildMeta = build_meta_for(Reason, Tokens, Req, Data),
     T0 = erlang:monotonic_time(nanosecond),

@@ -3,8 +3,8 @@
 %%
 -module(erllama_cache_writer).
 -moduledoc false.
-%% File-tier save orchestrator with a leak-proof ETS counting
-%% semaphore.
+%% Save orchestrator: RAM-tier saves, and file-tier saves bounded by a
+%% leak-proof ETS counting semaphore.
 %%
 %% Modelled on `py_semaphore` from erlang-python (Discord pattern):
 %% one ETS table holding `{running, N}` and `{max, M}` counters;
@@ -130,7 +130,7 @@ release() ->
 
 -spec save(
     atom(),
-    disk | ram_file,
+    erllama_cache:tier(),
     erllama_cache_kvc:build_meta(),
     binary()
 ) -> {ok, erllama_cache:cache_key()} | {error, term()}.
@@ -139,11 +139,28 @@ save(TierSrv, Tier, BuildMeta, Payload) ->
 
 -spec save(
     atom(),
-    disk | ram_file,
+    erllama_cache:tier(),
     erllama_cache_kvc:build_meta(),
     binary(),
     timeout()
 ) -> {ok, erllama_cache:cache_key()} | {error, term()}.
+%% The RAM tier does no IO, so it takes no writer slot: the slab goes
+%% straight into `erllama_cache_ram` under a meta-server reservation.
+save(_TierSrv, ram, BuildMeta, Payload, _AcquireTimeout) ->
+    case derive_key(BuildMeta) of
+        {ok, Key} ->
+            case erllama_cache_meta_srv:reserve_save(Key, ram, self()) of
+                {ok, Token} ->
+                    save_ram_reserved(Key, Token, BuildMeta, Payload);
+                {error, already_present} ->
+                    erllama_cache_counters:incr(?C_DUPLICATE_DROPPED),
+                    {error, already_present};
+                {error, _} = E ->
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end;
 save(TierSrv, Tier, BuildMeta, Payload, AcquireTimeout) when
     Tier =:= disk; Tier =:= ram_file
 ->
@@ -359,6 +376,31 @@ after_publish(Key, Token, BuildMeta, FinalPath, Header, Size) ->
             %% mark_published. The file is published; the meta sweep
             %% will validate-and-adopt it on its next pass. Same
             %% non-fatal outcome as above.
+            E
+    end.
+
+%% Store the slab, then publish the row. A slab whose row could not be
+%% published is deleted again; a writer that dies in between is cleaned
+%% up by the meta server's pre_link handling, which also drops the slab.
+save_ram_reserved(Key, Token, BuildMeta, Payload) ->
+    case erllama_cache_ram:store(Key, Payload) of
+        ok ->
+            TokensBin = erllama_cache_key:encode_tokens(maps:get(tokens, BuildMeta)),
+            TextBytes = byte_size(maps:get(prompt_text, BuildMeta, <<>>)),
+            case
+                erllama_cache_meta_srv:announce_saved(
+                    Key, Token, byte_size(Payload), <<>>, TokensBin, TextBytes
+                )
+            of
+                ok ->
+                    bump_save_counter(maps:get(save_reason, BuildMeta, unknown)),
+                    {ok, Key};
+                {error, _} = E ->
+                    ok = erllama_cache_ram:delete(Key),
+                    E
+            end;
+        {error, _} = E ->
+            _ = erllama_cache_meta_srv:cancel_reservation(Key, Token),
             E
     end.
 

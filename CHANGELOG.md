@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Models on the default `ram` tier never saved anything, so with the
+  default configuration the KV cache never warmed and every request
+  ran cold. RAM saves now work, bounded by the new `ram_tier_budget`
+  setting (25% of system memory by default, `0` to turn them off):
+  the least used rows are evicted to make room.
+
 - A cache entry that could not be restored stayed in place, so every
   later request for the same prompt tried it again, ran cold, and its
   fresh save was dropped as a duplicate. The prompt never got a warm

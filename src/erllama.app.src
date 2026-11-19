@@ -31,6 +31,10 @@
         %% is #{name, backend => disk | ram_file, root}. The RAM tier
         %% is always on.
         {tiers, []},
+        %% Byte budget of the RAM tier: a byte count, {fraction, F} of
+        %% total system memory, or 0 to turn RAM saves off. The oldest
+        %% RAM rows are evicted to make room for new saves.
+        {ram_tier_budget, {fraction, 0.25}},
         %% Cache policy defaults; every key can be overridden per model
         %% in the `policy' load config map.
         {min_tokens, 512},
