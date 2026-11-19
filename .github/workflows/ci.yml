@@ -277,6 +277,16 @@ jobs:
           done
           $R/bin/erllama --version
           $R/bin/erllama ping
+          $R/bin/erllama_server eval 'erllama:load_model(<<"stub">>, #{backend => erllama_model_stub, step_delay_ms => 20}).'
+          $R/bin/erllama status
+          $R/bin/erllama run stub --max-tokens 8 hello there
+          RUN=$($R/bin/erllama run stub --max-tokens 500 --detach a long one)
+          $R/bin/erllama cancel "$RUN"
+          if OUT=$($R/bin/erllama attach "$RUN"); then
+            echo "attach should report the cancelled run"; exit 1
+          fi
+          echo "$OUT" | grep -q '\[cancelled\]'
+          $R/bin/erllama result "$RUN" | grep -q cancelled
           $R/bin/erllama_server stop
 
   sanitizers:

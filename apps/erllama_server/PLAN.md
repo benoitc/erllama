@@ -1,146 +1,190 @@
-# erllama umbrella + erllama_server: plan
+# Phase 2: service API, runs and the RPC client
 
 ## Context
 
-The maintainer's implementation brief (kept outside the repository) asks for one repository with two OTP applications, one relx release, and a CLI connected to the release over Erlang RPC, built in seven phases.
+The maintainer's implementation brief (kept outside the repository) describes seven phases for turning erllama into a local inference and agent product. Phase 1 is committed on `refactor/umbrella-layout` (commits 38a45d7..8401bc3) and not pushed yet:
+- the umbrella layout;
+- the standalone Hex package check;
+- an `erllama_server` app that is only a skeleton: an empty supervisor and a CLI with `--version` and `ping`.
 
-Phase 1 was started on the local branch `refactor/umbrella-layout`, then parked so 0.12.0 could ship (now released, `v0.12.0` = `ad47520`). The branch is three commits ahead of the old main (`b9554ea`), and main has moved by #79, which touched 29 library files (src, test, guides, README, CHANGELOG, AGENTS).
 
-This plan replaces the first version of this file. The changes the brief brought:
+Phase 2 is the first phase with real behaviour. The release owns generation runs. The `erllama` CLI drives them over Erlang distribution:
+- it starts a run on a model;
+- it streams the tokens as they arrive;
+- it cancels, detaches and reattaches with a cursor;
+- it gets the result.
 
-- **CLI** is an escript shipped beside the release and started by a launcher that uses the release's bundled runtime. There is no third OTP application, and the client never starts erllama or loads the NIF.
-- **Livery handles both HTTP serving and outbound HTTP.** Downloads use `livery_client`, verified to exist: `request/3,4`, streamed bodies via `read/2` and `stream_next/1`, custom headers for `Range`, and timeout and retry layers. Hackney is not used directly.
-- **barrel_mcp** handles MCP; only the bridge to the agent runtime is new.
-- **No copying** from `erllama_server`, `barrel_inference_server` or ds4. They may only inform requirements and behaviour.
-- **erllama keeps its package identity and public API.** Library consumers never pick up server dependencies or listeners: the server deps go only in `apps/erllama_server/rebar.config`.
-- **The cache and NIF invariants in AGENTS.md stay intact.**
+It also gives clear errors when the release is down or speaks another API version. Everything goes through one small versioned service API that the Phase 3 HTTP adapters will reuse.
 
-Kept from before:
-- `guides/` and `internals/` stay at the root, and ex_doc runs from the root.
-- The HTTP endpoint table (Phase 3).
-- The progress record lives in `doc/features.md`.
-- **One PR per phase:** stop for validation after each phase, with no commit or push without approval.
+**Out of this phase:**
+- the model registry and downloads (Phase 3);
+- the agent loop and tools (Phase 4);
+- MCP (Phase 5);
+- persistence (Phase 6);
+- terminal polish (Phase 7).
 
----
+Loading a model in Phase 2 is an interim `load PATH`, which the Phase 3 registry replaces.
 
-## Step 0: GitHub release 0.12.0 (done)
+The branch is `feat/server-rpc`, cut from `refactor/umbrella-layout`. Its PR is rebased onto main after the Phase 1 PR merges. Each phase stops for review before it is committed.
 
-Published on 2026-11-19 at 09:54 UTC as "erllama 0.12.0", marked Latest: https://github.com/benoitc/erllama/releases/tag/v0.12.0
-- The tag `v0.12.0` points at `ad47520`, the merge of #79.
-- The notes are the CHANGELOG 0.12.0 section, as is.
-- Hex publishing stays with you.
+## What erllama already gives us (reused, not reimplemented)
 
-Phase 1 starts only after this.
+- **Streaming:** `erllama:stream/3` returns `{ok, Ref}` and sends `{erllama, Ref, Event}` to the `to` pid (`apps/erllama/src/erllama.erl:870`). The events are `{token, Bin}`, `{thinking, Bin}`, `{thinking_end, Bin}`, `{done, Stats}` and `{error, R}`. `Stats` holds `finish_reason`, `finish_key`, `generated`, the token counts and the timings.
+- **Cancel:** `erllama:cancel(Ref)` is idempotent and still delivers `done` with `finish_reason => cancelled`.
+- **Chat rendering on a real model:**
+  - `erllama:chat_apply/3`, then `tokenize/3` with `#{add_special => false, parse_special => true}`;
+  - then `stream/3` with `sampler_opts` and `stop_sequences` merged in;
+  - then `chat_parse/3` on the final text.
 
-## Phase 1: repository and build migration (finish on `refactor/umbrella-layout`)
+  This is the same path `erllama_chat:chat/3` uses.
+- **Chat on the stub:** the stub backend returns `{error, chat_not_supported}` from `chat_apply` (`erllama_model.erl:2451`). The fallback is `erllama:render_chat_template/2`, then `stream/3`, which the stub implements. This keeps routine tests deterministic and lets the stub's `step_delay_ms` make runs slow enough to test cancel.
+- **Multi-turn warmth:** the run passes the previous turn's `finish_key` as `parent_key` (the AGENTS.md pattern). No sticky sessions in Phase 2.
+- **Models:** `erllama:load_model/2`, `unload/1`, `list_models/0`, `model_info/1` and `pressure/0`.
+- **Finding:** erllama does not monitor the stream's `to` pid (no monitor in `erllama_model.erl`). If the process that owns a stream dies, generation runs to its token limit. The run process therefore traps exits and cancels its ref in `terminate/2`. A brutal kill still leaks until the limit; this is documented, and it's not changed in the library this phase.
 
-### 1.A Rebase onto main (0.12.0)
-- `git rebase main` on `refactor/umbrella-layout`. Git's rename detection should carry #79's changes to `src/` and `test/` into `apps/erllama/`.
-- Resolve conflicts in the files both sides edited, keeping main's content and re-applying only the branch's path edits: `AGENTS.md` (layout tree and commands), `README.md` (it moves to `apps/erllama/README.md` and a new root README is added), `CHANGELOG.md` (moves), and the guides that #79 edited (`caching`, `configuration`, `examples`, `generation`, `loading`).
-- Check that the files #79 added landed under `apps/erllama/`: `src/erllama_fingerprint.erl`, `test/erllama_fingerprint_tests.erl` and the others.
-- Re-run the full gate before any new work.
+## Design
 
-### 1.B Finish the skeleton and release (turn the WIP commit into a clean one)
-- **Keep** `apps/erllama_server` (app, sup, CT suite), the relx release in the root `rebar.config`, `config/sys.config` and `config/vm.args.src`. The node is `-name erllama_server@127.0.0.1` with distribution on loopback only.
-- **CLI escript scaffold** (only `bin/erllama --version` and `ping` in this phase):
-  - Main module `erllama_server_cli` in `apps/erllama_server/src`.
-  - Root `rebar.config`: `{escript_main_app, erllama_server}`, `{escript_name, erllama}` and `{escript_incl_apps, [erllama_server]}`, so the erllama app and its NIF are not bundled.
-  - The relx overlay ships the escript as `bin/erllama_cli` plus a `bin/erllama` shell launcher. The launcher runs `"$REL_ROOT"/erts-*/bin/escript` when ERTS is included (prod profile), otherwise the system `escript`.
-- Update `apps/erllama_server/PLAN.md` on the branch to this plan, and `doc/features.md` to the current status.
+### Supervision (`apps/erllama_server/src`)
 
-### 1.C Prove erllama builds and is consumed on its own
-- **`scripts/check_library_package.sh`:**
-  - `rebar3 hex build --app erllama`, then unpack into a temporary consumer project's `_checkouts/erllama`.
-  - `rebar3 compile` there, then an eunit test that starts erllama, calls `erllama_nif:kv_format/0`, and loads a stub model with `erllama:load_model/2` using `backend => erllama_model_stub`.
-  - Assert that the consumer's lock has no `livery` or `barrel_mcp`.
-- **CI:**
-  - A `library-package` job running that script on ubuntu and macOS.
-  - A `release` job: `rebar3 as prod release`, then `bin/erllama_server daemon`, `ping`, `bin/erllama --version` (with a check that the erllama app is not loaded in the escript VM), and `stop`.
-  - The workflow path fixes from commit `c832a72` stay.
+```
+erllama_server_sup            rest_for_one; validates the app env in init/1
+├── erllama_server_runs       owns the run table (ETS, public reads), monitors runs
+├── erllama_server_convs      in-memory conversations (ETS), one active run each
+└── erllama_server_run_sup    simple_one_for_one, temporary: one erllama_server_run per run
+```
 
-### Phase 1 verification
-- **Full gate** from the root on OTP 28.3.1: fmt --check, compile, eunit, proper, ct, lint, dialyzer, xref. Deliberate fmt and lint violations must still fail.
-- **Real-model suite** via `--dir apps/erllama/test --suite erllama_real_model_SUITE`, on stories260K and TinyLlama.
-- **Fresh clone** build of the branch: `priv/erllama_nif.so` is in place.
-- `rebar3 ex_doc` from the root: no new warnings, links resolve.
-- `scripts/check_library_package.sh` passes.
-- The release starts, pings and stops, and the escript runs on the release's ERTS.
-- Green CI, then one PR for Phase 1. Stop for validation.
+`rest_for_one`: if the run table restarts, the runs are restarted too, so the table never points at the wrong pids.
 
----
+### Modules
 
-## Phases 2 to 7 (outline; each is planned in detail and shipped as its own PR)
+- **`erllama_server_api`** is the versioned facade, `-define(API_VSN, 1)`. It is the only module the RPC client calls, and Phase 3 HTTP will call it too. Every function returns `{ok, _}` or `{error, Reason}`, never throws.
+  - `hello(ClientApiVsn)`: `{ok, #{api, server_vsn, erllama_vsn, node}}` or `{error, {incompatible_api, #{server, client}}}`.
+  - `status()`: versions, the loaded models with their phase, the active runs and `erllama:pressure/0`.
+  - `models()`, `load_model(Path, Opts)`, `unload_model(Id)`. These are interim and are replaced by the Phase 3 registry.
+  - `start_run(Spec)` returns `{ok, #{run_id, conversation_id}}`. The spec is `#{model, messages | prompt, conversation_id => _, opts => _}`. `opts` is a whitelist: `response_tokens`, the sampling keys, `stop_sequences` and the chat keys. Anything else returns `{error, {invalid_option, K}}`.
+  - `attach(RunId, Pid, Cursor)`: `{ok, #{run_pid, replay => [Event], status}}` or `{error, {gap, OldestSeq}}` or `{error, not_found}`. `Cursor` is the next seq wanted (0 means from the start).
+  - `detach(RunId, Pid)`, `cancel(RunId)`, `result(RunId)` (`{ok, Result}` or `{error, running | not_found}`) and `runs()`.
+  - `conversation(Id)`: its messages and its active run.
+- **`erllama_server_run`** is a gen_server, one per run, that traps exits.
+  - **It owns the erllama stream ref.** It renders through `erllama_server_generate`.
+  - **Events:** it turns each erllama event into a sequenced event `#{seq, type, data}`. The types are `started`, `token`, `thinking`, `done`, `cancelled` and `error`. It keeps them in an `erllama_server_ring`.
+  - **Delivery:** it sends `{erllama_server_run, RunId, Event}` to each subscriber it monitors.
+  - **Flow control:** subscribers ack with `RunPid ! {ack, self(), Seq}`. A subscriber with more than `subscriber_max_unacked` unacked events is dropped and sent `{erllama_server_run, RunId, {dropped, NextSeq}}`, so it can reattach with a cursor.
+  - **Disconnect:** a subscriber that goes `DOWN` is removed, and the run continues. Runs survive CLI disconnect, as the prompt specifies.
+  - **End of a run:** on its terminal event, it sets the result (content, reasoning, tool calls when parsed, stats, finish_reason). Then it tells `erllama_server_convs` the outcome:
+    - on `done` with `stop` or `length`, the assistant message and the `finish_key` are appended;
+    - on cancel or error, nothing is appended and only the conversation's lock is released.
 
-**2. Release, service API, RPC client.**
-- `erllama_server_api` is a versioned module (`?API_VSN`) shared by the RPC and HTTP adapters.
-- Run and conversation ids, and events with sequence numbers.
-- Each run keeps a bounded ring buffer for replay. Each subscriber gets a bounded queue; one that overflows is dropped with a gap marker. `attach(RunId, Cursor)` returns the replay or `{gap, OldestSeq}`.
-- Cancel, attach, detach and fetching the result.
-- The CLI escript starts a temporary hidden node named `erllama_cli_<random>@127.0.0.1`.
-  - The cookie is documented: by default the release user's `~/.erlang.cookie`, with an override via env or flag. The relx `RELX_COOKIE` caveat found in Phase 1 is documented.
-  - Control operations use `erpc` with timeouts; events stream as messages to a local subscriber process.
-- Clear errors for an unreachable release and for incompatible protocol versions.
-- TLS distribution for remote administration is documented and off by default.
-- Workspaces always refer to the release machine.
-- **Tests** run in CT with `peer`: streaming, reconnect with a cursor, a gap, cancel, a version mismatch, and an assertion that the client node never loads `erllama`.
+    It stays alive for `run_retention_ms`, so `result` and `attach` still work, then stops.
+  - **Shutdown:** `terminate/2` cancels a ref that is still running.
+- **`erllama_server_generate`** holds the pure helpers that build the token stream for a spec:
+  - the `chat_apply` path, with a fallback to `render_chat_template` on `chat_not_supported`;
+  - the raw `prompt` path;
+  - `finish/2`, which parses the final text with `chat_parse/3` when a parser exists.
 
-**3. Model management and Livery API adapters.**
-- **Model registry:** persistent, with aliases, defaults, local GGUF registration and metadata inspection.
-- **Downloads** from `hf://`, `https://` and `ollama://` through `livery_client`: a streamed body into a `.part` file, `Range` resume, a sha256 check, progress events and cancellation.
-- **Model lifetime:** keep-alive and capacity reporting go through erllama's existing admission, `erllama:pressure/0`, `erllama_model_evictor` and the scheduler (no second scheduler).
-- Startup config validation.
-- **HTTP:** one normalised request path through `erllama:chat/3`, `stream/3` and `embed_batch/2`, with thin protocol adapters on Livery (`livery_resp:sse/3` and `ndjson`; cancel on `livery_disconnect`).
+  Phase 3 HTTP reuses it.
+- **`erllama_server_ring`** is a pure bounded event buffer:
+  - `new(Max)` and `push(Event, Ring)`;
+  - `from(Cursor, Ring)` returns `{ok, Events}` or `{gap, Oldest}`;
+  - `next_seq/1`.
+- **`erllama_server_runs`**: the ETS table `{RunId, Pid, ConvId, Model, StartedAt}`, with lookups done in the caller. The owner monitors the runs and deletes their rows on `DOWN`.
+- **`erllama_server_convs`**: an ETS table of `#{id, model, messages, last_finish_key, active_run}`.
+  - `begin_run/3` returns `{error, conversation_busy}` when a run is active.
+  - `end_run/3` appends the outcome.
+  - Phase 6 makes it durable behind the same calls.
+- **`erllama_server_ids`**: the `run_<base32 of 16 random bytes>` and `conv_...` ids.
+- **`erllama_server_client`** is the client side, used by the escript.
+  - **It never calls an `erllama*` library module**, which a test checks.
+  - **Connecting:**
+    - `connect/0` starts the hidden node, applies the cookie and calls `hello/1` with `?API_VSN` through `erpc:call(Node, erllama_server_api, hello, [V], Timeout)`;
+    - an `{exception, undef, _}` is mapped to "this release has no service API";
+    - a nodedown is mapped to "release not reachable".
+  - **`call/3`:** bounded erpc with a timeout, `control_timeout_ms` (default 10 s, overridden by `ERLLAMA_TIMEOUT`).
+  - **`follow(RunId, Cursor, Sink)`:**
+    - a local receive loop that acks every N events;
+    - on nodedown or `dropped` it reconnects, with backoff, from `last_seq + 1`;
+    - on `{gap, Oldest}` it reports the gap and continues from `Oldest`;
+    - it returns on a terminal event.
+- **`erllama_server_cli`** handles parsing and printing. Commands:
+  - `ping`, `status`, `models`;
+  - `load PATH [--id ID] [--n-ctx N] [--gpu-layers N]` and `unload ID`;
+  - `run MODEL [--conversation ID] [--detach] PROMPT...`, a single turn streamed to stdout (`--detach` prints the run id and exits);
+  - `chat MODEL`, a minimal line loop where each line is a turn in one conversation;
+  - `runs`, `attach RUN [--from SEQ]`, `cancel RUN`, `result RUN`, `--version`.
 
-  | Endpoint | Protocol | Streaming |
-  |---|---|---|
-  | `GET /v1/models`, `GET /v1/models/:id` | OpenAI | n/a |
-  | `POST /v1/chat/completions` | OpenAI Chat Completions | SSE, `[DONE]` |
-  | `POST /v1/responses`, `GET`/`DELETE /v1/responses/:id` | OpenAI Responses (tool calls, `previous_response_id`) | SSE typed events |
-  | `POST /v1/completions` | OpenAI Completions | SSE |
-  | `POST /v1/embeddings` | OpenAI | n/a |
-  | `POST /v1/messages`, `/v1/messages/count_tokens` | Anthropic Messages | SSE |
-  | `/api/chat`, `/api/generate`, `/api/embed[dings]`, `/api/tags`, `show`, `pull`, `delete`, `copy`, `ps`, `version` | Ollama | NDJSON |
-  | `GET /health`, `/ready`, `/metrics` | ops | n/a |
+  The exit codes are 0 on success, 1 for a release or run error, and 2 for usage.
 
-- **Across every adapter:** request ids, bearer auth, body and concurrency limits from Livery middleware, and one error shape.
-- A compatibility matrix lives at `guides/server/compatibility.md`; unsupported fields are rejected explicitly.
-- **Reused from erllama:** chat templates, grammar/json_schema, stop sequences, and the chat parser for tool calls.
-- Multimodal is exposed with its real limits.
+### Configuration (`erllama_server` app env, validated in `erllama_server_sup:init/1`)
 
-**4. Agent runtime and native tools.**
-- One supervised gen_statem per conversation, with at most one mutating run per conversation.
-- Tools run in monitored workers: file read (paginated), list and search, create and exact edit, and shell with a timeout, bounded output, background status, and a process-group kill.
-- **Run loop:**
-  - budgets for tokens, rounds and elapsed time;
-  - queued input and interruption;
-  - concurrent tool calls with results kept in call order, and workspace mutations applied in order;
-  - approval policy and requests;
-  - errors returned as tool results when the model can recover.
-- Tools declared by HTTP clients are executed by the client, never on the server.
+A bad value makes `start_link` fail.
+- `run_buffer_events`, default 1024;
+- `subscriber_max_unacked`, default 256;
+- `run_retention_ms`, default 300000;
+- `max_active_runs`, default 64; beyond it, `start_run` returns `{error, too_many_runs}`.
 
-**5. barrel_mcp bridge.**
-- **Client side:**
-  - stdio and Streamable HTTP clients (`barrel_mcp:start_client/2`);
-  - namespaced binary tool names with collision handling;
-  - a catalog fixed for each round and refreshed between rounds;
-  - resources, prompts and structured content, with unsupported content reported rather than dropped;
-  - calls wrapped in try/catch, because the client exits when the server closes, and every call has a timeout;
-  - the same policy as native tools;
-  - an optional server that is down never blocks inference.
-- **Opt-in MCP server:** `livery_mcp:router/1` on the same Livery service. Its known gaps (no disconnect relay, weaker origin defaults) are fixed upstream or worked around, verified first.
+### Node, cookie and TLS
 
-**6. Durable conversations.**
-- A transcript and run/tool log, stored apart from the KV cache files.
-- List, attach, resume, fork, delete and export.
-- A tool's intent is stored before it runs and its outcome before generation continues. An uncertain outcome is marked unresolved and never retried.
-- On resume: restore exact KV when possible, otherwise prefill the transcript.
-- Compaction, automatic and manual.
-- The disconnect semantics as specified.
+- **Release node:** `vm.args.src` keeps `-name erllama_server@127.0.0.1` and loopback distribution.
+- **Client node:** a hidden `erllama_cli_<unique>@<release host>`. The cookie is `ERLLAMA_COOKIE` or `~/.erlang.cookie`, and `ERLLAMA_NODE` sets the target.
+- **Remote administration over TLS:** `rel/erllama` reads `ERLLAMA_DIST_OPTFILE`. When it is set, it exports `ERL_FLAGS="-proto_dist inet_tls -ssl_dist_optfile $F"` before running the escript. The release enables TLS through its own `vm.args`, as documented.
+- **The guide** `guides/server/rpc.md` covers:
+  - the node names and cookies, and the caveat that `RELX_COOKIE` affects only control commands;
+  - the TLS setup for both sides;
+  - the API version rule;
+  - what a gap means;
+  - that workspaces always refer to the release machine.
 
-**7. Terminal, documentation, full release validation.**
-- Multiline input, streamed rendering, prefill and tool progress, and approvals.
-- `/new` `/sessions` `/switch` `/fork` `/compact` `/quit`.
-- Closing the terminal never unloads models or stops the release.
-- Server guides, and a final validation that lists which real-model checks ran and which were skipped.
+## Tests
 
-**Out of scope for every phase:** pipeline or tensor parallelism and cluster routing; no new repository, package publication or deployment.
+- **eunit:**
+  - `erllama_server_ring_tests`;
+  - `erllama_server_api_tests` for the config validation, the spec and option validation, and the version check;
+  - `erllama_server_cli_tests` (extended) for argument parsing and output formatting.
+- **PropEr:** `prop_erllama_server_ring`. For any push sequence and cursor, `from/2` returns either a contiguous run starting at the cursor or `{gap, Oldest}` with `Oldest > Cursor`.
+- **CT `erllama_server_rpc_SUITE`:** one peer runs the release apps and loads the stub with `step_delay_ms`. A second peer, hidden, is the client and uses only `erllama_server_client`. Cases:
+  - streams tokens in order, ending with done;
+  - the result matches the stream;
+  - a cursor reattach is contiguous after the subscriber is killed;
+  - a gap with a small buffer;
+  - a slow subscriber is dropped and the run completes;
+  - cancel gives `cancelled`, and the conversation gets nothing appended;
+  - the run survives the client node stopping, and its result is fetched afterwards;
+  - `conversation_busy`;
+  - the second turn carries the history and the `parent_key`;
+  - `max_active_runs`;
+  - unload during a run gives an error event;
+  - stopping the app cancels in-flight streams;
+  - a version mismatch returns `incompatible_api`;
+  - an unreachable release;
+  - the client peer has never loaded `erllama`, `erllama_nif` or any `erllama_cache*` module (`code:all_loaded/0`).
+- **CT `erllama_server_tls_SUITE`:** the two peers use `inet_tls` with certificates generated by `public_key:pkix_test_data/1`; `hello` and a streamed run work. It skips if `ssl` is unavailable.
+- **Gated real model** (`LLAMA_TEST_MODEL`): a TinyLlama chat run goes through the `chat_apply` path and streams; the parsed message is non-empty. The final report says which real-model checks ran and which were skipped.
+- **CI release job:** extended with `bin/erllama_server eval` to load a stub model, then `bin/erllama run stub hello`, `run --detach` plus `attach` and `cancel`, then `stop`.
+
+## Docs and progress
+
+- `apps/erllama_server/README.md`: the CLI commands and the configuration keys.
+- `guides/server/rpc.md`: new.
+- `doc/features.md`: implemented, outstanding (the registry is interim, and the terminal has no Ctrl-C cancel: Ctrl-C exits the client and the run keeps going) and the validation results.
+- `apps/erllama_server/PLAN.md`: kept in sync.
+
+## Verification
+
+- **Full gate** from the root on OTP 28.3.1: fmt, compile, eunit, proper, ct, lint, dialyzer, xref.
+- **Real-model case** on TinyLlama (`~/Models/tinyllama-1.1b-chat.gguf`).
+- **The release end to end:**
+  - `rebar3 as prod release`, then `bin/erllama_server daemon`;
+  - `bin/erllama load ~/Models/tinyllama-1.1b-chat.gguf --id tiny`;
+  - `bin/erllama run tiny "hello"`, which streams;
+  - `run --detach`, `attach`, `cancel` and `result`;
+  - kill the client mid-run, reattach, and the run is complete;
+  - `bin/erllama_server stop`.
+- Stop for review before any commit or push.
+
+## Later phases (unchanged outline)
+
+3. Model registry and downloads (`livery_client`); the Livery HTTP adapters for the OpenAI, Anthropic and Ollama endpoint table, through `erllama_server_api` and `erllama_server_generate`.
+4. The agent runtime and native tools.
+5. The barrel_mcp bridge.
+6. Durable conversations behind `erllama_server_convs`.
+7. Terminal polish (Ctrl-C cancel, slash commands), the guides and full release validation.

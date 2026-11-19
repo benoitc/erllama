@@ -54,3 +54,48 @@ commands_do_not_load_erllama_test_() ->
             peer:stop(Peer)
         end
     end}.
+
+parse_opts_test() ->
+    Spec = [{"--id", id, string}, {"--n-ctx", n_ctx, int}, {"--detach", detach, flag}],
+    ?assertEqual(
+        {ok, #{id => "tiny", n_ctx => 2048, detach => true}, ["a", "b"]},
+        erllama_server_cli:parse_opts(
+            ["a", "--id", "tiny", "--detach", "b", "--n-ctx", "2048"], Spec
+        )
+    ),
+    ?assertEqual(
+        {ok, #{}, ["--id", "x"]}, erllama_server_cli:parse_opts(["--", "--id", "x"], Spec)
+    ),
+    ?assertMatch({error, _}, erllama_server_cli:parse_opts(["--n-ctx", "lots"], Spec)),
+    ?assertMatch({error, _}, erllama_server_cli:parse_opts(["--id"], Spec)),
+    ?assertMatch({error, _}, erllama_server_cli:parse_opts(["--nope"], Spec)).
+
+bad_options_are_usage_errors_test() ->
+    {2, Out} = out(erllama_server_cli:run(["load", "--n-ctx", "x", "f.gguf"])),
+    ?assertNotEqual(nomatch, binary:match(Out, <<"--n-ctx">>)).
+
+error_messages_test() ->
+    Msg = fun(R) -> unicode:characters_to_binary(erllama_server_cli:format_error(R)) end,
+    ?assertNotEqual(nomatch, binary:match(Msg({unreachable, 'a@h'}), <<"not reachable at a@h">>)),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(Msg({incompatible_api, #{server => 2, client => 1}}), <<"API version 2">>)
+    ),
+    ?assertNotEqual(
+        nomatch, binary:match(Msg({no_service_api, 'a@h'}), <<"no erllama service API">>)
+    ),
+    ?assertNotEqual(
+        nomatch, binary:match(Msg({model_not_loaded, <<"m">>}), <<"model m is not loaded">>)
+    ).
+
+%% Client node names must not repeat across CLI processes started at
+%% the same moment: the OS pid tells live processes apart, the random
+%% part covers pid reuse. (unique_integer/1, the old suffix, repeats
+%% between fresh VMs.)
+client_names_are_unique_across_processes_test() ->
+    A = atom_to_list(erllama_server_client:client_name("127.0.0.1")),
+    B = atom_to_list(erllama_server_client:client_name("127.0.0.1")),
+    ?assertNotEqual(A, B),
+    ?assertMatch("erllama_cli_" ++ _, A),
+    ?assertNotEqual(nomatch, string:find(A, "_" ++ os:getpid() ++ "_")),
+    ?assertMatch([_, "127.0.0.1"], string:split(A, "@")).

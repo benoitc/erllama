@@ -4,11 +4,14 @@
 {application, erllama_server, [
     {description, "erllama server release: models, conversations, agent runs and APIs"},
     {vsn, "0.1.0"},
-    {registered, [erllama_server_sup]},
+    {registered, [
+        erllama_server_sup, erllama_server_runs, erllama_server_convs, erllama_server_run_sup
+    ]},
     {mod, {erllama_server_app, []}},
     {applications, [
         kernel,
         stdlib,
+        crypto,
         erllama
     ]},
     {env, []},
