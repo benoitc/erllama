@@ -58,7 +58,10 @@ from `NextSeq`.
     mcp/0,
     mcp_tools/0,
     mcp_resources/1,
-    mcp_read/2
+    mcp_read/2,
+    mcp_prompts/1,
+    mcp_prompt/3,
+    agent_prompt/4
 ]).
 
 -include("erllama_server_api.hrl").
@@ -602,3 +605,37 @@ mcp_resources(Server) ->
 -spec mcp_read(binary(), binary()) -> {ok, binary()} | {error, binary()}.
 mcp_read(Server, Uri) ->
     erllama_server_mcp:read_resource(Server, Uri).
+
+-doc "The prompts an MCP server offers: `name`, `description`, `arguments`.".
+-spec mcp_prompts(binary()) -> {ok, [map()]} | {error, binary()}.
+mcp_prompts(Server) ->
+    erllama_server_mcp:prompts(Server).
+
+-doc "An MCP server's prompt filled with `Args`: the messages it expands to.".
+-spec mcp_prompt(binary(), binary(), #{binary() => binary()}) -> {ok, [map()]} | {error, binary()}.
+mcp_prompt(Server, Name, Args) ->
+    erllama_server_mcp:get_prompt(Server, Name, Args).
+
+-doc """
+Send an MCP server's prompt to an agent session as its input, as
+`agent_send/2` would send text. A prompt's assistant messages are kept,
+marked as such.
+""".
+-spec agent_prompt(binary(), binary(), binary(), #{binary() => binary()}) ->
+    ok | {queued, pos_integer()} | {error, term()}.
+agent_prompt(Id, Server, Name, Args) ->
+    case erllama_server_mcp:get_prompt(Server, Name, Args) of
+        {ok, Msgs} -> agent_send(Id, prompt_text(Msgs));
+        {error, _} = E -> E
+    end.
+
+prompt_text(Msgs) ->
+    iolist_to_binary(
+        lists:join(<<"\n\n">>, [
+            case R of
+                <<"assistant">> -> [<<"Assistant: ">>, C];
+                _ -> C
+            end
+         || #{role := R, content := C} <- Msgs
+        ])
+    ).

@@ -57,7 +57,9 @@
     class :: erllama_server_tools:class(),
     status = queued :: queued | pending | running | done,
     result :: {ok | error, binary()} | undefined,
-    worker :: {pid(), reference()} | undefined
+    worker :: {pid(), reference()} | undefined,
+    %% The catalog entry of an MCP tool (this round's snapshot).
+    mcp :: map() | undefined
 }).
 
 -record(d, {
@@ -65,7 +67,8 @@
     conv :: binary(),
     model :: binary(),
     workspace :: binary(),
-    policy :: #{binary() => erllama_server_tools:policy()},
+    %% See erllama_server_agent_policy.
+    policy :: erllama_server_agent_policy:policies(),
     %% `yes' and `read_only' also decide for MCP tools not in `policy'.
     mode = default :: default | yes | read_only,
     %% This round's MCP tools, by namespaced name.
@@ -122,7 +125,7 @@ init(#{run_id := Id, model := Model, workspace := Ws, conversation_id := Conv} =
         conv = Conv,
         model = Model,
         workspace = Ws,
-        policy = initial_policy(Spec),
+        policy = erllama_server_agent_policy:initial(Spec),
         mode = maps:get(mode, Spec, default),
         budgets = maps:merge(
             #{max_rounds => 20, max_tokens => 32768, max_elapsed_ms => 600000},
@@ -138,16 +141,6 @@ init(#{run_id := Id, model := Model, workspace := Ws, conversation_id := Conv} =
         started, #{agent_id => Id, conversation_id => Conv, model => Model, workspace => Ws}, D0
     ),
     {ok, idle, D}.
-
-%% The native tools' defaults, overridden by the session's choices.
-initial_policy(Spec) ->
-    maps:merge(
-        maps:from_list([
-            {N, erllama_server_tools:default_policy(N)}
-         || N <- erllama_server_tools:names()
-        ]),
-        maps:get(policy, Spec, #{})
-    ).
 
 %% --- calls every state answers ---------------------------------------------
 
@@ -245,7 +238,7 @@ start_turn(Text, #d{budgets = #{max_elapsed_ms := Ms}} = D) ->
     generate(emit(turn_started, #{input => Text}, D1#d{turn = Turn})).
 
 generate(#d{generator = G, model = M, transcript = T, turn = Turn, id = Id} = D0) ->
-    D = D0#d{mcp = mcp_snapshot()},
+    D = D0#d{mcp = erllama_server_agent_policy:snapshot()},
     Native = [
         Def
      || #{name := N} = Def <- erllama_server_tools:definitions(),
@@ -283,36 +276,8 @@ after_generation(Result, #d{turn = Turn} = D) ->
             plan_calls(Calls, D1)
     end.
 
-mcp_snapshot() ->
-    case erllama_server_config:get(mcp_servers) of
-        [] -> #{};
-        _ -> maps:from_list([{N, E} || #{name := N} = E <- erllama_server_mcp:catalog()])
-    end.
-
-%% The policy of a tool in this session. A native tool's is in `policy'
-%% (filled from the defaults at start). For an MCP tool, a server the
-%% operator set to `deny' stays denied; otherwise the session's choice
-%% for that name, then its mode, then the server's policy decide.
-policy(Name, #d{policy = Policy, mcp = Mcp, mode = Mode}) ->
-    case {Mcp, Policy} of
-        {#{Name := #{policy := deny}}, _} -> deny;
-        {_, #{Name := P}} -> P;
-        {#{Name := #{class := Class, policy := P}}, _} -> mode_policy(Mode, Class, P);
-        _ -> deny
-    end.
-
-mode_policy(yes, _Class, _P) -> auto;
-mode_policy(read_only, write, _P) -> deny;
-mode_policy(_Mode, _Class, P) -> P.
-
-class(Name, #d{mcp = Mcp}) ->
-    case Mcp of
-        #{Name := #{class := C}} -> C;
-        _ -> erllama_server_tools:class(Name)
-    end.
-
-known(Name, #d{mcp = Mcp}) ->
-    is_map_key(Name, Mcp) orelse lists:member(Name, erllama_server_tools:names()).
+policy(Name, #d{policy = P, mcp = Mcp, mode = Mode}) ->
+    erllama_server_agent_policy:policy(Name, P, Mcp, Mode).
 
 %% Each call is denied, waits for approval, or is ready to run.
 plan_calls(Calls, D) ->
@@ -338,8 +303,15 @@ plan_calls(Calls, D) ->
 
 plan_call(I, #{id := Id, function := #{name := Name, arguments := ArgsJson}}, D) ->
     Args = decode_args(ArgsJson),
-    Base = #call{index = I, id = Id, name = Name, args = Args, class = class(Name, D)},
-    case {known(Name, D), policy(Name, D)} of
+    Base = #call{
+        index = I,
+        id = Id,
+        name = Name,
+        args = Args,
+        class = erllama_server_agent_policy:class(Name, D#d.mcp),
+        mcp = maps:get(Name, D#d.mcp, undefined)
+    },
+    case {erllama_server_agent_policy:known(Name, D#d.mcp), policy(Name, D)} of
         {false, _} ->
             Base#call{status = done, result = {error, <<"unknown tool: ", Name/binary>>}};
         {true, deny} ->
@@ -363,7 +335,7 @@ decode_args(A) when is_binary(A) ->
 
 approve_call(CallId, Decision, From, #d{calls = Calls, policy = Policy} = D) ->
     case [C || #call{id = Id, status = pending} = C <- Calls, Id =:= CallId] of
-        [#call{name = Name} = C] ->
+        [#call{} = C] ->
             {Updated, Policy1} =
                 case Decision of
                     deny ->
@@ -376,7 +348,9 @@ approve_call(CallId, Decision, From, #d{calls = Calls, policy = Policy} = D) ->
                     allow ->
                         {C#call{status = queued}, Policy};
                     always ->
-                        {C#call{status = queued}, Policy#{Name => auto}}
+                        {C#call{status = queued}, Policy#{
+                            erllama_server_agent_policy:grant_key(C#call.name, C#call.mcp) => auto
+                        }}
                 end,
             D1 = D#d{calls = replace(Updated, Calls), policy = Policy1},
             case [P || #call{status = pending} = P <- D1#d.calls] of
@@ -423,14 +397,14 @@ schedule(#d{calls = Calls} = D0) ->
 
 start_call(
     #call{index = I, name = Name, args = Args, id = Id} = C,
-    #d{workspace = Ws, jobs = Jobs, mcp = Mcp} = D
+    #d{workspace = Ws, jobs = Jobs} = D
 ) ->
     Self = self(),
     Ctx0 = #{workspace => Ws, owner => Self, jobs => Jobs},
     Ctx =
-        case Mcp of
-            #{Name := Entry} -> Ctx0#{mcp => Entry};
-            _ -> Ctx0
+        case C#call.mcp of
+            undefined -> Ctx0;
+            Entry -> Ctx0#{mcp => Entry}
         end,
     Worker = spawn_monitor(fun() ->
         Self ! {tool_done, self(), I, erllama_server_tools:execute(Name, Args, Ctx)}
@@ -559,6 +533,12 @@ interrupt(_State, _Why, D) ->
 kill_worker(#call{name = <<"shell">>, worker = {Pid, Mon}}) ->
     erlang:demonitor(Mon, [flush]),
     ok = erllama_server_tool_shell:stop_run(Pid),
+    exit(Pid, kill);
+kill_worker(#call{mcp = #{server := Server}, worker = {Pid, Mon}}) ->
+    %% The request is the server's to stop: tell it, for this call only
+    %% (the connection is shared with other sessions).
+    erlang:demonitor(Mon, [flush]),
+    _ = erllama_server_mcp:cancel_call(Server, Pid),
     exit(Pid, kill);
 kill_worker(#call{worker = {Pid, Mon}}) ->
     erlang:demonitor(Mon, [flush]),

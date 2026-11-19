@@ -136,6 +136,14 @@ default_policy(N) ->
 %% server.
 -spec execute(binary(), map(), map()) ->
     {ok | error, binary()} | {ok, binary(), {job, binary(), pid()}}.
+execute(_Name, _Args, #{mcp := #{server := Server, remote := list_resources}}) ->
+    erllama_server_mcp:resources(Server);
+execute(_Name, #{<<"uri">> := Uri}, #{mcp := #{server := Server, remote := read_resource}}) when
+    is_binary(Uri)
+->
+    erllama_server_mcp:read_resource(Server, Uri);
+execute(_Name, _Args, #{mcp := #{remote := read_resource}}) ->
+    {error, <<"missing argument: uri">>};
 execute(_Name, Args, #{mcp := #{server := Server, remote := Tool}}) when is_map(Args) ->
     erllama_server_mcp:call(Server, Tool, Args, erllama_server_config:get(mcp_timeout_ms));
 execute(Name, Args, #{workspace := Ws} = Ctx) when is_map(Args) ->

@@ -21,10 +21,14 @@
     policies/1,
     errors_and_timeouts/1,
     server_down_and_back/1,
-    endpoint_serves_the_release/1
+    endpoint_serves_the_release/1,
+    interrupt_cancels_the_remote_call/1,
+    aliases_stay_with_their_tool/1,
+    bad_server_stays_contained/1,
+    resources_and_prompts/1
 ]).
 %% Tools of the test servers.
--export([echo/1, fail/1, slow/1, picture/1, touch/1]).
+-export([echo/1, fail/1, slow/1, picture/1, touch/1, named/1, review/1, notes/1]).
 
 all() ->
     [
@@ -33,7 +37,11 @@ all() ->
         policies,
         errors_and_timeouts,
         server_down_and_back,
-        endpoint_serves_the_release
+        endpoint_serves_the_release,
+        interrupt_cancels_the_remote_call,
+        aliases_stay_with_their_tool,
+        bad_server_stays_contained,
+        resources_and_prompts
     ].
 
 init_per_testcase(TC, Config) ->
@@ -49,6 +57,22 @@ setup(endpoint_serves_the_release, Config) ->
     ok = application:set_env(erllama_server, http, #{port => 0}),
     ok = application:set_env(erllama_server, mcp_endpoint, true),
     ok = application:set_env(erllama_server, api_keys, ["k1"]),
+    boot(Config);
+setup(bad_server_stays_contained, Config) ->
+    %% Not started here: the case starts the MCP manager alone.
+    Config;
+setup(interrupt_cancels_the_remote_call, Config) ->
+    ok = application:set_env(erllama_server, mcp_servers, [
+        #{
+            name => "local",
+            transport => stdio,
+            command => os:find_executable("erl"),
+            args => fake_args(),
+            policy => auto
+        }
+    ]),
+    %% Long, so the client's own timeout is not what cancels the call.
+    ok = application:set_env(erllama_server, mcp_timeout_ms, 30000),
     boot(Config);
 setup(stdio_server, Config) ->
     ok = application:set_env(erllama_server, mcp_servers, [
@@ -87,8 +111,19 @@ end_per_testcase(_TC, Config) ->
     end,
     [
         barrel_mcp:unreg_tool(N)
-     || N <- [<<"echo">>, <<"fail">>, <<"slow">>, <<"picture">>, <<"touch">>]
+     || N <- [
+            <<"echo">>,
+            <<"fail">>,
+            <<"slow">>,
+            <<"picture">>,
+            <<"touch">>,
+            <<"effect">>,
+            <<"a.b">>,
+            <<"a_b">>
+        ]
     ],
+    _ = barrel_mcp:unreg_prompt(<<"review">>),
+    _ = barrel_mcp:unreg_resource(<<"notes">>),
     [barrel_mcp:unreg_tool(N) || N <- [<<"erllama_models">>, <<"erllama_chat">>]],
     [
         application:unset_env(erllama_server, K)
@@ -115,6 +150,13 @@ test_server() ->
         description => <<"A picture and a caption.">>
     }),
     ok = barrel_mcp:reg_tool(<<"touch">>, ?MODULE, touch, #{description => <<"Changes things.">>}),
+    ok = barrel_mcp:reg_prompt(<<"review">>, ?MODULE, review, #{
+        description => <<"Review a file.">>,
+        arguments => [#{name => <<"file">>, description => <<"The file.">>, required => true}]
+    }),
+    ok = barrel_mcp:reg_resource(<<"notes">>, ?MODULE, notes, #{
+        name => <<"Notes">>, uri => <<"notes://today">>, description => <<"Today's notes">>
+    }),
     {ok, Pid} = livery:start_service(#{
         http => #{ip => {127, 0, 0, 1}, port => 0}, router => livery_mcp:router()
     }),
@@ -141,6 +183,26 @@ picture(_) ->
     ].
 
 touch(_) -> <<"changed">>.
+
+named(_) -> <<"named">>.
+
+review(#{<<"file">> := F}) ->
+    #{
+        description => <<"Review">>,
+        messages => [
+            #{
+                role => <<"user">>,
+                content => #{<<"type">> => <<"text">>, <<"text">> => <<"Please review ", F/binary>>}
+            }
+        ]
+    }.
+
+notes(_) -> <<"buy milk">>.
+
+%% An `erl' running the fake server (erllama_server_fake_mcp).
+fake_args() ->
+    Dir = filename:dirname(code:which(erllama_server_fake_mcp)),
+    ["-noshell", "-pa", Dir, "-eval", "erllama_server_fake_mcp:main()."].
 
 %% An `erl' that serves `echo' over stdio, with nothing else on stdout.
 stdio_args() ->
@@ -420,3 +482,126 @@ list_or_dead(C) ->
         false -> {error, closed};
         true -> barrel_mcp_client:list_tools(C)
     end.
+
+%% Interrupting a session cancels its call at the server
+%% (`notifications/cancelled' for that request): a server that honours
+%% it never performs the side effect. The connection, shared with other
+%% sessions, stays up. The server is erllama_server_fake_mcp: barrel_mcp's
+%% servers do not stop a running tool on cancel yet.
+interrupt_cancels_the_remote_call(Config) ->
+    ok = wait_ready([<<"local">>]),
+    Marker = filename:join(?config(priv_dir, Config), "effect.txt"),
+    Id = start(Config, [
+        #{calls => [{<<"x1">>, <<"local__effect">>, #{<<"path">> => list_to_binary(Marker)}}]},
+        #{text => <<"never">>}
+    ]),
+    ok = erllama_server_api:agent_send(Id, <<"go">>),
+    ok = wait(fun() -> started(Id, <<"x1">>) end),
+    timer:sleep(200),
+    ok = erllama_server_api:agent_interrupt(Id),
+    timer:sleep(1500),
+    ?assertNot(filelib:is_file(Marker)),
+    ?assert(filelib:is_file(Marker ++ ".cancelled")),
+    ?assertEqual(
+        {ok, <<"still here">>},
+        erllama_server_mcp:call(<<"local">>, <<"echo">>, #{<<"text">> => <<"still here">>}, 5000)
+    ).
+
+started(Id, CallId) ->
+    {ok, #{replay := Replay}} = erllama_server_api:attach(Id, self(), 0),
+    ok = erllama_server_api:detach(Id, self()),
+    flush(Id),
+    lists:member(CallId, [C || #{type := tool_started, data := #{call_id := C}} <- Replay]).
+
+%% An alias belongs to one tool for good: a tool that goes does not
+%% hand its name, or an approval given to it, to another.
+aliases_stay_with_their_tool(Config) ->
+    ok = wait_ready([<<"guarded">>]),
+    ok = barrel_mcp:reg_tool(<<"a.b">>, ?MODULE, named, #{description => <<"dot">>}),
+    ok = barrel_mcp:reg_tool(<<"a_b">>, ?MODULE, named, #{description => <<"underscore">>}),
+    ok = erllama_server_mcp:refresh(),
+    Remote = fun(Alias) ->
+        {ok, T} = erllama_server_api:mcp_tools(),
+        [R || #{name := N, server := <<"guarded">>, remote := R} <- T, N =:= Alias]
+    end,
+    ok = wait(fun() -> Remote(<<"guarded__a_b_2">>) =/= [] end),
+    ?assertEqual([<<"a.b">>], Remote(<<"guarded__a_b">>)),
+    ?assertEqual([<<"a_b">>], Remote(<<"guarded__a_b_2">>)),
+    %% Always allow the first, in a session.
+    Id = start(Config, [
+        #{calls => [{<<"g1">>, <<"guarded__a_b">>, #{}}]},
+        #{text => <<"one">>},
+        #{calls => [{<<"g2">>, <<"guarded__a_b_2">>, #{}}]},
+        #{text => <<"two">>}
+    ]),
+    ok = erllama_server_api:agent_send(Id, <<"first">>),
+    ok = wait(fun() -> lists:member(<<"g1">>, pending_requests(Id)) end),
+    ok = erllama_server_api:agent_approve(Id, <<"g1">>, always),
+    _ = collect_turn(Id),
+    %% The first goes away; its alias is not given to the second.
+    ok = barrel_mcp:unreg_tool(<<"a.b">>),
+    ok = erllama_server_mcp:refresh(),
+    ok = wait(fun() -> Remote(<<"guarded__a_b">>) =:= [] end),
+    ?assertEqual([<<"a_b">>], Remote(<<"guarded__a_b_2">>)),
+    %% And the approval stays with the first: the second still asks.
+    ok = erllama_server_api:agent_send(Id, <<"second">>),
+    ok = wait(fun() -> lists:member(<<"g2">>, pending_requests(Id)) end),
+    ok = erllama_server_api:agent_approve(Id, <<"g2">>, deny),
+    _ = collect_turn(Id).
+
+%% A server whose connection cannot even be set up is marked down; the
+%% manager and the other servers go on. (Startup validation refuses such
+%% a value; this checks the manager holds if one gets through.)
+bad_server_stays_contained(_Config) ->
+    ?assertMatch(
+        {error, {invalid_config, mcp_servers, _}},
+        erllama_server_config:validate(#{
+            mcp_servers => [
+                #{name => "bad", transport => http, url => "http://x/mcp", token => 123}
+            ]
+        })
+    ),
+    ok = application:set_env(erllama_server, mcp_servers, [
+        #{name => "bad", transport => http, url => "http://127.0.0.1:1/mcp", token => 123}
+    ]),
+    {ok, Pid} = erllama_server_mcp:start_link(),
+    try
+        ok = wait(fun() ->
+            case erllama_server_mcp:status() of
+                [#{status := down, error := {connect_failed, _, _}}] -> true;
+                _ -> false
+            end
+        end),
+        ?assert(is_process_alive(Pid))
+    after
+        unlink(Pid),
+        exit(Pid, shutdown)
+    end.
+
+%% A session reads a server's resources with tools, and takes a
+%% server's prompt as its input.
+resources_and_prompts(Config) ->
+    ok = wait_ready([<<"web">>]),
+    {ok, [#{name := <<"review">>, arguments := [#{name := <<"file">>, required := true}]}]} =
+        erllama_server_api:mcp_prompts(<<"web">>),
+    {ok, [#{role := <<"user">>, content := <<"Please review a.erl">>}]} =
+        erllama_server_api:mcp_prompt(<<"web">>, <<"review">>, #{<<"file">> => <<"a.erl">>}),
+    Id = start(Config, [
+        #{
+            calls => [
+                {<<"r1">>, <<"web__list_resources">>, #{}},
+                {<<"r2">>, <<"web__read_resource">>, #{<<"uri">> => <<"notes://today">>}}
+            ]
+        },
+        #{text => <<"done">>}
+    ]),
+    ok = erllama_server_api:agent_prompt(Id, <<"web">>, <<"review">>, #{<<"file">> => <<"a.erl">>}),
+    _ = collect_turn(Id),
+    [First | _] = erllama_server_agent_script:rounds(Id),
+    ?assertEqual(
+        [<<"Please review a.erl">>], [C || #{role := <<"user">>, content := C} <- First]
+    ),
+    [{<<"web__list_resources">>, Listed}, {<<"web__read_resource">>, Read}] =
+        last_tool_results(Id),
+    ?assertNotEqual(nomatch, binary:match(Listed, <<"notes://today">>)),
+    ?assertNotEqual(nomatch, binary:match(Read, <<"buy milk">>)).

@@ -26,6 +26,8 @@ The build failed because ...
 you> /quit
 ```
 
+- `/prompt SERVER NAME [KEY=VALUE ...]` sends an MCP server's prompt
+  as your input (see [MCP servers](mcp.md)).
 - `/quit` (or the end of input) leaves the session running;
   `erllama agents` lists sessions, and `erllama agent-stop AGENT` ends
   one.

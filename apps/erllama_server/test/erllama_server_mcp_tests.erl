@@ -80,4 +80,15 @@ config_test() ->
             #{name => "a", transport => http, url => "https://y"}
         ])
     ),
-    ?assertMatch({error, _}, erllama_server_config:validate(#{mcp_endpoint => yes})).
+    ?assertMatch({error, _}, erllama_server_config:validate(#{mcp_endpoint => yes})),
+    %% Optional fields are checked too, and unknown keys refused.
+    Http = #{name => "h", transport => http, url => "https://x/mcp"},
+    Stdio = #{name => "s", transport => stdio, command => "/bin/srv"},
+    ?assertEqual(ok, V([Http#{token => "t", headers => [{"origin", "https://app"}]}])),
+    ?assertMatch({error, _}, V([Http#{token => 123}])),
+    ?assertMatch({error, _}, V([Http#{headers => [{"origin", 1}]}])),
+    ?assertMatch({error, _}, V([Http#{tokens => "typo"}])),
+    ?assertEqual(ok, V([Stdio#{args => ["--x", <<"y">>], env => [{"K", "v"}, {"U", false}]}])),
+    ?assertMatch({error, _}, V([Stdio#{args => [1]}])),
+    ?assertMatch({error, _}, V([Stdio#{env => [{"K", 1}]}])),
+    ?assertMatch({error, _}, V([Stdio#{url => "https://x"}])).

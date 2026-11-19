@@ -17,13 +17,25 @@
 %% Agent sessions see a server's tools as `<server>__<tool>' (letters,
 %% digits, `_' and `-', at most 64 bytes, a numeric suffix on a
 %% collision); the session takes a snapshot of the catalog for each
-%% generation round. Names stay binaries: no atom is ever made from a
-%% name a server sent.
+%% generation round. A tool's alias is given once, the first time the
+%% tool is seen, and never handed to another tool while the release
+%% runs, even after the first one goes: a name the model or a user
+%% approved always means the same server and tool. Names stay
+%% binaries: no atom is ever made from a name a server sent.
 
 -behaviour(gen_server).
 
 -export([
-    start_link/0, catalog/0, status/0, call/4, resources/1, read_resource/2
+    start_link/0,
+    catalog/0,
+    refresh/0,
+    status/0,
+    call/4,
+    cancel_call/2,
+    resources/1,
+    read_resource/2,
+    prompts/1,
+    get_prompt/3
 ]).
 -export([render/1, namespace/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
@@ -42,7 +54,12 @@
     attempts = 0 :: non_neg_integer()
 }).
 
--record(state, {servers = #{} :: #{binary() => #srv{}}}).
+-record(state, {
+    servers = #{} :: #{binary() => #srv{}},
+    %% Every alias given so far, by the tool it names. Never reassigned.
+    aliases = #{} :: #{{binary(), binary() | atom()} => binary()},
+    taken = #{} :: #{binary() => true}
+}).
 -type state() :: #state{}.
 
 -spec start_link() -> {ok, pid()} | {error, term()}.
@@ -55,6 +72,12 @@ start_link() ->
 -spec catalog() -> [map()].
 catalog() ->
     safe_call(catalog, []).
+
+%% Ask every connected server for its tools now instead of at the next
+%% periodic refresh. Returns at once.
+-spec refresh() -> ok.
+refresh() ->
+    gen_server:cast(?MODULE, refresh).
 
 -spec status() -> [map()].
 status() ->
@@ -105,6 +128,105 @@ read_resource(Server, Uri) ->
                 {error, iolist_to_binary(io_lib:format("~0p", [R]))}
         end
     end).
+
+%% The prompts a server offers: `#{name, description, arguments}'.
+-spec prompts(binary()) -> {ok, [map()]} | {error, binary()}.
+prompts(Server) ->
+    with_client(Server, fun(Pid) ->
+        case barrel_mcp_client:list_prompts_all(Pid) of
+            {ok, Ps} -> {ok, [prompt_entry(P) || #{<<"name">> := N} = P <- Ps, is_binary(N)]};
+            {error, R} -> {error, iolist_to_binary(io_lib:format("~0p", [R]))}
+        end
+    end).
+
+prompt_entry(P) ->
+    #{
+        name => maps:get(<<"name">>, P),
+        description => text_or_empty(maps:get(<<"description">>, P, <<>>)),
+        arguments => [
+            #{
+                name => A,
+                description => text_or_empty(maps:get(<<"description">>, Arg, <<>>)),
+                required => is_true(maps:get(<<"required">>, Arg, false))
+            }
+         || #{<<"name">> := A} = Arg <- maps:get(<<"arguments">>, P, []), is_binary(A)
+        ]
+    }.
+
+%% A prompt filled with `Args' (binary names and values), as the
+%% messages it expands to: `#{role, content}' with the content as text.
+-spec get_prompt(binary(), binary(), #{binary() => binary()}) ->
+    {ok, [map()]} | {error, binary()}.
+get_prompt(Server, Name, Args) ->
+    with_client(Server, fun(Pid) ->
+        case barrel_mcp_client:get_prompt(Pid, Name, Args) of
+            {ok, #{<<"messages">> := Msgs}} when is_list(Msgs) ->
+                {ok, [
+                    #{role => role(maps:get(<<"role">>, M, <<"user">>)), content => block(C)}
+                 || #{<<"content">> := C} = M <- Msgs
+                ]};
+            {ok, Other} ->
+                {error, iolist_to_binary(["unexpected prompt result: ", json:encode(Other)])};
+            {error, R} ->
+                {error, iolist_to_binary(io_lib:format("~0p", [R]))}
+        end
+    end).
+
+is_true(true) -> true;
+is_true(_) -> false.
+
+role(<<"assistant">>) -> <<"assistant">>;
+role(_) -> <<"user">>.
+
+text_or_empty(T) when is_binary(T) -> T;
+text_or_empty(_) -> <<>>.
+
+%% Cancel the request `Caller' (a tool worker) is waiting on at
+%% `Server', if any: the server is told (`notifications/cancelled') and
+%% the call returns `{error, cancelled}'. Only that request is touched;
+%% the connection, shared with other sessions, stays up.
+%%
+%% barrel_mcp's client does not tell a caller its request id, so it is
+%% read from the client's state (the pending request whose caller is
+%% `Caller'). The shape is checked; anything unexpected means no cancel,
+%% never a crash. erllama_server_mcp_SUITE pins this.
+-spec cancel_call(binary(), pid()) -> ok | not_found.
+cancel_call(Server, Caller) ->
+    case safe_call({pid, Server}, {error, unavailable}) of
+        {ok, Client} ->
+            case pending_request(Client, Caller) of
+                {ok, Id} -> barrel_mcp_client:cancel(Client, Id);
+                not_found -> not_found
+            end;
+        {error, _} ->
+            not_found
+    end.
+
+pending_request(Client, Caller) ->
+    try sys:get_state(Client, 1000) of
+        {_StateName, Data} when is_tuple(Data), element(1, Data) =:= data ->
+            find_caller(element(5, Data), Caller);
+        _ ->
+            not_found
+    catch
+        _:_ -> not_found
+    end.
+
+find_caller(Pending, Caller) when is_map(Pending) ->
+    Ids = [
+        Id
+     || Id := P <- Pending,
+        is_tuple(P),
+        element(1, P) =:= pending,
+        is_tuple(element(2, P)),
+        element(1, element(2, P)) =:= Caller
+    ],
+    case Ids of
+        [Id | _] -> {ok, Id};
+        [] -> not_found
+    end;
+find_caller(_, _) ->
+    not_found.
 
 with_client(Server, Fun) ->
     case with_pid(Server, fun(Pid) -> {done, Fun(Pid)} end) of
@@ -187,25 +309,34 @@ resource_line(#{<<"uri">> := U} = R) ->
 %% -----------------------------------------------------------------------------
 
 %% `<server>__<tool>' made safe for every chat template and API.
--spec namespace(binary(), binary()) -> binary().
+-spec namespace(binary(), binary() | atom()) -> binary().
+namespace(Server, Tool) when is_atom(Tool) ->
+    namespace(Server, atom_to_binary(Tool));
 namespace(Server, Tool) ->
     Safe = re:replace(<<Server/binary, "__", Tool/binary>>, <<"[^A-Za-z0-9_-]">>, <<"_">>, [
         global, {return, binary}
     ]),
     binary:part(Safe, 0, min(?NAME_MAX, byte_size(Safe))).
 
-%% Namespaced names with collisions resolved by a numeric suffix.
-unique(Tools) ->
-    {Named, _} = lists:mapfoldl(
-        fun(#{server := S, remote := R} = T, Seen) ->
-            Base = namespace(S, R),
-            Name = free_name(Base, Seen, 1),
-            {T#{name => Name}, Seen#{Name => true}}
+%% Give an alias to each tool not seen before. Tools already named
+%% keep theirs; a name once given is never free again.
+assign(Tools, #state{aliases = A0, taken = T0} = St) ->
+    {A, T} = lists:foldl(
+        fun(#{server := S, remote := R}, {A1, T1} = Acc) ->
+            case is_map_key({S, R}, A1) of
+                true ->
+                    Acc;
+                false ->
+                    Name = free_name(namespace(S, R), T1, 1),
+                    {A1#{{S, R} => Name}, T1#{Name => true}}
+            end
         end,
-        #{},
-        Tools
+        {A0, T0},
+        lists:sort(fun(X, Y) -> key(X) =< key(Y) end, Tools)
     ),
-    Named.
+    St#state{aliases = A, taken = T}.
+
+key(#{server := S, remote := R}) -> {S, R}.
 
 free_name(Base, Seen, N) ->
     Candidate =
@@ -236,12 +367,12 @@ init([]) ->
     _ = [self() ! {connect, N} || N := _ <- Servers],
     {ok, #state{servers = Servers}}.
 
-handle_call(catalog, _From, #state{servers = Ss} = St) ->
+handle_call(catalog, _From, #state{servers = Ss, aliases = A} = St) ->
     Tools = lists:append([
-        Tools
+        lists:sort(fun(X, Y) -> key(X) =< key(Y) end, Tools)
      || _ := #srv{status = ready, tools = Tools} <- maps:iterator(Ss, ordered)
     ]),
-    {reply, unique(Tools), St};
+    {reply, [T#{name => maps:get(key(T), A)} || T <- Tools], St};
 handle_call(status, _From, #state{servers = Ss} = St) ->
     {reply, [describe(N, S) || N := S <- maps:iterator(Ss, ordered)], St};
 handle_call({pid, Name}, _From, #state{servers = Ss} = St) ->
@@ -253,6 +384,9 @@ handle_call({pid, Name}, _From, #state{servers = Ss} = St) ->
 handle_call(_Req, _From, St) ->
     {reply, {error, unknown_call}, St}.
 
+handle_cast(refresh, #state{servers = Ss} = St) ->
+    _ = [self() ! {refresh, N, P} || N := #srv{pid = P} <- Ss, is_pid(P)],
+    {noreply, St};
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
@@ -261,7 +395,9 @@ handle_info({connect, Name}, St) ->
 handle_info({refresh, Name, Pid}, St) ->
     {noreply, update(Name, fun(S) -> refresh(Name, Pid, S) end, St)};
 handle_info({catalog, Name, Pid, Result}, St) ->
-    {noreply, update(Name, fun(S) -> catalog_result(Name, Pid, Result, S) end, St)};
+    St1 = update(Name, fun(S) -> catalog_result(Name, Pid, Result, S) end, St),
+    #{Name := #srv{tools = Tools}} = St1#state.servers,
+    {noreply, assign(Tools, St1)};
 handle_info({'EXIT', _Pid, _Reason}, St) ->
     %% A client's end is handled by its monitor.
     {noreply, St};
@@ -283,22 +419,28 @@ update(Name, Fun, #state{servers = Ss} = St) ->
 %% its tools from a helper, so this process never waits on a server.
 %% Clients are linked: they end with this process, so a restart never
 %% leaves a second copy of a stdio server running.
+%% Whatever goes wrong stays with this server: it is marked down and
+%% tried again later, and the other servers and the release go on.
 connect(Name, #srv{spec = Spec} = S) ->
-    case barrel_mcp_client:start_link(connect_spec(Spec)) of
+    try barrel_mcp_client:start_link(connect_spec(Spec)) of
         {ok, Pid} ->
             Mon = erlang:monitor(process, Pid),
             self() ! {refresh, Name, Pid},
             S#srv{pid = Pid, mon = Mon, status = connecting};
         {error, R} ->
             retry(Name, R, S)
+    catch
+        Class:Reason ->
+            retry(Name, {connect_failed, Class, Reason}, S)
     end.
 
 refresh(Name, Pid, #srv{pid = Pid} = S) ->
     Self = self(),
     _ = spawn(fun() ->
         Result =
-            try
-                barrel_mcp_client:list_tools_all(Pid)
+            try barrel_mcp_client:list_tools_all(Pid) of
+                {ok, Tools} -> {ok, Tools, capabilities(Pid)};
+                Other -> Other
             catch
                 exit:R -> {error, R}
             end,
@@ -308,21 +450,26 @@ refresh(Name, Pid, #srv{pid = Pid} = S) ->
 refresh(_Name, _Pid, S) ->
     S.
 
-catalog_result(Name, Pid, {ok, Tools}, #srv{pid = Pid, spec = Spec} = S) ->
+catalog_result(Name, Pid, {ok, Tools, Caps}, #srv{pid = Pid, spec = Spec} = S) ->
     _ = erlang:send_after(?REFRESH_MS, self(), {refresh, Name, Pid}),
     Policy = maps:get(policy, Spec, ask),
     Entries = [
         #{
             server => Name,
             remote => N,
-            description => maps:get(<<"description">>, T, <<>>),
-            parameters => maps:get(<<"inputSchema">>, T, #{<<"type">> => <<"object">>}),
+            description => text_or_empty(maps:get(<<"description">>, T, <<>>)),
+            parameters => schema(maps:get(<<"inputSchema">>, T, undefined)),
             class => class(T),
             policy => Policy
         }
      || #{<<"name">> := N} = T <- Tools, is_binary(N)
     ],
-    S#srv{status = ready, tools = Entries, error = undefined, attempts = 0};
+    S#srv{
+        status = ready,
+        tools = Entries ++ resource_tools(Name, Policy, Caps),
+        error = undefined,
+        attempts = 0
+    };
 catalog_result(Name, Pid, {error, not_ready}, #srv{pid = Pid, status = connecting} = S) ->
     %% Still in its handshake (the client stops itself if that never
     %% ends).
@@ -334,6 +481,48 @@ catalog_result(Name, Pid, {error, R}, #srv{pid = Pid} = S) ->
     S#srv{status = down, error = R, tools = [], attempts = S#srv.attempts + 1};
 catalog_result(_Name, _Pid, _Result, S) ->
     S.
+
+capabilities(Pid) ->
+    try barrel_mcp_client:server_capabilities(Pid) of
+        {ok, #{} = C} -> C;
+        _ -> #{}
+    catch
+        _:_ -> #{}
+    end.
+
+%% A server that offers resources gets two tools of ours: list them,
+%% read one. Their remote side is ours (an atom we chose, never a name
+%% the server sent), so they cannot be mistaken for the server's tools.
+resource_tools(Name, Policy, #{<<"resources">> := _}) ->
+    [
+        #{
+            server => Name,
+            remote => list_resources,
+            description => <<"List the resources the ", Name/binary, " MCP server offers.">>,
+            parameters => #{<<"type">> => <<"object">>, <<"properties">> => #{}},
+            class => read,
+            policy => Policy
+        },
+        #{
+            server => Name,
+            remote => read_resource,
+            description => <<"Read a resource of the ", Name/binary, " MCP server by its URI.">>,
+            parameters => #{
+                <<"type">> => <<"object">>,
+                <<"properties">> => #{
+                    <<"uri">> => #{<<"type">> => <<"string">>, <<"description">> => <<"The URI.">>}
+                },
+                <<"required">> => [<<"uri">>]
+            },
+            class => read,
+            policy => Policy
+        }
+    ];
+resource_tools(_Name, _Policy, _Caps) ->
+    [].
+
+schema(#{} = S) -> S;
+schema(_) -> #{<<"type">> => <<"object">>}.
 
 %% A tool runs alongside reads only when its server says it does not
 %% change anything; otherwise it is ordered like a native write.
@@ -366,7 +555,7 @@ connect_spec(#{transport := stdio, command := Cmd} = S) ->
             {stdio, #{
                 command => Cmd,
                 args => maps:get(args, S, []),
-                env => maps:get(env, S, [])
+                env => [{str(K), env_value(V)} || {K, V} <- maps:get(env, S, [])]
             }}
     },
     common(Base, S);
@@ -389,3 +578,8 @@ common(Base, _S) ->
         client_info => #{name => <<"erllama_server">>, version => <<"0.1.0">>},
         request_timeout => erllama_server_config:get(mcp_timeout_ms)
     }.
+
+str(V) -> unicode:characters_to_list(V).
+
+env_value(false) -> false;
+env_value(V) -> str(V).

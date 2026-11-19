@@ -8,6 +8,7 @@
 %% `agents' and `agent-stop'. Leaving the loop leaves the session
 %% running on the release.
 
+-export([prompt_args/1]).
 -export([agent/4, agents/4, stop/4]).
 
 agent(Node, _Info, #{workspace := Ws} = Opts, [Model]) ->
@@ -59,13 +60,40 @@ agent_loop(Node, Id, Cursor) ->
                     );
                 "" ->
                     agent_loop(Node, Id, Cursor);
+                "/prompt " ++ Rest ->
+                    case prompt_args(string:lexemes(Rest, " ")) of
+                        {ok, Server, Name, Args} ->
+                            agent_turn(Node, Id, Cursor, agent_prompt, [Server, Name, Args]);
+                        error ->
+                            io:put_chars("usage: /prompt SERVER NAME [KEY=VALUE ...]\n"),
+                            agent_loop(Node, Id, Cursor)
+                    end;
                 Text ->
-                    agent_turn(Node, Id, Cursor, unicode:characters_to_binary(Text))
+                    agent_turn(Node, Id, Cursor, agent_send, [unicode:characters_to_binary(Text)])
             end
     end.
 
-agent_turn(Node, Id, Cursor, Text) ->
-    case erllama_server_client:call(Node, agent_send, [Id, Text]) of
+%% `SERVER NAME KEY=VALUE...' as binaries.
+-spec prompt_args([string()]) -> {ok, binary(), binary(), #{binary() => binary()}} | error.
+prompt_args([Server, Name | Pairs]) ->
+    Split = [string:split(P, "=") || P <- Pairs],
+    case lists:all(fun is_pair/1, Split) of
+        true ->
+            Args = maps:from_list([{bin(K), bin(V)} || [K, V] <- Split]),
+            {ok, bin(Server), bin(Name), Args};
+        false ->
+            error
+    end;
+prompt_args(_) ->
+    error.
+
+is_pair([_, _]) -> true;
+is_pair(_) -> false.
+
+bin(S) -> unicode:characters_to_binary(S).
+
+agent_turn(Node, Id, Cursor, Fun, Args) ->
+    case erllama_server_client:call(Node, Fun, [Id | Args]) of
         Sent when Sent =:= ok; element(1, Sent) =:= queued ->
             Sink = fun(E) -> agent_event(Node, Id, E) end,
             Stop = fun(#{type := T}) -> T =:= turn_done end,

@@ -15,6 +15,19 @@ mcp(Node, _Info, _Opts, ["tools"]) ->
     erllama_server_cli:reply(erllama_server_client:call(Node, mcp_tools, []), fun tools/1);
 mcp(Node, _Info, _Opts, ["resources", Server]) ->
     text(erllama_server_client:call(Node, mcp_resources, [bin(Server)]));
+mcp(Node, _Info, _Opts, ["prompts", Server]) ->
+    erllama_server_cli:reply(
+        erllama_server_client:call(Node, mcp_prompts, [bin(Server)]), fun prompts/1
+    );
+mcp(Node, _Info, _Opts, ["prompt", Server, Name | Pairs]) ->
+    case erllama_server_cli_agent:prompt_args([Server, Name | Pairs]) of
+        {ok, S, N, Args} ->
+            erllama_server_cli:reply(
+                erllama_server_client:call(Node, mcp_prompt, [S, N, Args]), fun messages/1
+            );
+        error ->
+            erllama_server_cli:usage("mcp")
+    end;
 mcp(Node, _Info, _Opts, ["read", Server, Uri]) ->
     text(erllama_server_client:call(Node, mcp_read, [bin(Server), bin(Uri)]));
 mcp(_, _, _, _) ->
@@ -38,6 +51,25 @@ tools(L) ->
         io_lib:format("~ts  ~p  ~p  ~ts~n", [N, P, C, first_line(D)])
      || #{name := N, policy := P, class := C, description := D} <- L
     ].
+
+prompts([]) ->
+    "no prompts\n";
+prompts(L) ->
+    [
+        io_lib:format("~ts(~ts)  ~ts~n", [N, args(A), first_line(D)])
+     || #{name := N, arguments := A, description := D} <- L
+    ].
+
+args(A) ->
+    lists:join(", ", [
+        case R of
+            true -> N;
+            false -> [N, "?"]
+        end
+     || #{name := N, required := R} <- A
+    ]).
+
+messages(Msgs) -> [io_lib:format("[~ts] ~ts~n", [R, C]) || #{role := R, content := C} <- Msgs].
 
 first_line(D) -> hd(binary:split(D, <<"\n">>) ++ [<<>>]).
 

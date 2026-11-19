@@ -35,6 +35,9 @@ local command (stdio) or is reached over HTTP (Streamable HTTP).
 - `policy`: `ask` (the default), `auto` or `deny`, for every tool of
   the server.
 - `mcp_timeout_ms` (default 60000) bounds every call to a server.
+- Every field is checked when the release starts, and unknown keys are
+  refused: a typo or a wrong type stops the release with an error
+  naming `mcp_servers`, instead of failing later.
 
 The release starts with the servers in the background. A server that is
 slow, down or misconfigured never stops the release or a session: its
@@ -52,8 +55,12 @@ git__git_status  ask  read  Shows the working tree status
 ...
 ```
 
-`erllama mcp resources SERVER` lists a server's resources and
-`erllama mcp read SERVER URI` prints one.
+| Command | Does |
+|---|---|
+| `erllama mcp resources SERVER` | lists a server's resources |
+| `erllama mcp read SERVER URI` | prints one |
+| `erllama mcp prompts SERVER` | lists a server's prompts and their arguments (`?` marks optional ones) |
+| `erllama mcp prompt SERVER NAME [KEY=VALUE ...]` | prints the messages a prompt expands to |
 
 ## What a session sees
 
@@ -61,6 +68,13 @@ git__git_status  ask  read  Shows the working tree status
   servers that are ready at that moment. The model's calls in that
   round resolve against that same list, so a server that comes or goes
   mid-round changes nothing until the next round.
+- A tool keeps its name for as long as the release runs. Two remote
+  names that clean up to the same name get a numeric suffix
+  (`s__a_b`, `s__a_b_2`); when a tool goes away its name is not given
+  to another one.
+- A server that offers resources also gives the session two tools:
+  `SERVER__list_resources` and `SERVER__read_resource` (`uri`). They
+  only read, and follow the server's policy.
 - A tool the server marks read-only (`readOnlyHint`) runs alongside
   the other reads. Any other MCP tool is ordered like a native write:
   it waits for the calls before it and holds back the calls after it.
@@ -69,6 +83,9 @@ git__git_status  ask  read  Shows the working tree status
   resources are shown when they are text.
 - A tool error, a timeout or a server that went away becomes an error
   result the model can act on. The turn goes on.
+- Interrupting the turn cancels the session's calls at their servers
+  (that request only; other sessions keep using the connection). What
+  the server does then is up to it: MCP asks it to stop the call.
 
 ## Policy
 
@@ -83,8 +100,21 @@ The server's `policy` is the default for its tools. In a session:
 
 A server set to `deny` stays denied whatever the session says: its
 tools are not offered, and a call to one is refused. Answering `a`
-(always) to an approval allows that one tool for the rest of the
-session.
+(always) to an approval allows that one tool, by its server and remote
+name, for the rest of the session.
+
+## Use a prompt in a session
+
+A server's prompt can be the input of a turn:
+
+```bash
+$R/bin/erllama agent qwen --workspace /srv/projects/app
+you> /prompt git review file=src/app.erl
+```
+
+The prompt's messages are sent as your input, its assistant messages
+marked as such. Through the service API, `agent_prompt(Agent, Server,
+Name, Args)` does the same.
 
 ## Serve the release over MCP
 

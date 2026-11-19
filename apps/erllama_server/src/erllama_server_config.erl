@@ -102,13 +102,38 @@ valid_http(#{port := P} = H) ->
 valid_http(_) ->
     false.
 
-%% An MCP server: a name (letters, digits, `_', `-') and a transport.
+%% An MCP server: a name (letters, digits, `_', `-') and a transport,
+%% with every optional field checked too (and no unknown key): a bad
+%% value is refused at startup, never found by a crash later.
 valid_mcp(#{name := N, transport := stdio, command := C} = S) ->
-    mcp_name(N) andalso is_path(C) andalso mcp_policy(S);
+    only_keys(S, [name, transport, command, args, env, policy]) andalso
+        mcp_name(N) andalso is_path(C) andalso mcp_policy(S) andalso
+        optional(S, args, fun(L) -> is_list(L) andalso lists:all(fun is_text/1, L) end) andalso
+        optional(S, env, fun(L) -> is_list(L) andalso lists:all(fun env_pair/1, L) end);
 valid_mcp(#{name := N, transport := http, url := U} = S) ->
-    mcp_name(N) andalso is_url(U) andalso mcp_policy(S);
+    only_keys(S, [name, transport, url, token, headers, policy]) andalso
+        mcp_name(N) andalso is_url(U) andalso mcp_policy(S) andalso
+        optional(S, token, fun is_name/1) andalso
+        optional(S, headers, fun(L) -> is_list(L) andalso lists:all(fun header/1, L) end);
 valid_mcp(_) ->
     false.
+
+only_keys(M, Keys) -> maps:keys(maps:without(Keys, M)) =:= [].
+
+optional(M, K, Check) ->
+    case M of
+        #{K := V} -> Check(V);
+        _ -> true
+    end.
+
+is_text(V) -> is_binary(V) orelse (is_list(V) andalso io_lib:printable_unicode_list(V)).
+
+env_pair({K, false}) -> is_name(K);
+env_pair({K, V}) -> is_name(K) andalso is_text(V);
+env_pair(_) -> false.
+
+header({K, V}) -> is_name(K) andalso is_text(V);
+header(_) -> false.
 
 mcp_name(N) ->
     is_name(N) andalso re:run(unicode:characters_to_binary(N), <<"^[A-Za-z0-9_-]+$">>) =/= nomatch.

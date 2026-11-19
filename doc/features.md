@@ -143,7 +143,15 @@ Validation: `erllama_server_agent_SUITE` (9 cases with a scripted model: plain a
 | results | done | text, structured content as JSON, media described, embedded text resources shown; tool errors, timeouts and lost servers become error results |
 | policy | done | per server (`ask` by default, `auto`, `deny`); a denied server stays denied; `--yes` and `--read-only` apply to MCP tools; per-tool overrides through the service API |
 | endpoint | done | opt-in `mcp_endpoint`: `/mcp` on the HTTP listener behind the API keys, tools `erllama_models` and `erllama_chat` (a stateless run, cancelled when the caller gives up) |
-| API and CLI | done | `mcp/0`, `mcp_tools/0`, `mcp_resources/1`, `mcp_read/2`; `erllama mcp [tools \| resources SERVER \| read SERVER URI]` |
+| API and CLI | done | `mcp/0`, `mcp_tools/0`, `mcp_resources/1`, `mcp_read/2`, `mcp_prompts/1`, `mcp_prompt/3`, `agent_prompt/4`; `erllama mcp [tools \| resources SERVER \| read SERVER URI \| prompts SERVER \| prompt SERVER NAME ...]` |
+
+Review fixes (2026-11-19):
+- interrupting a session cancels its MCP requests at their servers (that request only; the shared connection stays);
+- tool aliases are given once and never reassigned, and an `always` approval is bound to the server and remote tool, not the alias;
+- every MCP server field is validated at startup (unknown keys refused), and a connection that cannot be set up stays with its server;
+- resources (two tools per server that offers them) and prompts (API, `erllama mcp prompts`/`prompt`, `/prompt` in a session) are available to agent sessions.
+
+Known gaps upstream: barrel_mcp's stdio server does not stop a running tool on `notifications/cancelled`, and livery_mcp does not pass a closed request stream (how a modern HTTP client cancels) on to the tool; the cancellation case uses a small spec-following stdio server (`erllama_server_fake_mcp`). The client learns a request's id by reading barrel_mcp's client state, since 4.6.0 does not expose it; the suite pins that.
 
 Validation: `erllama_server_mcp_SUITE` (6 cases against real servers: Streamable HTTP through livery_mcp in the test node and stdio through an `erl` subprocess; namespaced tools offered and called, media rendering, server and session policies with approvals, tool errors and timeouts, an unreachable server, a server going away and coming back, the release's own endpoint with API keys) and `erllama_server_mcp_tests` (names, rendering, configuration).
 
