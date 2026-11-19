@@ -157,8 +157,8 @@ module.
 ### RPC / remote devices
 
 Not available: the ggml RPC backend is pruned from the vendored
-llama.cpp tree (scripts/vendor_llama.sh) and GGML_RPC is forced OFF
-in c_src/CMakeLists.txt. Re-vendoring it would enable
+llama.cpp tree (apps/erllama/scripts/vendor_llama.sh) and GGML_RPC is forced OFF
+in apps/erllama/c_src/CMakeLists.txt. Re-vendoring it would enable
 `--rpc`-style remote devices; distribution work is planned at the
 Erlang level instead (see erllama_cluster).
 

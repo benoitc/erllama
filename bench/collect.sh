@@ -120,7 +120,7 @@ fi
 GPU_SLUG="$(echo "$GPU_NAME" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g;s/^-//;s/-$//' | cut -c1-40)"
 [[ -z "$GPU_SLUG" ]] && GPU_SLUG="cpu"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-VSN="$(awk -F'"' '/vsn,/ {print $2; exit}' src/erllama.app.src 2>/dev/null || echo unknown)"
+VSN="$(awk -F'"' '/vsn,/ {print $2; exit}' apps/erllama/src/erllama.app.src 2>/dev/null || echo unknown)"
 GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null; then
     GIT_DIRTY="clean"
@@ -139,7 +139,7 @@ echo "building erllama..." >&2
 rebar3 compile >/dev/null
 
 mkdir -p _build/bench/ebin
-erlc -o _build/bench/ebin -I include -pa _build/default/lib/erllama/ebin \
+erlc -o _build/bench/ebin -I apps/erllama/include -pa _build/default/lib/erllama/ebin \
     bench/erllama_bench_collect.erl
 
 EBIN_PATHS=$(find _build/default/lib -maxdepth 2 -name ebin -type d | xargs -I {} echo "-pa {}")

@@ -1,0 +1,1423 @@
+# Changelog
+
+All notable changes to erllama are documented here. The format
+follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+this project adheres to [Semantic Versioning](https://semver.org).
+
+## [Unreleased]
+
+### Added
+
+- `media_add_special`, a request option for streams with media: set it
+  to `false` when the prompt comes from a chat template, so the BOS
+  token is not added a second time. `chat/3` already did this; streamed
+  multimodal chat can now do the same.
+
+### Fixed
+
+- A streaming request kept generating until its token limit when the
+  process receiving its events exited, holding a sequence and compute
+  that nobody would use. erllama now watches the receiver of every
+  stream and cancels the request when it exits.
+- A model unloaded with `unload/1` could not be loaded again under the
+  same id: `load_model/2` answered `already_loaded` for a model that no
+  longer ran, because the id was never released.
+
+## [0.12.0] - 2026-11-19
+
+### Fixed
+
+- Models on the default `ram` tier never saved anything, so with the
+  default configuration the KV cache never warmed and every request
+  ran cold. RAM saves now work, bounded by the new `ram_tier_budget`
+  setting (25% of system memory by default, `0` to turn them off):
+  the least used rows are evicted to make room.
+- Models loaded without a `fingerprint` all shared one cache
+  namespace, so two different models could restore each other's KV
+  state. erllama now derives the fingerprint from the GGUF file when
+  you don't pass one. The new default `fingerprint_mode` is
+  `gguf_chunked` (file size plus the start and end of the file, a few
+  tens of milliseconds at load); `safe` hashes the whole file. Cache
+  entries saved without a fingerprint are not reused.
+- `unload/1` and stopping the application did not save anything,
+  although the docs said they did. They now save the live context of
+  in-flight requests before the model goes away, bounded by
+  `evict_save_timeout_ms`.
+- A stream running on a model that was unloaded or stopped never got
+  a final event, so its caller waited until its own timeout. It now
+  ends with `{error, not_loaded}`, and requests queued on that model
+  get the same error.
+- The `evict/1` docs said it released the model's live KV state; it
+  only saves it, and the docs now say so.
+- Several docs described behaviour the code does not have. The
+  caching guide now gives the real lookup order and when saves
+  happen, the README quick taste shows real cache hits, and the
+  examples' smoke test and thinking snippets run as written.
+
+- A cache entry that could not be restored stayed in place, so every
+  later request for the same prompt tried it again, ran cold, and its
+  fresh save was dropped as a duplicate. The prompt never got a warm
+  start again until the entry was evicted. Such an entry is now
+  removed, and the next save replaces it.
+- Loading a model with `flash_attn => enabled` or `disabled`, or with
+  `type_k` / `type_v` set to `auto`, failed when the context was
+  created, although the options were accepted. These values now work;
+  `auto` keeps llama.cpp's default KV type.
+- With a `quant_type` that erllama did not know (for example
+  `mxfp4_moe`), cache files were written but could not be read back,
+  so the disk cache never warmed for such models. Every llama.cpp
+  quantisation now has its own identifier, and files saved under an
+  unknown label are readable.
+
+### Changed
+
+- Vendored llama.cpp bumped from b10593 to v1.0.0. This brings
+  upstream fixes for a stack overflow on deeply recursive grammars, a
+  CPU and memory blowup with many DRY sequence breakers, an abort on
+  malformed grammar triggers, an integer overflow when reading GGUF
+  files, cleanup after a failed KV restore, and many Metal and CUDA
+  out-of-bounds and leak fixes.
+- KV cache entries are now tied to the llama.cpp build that wrote
+  them and to the context settings that shape the KV state (KV cache
+  types, flash attention, sequence count and unified KV). After this
+  upgrade, after every later llama.cpp bump, and when you change one
+  of those settings, the cache starts cold once instead of trying to
+  restore entries the context cannot read.
+- `dry_sequence_breakers` accepts at most 64 entries. A longer list is
+  rejected with `invalid_option` instead of being cut short silently.
+
+### Added
+
+- FP8 KV cache: `type_k` / `type_v` accept `f8_e4m3`.
+- MoE expert cache (experimental in llama.cpp): with the experts of a
+  MoE model kept in host memory, `moe_cache_size` holds the recently
+  used ones in a device buffer, and `moe_cache_cpu_share` runs part of
+  the cache misses on the CPU instead of uploading them.
+- `quant_type` and `quant_bits` are read from the model file when you
+  don't pass them, and reported by `model_info/1`. Before, they
+  defaulted to `f16` / 16 whatever the model was.
+- Vision and audio input: load an `mmproj_path` projector alongside
+  the model, send
+  `#{type => image | audio, data => Bytes}` chat content parts or
+  the `media` request option on `stream/3` / `complete/3` (one
+  `media_marker/0` per item in the prompt). Formats: jpg/png/bmp/gif
+  and wav/mp3/flac. `model_info/1` reports `mmproj` modalities;
+  stats gain `media => #{items, n_tokens, n_pos}`. v1 limits: media
+  requests bypass the KV cache, reject the session/cache/speculation
+  options, and prefill as the sole active request; video, webp and
+  mtmd's experimental TTS are not exposed. A dedicated
+  whisper.cpp-style transcription API remains a separate roadmap
+  item.
+- Device selection, MoE offload, and auto-fit at model load:
+  `model_opts` gains `devices` (`[NameBin] | none`), `cpu_moe`
+  (`true | N`, expert tensors to CPU), `tensor_buft_overrides`
+  (`[{RegexBin, cpu | DeviceNameBin}]`), and `fit` (`true | map()`,
+  picking n_gpu_layers / tensor_split / overrides from measured
+  memory; result on `model_info/1` under `fit`). New `erllama:list_devices/0` device probe. Negative
+  `n_gpu_layers` is now honoured (all layers); an explicit 0 no
+  longer counts as full VRAM in `vram_estimate_b`.
+- `speculative` request option: draft-model-free ngram speculation
+  on `stream/3`, `complete/3` and `continue/3`. Output is byte-identical to
+  non-speculative decoding (including seeded sampling); drafts are
+  verified in one batched decode and rejected tokens rolled back.
+  Pauses under concurrent requests; disabled on recurrent/hybrid
+  models, with `thinking`, or with `logprobs`. Stats gain
+  `speculative => #{drafted, accepted}`.
+- Guides: generating text, sessions, tokens and vocabulary,
+  embeddings, LoRA adapters, observability, and testing with the stub
+  backend; the tool-calls guide now walks the full tool round trip.
+  Examples for fork_session, logprobs, FIM, json_schema, load
+  progress, and native logs.
+
+## [0.11.0] - 2026-08-25
+
+### Changed
+
+- `chat/3` defaults `reasoning_format` to `deepseek`: thinking models
+  now return their thinking text in `reasoning_content` instead of
+  inline in `content` (llama-server's default). Opt out per call with
+  `reasoning_format => none`.
+- `chat_apply/3` returns the template's constraint set alongside
+  `prompt` and `params`: `sampler_opts`, `stop_sequences`,
+  `generation_prompt`, `supports_thinking`, `thinking_start_tag`,
+  `thinking_end_tags`. Merge `sampler_opts` + `stop_sequences` into
+  the `stream/3` options (the tool-calls guide shows how).
+
+### Added
+
+- `erllama:fork_session/3`: duplicate a sticky session's live KV into
+  a new session (`llama_memory_seq_cp`), so two continuations explore
+  different branches without re-prefilling the shared prefix. Works
+  on every model family; never queues (`seq_capacity` when no
+  sequence is free).
+- Load progress: `progress_to => Pid` on `load_model` delivers
+  `{erllama_load_progress, ModelId, Float}` messages (whole-percent
+  throttled, final `1.0`) while the GGUF loads.
+- Native logs: llama.cpp / ggml log lines are forwarded into `logger`
+  under the domain `[erllama, native]`, gated by the `native_log_level`
+  application env (`none | error | warning | info | debug`, default
+  `warning`).
+- Full llama.cpp sampler surface as request options: `typical_p`,
+  `top_n_sigma`, `xtc_probability` / `xtc_threshold`,
+  `dynatemp_range` / `dynatemp_exponent`, `min_keep`,
+  `frequency_penalty` / `presence_penalty` / `penalty_last_n`, DRY
+  (`dry_multiplier`, `dry_base`, `dry_allowed_length`,
+  `dry_penalty_last_n`, `dry_sequence_breakers`), `mirostat` (1 | 2)
+  with `mirostat_tau` / `mirostat_eta`, `logit_bias`, `ignore_eos`
+  and `infill`. Chain order follows llama.cpp's default; see the
+  sampling reference in the configuration guide.
+- Per-token logprobs: `logprobs => N` (1..32) emits
+  `{erllama, Ref, {logprobs, #{token_id, logprob, top}}}` stream
+  events and adds a `logprobs` list to `complete/3` / `collect/2`
+  results. Full-vocab log-softmax over the raw model distribution
+  (OpenAI semantics).
+- `erllama:vocab_info/1`: vocabulary size, `add_bos` / `add_eos`, and
+  the special / FIM token ids (`bos`, `eos`, `eot`, `sep`, `nl`,
+  `pad`, `mask`, `fim_pre`, `fim_suf`, `fim_mid`, `fim_pad`,
+  `fim_rep`, `fim_sep`) for fill-in-the-middle prompt assembly.
+- `erllama:detokenize/3` with `remove_special` / `unparse_special`
+  (renders special tokens), backed by `llama_detokenize`.
+  `detokenize/2` is untouched: the cache byte-keys are computed over
+  its output.
+- Tool-call grammar enforcement: `chat/3` merges the grammar llama.cpp
+  synthesizes from the chat template into the request, so
+  `tool_choice => required` always yields a parsed call and
+  `tool_choice => auto` arms a lazy grammar that constrains the reply
+  once the model opens a call. Template-declared stop strings are
+  honoured. A caller `grammar` combined with active tools is rejected.
+- `json_schema` chat option (OpenAI `response_format` semantics): the
+  reply's content is grammar-constrained to the schema. Rejected in
+  combination with `tools`.
+- Chat options `enable_thinking` (default true) and
+  `continue_final_message` (`none | auto | content | reasoning`) for
+  assistant prefill.
+- Request options `grammar_lazy`, `trigger_patterns`,
+  `trigger_tokens`, `grammar_prefill`: the lazy / template-grammar
+  sampler shape (`llama_sampler_init_grammar_lazy_patterns`), usable
+  directly with `stream/3` and friends.
+
+### Fixed
+
+- Cache correctness on recurrent / hybrid models (Mamba, RWKV, Jamba,
+  Qwen3-Next, LFM2, ...): a warm exact hit no longer duplicates the
+  last prompt token when the memory refuses the primer's partial
+  removal; the engine falls back to a cold prefill and bumps the new
+  `restore_failed` counter. A failed `kv_unpack` no longer crashes the
+  model process (the row is treated as a miss).
+- Partial warm hits (extended prompts) prefill the suffix directly
+  instead of dropping and re-decoding the last cached token: one fewer
+  decoded token per partial hit, and no partial `seq_rm`, so the path
+  stays warm on recurrent models.
+- `nif_kv_seq_rm` refreshes the per-seq position bookkeeping on
+  failure too, keeping Erlang and llama.cpp in agreement when a
+  partial removal is refused.
+
+### Added
+
+- Model-family probe at load: `model_info/1` reports `arch`,
+  `n_ctx_train`, `n_params`, `n_embd`, `n_layer`, `n_swa`,
+  `recurrent` and `hybrid` (llama backend). Encoder-decoder (T5) and
+  diffusion archs are rejected at load with
+  `{error, {unsupported_model, encoder_decoder | diffusion}}` instead
+  of failing confusingly at the first decode.
+- Context option `n_rs_seq` (recurrent-state rollback snapshots per
+  seq); defaults to 1 on recurrent / hybrid models so warm hits work
+  where the arch supports rollback.
+- `split_mode => tensor` (experimental upstream tensor-parallel
+  split; `row` is deprecated upstream).
+- Cache counter `restore_failed`; stub backend knobs
+  `fail_seq_rm_last` / `fail_kv_unpack` to test the fallback paths.
+
+## [0.10.1] - 2026-08-23
+
+### Fixed
+
+- `chat/3` and `chat_apply/3` hand tools to llama.cpp in the OpenAI
+  shape (`{"type": "function", "function": {...}}`); the flat
+  `chat_tool()` maps were rejected with `chat_parse_failed`.
+- `erllama_chat_SUITE` starts the application with its dependencies when
+  run on its own.
+
+### Added
+
+- Load option `chat_template`: Jinja source replacing the template
+  stored in the GGUF for `chat/3` / `chat_apply/3`.
+- `examples/agent_loop`: a tool-calling agent loop on `chat/3`.
+
+## [0.10.0] - 2026-08-23
+
+### Changed
+
+- Vendored llama.cpp bumped from b10068 to b10593 (`vendor/` is now kept
+  whole: upstream builds it as CMake targets). `model_opts` gains
+  `load_mode` (upstream's `llama_load_mode`); `use_mmap` / `use_mlock`
+  are mapped onto it.
+
+### Removed (BREAKING)
+
+- `unload_model/1` (use `unload/1`), `models/0` (use
+  `list_models/0`), `list_cached_prefixes/2` (renamed
+  `cached_prefix_len/2`).
+- `infer/4`: use `stream/3` (text or tokens; the receiving
+  process is the `to` option, default the caller). `continue/3` takes
+  `to` instead of `caller_pid`; a missing `session_id` is
+  `{error, {missing_option, session_id}}`.
+- Stream messages `{erllama_token, Ref, _}`, `{erllama_token_id, Ref,
+  _}`, `{erllama_thinking_end, Ref, _}`, `{erllama_done, Ref, _}`,
+  `{erllama_error, Ref, _}`: every event is now `{erllama, Ref,
+  Event}` with `Event :: {token, Bin} | {token_id, Id} | {thinking,
+  Bin} | {thinking_end, Sig} | {done, Stats} | {error, Reason}`
+  (`erllama:stream_event()`).
+- `apply_chat_template/2` renamed `render_chat_template/2`.
+- `chat_apply/2` is `chat_apply/3` (model, messages, opts) and
+  returns `{ok, #{prompt, params}}`; messages and tools are Erlang
+  maps, JSON encoding happens at the NIF boundary.
+- `verify/4` returns `{ok, #{accepted, next}}`.
+- `set_observer/1` and `clear_observer/0`: use a
+  middleware (`erllama_middleware`, `guides/middleware.md`).
+- Application environment: `chat_params_cache_size` renamed
+  `chat_cache_size`; `quota_mb` dropped from the `tiers` entries.
+
+### Changed (BREAKING)
+
+- Every per-model call returns `{ok, Result}` or `{error, not_loaded}`
+  for an unknown or stopped model instead of exiting with `noproc`:
+  `model_info/1`, `status/1`, `phase/1`, `pending_len/1`,
+  `queue_depth/1`, `last_cache_hit/1`, `list_adapters/1` now wrap
+  their result in `{ok, _}`; `unload/1`, `evict/1`, `shutdown/1`,
+  `end_session/2` return `{error, not_loaded}`.
+- `load_model/1,2` validates the config (`erllama_opts`): `backend`
+  defaults to `erllama_model_llama`; a missing `model_path` is
+  `{error, {missing_config, model_path}}`, a missing file is
+  `{error, {invalid_config, model_path, Path}}`, an unknown key is
+  `{error, {unknown_option, Key}}`. `model_id` in the config map is
+  honoured by `load_model/1`.
+- `complete/3`, `prefill_only/3` and `infer/4` validate their option
+  maps: unknown keys are `{error, {unknown_option, Key}}`, wrong types
+  `{error, {invalid_option, Key, Value}}`.
+- `response_tokens` defaults to 64 on every path (`complete/3` used 4).
+- `evict/1` and `shutdown/1` honour the `evict_save_timeout_ms`
+  application environment key (default 30 s); it was documented but
+  unread.
+- `list_adapters/1` entries use the key `adapter` (was `handle`).
+
+### Added
+
+- `erllama:stream/3` and `erllama:collect/2`: streaming inference
+  with a typed event envelope and a collector that folds the events
+  into a `stream_result()`.
+- `erllama:chat/3`: one chat turn (render, generate, parse) with
+  Erlang-term messages and tools; returns the parsed assistant
+  message with content, reasoning and tool calls.
+- `erllama:embed/2` accepts text; `erllama:embed_batch/2` embeds a
+  list of inputs in one round-trip to the model process.
+- `erllama:whereis/1` returns the model pid for monitoring.
+- Supervised cache tiers: `erllama_cache:add_tier/1`, `remove_tier/1`,
+  `list_tiers/0`, `info/0`, and the `tiers` application environment
+  key (`[#{name, backend => disk | ram_file, root}]`) started with
+  the application. `load_model` checks that `tier_srv` is running and
+  matches `tier`.
+- `erllama_middleware`: hackney-style middleware chain around every
+  API call (global via the `middleware` environment key, or per call
+  with the `middleware` option).
+- `erllama:pressure/0`, `pressure_sources/0`, `requests/0`,
+  `request_info/1`.
+- Application environment keys `fingerprint_mode` (now the default
+  for models that do not set it), `writer_max_concurrent`,
+  `chat_cache_size`, `thinking_signing_key`, `middleware` and `tiers`
+  are declared in the app file and documented; `os_mon` is a
+  declared dependency (the `system` pressure source needs memsup).
+- `erllama_scheduler:validate_config/1` checks that `model_evictor`
+  names a loadable module exporting `evict_one/0`.
+- Documentation: public modules are `erllama`, `erllama_cache`,
+  `erllama_middleware`, `erllama_scheduler` and the
+  `erllama_model_backend`, `erllama_model_evictor`, `erllama_pressure`
+  behaviours plus the `erllama_model_stub` test backend; every other
+  module is hidden from hexdocs. Guides rewritten around the public
+  API (the tool-calls guide now documents `chat/3`; the
+  `tool_call_markers` option it described never existed). Public
+  types are defined in `erllama`.
+- Tests: shared `erllama_test_helpers`; no `catch Expr` left, so the
+  suite compiles on OTP 29 without `nowarn_deprecated_catch`.
+- `erllama` exports the types its specs use (`token_id/0`,
+  `cache_key/0`, `completion_result/0`, `stats/0`, `request_opts/0`,
+  `load_config/0`, `error_reason/0`, ...) and documents every error
+  reason in `error_reason/0`.
+
+## [0.9.0] - 2026-08-23
+
+### Added
+
+- `erllama_chat:set_observer/1' / `clear_observer/0' hook.
+  Lets a separate module (typically the server's metrics module)
+  observe wall-time of every chat-NIF call (apply / parse) without the runtime taking a compile-time
+  dependency on the metrics module. Registered via persistent_term;
+  unset = no-op. Drives the new
+  `erllama_chat_*_duration_seconds' Prometheus histograms
+  on the server side.
+- `erllama_app:start/2' enables
+  `erlang:system_flag(scheduler_wall_time, true)' at boot so callers
+  (the server's metrics module among them) can read per-scheduler
+  busy ratios for the autoparser dirty-pool monitoring.
+
+### Changed
+
+- `chat_apply/2' runs upstream's `common_chat_templates_apply' once per
+  request (prompt + parser). The per-tools params cache and the
+  render-only NIF are gone; only the per-model templates ref is
+  cached.
+- Vendored llama.cpp is b10068, upstream and unmodified (no local
+  patches). `scripts/vendor_llama.sh <tag>` performs bumps and fails
+  if any vendored file differs from the tarball. Unused `vendor/`
+  libraries are pruned and `LLAMA_OPENSSL` is off (no OpenSSL link).
+- Hex package manifest now includes `c_src/erllama_chat_nif.{cpp,h}`
+  and `c_src/erllama_resources.h` (previous tarballs could not build).
+- Bump vendored llama.cpp from b9334 to b9585. No API-breaking changes
+  on our touchpoints; brings `common/chat*` bug fixes (LFM2 reasoning,
+  tool-parser unification). UPDATE_LLAMA.md refreshed to document
+  the `common/` + `vendor/` sync the prior procedure left implicit.
+
+### Removed (BREAKING)
+
+- Streaming API: `{erllama_token, _, {tool_call_delta, _}}'
+  and `erllama_tool_call_end' messages, plus the matching
+  step result variants. The engine no longer classifies tool-call
+  bytes mid-stream. Callers using `erllama:infer/4'
+  directly buffer tokens and call `erllama:chat_parse/3'
+  at done for structured extraction. HTTP wire format on the
+  server is unchanged.
+- Backend `tool_call_end_is_eos/1' callback.
+
+### Changed
+
+- `erllama:chat_apply/3' becomes `chat_apply/2' (drops the
+  `ToolsHash' parameter). `erllama_chat_cache' shrinks to
+  caching only the heavy `common_chat_templates_init' ref per model;
+  each request invokes `common_chat_templates_apply' fresh because
+  the synthesized parser is sensitive to `tool_choice' and
+  `parallel_tool_calls' (now folded into the NIF Inputs map).
+
+### Added
+
+- Public `chat_apply/2` + `chat_parse/3` that delegate
+  to `erllama_chat` via the model gen_statem so callers can
+  build a `chat_params_ref' and parse model output without touching
+  the underlying NIF model resource. Backend gains an optional
+  `get_model_ref/1' callback; the stub backend returns
+  `{error, chat_not_supported}'. `chat_purge/1' drops cached entries
+  on demand for a given model id.
+
+### Fixed
+
+- EOS-bounded tool-call flush: don't capture the EOS token's bytes
+  before flushing the span. The previous in-span EogFlag path called
+  `req_tool_call_emit/3` unconditionally; for Granite / Phi-4 the EOS
+  is a special token that detokenizes empty under `special=false`,
+  so the buffer stayed clean in practice, but the path was fragile
+  for any future model whose EOS detokenises to visible bytes. Now
+  the EOS-end branch skips the emit and calls `req_tool_call_end/2`
+  directly, matching the byte-string-end-marker semantics.
+
+### Added
+
+- Complete the chat-autoparser NIF wiring. `nif_chat_templates_apply`
+  now translates an Erlang inputs map (`messages` + `tools` JSON
+  binaries, optional `tool_choice`) into `common_chat_templates_inputs`
+  via `common_chat_msgs_parse_oaicompat` / `common_chat_tools_parse_oaicompat`,
+  calls upstream, and returns the synthesized `chat_params_ref` plus
+  the rendered prompt bytes. `nif_chat_parse` deserialises the
+  per-template PEG arena from the cached params string and dispatches
+  to `common_chat_parse`. The parsed `common_chat_msg` is marshalled
+  to `#{role, content, reasoning_content, tool_calls}`; tool-call
+  arguments come back as raw JSON binaries and are decoded to maps
+  at the Erlang facade boundary (`erllama_chat:parse` (arity 3)).
+  New `erllama_chat_SUITE` real-model CT (gated on
+  `LLAMA_TEST_MODEL`) covers init / apply / parse round-trip and a
+  partial-then-full streaming case.
+- NIF wrapper for llama.cpp's `common_chat_*` autoparser. Vendors
+  `common/` + `vendor/nlohmann` + `vendor/cpp-httplib` from the
+  pinned llama.cpp tree, flips `LLAMA_BUILD_COMMON=ON`, and links
+  `llama-common` into the NIF .so. Three new entry points
+  (`nif_chat_templates_init/2`, `nif_chat_templates_apply/2`,
+  `nif_chat_parse/3`) run on dirty CPU; two new resources
+  (`chat_templates_ref`, `chat_params_ref`) wrap
+  `common_chat_templates_ptr` and `common_chat_params`. New Erlang
+  facade `erllama_chat` (raw NIF shim) and
+  `erllama_chat_cache` (LRU cache keyed on
+  `{ModelIdBin, ToolsHash}`, with `purge/1` for model unload). The
+  refactored `erllama_resources.h` exposes the existing
+  C resource type pointers + `erllama_model_t` to C++
+  TUs behind an `extern "C"` guard. `templates_init` works
+  end-to-end; `templates_apply` and `parse` ship as
+  `{error, not_implemented}` placeholders (the Erlang-term marshalling
+  lands in the follow-up). Dormant capability: the chat / messages /
+  responses handlers do not consume this surface yet; Phase 3.C
+  wires them up.
+- EOS-bounded tool-call end-marker capture. Models configured with
+  `tool_call_markers => #{start => Bytes, 'end' => <<"$eos">>}` opt
+  into the new path: when the scheduler is inside an open tool-call
+  span and the model samples a token with `EogFlag = 1`, the
+  accumulated `tool_call_bytes` buffer is flushed via the existing
+  `erllama_tool_call_end` message before the request
+  finishes. Previously the buffer was silently dropped in that
+  branch (the only emission site was the byte-string end-marker
+  match in `erllama_model_llama:map_marker` (arity 2)). The
+  byte-string-end families (Mistral `</s>`, Qwen `</tool_call>`,
+  DeepSeek `<｜tool▁call▁end｜>`, Llama 3.1 `<|eom_id|>`) are
+  byte-exact unchanged; the new path is opt-in via the sentinel
+  binary `<<"$eos">>` on the `end' key. Backend behaviour gains
+  one optional `tool_call_end_is_eos/1` callback (the scheduler
+  defaults to `false` for backends that have not been updated).
+  Targets the IBM Granite-3.x and Microsoft Phi-4-mini families
+  whose wire shape bounds the call at EOS rather than a
+  byte-string end marker; the server-side migrations land in
+  follow-up PRs.
+
+### Changed
+
+- The native tool-call capture splits spans on a repeated start marker. Families like
+  Mistral tekken delimit parallel calls by emitting the start marker again
+  (`[TOOL_CALLS]n1[ARGS]a1[TOOL_CALLS]n2[ARGS]a2</s>`) with no per-call end between
+  them; the previous single-span capture concatenated every call into one
+  `erllama_tool_call_end` message, which the server parsed as one garbled
+  call. `apply_step_results/2` now finalises the current span before opening the next
+  when a start marker fires while already in-span, so each call yields its own end
+  message and reuses the upstream per-call accumulation. Behaviour-preserving for
+  families with explicit per-call end markers (qwen-xml, qwen3-coder, dsml): a start
+  never fires while in-span because the end fires first. The stub backend gains an
+  optional `tool_call_script :: [start | body | end_tok]` config so tests can drive
+  exact decode-step sequences (the Mistral tekken `[start, body, body, start, body,
+  body, end_tok]` shape and the qwen-style `[start, body, end_tok, start, body,
+  end_tok]` regression guard run from the same harness).
+- The tool-call end marker now carries the source token's eog flag.
+  `erllama_model_llama:map_marker` (arity 2) was discarding `EogFlag` on the end
+  marker, so a model whose end marker IS the eos token (Mistral tekken uses `</s>` as
+  both the per-span end marker and the assistant turn's eos) kept decoding past the
+  close and spammed repeated tool calls under the greedy continuation. Backend step
+  results emit `{tool_call_end, Eog}` instead of the bare atom; the scheduler sets
+  `Req.finishing = true` on eog so the turn ends cleanly. Backend type spec updated
+  accordingly.
+- `erllama_model_stub` gains an opt-in `step_delay_ms :: non_neg_integer()`
+  test knob that `timer:sleep`s for the configured number of milliseconds at the top
+  of every `step/2` call. Lets server-side concurrency tests deterministically keep a
+  holder request in-flight while other requests race for the queue (used by the e2e
+  suite's `chat_busy_returns_429` to fix a pre-existing CI timing flake where the
+  holder's stream could finish before the racing requests arrived). Default 0 is a
+  true no-op for the cache / integration tests that already use the stub. Invalid
+  configs coerce to 0.
+
+### Fixed
+
+- Idle sticky-session seq pins are now reclaimed under seq-pool pressure, so the pool no
+  longer permanently exhausts. A completed sticky turn keeps its sequence pinned for warm
+  continuation, but those pins were never released (only `end_session/2` or model stop
+  freed them) - so after `n_seq_max` distinct sessions, every new session got
+  `{error, seq_capacity}` (529) with retries never recovering. Admission now reclaims the
+  least-recently-used **idle** pin (a `session_seq` entry whose seq has no in-flight
+  request) when the pool is full, on both the fresh-admit (`admit_normal/2`) and queued-
+  dispatch (`dispatch_pending_admits/2`) paths, while never reclaiming an in-flight
+  session. `seq_capacity` now only fires when every seq is genuinely active. A reclaimed
+  session re-admits cold (or warm-restores from the tiered cache) on its next turn.
+  `model_info/1` gains `pinned_idle_seqs` (reclaimable headroom; `available_seqs` stays
+  ~0 since an admitted request immediately re-pins).
+- Native tool-call capture now keeps the body between the markers. The marker scanner
+  (`erllama_model_llama:map_marker` (arity 2)) is stateless - it tags only the start/end
+  marker tokens - so for a model whose tool-call body is ordinary tokens (e.g.
+  Qwen3-Coder's `<tool_call><function=NAME><parameter=P>v</parameter></function></tool_call>`)
+  the body was streamed as content and the captured `tool_call_bytes` held only the
+  start marker, yielding an empty call (`name "unknown"`, `arguments {}`). The decode
+  loop now accumulates any token sampled while a tool-call span is open
+  (`active_sampler` = `tool_call_syntax` / `tool_call_payload`) into the tool-call bytes
+  instead of the content stream, so the full call reaches the parser. Models that emit
+  their call without the marker tokens (e.g. Qwen2.5 `qwen-xml` JSON) are unaffected -
+  they never open a span.
+
+### Added
+
+- Scheduler can proactively unload an idle model under sustained memory pressure
+  (opt-in `scheduler.unload_models_under_pressure => true`). After cache eviction runs,
+  if it could not free the target and pressure is still high, the scheduler calls the
+  configured `model_evictor` (new `erllama_model_evictor` behaviour,
+  `evict_one/0`) to unload the least-recently-active idle model. Cache slabs are always
+  freed first; at most one model is unloaded per tick; the callback's return is
+  validated so a missing or misbehaving evictor degrades to no-op. `status/0` reports
+  `models_unloaded_total` / `last_model_unloaded`. The engine names the evictor module
+  via config only - no compile-time dependency on the server app that implements it.
+
+### Changed
+
+- Vendored llama.cpp bumped from `b9222` to `b9334` (ggml 0.12.0 -> 0.13.0). No erllama
+  source changes required; the C ABI surfaces the NIF wraps
+  (`erllama_safe.cpp`: model load/free, context, sampler chain, `llama_decode`,
+  `llama_memory_seq_*`, `llama_state_seq_*`) are unchanged.
+- Cache eviction is now frecency-scored, not pure LRU. Byte-targeted eviction
+  (`evict_bytes`, scheduler memory pressure) drops the lowest-scoring rows first, where
+  the score is recency biased forward by the row's hit count with a 6 h half-life decay
+  (`erllama_cache_meta_srv:eviction_score/3`). Pinned static-prefix rows and the
+  currently-live session key (`set_live_key/1`, ds4 `protected_sha`) sort in a higher
+  rank so they survive `gc/0` and are evicted by `evict_bytes` only as a last resort
+  when nothing else frees enough. The old one-shot `last_used += hits*1s` install bias
+  is removed (hits now feed the score directly, so they are no longer double-counted).
+
+### Added
+
+- Pinned static-prefix (`agent_prefix`) checkpoints. When a caller supplies a
+  verified `prefix_checkpoint_len` (the end-of-tools token offset), the cold prefill
+  writes an `agent_prefix` KV checkpoint at exactly that boundary - independent of the
+  `cold_min/cold_max` band - and pins it so the hot, shared system+tools prefix is not
+  evicted under churn. The pin is bounded to one row per namespace
+  (`erllama_cache_key:namespace/3`), survives restart (recovered from the
+  persisted save reason on the disk scan), and is re-applied on a warm resume that
+  lands on the boundary. New `erllama_cache_meta_srv:pin_row/2`, `?POS_PINNED`
+  row field, `?C_SAVES_AGENT_PREFIX` counter (`saves_agent_prefix`), and KVC save
+  reason 6 (mirrors ds4 `AGENT_SYSTEM`). Cold-prefill segments now carry a per-boundary
+  save reason.
+
+### Changed
+
+- KV cache is now keyed by the **rendered prompt bytes**
+  (`detokenize(tokens)`), not the token-id list (ds4-style,
+  content-addressed). The same logical prompt now hits across turns
+  even when it retokenises (chat-template wrapping, tool rendering,
+  generated ids vs re-tokenised assistant text), where the old
+  token-keyed cache went cold every turn. The longest-prefix lookup
+  (`erllama_cache_meta_srv:lookup_longest_text_prefix/2`)
+  scans stored byte-prefix lengths and resumes from the longest match.
+  The uncovered suffix reuses the caller's original tokens when the
+  byte boundary lands on a token boundary (token-exact resume - so a
+  re-sent prompt still reproduces its reply); only a mid-token boundary
+  re-tokenises the byte remainder (`checkpoint_tokens ++
+  tokenize(byte_suffix)`, identical byte stream, sound). Hits stay
+  exact (SHA-256 over the bytes; no fuzzy match). The KVC file format
+  version is bumped to **v2**; old v1 (token-keyed) files are rejected
+  on the startup disk scan, so the cache refills under the new scheme.
+  `list_cached_prefixes/2` now reports the matched
+  **byte** length.
+
+### Added
+
+- Per-context compiled-grammar cache. An identical GBNF (agentic clients like
+  Claude Code resend the same tool grammar every turn) is now parsed once and
+  cloned per request via `llama_sampler_clone` instead of re-parsed, which
+  dominated infer admission for large tool grammars. The cache is a small
+  byte-verified LRU on the context resource (a hash is only a pre-filter; identity
+  is confirmed by length + `memcmp`), freed with the context. New
+  `erllama_nif:grammar_cache_stats` (arity 1) (`#{hits, misses}`) exposes whether
+  the cache is taking effect.
+
+## [0.8.0] - 2026-05-23
+
+Engine-robustness release covering the `erllama_server` hardening
+brief observed under real 30B/Metal load (cold-admit decode wedges,
+agentic tool-continue loops).
+
+### Added
+
+- Bounded, interruptible, self-recovering decode. Every context
+  installs a ggml abort callback. Each decode step arms a per-step
+  wall-clock budget (`context_opts.decode_budget_ms`, default 30000,
+  0 disables); exceeding it aborts the decode and returns
+  `{error, decode_timeout}` instead of blocking forever.
+  `erllama_nif:request_abort` (arity 1) sets an atomic flag the callback
+  honours without taking the context mutex, so a running decode can
+  be interrupted from outside the (blocked) gen_statem and returns
+  `{error, decode_aborted}`; `cancel/1` fires it best-effort. On
+  `decode_timeout`/`decode_aborted` the engine recovers in place:
+  fails in-flight and queued callers, recreates the context via the
+  new backend `reset_context/1` (model stays loaded), resets seq and
+  session state, and returns to idle. Recovery drops only the live
+  in-context KV cells and sticky-session pins; the persistent tiered
+  cache (RAM/disk rows) is untouched, so the next admission still
+  warm-restores from cache where a saved row matches rather than
+  starting fully cold.
+- `on_full => block | error` admission option on `complete/3`,
+  `prefill_only/3`, `infer/4` (default `block`). `error` fails fast
+  with `{error, seq_capacity}` instead of queueing when no seq is
+  free — pair with `available_seqs` / `n_seq_max` from `model_info/1`.
+- `generated => [token_id()]` in the `erllama_done` Stats map: the
+  exact generated token ids in order, so a caller can build a
+  byte-exact suffix for `continue/3` without re-tokenising
+  detokenised text.
+- `expect_committed => [token_id()]` option on `continue/3`: the
+  caller's view of the session's committed tokens. When supplied it
+  must equal the stored context exactly, otherwise `continue/3`
+  returns `{error, {transcript_mismatch, #{stored_len, expected_len,
+  diverge_at}}}` without prefilling, leaving the seq pinned for a
+  re-sync and retry.
+
+### Changed
+
+- A binary `grammar` is now authoritative through tool-call syntax
+  tokens. Previously, on a model with `tool_call_markers`, a
+  `tool_choice=required` / `response_format` grammar was abandoned
+  once a tool-call span opened (syntax tokens went through a
+  grammar-less greedy sampler), letting output drift to free-form.
+  The greedy-on-syntax swap is now disabled for any request carrying
+  a grammar, so the constraint holds end to end on `infer/4` and
+  `continue/3`.
+- `nif_decode_one` now returns `{error, {decode_failed, Rc}}` instead
+  of a bare `{error, Rc}`, matching `nif_step`.
+
+## [0.7.0] - 2026-05-20
+
+### Added
+
+- `erllama:reset_session/2` recovery primitive. Forcibly drops a
+  sticky session's live KV cells and any in-flight `#req{}` on its
+  seq, then returns the seq slot to the idle pool. Uses a 5 s
+  `gen_statem:call` timeout so it stays reachable when the engine's
+  `infinity`-timeout hot path is wedged. Returns
+  `{ok, recovered | not_found} | {error, timeout}`. Streaming
+  callers on the reset seq receive `{erllama_error, Ref, engine_reset}`.
+- `n_seq_max` and `available_seqs` keys in `erllama:model_info/1`.
+  `available_seqs` is the live idle-list length; sticky-pinned seqs
+  count as unavailable. Lets callers detect saturation up front
+  instead of inferring it from `sticky_busy` errors.
+
+### Changed
+
+- `nif_step` now returns `{error, {decode_failed, Rc}}` (was bare
+  `{error, decode_failed}`). The `Rc` integer surfaces the
+  `llama_decode` return code (1, -1, 2, ...) so operators can tell
+  OOM from KV-cache corruption from sample rejection. The exception
+  path (`{error, exception}`) is unchanged.
+
+## [0.6.2] - 2026-05-19
+
+### Changed
+
+- Vendored llama.cpp bumped from `b9119` to `b9222`. No erllama
+  source changes required; the C ABI surfaces we depend on (model
+  load/free, context, sampler chain, `llama_n_batch`,
+  `llama_state_seq_*`) are unchanged.
+
+## [0.6.1] - 2026-05-18
+
+### Fixed
+
+- BEAM segfault in `apply_chat_template/2` on rendered
+  chat-template output above the initial 4 KiB render buffer. The
+  vendored `llama_chat_apply_template` returns the full formatted
+  size as a positive value even when the caller's buffer was too
+  small (`strncpy` silently truncates). The NIF retry path only
+  fired on negative return, so the positive size was fed as
+  `text_len` to `llama_tokenize` and the subsequent `std::string`
+  construction walked past the truncated buffer into unmapped pages.
+  Retry now triggers on `written > buf_size`. Caps bumped to match
+  the downstream's 64 MiB body limit: `ERLLAMA_MAX_TOKEN_TEXT`
+  4 MiB → 64 MiB, `ERLLAMA_MAX_TOKENS` 1 M → 16 M. The token output
+  cap is enforced on the tokenize success path so byte-fallback
+  tokenizers don't return over-cap lists.
+
+## [0.6.0] - 2026-05-18
+
+### Added
+
+- `erllama:continue/3` for caller-asserted chat-template continuation
+  on a sticky session. Skips the prompt prefix-equality check in
+  `resolve_sticky_continuation` so chat templates whose rendered
+  prefix shifts between turns can still reuse the live KV cells.
+  Caller passes the tokenised tail directly; the engine prefills
+  only that tail on top of the pinned seq's stored KV. Returns
+  `{error, no_session}` for unknown session ids and
+  `{error, sticky_busy}` for in-flight seqs. New
+  `cache_hit_kind => continuation` reports the path in `Stats`.
+  Companion guide section in `guides/examples.md` and lifecycle
+  notes in `internals/request-lifecycle.md`.
+
+## [0.5.1] - 2026-05-17
+
+Documentation-only patch on top of 0.5.0.
+
+### Added
+
+- `## Tool-call handling` section in the README describing what
+  erllama exposes (per-model `tool_call_markers`, the
+  `{tool_call_delta, _}` / `{erllama_tool_call_end, _, Full}`
+  streaming wire, and the automatic greedy-on-syntax sampler
+  swap) and what it deliberately leaves to the HTTP layer (tool
+  id minting, JSON parsing, canonicalisation).
+- New `guides/tool-calls.md` companion to the README section,
+  linked from the documentation table.
+- New `internals/request-lifecycle.md` describing the per-model
+  `gen_statem` admission, cache resolution, decode, and save
+  pipeline.
+- `internals/c-safety-audit.md` added to the HexDocs navigation.
+
+### Changed
+
+- README rewritten for sharper top-of-funnel: tighter "Why" list,
+  cleaner Quick taste, Common patterns block replacing the old
+  long example.
+- Architecture diagram corrected — `erllama_cache_ramfile_srv`
+  and `erllama_cache_disk_srv` are operator-started standalone
+  servers, not children of `erllama_cache_sup`. Added
+  `erllama_registry` and `erllama_inflight` which were missing.
+- "Inside a request" lifecycle updated for the multi-seq
+  scheduler: two states (idle/running) instead of the v0.1
+  three-phase model, with co-batched `nif_step` and inline
+  thinking/tool-call marker recognition.
+
+## [0.5.0] - 2026-05-16
+
+Tool-call exact-replay scaffolding for downstream HTTP front ends.
+Models loaded with `tool_call_markers` produce structured boundary
+messages on the streaming wire so a caller can capture the exact
+bytes the model sampled, store them under a tool id, and splice
+them back verbatim on later turns to keep the KV-cache prefix
+match working. Companion primitives expose explicit suffix replay
+and sticky per-session seq_id pinning.
+
+### Added
+
+- `tool_call_markers => #{start, end, payload_start (optional),
+  payload_end (optional)}` on `erllama:load_model/2` Config. Each
+  binary is tokenised through the model's own vocabulary at load
+  time; multi-token markers are supported. Omitting the key keeps
+  the backend on the existing path (#39, #42).
+- Streaming wire on `infer/4` gains
+  `{erllama_token, Ref, {tool_call_delta, Bin}}` per chunk and a
+  single `{erllama_tool_call_end, Ref, Full :: binary()}` per
+  span, with `Full` carrying every emitted delta concatenated so
+  the downstream's exact-replay map stores them verbatim without
+  re-buffering (#39).
+- `erllama:prefill_only/3` accepting `Opts` with `parent_key`.
+  When passed a prior turn's `finish_key`, the call warm-restores
+  from that row and prefills only the new suffix before firing the
+  finish save — useful for chaining cache-warming calls across
+  turns (#40).
+- `session_id => term()` on `infer/4` Params and
+  `complete/3` / `prefill_only/3` Opts. Pins the underlying seq_id
+  to that session across requests so the next turn whose prompt
+  continues the stored tokens truncates-and-prefills in place on
+  the already-live KV cells (`cache_hit_kind => sticky`).
+  Concurrent admits on the same `session_id` return `{error,
+  sticky_busy}`. Release with `erllama:end_session/2` (#41).
+- Per-request greedy sampler swap on tool-call syntax tokens.
+  Models with `tool_call_markers` build a second sampler chain
+  (`temperature => 0`) at admission; the scheduler routes syntax
+  tokens through it so a tool call is byte-deterministic from a
+  fixed prefix. Optional payload markers flip back to the request's
+  normal sampler for caller-supplied string contents so they stay
+  diverse (#42).
+
+### Changed
+
+- `step_result()` on `erllama_model_backend` gains four variants
+  (`{tool_call_token, _}`, `tool_call_end`, `{tool_call_payload_open,
+  _}`, `{tool_call_payload_close, _}`). Backends without
+  tool-call markers emit none of them.
+- `erllama_model_stub` phase machine re-keyed from sampler ref onto
+  seq_id so mid-request sampler swaps (the new greedy-on-syntax
+  path) don't reset state across ticks. `seq_rm` now cleans the
+  per-seq phase entry.
+
+## [0.4.0] - 2026-05-16
+
+Anthropic-Messages compatibility follow-ups: per-request cache
+delta accounting, a real thinking sampler in the llama.cpp
+backend, and caller-side thinking-budget clipping. All three are
+strict additions; existing consumers see no shape change unless
+they opt in.
+
+### Added
+
+- `cache_delta => #{read := N, created := N}` on
+  `completion_result()`, `stats()`, and `prefill_result()` so the
+  downstream Anthropic Messages server can emit accurate
+  `cache_creation_input_tokens` / `cache_read_input_tokens`
+  values. `read` is the warm prefix length restored at admission;
+  `created` is the largest contribution this request added to the
+  cache beyond that prefix (#35).
+- `thinking_markers => #{start := binary(), end := binary()}` on
+  `erllama:load_model/2` Config. The backend tokenises both
+  strings through the model's vocabulary at load time and the
+  `step/2` wrapper maps any sampled token matching a marker into
+  `{thinking_token, _}` or `thinking_end`. Multi-token markers
+  (BPE-split `<think>`) are supported. Omitting the key keeps the
+  backend on the non-thinking path (#36).
+- `thinking_signing_key` application env. When set, the real
+  backend's `thinking_signature/3` HMAC-SHA256s the observed
+  thinking-phase bytes with this key; unset returns `<<>>` so
+  the downstream omits `signature_delta` (#36).
+- `thinking_budget_tokens => pos_integer()` on `infer/4` `Params`.
+  Caps the number of `{thinking_delta, _}` payloads delivered
+  before the scheduler synthesises `{erllama_thinking_end, _, _}`
+  and re-routes further model thinking tokens through the normal
+  post-thinking pipeline (#37).
+
+### Changed
+
+- `thinking_signature/2` callback on `erllama_model_backend`
+  bumped to `/3` (third argument is the accumulated thinking
+  bytes). Backwards-compatible: only `erllama_model_stub`
+  implemented the optional callback in 0.3 and the stub +
+  scheduler + new `erllama_model_llama` move in lockstep (#36).
+
+## [0.3.0] - 2026-05-16
+
+Anthropic-Messages compatibility additions on top of 0.2.0:
+caller-supplied stop sequences with trimmed output, an opt-in
+extended-thinking message surface with per-block integrity
+signatures, and a round of NIF safety hardening on the C/C++ side.
+
+### Added
+
+- `stop_sequences :: [binary()]` on `infer/4` `Params` and
+  `complete/3` `Opts`. Generation halts on the first occurrence of
+  any element in the accumulated detokenised output. The match is
+  trimmed from the streamed `{erllama_token, _, _}` chunks and the
+  synchronous `reply`, and the matched binary is reported as
+  `stop_sequence` on the result map (`complete/3`) and stats map
+  (`infer/4` done message). The key is absent when generation hit
+  `length`, was cancelled, or reached EOG without a match. The
+  previously reserved `stop` placeholder is renamed to
+  `stop_sequences`; it was never wired up so this is not a
+  breaking change (#32).
+- `thinking => enabled | disabled` on `infer/4` `Params` (default
+  `disabled`). When `enabled` against a thinking-capable backend,
+  streaming requests receive `{erllama_token, Ref, {thinking_delta,
+  Bin}}` fragments and a single `{erllama_thinking_end, Ref, Sig}`
+  close marker before any subsequent token. `Sig` is an opaque
+  integrity signature the downstream forwards verbatim into the
+  Anthropic `signature_delta` SSE event, or `<<>>` when no
+  signature is available (#33).
+- `erllama_model_backend` gains `{thinking_token, token_id()}` and
+  `thinking_end` variants on `step_result()` plus an optional
+  `thinking_signature/2` callback. Backends without extended
+  thinking emit neither variant and require no changes (#33).
+
+### Changed
+
+- `llama_batch_init`, `llama_batch_free`, and `llama_batch_get_one`
+  are now routed through `erllama_safe_batch_*` `noexcept` shims
+  so a C++ exception cannot unwind through the C NIF frame (#30).
+- Per-thread `thread_local` storage replaces the process-global
+  log buffer used by the malformed-GGUF classifier; concurrent
+  model loads no longer scramble each other's `GGML_ASSERT` text
+  on a NULL return (#31).
+- NIF unload no longer calls `llama_backend_free` (avoids a
+  `pthread_once` wedge on `.so` reload paths) and clears the
+  `llama_log_set` callback so a post-unload log emission cannot
+  dispatch into freed memory (#31).
+
+## [0.2.0] - 2026-05-15
+
+Multi-sequence batched scheduling, map-shaped completion results,
+chunked prefill, per-model observability, and direct passthrough of
+the llama.cpp multi-GPU / flash-attention / KV-quant params.
+
+### Changed (breaking)
+
+- `erllama:complete/2,3` and `erllama_model:complete/2,3` now return
+  `{ok, completion_result()}` instead of the legacy
+  `{ok, ReplyBinary, GeneratedTokens}` tuple. The map carries:
+  - `reply :: binary()`
+  - `generated :: [token_id()]`
+  - `context_tokens :: [token_id()]` (prompt ++ generated)
+  - `committed_tokens :: non_neg_integer()` (`length(context_tokens)`)
+  - `finish_key :: cache_key() | undefined` — token-exact key for the
+    full context, suitable as `parent_key` on the next turn;
+    `undefined` if the finish save was suppressed
+  - `cache_hit_kind :: exact | partial | cold`
+  - `finish_reason :: stop | length | cancelled`
+  - `stats :: stats()`
+
+  Mechanical migration:
+
+  ```erlang
+  %% before
+  {ok, Reply, _Tokens} = erllama:complete(Model, Prompt).
+  %% after
+  {ok, #{reply := Reply, finish_key := FK}} =
+      erllama:complete(Model, Prompt).
+  ```
+
+- Streaming `{erllama_done, Ref, Stats}` (`infer/4`) `Stats` map
+  gains two additive keys: `finish_key` and `committed_tokens`. No
+  shape break for existing consumers (#21).
+
+### Added
+
+#### Multi-sequence batched scheduler (#24, #25, #26, #27)
+
+- `erllama_nif:step` (arity 2) is the new multi-sequence batched decode
+  primitive. One `llama_decode` call mixes prefill and decode rows
+  freely (SARATHI-style co-batching), bounded by the live context's
+  `n_batch`. Returns `{error, batch_overflow}` cleanly so a
+  budget-aware scheduler can shrink and retry, and `{error,
+  no_logits}` when a decode row has no prefill yet on its seq.
+- Per-context `per_seq[]` tracking (`last_logits_idx`, `next_pos`)
+  with `ERLLAMA_N_SEQ_MAX_CAP = 256`. `kv_unpack` / `kv_seq_rm`
+  refresh the per-seq position so subsequent `step` calls see
+  correct state.
+- `erllama_model_backend` behaviour gains optional callbacks
+  `step/2`, `sampler_new/2`, `sampler_free/1`, `seq_rm/2`,
+  `seq_rm_last/3`, plus seq-aware `kv_pack/3` and `kv_unpack/3`.
+  All optional; existing backends keep compiling.
+- The model gen_statem now runs a multi-tenant scheduler. With
+  `context_opts.n_seq_max => 1` (the default), behaviour is
+  bit-identical to 0.1: exactly one request runs at a time. Setting
+  `n_seq_max > 1` lets up to N requests prefill and decode
+  concurrently through one `llama_decode` per tick. State collapses
+  from `idle/prefilling/generating` to `idle/running`; admissions
+  past the seq-id capacity queue FIFO in `pending`.
+- Each in-flight request owns its own sampler chain (built at
+  admission via `backend:sampler_new/2`, freed at finish), so
+  concurrent requests with different `temperature` / `seed` /
+  `grammar` settings never share sampler state.
+- Cache save reasons (`cold`, `continued`, `finish`, `evict`,
+  `shutdown`) all thread through the request's `seq_id` and remain
+  token-exact per-sequence.
+
+#### Chunked prefill (#28)
+
+- `prefill_chunk_size` policy knob caps how many tokens a single
+  prefill row contributes to one tick. Default
+  `max(64, n_batch div 4)`; pass `infinity` to disable. A long
+  prompt is sliced across multiple ticks so it never monopolises
+  the batch and concurrent decoders keep making progress between
+  chunks. Layered on top of the `n_batch` per-tick budget.
+
+#### `prefill_only/2` (#21)
+
+- `erllama:prefill_only/2` and `erllama_model:prefill_only/2` decode
+  a prompt into KV state and fire a finish save without sampling
+  any output tokens. Returns a `prefill_result()` map carrying
+  `context_tokens`, `committed_tokens`, `finish_key`, and
+  `cache_hit_kind`. Useful for priming the cache before a burst of
+  short follow-ups, or for holding a warm session across long pauses
+  without consuming generation budget.
+
+#### Per-model observability (#22)
+
+- New public ETS table `erllama_model_obs`, owned by
+  `erllama_inflight`, written by each model gen_statem on every
+  state transition and read lock-free from any process (including
+  remote nodes via `erpc`).
+- Four new accessors on `erllama`:
+  - `phase/1`: `idle | prefilling | generating` for one model id.
+  - `pending_len/1`: gen_statem pending FIFO depth (calls queued
+    behind whatever is currently running).
+  - `last_cache_hit/1`: `#{kind, prefix_len}` of the most recent
+    admission, or `undefined` if the model has never admitted.
+  - `queue_depth/1`: per-model variant of the existing global
+    `queue_depth/0`; counts admitted streaming `infer/4` rows.
+- `model_info/1` map gains `phase`, `pending_len`, and
+  `last_cache_hit` keys. Additive: existing keys preserved.
+
+#### llama.cpp option passthrough (#23)
+
+- `erllama_nif:load_model` (arity 2) now reads three additional keys from
+  `model_opts`:
+  - `split_mode :: none | layer | row`: multi-GPU split policy.
+  - `main_gpu :: non_neg_integer()`: GPU index when `split_mode = none`.
+  - `tensor_split :: [float()]`: per-device proportions (up to 16
+    entries; shorter lists zero-fill).
+- `erllama_nif:new_context` (arity 2) reads three more from `context_opts`:
+  - `flash_attn :: boolean() | auto`: enable, disable, or defer to
+    llama.cpp.
+  - `type_k`, `type_v :: f16 | f32 | bf16 | q4_0 | q5_0 | q5_1 | q8_0`:
+    KV cache element type for keys and values.
+- Bad atoms raise `badarg` before the load runs.
+
+### Fixed
+
+- `warm_restore_primer` passed `1` instead of the current cell count
+  to the prefill primer, so warm restores that ran the primer at a
+  non-zero offset wrote KV at the wrong position. The primer now
+  takes the live cell count from the per-seq tracker.
+- The cold prefill path could fire the cold save inside the
+  remainder prefill rather than between the trim prefix and the
+  remainder, leading to a save row that did not match the
+  trim-aligned boundary. The cold save now fires at the
+  cursor-emptied transition between the trim and the remainder.
+
+### Internal
+
+- New types exported from `erllama_model`: `completion_result/0`,
+  `prefill_result/0`.
+- `erllama_model_t` now owns the `tensor_split` buffer; the vendored
+  llama.cpp aliases the pointer rather than copying it, so its
+  storage must outlive the model.
+- `erllama_model_stub` derives per-seq tokens from
+  `phash2({decode_step_stub, SeqId, Sampler})` so a scheduler bug
+  that swaps samplers between seqs becomes observable in tests.
+
+## [0.1.2] - 2026-05-12
+
+Cluster-routing primitives, speculative-decoding verifier, a
+cold-path correctness fix, and C-safety CI tooling. All additions
+are backwards-compatible; existing API call sites unchanged.
+
+### Added
+
+#### Cluster routing and load-balancing (#13)
+
+- `erllama:queue_depth/0` returns O(1) inflight count via an
+  atomics counter parked in persistent_term, readable cross-node
+  via `erpc`. Used by the upcoming `erllama_cluster` load
+  balancer (least_loaded, power_of_two strategies).
+- `list_cached_prefixes/2` returns the longest cached
+  prefix length of a token list for a given model on this node,
+  across all cache tiers. Used by the cluster cache-affinity
+  router.
+- `erllama_nif:vram_info` (arity 0) walks every loaded ggml backend and
+  sums free + total memory across non-CPU devices; returns
+  `{error, no_gpu}` on a CPU-only build. Used by the cluster
+  scheduler for bin-packing model placement.
+- `erllama:list_models/0` map gains `model_id`, `quant_tag`,
+  `loaded_at_monotonic`, and `vram_estimate_b` keys. Existing
+  keys (`id`, `pid`, `status`, etc.) are unchanged.
+
+#### Speculative decoding (#13)
+
+- `erllama:draft_tokens/3` synchronously generates up to `Max`
+  next-token ids for a prefix. Times out at 30 s with a clean
+  cancel + drain so the caller's mailbox stays clean. Empty
+  prefix is rejected as `{error, empty_prefix}`.
+- `verify/4` runs `PrefixTokens ++ Candidates` through
+  the model in one forward pass and returns the longest accepted
+  prefix length plus the verifier's own next token. Acceptance
+  walks `Argmax[P + i - 1] == c_i` and stops at the first
+  mismatch. End-of-generation tokens map to the atom `eos`.
+  Snapshot + restore protocol leaves the caller's pre-call
+  context view unchanged. Allowed only from the model
+  gen_statem's idle state; non-idle callers receive
+  `{error, busy}`.
+- Token-id streaming: `erllama_model:stream_emit` now also sends
+  `{erllama_token_id, Ref, Id}` on every produced token, in
+  addition to the existing `{erllama_token, Ref, Bin}`.
+  Empty-text tokens (special tokens, BPE merges with no visible
+  bytes) still produce an id message. Existing consumers ignore
+  the new tag.
+
+#### Backend behaviour
+
+- Optional callbacks `extra_metadata/1` (vram-related model
+  metadata) and `verify/4` (speculative verifier) on
+  `erllama_model_backend`. Backends that omit either get a
+  graceful `{error, not_supported}` fallback (#13).
+- Optional callback `seq_clear/1` on `erllama_model_backend`.
+  Llama backend implements it as `llama_state_seq_rm(0, 0, -1)`.
+  Called by the model layer at the top of `enter_prefilling`;
+  see the Fixed section below (#16).
+
+#### NIFs (#13)
+
+- `nif_model_size/1`, `nif_model_n_layer/1`,
+  `nif_forward_with_argmax/2`, `nif_vram_info/0`. Previously
+  unreachable from Erlang.
+
+### Fixed
+
+- Cold-path prefill KV-state leak: `erllama_model:enter_prefilling`
+  did not reset the llama_context's KV cache before the new
+  prefill. `llama_batch_get_one` auto-positions at `n_past`, so a
+  second cold request on the same model wrote its prompt KV at
+  `[previous_n_past..]` instead of `[0..]`, producing different
+  output for the same prompt + seed across calls. The new
+  `seq_clear/1` callback wipes seq 0 before the cold prefill.
+  Warm restores via `kv_unpack` were already correct (#16).
+
+### Changed
+
+- Vendored `c_src/llama.cpp/` bumped from `b9093` to `b9119`
+  (16 files, mostly Metal/CUDA tweaks plus a new
+  `ggml-cuda/allreduce` kernel pair). Public `llama.h` API used
+  by the NIF is unchanged (#15).
+- `erllama_inflight:register/2` and `unregister/1` switched to
+  `ets:insert_new` / `ets:take` so the new atomics counter sees
+  only true admissions and true removals; double-register or
+  double-unregister become observable no-ops (#13).
+
+### Internal
+
+- New CI jobs: `sanitizers` (ASan+UBSan against
+  `tinyllamas/stories260K.gguf` under `LD_PRELOAD`'d libasan),
+  `clang-tidy` (NIF sources only), and `scan-build`
+  (Clang Static Analyzer with `--status-bugs`) (#14).
+- New `c_src/CMakeLists.txt` options:
+  `ENABLE_ASAN`, `ENABLE_TSAN`, `ENABLE_UBSAN`, `ENABLE_CLANG_TIDY`,
+  scoped to the `erllama_nif` target; default OFF.
+- `.clang-tidy` config at repo root. Vendored llama.cpp is not
+  linted.
+
+### ROADMAP
+
+- Pipeline parallelism deferred; blocked on upstream llama.cpp
+  adding layer-range execution to `llama_decode`. The cluster
+  degrades gracefully via `function_exported`.
+- Verify context isolation: the current snapshot/restore protocol
+  does not preserve the caller's pre-call `decode_ready` flag;
+  callers are assumed to issue `decode_one` imminently. A v2
+  extension to cover `decode_ready` is documented for the next
+  contributor.
+
+## [0.1.1] - 2026-05-12
+
+NIF safety and SIGSEGV hardening. No public API additions; new
+error tuples surface paths that previously crashed the BEAM or
+raised `badarg` across a dirty scheduler.
+
+### Fixed
+
+- Adapter use-after-free / double-free when `free_model/1` ran
+  while adapter wrappers still referenced the model. The model
+  resource now tracks `active_adapters` alongside `active_contexts`
+  and defers `llama_model_free` until both reach zero (#10).
+- Race in `set_adapters/2` where a concurrent `adapter_free` could
+  null the underlying pointer between the per-adapter mutex
+  release and the `llama_set_adapters_lora` call. Locks are now
+  held across the llama call in pointer-sorted order to defeat
+  AB-BA between concurrent callers (#10).
+- Per-message memory leak in `apply_chat_template` when the
+  message list was malformed or allocation failed mid-build. The
+  helper now releases its own role/content allocations on every
+  error path (#10).
+- `prefill/2` and `embed/2` walked past the KV slab when the
+  prompt size reached `n_ctx`, and produced undefined behaviour
+  when it exceeded `n_batch`. Both now bounds-check against the
+  live context before touching state, returning
+  `{error, context_overflow}` or `{error, batch_overflow}` (#11).
+- `apply_chat_template/2` raised `badarg` across the dirty
+  scheduler when `content` was a list-of-maps (Anthropic-style
+  content blocks) instead of a binary. Returns
+  `{error, invalid_content}` (#11).
+- `load_model/2` surfaced a generic `{error, load_failed}` for
+  malformed GGUF files. Now returns `{error, malformed_gguf}` on
+  a best-effort basis when the captured llama log line contains
+  `GGML_ASSERT`. Best-effort only: `llama_log_set` is process
+  global and concurrent loads can mis-attribute classification.
+  A `GGML_ASSERT` that hits `abort()` still terminates the BEAM
+  process; subprocess isolation would be required for a complete
+  fix and is intentionally out of scope (#11).
+
+### Added
+
+- New error atoms returned by the NIF: `context_overflow`,
+  `batch_overflow`, `invalid_content`, `malformed_gguf`. Callers
+  matching `{error, _}` are unaffected; callers that care about
+  the specific reason should match the new atoms.
+
+## [0.1.0] - 2026-05-11
+
+Initial public release.
+
+### Added
+
+#### Public API
+
+- Native Erlang/OTP wrapper around llama.cpp via a single
+  dirty-scheduler NIF (`erllama_nif`) covering model load, context
+  construction, tokenisation, prefill, single-token decode, and
+  KV pack/unpack.
+- Models are identified by `binary()` on the public API.
+  `erllama:load_model/2`, `complete/2,3`, `unload/1`, `status/1`,
+  `evict/1`, `shutdown/1` take `binary() | pid()`. Internal
+  registration uses `{via, erllama_registry, BinaryId}` so user-
+  supplied ids cannot exhaust the atom table.
+- `erllama:list_models/0` returning `[model_info()]` and
+  `erllama:model_info/1` keyed on a model id.
+- Public `erllama:tokenize/2` and `erllama:detokenize/2` keyed on a
+  model id. The low-level `erllama_nif:tokenize` (arity 3) and
+  `erllama_nif:detokenize` (arity 2) remain available.
+- `unload_model/1` as an alias for `erllama:unload/1`
+  matching the OpenAI/Ollama-style naming downstream HTTP servers
+  use.
+- `infer/4` streaming inference. Returns `{ok, Ref}`;
+  tokens are delivered to the caller as `{erllama_token, Ref, _}`,
+  `{erllama_done, Ref, Stats}`, `{erllama_error, Ref, Reason}`.
+- `erllama:cancel/1`. Idempotent and fire-and-forget; observed
+  between tokens.
+- `apply_chat_template/2`. Renders a normalised chat
+  request (`messages`, `system`, `tools`) through the model's
+  GGUF chat template and tokenises. Backed by
+  `llama_chat_apply_template`.
+- `erllama:embed/2`. Per-sequence pooled embedding via
+  `llama_get_embeddings_seq` with last-token fallback.
+
+#### Sampling
+
+- Sampler parameters: `complete/3` and `infer/4` honour
+  `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
+  `seed`, and `grammar` via one combined chain builder
+  (`erllama_nif:configure_sampler` (arity 2)). Chain order:
+  `grammar -> repetition_penalty -> top_k -> top_p -> min_p ->
+  (temperature > 0 ? temp -> dist(seed) : greedy)`. `set_grammar/2`
+  retained as a backwards-compatible alias.
+- Grammar-constrained sampling: pass `grammar => GBNF` in the
+  `complete/3` Opts or `infer/4` Params; the per-model sampler
+  chain is rebuilt as grammar then greedy for the duration of
+  the request and reset on completion or cancellation.
+
+#### LoRA adapters
+
+- `erllama:load_adapter/2`, `unload_adapter/2`,
+  `set_adapter_scale/3`, `list_adapters/1`. Per-adapter sha256 +
+  scale fold into the cache via
+  `erllama_cache_key:effective_fingerprint/2`, so rows produced
+  with adapter A never collide with rows from adapter B.
+  Snapshot-at-admission semantics keep in-flight requests on
+  their original fingerprint even if an adapter mutation arrives
+  mid-generation.
+
+#### Concurrency model
+
+- Concurrent request queue: a second `complete/3` or `infer/4`
+  arriving while one is in flight is queued FIFO instead of
+  getting `{error, busy}`. The reply `{ok, Ref}` is sent as soon
+  as the call is admitted; streaming events follow once the
+  queue head advances to the request.
+- Decode loop schedules each step via
+  `gen_statem:cast(self(), decode_step)` instead of `next_event`
+  so cancel, evict, status, and queued requests interleave
+  fairly between tokens.
+- Seq-aware NIFs (infrastructure for 0.2 multi-seq batching):
+  `nif_kv_pack/4` accepts an explicit `seq_id`; new
+  `erllama_sampler_t` resource owning a standalone
+  `llama_sampler*`; `nif_sampler_new/2`, `nif_sampler_free/1`.
+  Cache rows stay seq-id-free: `seq_id` is a save/load call
+  argument, never row metadata.
+
+#### Internals
+
+- `erllama_registry` module: ETS-backed `via` callback for binary
+  model ids.
+- `erllama_inflight` module: `Ref -> ModelPid` table so
+  `cancel/1` routes to the right gen_statem.
+- `erllama_model_backend` optional callbacks:
+  `apply_chat_template/2`, `embed/2`, `set_grammar/2`,
+  `configure_sampler/2`, `clear_sampler/1`, `load_adapter/2`,
+  `unload_adapter/2`, `apply_adapters/2`. Backends that omit them
+  surface `{error, not_supported}` from the public API.
+
+#### Cache subsystem
+
+- Token-exact KV cache with three independently-supervised tiers:
+  RAM (ETS slabs), `ram_file` (`/dev/shm`), and disk (plain read
+  I/O).
+- Sole-writer arbitration through `erllama_cache_meta_srv`; reads
+  on the hot path go to ETS directly. `lookup_exact/1` is a
+  single atomic `ets:lookup` (no two-call race) and the meta
+  server cancels waiter timers when an early reply lands so the
+  mailbox doesn't bloat under load.
+- The disk tier reads files via plain `file:read_file/1` into a
+  fresh BEAM heap binary; mmap is deliberately not used. The
+  process already mmaps multi-GB GGUF weights, and a region
+  binary that outlived its closing NIF call would have exposed
+  the BEAM to SIGBUS from any external truncation.
+- Crash-safe save publish protocol: reserve, write_tmp, check,
+  `link(2)`, mark_published; two-stage TTL cleanup with orphan
+  adoption.
+- Five save reasons (`cold`, `continued`, `finish`, `evict`,
+  `shutdown`) with async/sync semantics matching their use.
+- `saves_dropped` counter: bumps whenever a back-pressured writer
+  pool refuses a save the model wanted to fire.
+- Multi-turn warmth via explicit `parent_key` resume and
+  stateless longest-prefix walk for OpenAI/Anthropic-shaped
+  clients.
+- `erllama_scheduler` memory-pressure poller with pluggable
+  sources (`memsup`, `nvidia-smi`, custom callback). Off by
+  default. Sweep timer is cancelled on `terminate/2` so a
+  supervisor restart never leaves a zombie firing into a fresh
+  server.
+- `erllama_cache_writer` dirty-IO writer pool with a leak-proof
+  reservation semaphore. `pin_and_load/2` wraps load + unpack in
+  `try/after` so the holder is always checked in.
+- Persisted hit counters (u32 in disk header) so popular prefixes
+  survive an LRU walk after restart.
+- End-to-end metrics: hits/misses/saves/evictions plus per-path
+  latency totals (`pack_total_ns`, `load_total_ns`,
+  `longest_prefix_ns`, `longest_prefix_probes`).
+
+#### NIF safety
+
+- Per-resource `pthread_mutex` and two-resource lifetime pattern
+  for safe concurrent `free_*/1` plus dirty NIF ops.
+- `extern "C" noexcept` shim catching every llama.cpp C++
+  exception at the boundary; `decode_one` defensive guard
+  against `GGML_ASSERT` aborts.
+- `llama_backend_init` is deferred to the first `nif_load_model`
+  via `pthread_once`, so cache-only and unit-test workloads do
+  not pay the `ggml_backend_load_all` cost at NIF load.
+- `nif_tokenize` and `nif_detokenize` honour `release_pending`,
+  so a model returned by `free_model/1` as `{ok, deferred}`
+  cannot be reused via tokenize.
+- `nif_detokenize` fails closed on `n_vocab <= 0` (matches
+  `nif_prefill`).
+- `make_errno_atom` maps FreeBSD's `EINTEGRITY` to `eintegrity`.
+
+#### Tooling
+
+- `FindErlang.cmake` (adopted from erlang-rocksdb) detects
+  `ERTS_INCLUDE_DIR` via the standard CMake find-module
+  contract.
+- Bench harness (`bench/run.sh`) with cold-vs-warm matrix and a
+  4-agent shared-prefix scenario. TinyLlama and LLaMA-3 8B
+  presets.
+
+### CI
+
+- `actions/checkout` and `actions/cache` bumped to `@v5`
+  (Node.js 24).
+- `xref`, `dialyzer`, `erlfmt`, `elvis` promoted to gate jobs;
+  `build`, `eunit`, `proper`, `ct`, `freebsd` depend on them.
+- macOS matrix is `macos-14, macos-15`.
+- FreeBSD matrix added: `release: ['14.2', '14.4']`. Inside the
+  VM: refresh `pcre2` so git can run, install `git`, set
+  `git config --global --add safe.directory '*'` so llama.cpp's
+  build-info `git rev-parse` succeeds.
+- `erllama_nif_tests:load_model_rejects_non_existent_path_test` is
+  now a generator with a 60 s timeout to absorb the lazy Metal
+  init on macOS.
+
+### Tests
+
+- 211 EUnit + PropEr property tests + 7 stub Common Test cases.
+  Real-model Common Test suite gated on `LLAMA_TEST_MODEL`
+  (14 cases including seed determinism, grammar+sampler,
+  apply_chat_template, embeddings, KV pack/unpack round-trip).
+- New stub-backed coverage: sampler params (`erllama_sampler_tests`),
+  LoRA adapters + cache identity (`erllama_lora_tests`), FIFO
+  queueing of concurrent infers (`erllama_streaming_tests`).
+- Multi-platform CI: Ubuntu 24.04 amd64, Ubuntu 24.04 arm64,
+  macOS 14 + 15 (Apple Silicon), FreeBSD 14.2 + 14.4. OTP 28
+  across the matrix.
+
+### Documentation
+
+- README rewritten as a friendly entry point with snippets.
+- User guides: loading, caching, configuration, building, examples.
+- Internal design notes: cache design, publish protocol, NIF safety.
+- ex_doc-friendly module documentation throughout.
+- ROADMAP.md: what 0.1 does not do yet (multi-seq concurrent
+  decoding, speculative decoding, vision, audio, ONNX/safetensors,
+  stop-sequences, telemetry hooks, multi-GPU pressure, KV
+  compression, cluster).
+- README closes with a teaser for the upcoming erllama_cluster
+  application: a separate OTP project that coordinates a fleet of
+  erllama nodes (request distribution, cross-node speculative
+  decoding, pipeline parallelism over QUIC).
+
+### Acknowledgements
+
+Same idea as [antirez/ds4](https://github.com/antirez/ds4).
+
+[Unreleased]: https://github.com/benoitc/erllama/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/benoitc/erllama/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/benoitc/erllama/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/benoitc/erllama/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/benoitc/erllama/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/benoitc/erllama/compare/v0.6.2...v0.7.0
+[0.6.2]: https://github.com/benoitc/erllama/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/benoitc/erllama/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/benoitc/erllama/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/benoitc/erllama/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/benoitc/erllama/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/benoitc/erllama/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/benoitc/erllama/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/benoitc/erllama/compare/v0.1.2...v0.2.0
+[0.1.2]: https://github.com/benoitc/erllama/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/benoitc/erllama/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/benoitc/erllama/releases/tag/v0.1.0

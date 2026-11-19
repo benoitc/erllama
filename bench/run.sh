@@ -23,7 +23,7 @@ EBIN_PATHS=$(find _build/default/lib -maxdepth 2 -name ebin -type d | xargs -I {
 # Bench module lives in bench/ (not part of rebar3 src tree). Compile it
 # on the fly into _build so its deps resolve via the same paths.
 mkdir -p _build/bench/ebin
-erlc -o _build/bench/ebin -I include -pa _build/default/lib/erllama/ebin \
+erlc -o _build/bench/ebin -I apps/erllama/include -pa _build/default/lib/erllama/ebin \
     bench/erllama_bench.erl
 
 # shellcheck disable=SC2086
