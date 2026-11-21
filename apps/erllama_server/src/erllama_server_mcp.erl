@@ -31,7 +31,6 @@
     refresh/0,
     status/0,
     call/4,
-    cancel_call/2,
     resources/1,
     read_resource/2,
     prompts/1,
@@ -180,53 +179,6 @@ role(_) -> <<"user">>.
 
 text_or_empty(T) when is_binary(T) -> T;
 text_or_empty(_) -> <<>>.
-
-%% Cancel the request `Caller' (a tool worker) is waiting on at
-%% `Server', if any: the server is told (`notifications/cancelled') and
-%% the call returns `{error, cancelled}'. Only that request is touched;
-%% the connection, shared with other sessions, stays up.
-%%
-%% barrel_mcp's client does not tell a caller its request id, so it is
-%% read from the client's state (the pending request whose caller is
-%% `Caller'). The shape is checked; anything unexpected means no cancel,
-%% never a crash. erllama_server_mcp_SUITE pins this.
--spec cancel_call(binary(), pid()) -> ok | not_found.
-cancel_call(Server, Caller) ->
-    case safe_call({pid, Server}, {error, unavailable}) of
-        {ok, Client} ->
-            case pending_request(Client, Caller) of
-                {ok, Id} -> barrel_mcp_client:cancel(Client, Id);
-                not_found -> not_found
-            end;
-        {error, _} ->
-            not_found
-    end.
-
-pending_request(Client, Caller) ->
-    try sys:get_state(Client, 1000) of
-        {_StateName, Data} when is_tuple(Data), element(1, Data) =:= data ->
-            find_caller(element(5, Data), Caller);
-        _ ->
-            not_found
-    catch
-        _:_ -> not_found
-    end.
-
-find_caller(Pending, Caller) when is_map(Pending) ->
-    Ids = [
-        Id
-     || Id := P <- Pending,
-        is_tuple(P),
-        element(1, P) =:= pending,
-        is_tuple(element(2, P)),
-        element(1, element(2, P)) =:= Caller
-    ],
-    case Ids of
-        [Id | _] -> {ok, Id};
-        [] -> not_found
-    end;
-find_caller(_, _) ->
-    not_found.
 
 with_client(Server, Fun) ->
     case with_pid(Server, fun(Pid) -> {done, Fun(Pid)} end) of

@@ -21,6 +21,7 @@
     https_with_checksum/1,
     https_wrong_checksum/1,
     broken_transfer_resumes/1,
+    dropped_connection_resumes/1,
     ignored_range_restarts/1,
     corrupt_blob_is_rejected/1,
     cancel_then_resume/1,
@@ -38,6 +39,7 @@ all() ->
         https_with_checksum,
         https_wrong_checksum,
         broken_transfer_resumes,
+        dropped_connection_resumes,
         ignored_range_restarts,
         corrupt_blob_is_rejected,
         cancel_then_resume,
@@ -194,6 +196,22 @@ https_wrong_checksum(Config) ->
 broken_transfer_resumes(Config) ->
     ok = erllama_server_fake_registry:set(interrupt_after, 100000),
     {#{type := done, data := #{model := M}}, _} = pull(<<"tiny:1b">>),
+    ?assertEqual(blob_sha(model), file_sha(maps:get(path, M))),
+    Ranges = [R || #{range := R} <- erllama_server_fake_registry:seen(), R =/= undefined],
+    ?assertMatch([<<"bytes=", _/binary>> | _], Ranges),
+    ?assertEqual([], [
+        F
+     || F <- filelib:wildcard("*", blobs(Config)), filename:extension(F) =:= ".part"
+    ]).
+
+%% The connection breaks in the middle of a blob: the pull asks for the
+%% rest at once, without waiting for its idle timeout.
+dropped_connection_resumes(Config) ->
+    ok = erllama_server_fake_registry:set(interrupt_after, 100000),
+    ok = erllama_server_fake_registry:set(interrupt_how, drop),
+    T0 = erlang:monotonic_time(millisecond),
+    {#{type := done, data := #{model := M}}, _} = pull(<<"tiny:1b">>),
+    ?assert(erlang:monotonic_time(millisecond) - T0 < 1500),
     ?assertEqual(blob_sha(model), file_sha(maps:get(path, M))),
     Ranges = [R || #{range := R} <- erllama_server_fake_registry:seen(), R =/= undefined],
     ?assertMatch([<<"bytes=", _/binary>> | _], Ranges),

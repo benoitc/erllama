@@ -534,12 +534,10 @@ kill_worker(#call{name = <<"shell">>, worker = {Pid, Mon}}) ->
     erlang:demonitor(Mon, [flush]),
     ok = erllama_server_tool_shell:stop_run(Pid),
     exit(Pid, kill);
-kill_worker(#call{mcp = #{server := Server}, worker = {Pid, Mon}}) ->
-    %% The request is the server's to stop: tell it, for this call only
-    %% (the connection is shared with other sessions).
-    erlang:demonitor(Mon, [flush]),
-    _ = erllama_server_mcp:cancel_call(Server, Pid),
-    exit(Pid, kill);
+%% Any other call, MCP ones included: stopping the worker is enough. An
+%% MCP request belongs to the worker that made it, and barrel_mcp's
+%% client cancels it at the server (that request only; the connection
+%% stays) when that process exits.
 kill_worker(#call{worker = {Pid, Mon}}) ->
     erlang:demonitor(Mon, [flush]),
     exit(Pid, kill).

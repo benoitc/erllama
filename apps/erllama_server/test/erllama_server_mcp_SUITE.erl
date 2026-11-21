@@ -28,7 +28,7 @@
     resources_and_prompts/1
 ]).
 %% Tools of the test servers.
--export([echo/1, fail/1, slow/1, picture/1, touch/1, named/1, review/1, notes/1]).
+-export([echo/1, fail/1, slow/1, picture/1, touch/1, effect/2, named/1, review/1, notes/1]).
 
 all() ->
     [
@@ -67,7 +67,7 @@ setup(interrupt_cancels_the_remote_call, Config) ->
             name => "local",
             transport => stdio,
             command => os:find_executable("erl"),
-            args => fake_args(),
+            args => stdio_args(),
             policy => auto
         }
     ]),
@@ -150,6 +150,9 @@ test_server() ->
         description => <<"A picture and a caption.">>
     }),
     ok = barrel_mcp:reg_tool(<<"touch">>, ?MODULE, touch, #{description => <<"Changes things.">>}),
+    ok = barrel_mcp:reg_tool(<<"effect">>, ?MODULE, effect, #{
+        description => <<"Writes a file after a second.">>
+    }),
     ok = barrel_mcp:reg_prompt(<<"review">>, ?MODULE, review, #{
         description => <<"Review a file.">>,
         arguments => [#{name => <<"file">>, description => <<"The file.">>, required => true}]
@@ -184,6 +187,19 @@ picture(_) ->
 
 touch(_) -> <<"changed">>.
 
+%% Honours cancellation (an arity-2 handler is sent `{cancel, Id}'): a
+%% cancelled call records it and stops before its side effect.
+effect(#{<<"path">> := P}, _Ctx) ->
+    ok = file:write_file(<<P/binary, ".started">>, <<"started">>),
+    receive
+        {cancel, _RequestId} ->
+            ok = file:write_file(<<P/binary, ".cancelled">>, <<"cancelled">>),
+            <<"cancelled">>
+    after 1000 ->
+        ok = file:write_file(P, <<"done">>),
+        <<"written">>
+    end.
+
 named(_) -> <<"named">>.
 
 review(#{<<"file">> := F}) ->
@@ -199,12 +215,8 @@ review(#{<<"file">> := F}) ->
 
 notes(_) -> <<"buy milk">>.
 
-%% An `erl' running the fake server (erllama_server_fake_mcp).
-fake_args() ->
-    Dir = filename:dirname(code:which(erllama_server_fake_mcp)),
-    ["-noshell", "-pa", Dir, "-eval", "erllama_server_fake_mcp:main()."].
-
-%% An `erl' that serves `echo' over stdio, with nothing else on stdout.
+%% An `erl' that serves `echo' and `effect' over stdio, with nothing
+%% else on stdout.
 stdio_args() ->
     Root = code:root_dir(),
     Paths = lists:append([
@@ -216,6 +228,8 @@ stdio_args() ->
         "{ok, _} = application:ensure_all_started(barrel_mcp),"
         "ok = barrel_mcp:reg_tool(<<\"echo\">>, erllama_server_mcp_SUITE, echo,"
         " #{description => <<\"Echo the text.\">>}),"
+        "ok = barrel_mcp:reg_tool(<<\"effect\">>, erllama_server_mcp_SUITE, effect,"
+        " #{description => <<\"Writes a file after a second.\">>}),"
         "barrel_mcp:start_stdio(), halt().",
     ["-noshell" | Paths] ++ ["-eval", Eval].
 
@@ -483,35 +497,37 @@ list_or_dead(C) ->
         true -> barrel_mcp_client:list_tools(C)
     end.
 
-%% Interrupting a session cancels its call at the server
-%% (`notifications/cancelled' for that request): a server that honours
-%% it never performs the side effect. The connection, shared with other
-%% sessions, stays up. The server is erllama_server_fake_mcp: barrel_mcp's
-%% servers do not stop a running tool on cancel yet.
+%% Interrupting a session cancels its call at the server: the session
+%% stops the tool worker, barrel_mcp's client cancels the request its
+%% caller left, and the tool is told and skips its side effect. The
+%% connection, shared with other sessions, stays up.
+%%
+%% Over stdio only for now. Over Streamable HTTP on the 2026-07-28
+%% revision the client cancels by closing the request's connection, and
+%% barrel_mcp 4.8.0 does not always close it (about half the time in a
+%% loop of 40, with Livery's side shown correct by closing a raw socket).
+%% Add `web' here once barrel_mcp fixes that.
 interrupt_cancels_the_remote_call(Config) ->
     ok = wait_ready([<<"local">>]),
-    Marker = filename:join(?config(priv_dir, Config), "effect.txt"),
+    interrupt_one(Config, <<"local">>).
+
+interrupt_one(Config, Server) ->
+    Marker = filename:join(?config(priv_dir, Config), <<Server/binary, "-effect.txt">>),
     Id = start(Config, [
-        #{calls => [{<<"x1">>, <<"local__effect">>, #{<<"path">> => list_to_binary(Marker)}}]},
+        #{calls => [{<<"x1">>, <<Server/binary, "__effect">>, #{<<"path">> => Marker}}]},
         #{text => <<"never">>}
     ]),
     ok = erllama_server_api:agent_send(Id, <<"go">>),
-    ok = wait(fun() -> started(Id, <<"x1">>) end),
-    timer:sleep(200),
+    %% Interrupt once the tool runs at the server.
+    ok = wait(fun() -> filelib:is_file(<<Marker/binary, ".started">>) end),
     ok = erllama_server_api:agent_interrupt(Id),
-    timer:sleep(1500),
+    ok = wait(fun() -> filelib:is_file(<<Marker/binary, ".cancelled">>) end),
+    timer:sleep(1200),
     ?assertNot(filelib:is_file(Marker)),
-    ?assert(filelib:is_file(Marker ++ ".cancelled")),
     ?assertEqual(
         {ok, <<"still here">>},
-        erllama_server_mcp:call(<<"local">>, <<"echo">>, #{<<"text">> => <<"still here">>}, 5000)
+        erllama_server_mcp:call(Server, <<"echo">>, #{<<"text">> => <<"still here">>}, 5000)
     ).
-
-started(Id, CallId) ->
-    {ok, #{replay := Replay}} = erllama_server_api:attach(Id, self(), 0),
-    ok = erllama_server_api:detach(Id, self()),
-    flush(Id),
-    lists:member(CallId, [C || #{type := tool_started, data := #{call_id := C}} <- Replay]).
 
 %% An alias belongs to one tool for good: a tool that goes does not
 %% hand its name, or an approval given to it, to another.

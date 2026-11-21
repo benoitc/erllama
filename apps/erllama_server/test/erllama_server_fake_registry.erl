@@ -7,7 +7,8 @@
 %% registry, `localhost' for the CDN), so pulls can be tested end to end
 %% without the network. Its behaviour is set through `set/2':
 %% `interrupt_after' (bytes sent before the first transfer of a blob is
-%% cut), `ignore_range', `corrupt' (serve other bytes than announced)
+%% cut) and `interrupt_how' (`stall', the default: the transfer goes
+%% silent; `drop': the connection breaks), `ignore_range', `corrupt' (serve other bytes than announced)
 %% and `require_token'. `seen/0' returns what each origin received.
 %% @end
 -module(erllama_server_fake_registry).
@@ -242,11 +243,16 @@ send(Emit, Body, undefined) ->
     chunks(Emit, Body);
 send(Emit, Body, Cut) ->
     ok = chunks(Emit, binary:part(Body, 0, Cut)),
-    %% Stall half way through, as a dropped transfer looks to a client.
-    %% (Crashing the handler instead makes Livery write a 500 response
-    %% into the unfinished body.)
-    timer:sleep(5000),
-    ok.
+    case opt(interrupt_how, stall) of
+        stall ->
+            %% Silent half way through: the client's idle timeout notices.
+            timer:sleep(5000),
+            ok;
+        drop ->
+            %% The handler dies mid-body: Livery resets the stream and
+            %% closes the connection, as a broken transfer looks.
+            exit(transfer_dropped)
+    end.
 
 chunks(_Emit, <<>>) ->
     ok;
