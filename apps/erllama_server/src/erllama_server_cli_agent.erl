@@ -208,6 +208,9 @@ event(_Node, _Id, #{type := token, data := Bin}) ->
     erllama_server_cli_term:out(Bin);
 event(_Node, _Id, #{type := thinking, data := Bin}) ->
     erllama_server_cli_term:dim(Bin);
+event(_Node, _Id, #{type := tool_call}) ->
+    %% Shown once it starts, with its arguments (tool_started).
+    ok;
 event(_Node, _Id, #{type := T}) when T =:= turn_started; T =:= round ->
     erllama_server_cli_term:status("thinking");
 event(_Node, _Id, #{type := tool_started, data := #{name := N, arguments := A}}) ->

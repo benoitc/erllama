@@ -8,7 +8,7 @@ your own OTP application, or run the server.
 | You want to | Go to |
 |---|---|
 | Use erllama as a dependency (Hex package `erllama`) | [apps/erllama](apps/erllama/README.md) |
-| Run the server release | [apps/erllama_server](apps/erllama_server/README.md) (in progress) |
+| Run the server release | [apps/erllama_server](apps/erllama_server/README.md) |
 | Read the usage guides | [guides/](guides/) |
 | Understand the cache, NIF and request design | [internals/](internals/) |
 | Contribute | [AGENTS.md](AGENTS.md) |

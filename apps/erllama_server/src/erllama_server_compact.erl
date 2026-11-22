@@ -20,6 +20,7 @@
 %% finish key. Nothing about it goes into the KV cache.
 
 -export([run/3, start/4, conversation/2, needed/2, plan/2, apply_summary/2, render/1]).
+-export([with_system/2]).
 
 -define(CLIP, 2048).
 -define(SUMMARY_TIMEOUT, 120000).
@@ -175,6 +176,26 @@ plan(Msgs, Keep) ->
             end;
         _ ->
             nothing
+    end.
+
+%% `System' first, then `History', with one leading system message:
+%% system messages the history holds (a compaction's summary, earlier
+%% instructions) are appended to `System', and a copy of `System' itself
+%% at their start is not repeated. Agent sessions build their
+%% transcript with it when they continue a conversation.
+-spec with_system(binary(), [map()]) -> [map()].
+with_system(System, History) ->
+    Extra = [
+        string:trim(strip_prefix(System, C))
+     || #{role := <<"system">>, content := C} <- History, is_binary(C)
+    ],
+    Content = iolist_to_binary(lists:join(<<"\n\n">>, [System | [E || E <- Extra, E =/= <<>>]])),
+    [#{role => <<"system">>, content => Content} | [M || M <- History, not is_system(M)]].
+
+strip_prefix(Prefix, C) ->
+    case string:prefix(C, Prefix) of
+        nomatch -> C;
+        Rest -> unicode:characters_to_binary(Rest)
     end.
 
 is_system(#{role := <<"system">>}) -> true;

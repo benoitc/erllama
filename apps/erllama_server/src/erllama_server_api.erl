@@ -569,7 +569,7 @@ agent_spec(Spec, Id, Model, Ws, #{id := Conv, messages := History, parent_key :=
         model => Model,
         workspace => Ws,
         conversation_id => Conv,
-        history => [M || #{role := R} = M <- History, R =/= <<"system">>],
+        history => History,
         parent_key => PK,
         policy => agent_policy(maps:get(policy, Spec, #{})),
         mode => agent_mode(maps:get(policy, Spec, #{})),

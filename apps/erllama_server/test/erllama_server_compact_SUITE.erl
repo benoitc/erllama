@@ -20,6 +20,7 @@
     conversation_compacts_on_request/1,
     session_compacts_at_turn_start/1,
     session_compacts_on_request/1,
+    resumed_session_keeps_the_summary/1,
     interrupt_stops_compaction/1,
     real_model_summary/1
 ]).
@@ -30,6 +31,7 @@ all() ->
         conversation_compacts_on_request,
         session_compacts_at_turn_start,
         session_compacts_on_request,
+        resumed_session_keeps_the_summary,
         interrupt_stops_compaction,
         real_model_summary
     ].
@@ -42,6 +44,7 @@ init_per_testcase(TC, Config) ->
         case TC of
             conversation_compacts_on_request -> false;
             session_compacts_on_request -> false;
+            resumed_session_keeps_the_summary -> false;
             interrupt_stops_compaction -> false;
             real_model_summary -> false;
             _ -> 0.001
@@ -202,6 +205,29 @@ session_compacts_on_request(Config) ->
     check_compacted(messages(Conv), <<"first task">>),
     %% The session goes on.
     ok = agent_turn(Id, <<"fourth">>).
+
+%% A session resuming a compacted conversation sees its summary, in one
+%% leading system message with the session's own prompt once.
+resumed_session_keeps_the_summary(Config) ->
+    {Id, Conv} = session(Config, [#{text => <<"one">>}, #{text => <<"two">>}]),
+    ok = agent_turn(Id, <<"first task">>),
+    ok = agent_turn(Id, <<"second">>),
+    ok = agent_turn(Id, <<"third">>),
+    {ok, _} = erllama_server_api:agent_compact(Id),
+    ok = erllama_server_api:agent_stop(Id),
+    {ok, #{agent_id := Id2}} = erllama_server_api:agent_start(#{
+        model => <<"stub">>,
+        conversation_id => Conv,
+        generator => erllama_server_agent_script
+    }),
+    ok = erllama_server_agent_script:set(Id2, [#{text => <<"resumed">>}]),
+    ok = agent_turn(Id2, <<"go on">>),
+    [[#{role := <<"system">>, content := Head} | Rest]] = erllama_server_agent_script:rounds(Id2),
+    ?assertEqual([], [M || #{role := <<"system">>} = M <- Rest]),
+    Count = fun(P) -> length(binary:matches(Head, P)) end,
+    ?assertEqual(1, Count(<<"You are an agent working in the directory">>)),
+    ?assertEqual(1, Count(<<"Summary of what happened since:">>)),
+    ?assertNotEqual(nomatch, binary:match(Head, <<"The first request was:\nfirst task">>)).
 
 %% A slow model (each token takes a while) so the compaction can be
 %% caught in progress.

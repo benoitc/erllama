@@ -145,7 +145,7 @@ init(#{run_id := Id, model := Model, workspace := Ws, conversation_id := Conv} =
         ),
         generator = maps:get(generator, Spec, erllama_server_agent_gen),
         events = erllama_server_events:new(Id),
-        transcript = [#{role => <<"system">>, content => System} | maps:get(history, Spec, [])],
+        transcript = erllama_server_compact:with_system(System, maps:get(history, Spec, [])),
         finish_key = maps:get(parent_key, Spec, undefined),
         retention = erllama_server_config:get(run_retention_ms)
     },

@@ -180,6 +180,34 @@ Validation: `erllama_server_conv_tests` (every message shape round trips, unknow
 
 Validation: `erllama_server_compact_tests` (system messages, first request, cuts at user messages, tool pairs, long turns, nothing to drop, rendering) and `erllama_server_compact_SUITE` (a run compacts automatically and goes on, the result survives a restart, on request with nothing to drop and with a middle, refused while a session holds the conversation, a session compacts at the start of a turn and on request, an interrupt stops a compaction in progress and leaves the conversation as it was). Gated real-model case on Qwen2.5 1.5B: six messages compacted to three, and the next turn still knows what was only in the summarised middle.
 
-## Phase 7
+## Phase 7: terminal and release validation (implemented)
 
-Not started.
+| Feature | State | Notes |
+|---|---|---|
+| Ctrl-C | done | in a terminal the CLI runs with `+Bc` and reads Ctrl-C as a key: `run` and a `chat` turn are cancelled, an `agent` turn interrupted, a `pull` cancelled (part file kept), `attach` detaches; a second Ctrl-C leaves; at a prompt it drops the line; with no terminal (`+Bd`) it ends the CLI at once |
+| input | done | cooked mode with line editing at the prompt, raw mode only while a turn streams; a line ending in `\` continues, `"""` opens a block, `/` starts a command |
+| commands | done | `chat`: `/new`, `/sessions`, `/switch`, `/fork`, `/compact`, `/help`, `/quit`; `agent`: the same on sessions, plus `/prompt` and `/stop` |
+| rendering | done | content as it streams, reasoning dimmed, tool calls and results, approvals at a prompt, and a status line (loading, compacting, prefill, running tool) after a quiet second |
+| closing the terminal | done | ends only the CLI: runs, sessions and loaded models stay on the release |
+| resumed sessions | done | a session continuing a compacted conversation keeps its summary, in one leading system message with its own prompt once |
+
+Terminal tests: `erllama_server_cli_input_tests` (continuation, blocks, commands, dropped lines, newline translation) and four cases in `erllama_server_rpc_SUITE` with the CLI under `script(1)`: Ctrl-C during a chat turn cancels the run and the prompt works after it; a continued line is one message; Ctrl-C at the prompt drops the line; `/switch` to another session whose approval is answered in the terminal. They run on macOS and on Linux.
+
+### Release validation (2026-11-23, OTP 28.3.1)
+
+- **Gate:** `rebar3 fmt --check`, compile, eunit, proper, ct, lint, dialyzer and xref, all clean; `scripts/check_library_package.sh` (the library builds standalone from its package, with no server dependency); the server suites on Linux (Docker, `erlang:28`).
+- **Prod release, end to end** (`rebar3 as prod release`, a fresh data directory):
+  - a real pull from Hugging Face (`hf://bartowski/SmolLM2-135M-Instruct-GGUF:Q4_K_M`, 100.6 MiB) and a run on it;
+  - a local Qwen2.5 1.5B registered and run;
+  - `chat` in a terminal: a turn, Ctrl-C on a long one (the run ends cancelled), `/sessions`, `/quit`;
+  - `agent` in a terminal: the model reads a file with its tool and answers;
+  - the official Python SDKs (`openai` chat, streaming and embeddings, `anthropic` messages);
+  - a release restart: the conversations are back, an interrupted session's conversation is freed, and a turn on one answers from its history;
+  - compaction on request: 6 messages to 3, with a summary that keeps the goal and the result;
+  - `status` and `ps`.
+- **Real models, server** (`rebar3 ct --dir apps/erllama_server/test`, `LLAMA_TEST_MODEL` Qwen2.5 1.5B, `LLAMA_TEST_VISION_MODEL` and `LLAMA_TEST_MMPROJ` SmolVLM 256M): 121 of 121 passed, none skipped. This covers chat, tool calls (streamed, with no call syntax in content), logprobs, the Responses chain, an Anthropic `tool_use` round trip, an image chat, an agent reading a file, a warm turn after a restart, and a compaction summary.
+- **Real models, library:**
+  - `erllama_real_model_SUITE` on TinyLlama 1.1B: 44 of 44;
+  - `erllama_vision_SUITE` on SmolVLM 256M: 6 of 7, the audio case skipped (no audio model locally);
+  - `erllama_family_SUITE` on Mamba 130M (recurrent) and Gemma 3 270M (sliding window): 5 of 5.
+- **Not run:** the audio case (no audio GGUF and projector at hand); MCP against servers other than barrel_mcp's own (covered by `erllama_server_mcp_SUITE` against barrel_mcp over stdio and Streamable HTTP).
