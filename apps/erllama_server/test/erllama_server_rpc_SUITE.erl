@@ -618,7 +618,15 @@ tty_ctrl_c_at_the_prompt_drops_the_line(Config) ->
         Before = length(runs_of(Config)),
         P = tty_cli(Config, ["chat", "fast"]),
         ok = tty_wait(P, <<"> ">>),
-        ok = tty_type(P, [$n, $o, $p, $e, 3, $\r]),
+        %% Typed as a person types: the keys, Ctrl-C, Enter, then the
+        %% next prompt before anything else.
+        ok = tty_type(P, "nope"),
+        timer:sleep(200),
+        ok = tty_type(P, [3]),
+        timer:sleep(200),
+        ok = tty_type(P, "\r"),
+        ok = tty_wait_re(P, "nope.*\r\n> "),
+        ?assertEqual(Before, length(runs_of(Config))),
         ok = tty_type(P, "/quit\r"),
         _ = tty_exit(P),
         ?assertEqual(Before, length(runs_of(Config)))
