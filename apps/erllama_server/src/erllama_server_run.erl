@@ -12,6 +12,10 @@
 %% This process is the stream's receiver: erllama cancels the stream
 %% when it exits, however it exits (shutdown, crash or kill), so a
 %% dead run never leaves its model generating.
+%%
+%% A conversation turn whose transcript nears the model's context is
+%% compacted first (erllama_server_compact), in a helper, once the
+%% model is held: `compacting', then `compacted' events.
 
 -behaviour(gen_server).
 
@@ -45,7 +49,9 @@
     %% terminal event; a cancel that arrives while it loads is applied
     %% once it is loaded.
     acquired = false :: boolean(),
-    cancel_requested = false :: boolean()
+    cancel_requested = false :: boolean(),
+    %% The helper compacting the conversation before the turn.
+    compactor :: pid() | undefined
 }).
 -type state() :: #state{}.
 
@@ -98,6 +104,12 @@ handle_call({attach, Sub, Cursor}, _From, #state{events = Ev, status = Status} =
     end;
 handle_call({detach, Sub}, _From, #state{events = Ev} = St) ->
     {reply, ok, St#state{events = erllama_server_events:detach(Sub, Ev)}};
+handle_call(cancel, _From, #state{status = running, compactor = C} = St) when is_pid(C) ->
+    unlink(C),
+    exit(C, kill),
+    Result = erllama_server_generate:finish(undefined, <<>>, <<>>, #{finish_reason => cancelled}),
+    release_conv(St),
+    {reply, ok, terminal(cancelled, Result, St#state{compactor = undefined})};
 handle_call(cancel, _From, #state{status = running, ref = undefined} = St) ->
     {reply, ok, St#state{cancel_requested = true}};
 handle_call(cancel, _From, #state{status = running, ref = Ref} = St) ->
@@ -121,11 +133,16 @@ handle_info({acquired, {ok, _Id}}, #state{status = running, cancel_requested = t
     Result = erllama_server_generate:finish(undefined, <<>>, <<>>, #{finish_reason => cancelled}),
     release_conv(St),
     {noreply, terminal(cancelled, Result, St#state{acquired = true})};
+handle_info({acquired, {ok, _Id}}, #state{status = running, conv = Conv} = St) when
+    is_binary(Conv)
+->
+    {noreply, maybe_compact(St#state{acquired = true})};
 handle_info({acquired, {ok, _Id}}, #state{status = running} = St) ->
-    case start_stream(St#state{acquired = true}) of
-        {ok, St1} -> {noreply, St1};
-        {error, Reason} -> {noreply, fail(Reason, St#state{acquired = true})}
-    end;
+    {noreply, stream_or_fail(St#state{acquired = true})};
+handle_info({compacting, C}, #state{compactor = C, status = running} = St) ->
+    {noreply, emit(compacting, #{}, St)};
+handle_info({compaction, C, Outcome}, #state{compactor = C, status = running} = St) ->
+    {noreply, stream_or_fail(compacted(Outcome, St#state{compactor = undefined}))};
 handle_info({acquired, {error, Reason}}, #state{status = running} = St) ->
     {noreply, fail(Reason, St)};
 handle_info({acquired, {ok, Id}}, St) ->
@@ -150,6 +167,39 @@ handle_info(_Msg, St) ->
     {noreply, St}.
 
 %% -----------------------------------------------------------------------------
+
+stream_or_fail(St) ->
+    case start_stream(St) of
+        {ok, St1} -> St1;
+        {error, Reason} -> fail(Reason, St)
+    end.
+
+%% Measure, and compact if needed, in a helper: the run keeps answering
+%% meanwhile.
+maybe_compact(#state{model = Model, input = {messages, All}} = St) ->
+    Self = self(),
+    Pid = spawn_link(fun() ->
+        Outcome = erllama_server_compact:run(Model, All, #{
+            on_start => fun() -> Self ! {compacting, self()} end
+        }),
+        Self ! {compaction, self(), Outcome}
+    end),
+    St#state{compactor = Pid};
+maybe_compact(St) ->
+    stream_or_fail(St).
+
+%% The compacted history replaces the conversation's (without this
+%% turn's new messages, which end_run adds as usual); the turn starts
+%% from no cache key.
+compacted({compacted, NewAll, Info}, #state{conv = Conv, id = Id, new_msgs = New} = St) ->
+    History = lists:sublist(NewAll, length(NewAll) - length(New)),
+    ok = erllama_server_convs:compact(Conv, Id, History, Info),
+    emit(compacted, Info, St#state{input = {messages, NewAll}, parent_key = undefined});
+compacted({error, Reason}, St) ->
+    logger:warning(#{msg => "compaction failed; the turn goes on", reason => Reason}),
+    St;
+compacted(none, St) ->
+    St.
 
 start_stream(#state{model = Model, input = Input, opts = Opts, parent_key = PK} = St) ->
     case erllama:whereis(Model) of

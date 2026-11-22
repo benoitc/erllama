@@ -62,12 +62,25 @@ bad_config_fails_the_start_test() ->
 conversations_test_() ->
     {setup,
         fun() ->
+            %% Conversations are persisted: keep them in a scratch directory,
+            %% never in the user's data directory.
+            Dir = filename:join([
+                os:getenv("TMPDIR", "/tmp"),
+                "erllama_api_tests",
+                os:getpid() ++ "-" ++ integer_to_list(erlang:unique_integer([positive]))
+            ]),
+            ok = application:set_env(erllama_server, data_dir, Dir),
             {ok, Pid} = gen_server:start(
                 {local, erllama_server_convs}, erllama_server_convs, [], []
             ),
-            Pid
+            {Pid, Dir}
         end,
-        fun(Pid) -> gen_server:stop(Pid) end, [
+        fun({Pid, Dir}) ->
+            gen_server:stop(Pid),
+            application:unset_env(erllama_server, data_dir),
+            file:del_dir_r(Dir)
+        end,
+        [
             fun one_run_at_a_time/0,
             fun turn_records_messages_and_parent_key/0,
             fun parent_key_is_per_model/0,

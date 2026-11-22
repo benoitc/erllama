@@ -419,11 +419,49 @@ cache.
 - Gated real model: a turn after a restart of erllama_server is warm
   (the persisted key restores the KV).
 
-## 6b. Compaction (outline, detailed before it starts)
+## 6b. Compaction (design)
 
-Automatic before a turn when the transcript nears the model's
-context, and on request. Keeps the system messages, the first user
-message, a model-written summary of the middle, and the recent
-messages verbatim with tool calls and results kept in pairs. Written
-as a `snapshot`; the finish key is dropped, so the compacted
-transcript is a new exact prompt.
+- **When.** Before a conversation turn, or at the start of an agent
+  session's turn, the transcript is measured (`count_tokens/3` with
+  the model's template). Above `compact_threshold` (default 0.75) of
+  the model's `context_size` it is compacted first. Also on request:
+  `conversation_compact/1` for an idle conversation,
+  `agent_compact/1` for an idle session, and
+  `erllama conversation compact ID`.
+- **What is kept.**
+  - Every system message verbatim. The first one stays at the head.
+    Any others, and a summary section, are appended to it, so strict
+    templates that accept a single leading system message still render.
+  - The summary section holds the first user request verbatim and a
+    summary of the middle, written by the conversation's own model.
+    It is asked to keep the goal and constraints, decisions, the state
+    of the work (files changed, commands run and their outcome) and
+    what remains: the durable task state.
+  - The recent messages verbatim, from a user message on. At least
+    `compact_keep_messages` (default 6) are kept, and the cut is always
+    at a user message, so tool calls and their results stay in pairs.
+  - Nothing to drop (the only user message is the first, or the cut
+    would keep everything): no compaction.
+- **How.** `erllama_server_compact` does the plan (pure), the
+  summary (a non-streamed generation of at most
+  `compact_summary_tokens`, default 512, over the middle rendered as
+  text, each message clipped to 2 KiB) and the measure. The
+  conversation records a `snapshot` of the compacted transcript with
+  no finish key, and a `compacted` record. The next turn is a new
+  exact prompt: no parent key, nothing semantic in the cache.
+- **Where.** A run compacts in a helper once the model is held, so it
+  keeps answering attach and cancel. An agent session goes through a
+  `compacting` state at the start of a turn, whose helper holds the
+  model. Input that arrives meanwhile is queued, and interrupt, stop
+  and the time budget apply. A failed summary leaves the transcript
+  as it was; the turn goes on.
+- **Events.** `compacting`, then `compacted` with the message counts
+  before and after.
+- **Tests.**
+  - eunit for the plan: system messages, the first request, cuts at
+    user messages, tool pairs, nothing to drop.
+  - CT on the stub with a small context: a run compacts automatically
+    and goes on; the snapshot survives a restart; the finish key is
+    dropped. A session compacts at the start of a turn and on request,
+    and an interrupt during compaction ends it.
+  - Gated: a real model writes a summary and the next turn answers.

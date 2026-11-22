@@ -24,7 +24,7 @@
 -behaviour(gen_server).
 
 -export([start_link/0, begin_run/3, begin_run/4, end_run/4, append/4, release/2, get/1, list/0]).
--export([fork/1, fork/2, delete/1, tool_intent/5, tool_outcome/5]).
+-export([fork/1, fork/2, delete/1, tool_intent/5, tool_outcome/5, compact/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(TAB, ?MODULE).
@@ -83,6 +83,13 @@ tool_intent(ConvId, Owner, CallId, Name, Args) ->
 -spec tool_outcome(binary(), binary(), binary(), ok | error, binary()) -> ok.
 tool_outcome(ConvId, Owner, CallId, Status, Text) ->
     gen_server:call(?MODULE, {tool, ConvId, Owner, {outcome, CallId, Status, Text}}).
+
+%% Replace the transcript with its compacted form (erllama_server_compact).
+%% The finish key goes: the compacted transcript is a new prompt. A
+%% no-op unless `Owner' holds the conversation.
+-spec compact(binary(), binary(), [map()], map()) -> ok.
+compact(ConvId, Owner, Msgs, Info) ->
+    gen_server:call(?MODULE, {compact, ConvId, Owner, Msgs, Info}).
 
 %% A new conversation with a copy of `ConvId''s history and cache key:
 %% what is later added to either one never shows in the other.
@@ -145,21 +152,11 @@ handle_call({append, ConvId, Owner, New, FinishKey}, _From, S) ->
     ok = do_append(ConvId, Owner, New, FinishKey),
     {reply, ok, S};
 handle_call({release, ConvId, RunId}, _From, S) ->
-    ok = owned(ConvId, RunId, fun(#{tools := Tools} = C) ->
-        {Repaired, Records} = erllama_server_conv_log:recover(
-            C#{open_run => RunId, tools := Tools}
-        ),
-        ok = log(ConvId, Records),
-        Repaired#{active_run := undefined, tools => #{}}
-    end),
-    {reply, ok, S};
+    {reply, do_release(ConvId, RunId), S};
 handle_call({tool, ConvId, Owner, What}, _From, S) ->
-    ok = owned(ConvId, Owner, fun(#{tools := Tools} = C) ->
-        Rec = tool_record(Owner, What),
-        ok = log(ConvId, [Rec]),
-        C#{tools := track(What, Rec, Tools)}
-    end),
-    {reply, ok, S};
+    {reply, do_tool(ConvId, Owner, What), S};
+handle_call({compact, ConvId, Owner, Msgs, Info}, _From, S) ->
+    {reply, do_compact(ConvId, Owner, Msgs, Info), S};
 handle_call({fork, ConvId, Kind}, _From, S) ->
     {reply, do_fork(ConvId, Kind), S};
 handle_call({delete, ConvId}, _From, S) ->
@@ -172,6 +169,36 @@ handle_cast(_Msg, S) ->
 
 handle_info(_Msg, S) ->
     {noreply, S}.
+
+do_release(ConvId, RunId) ->
+    owned(ConvId, RunId, fun(#{tools := Tools} = C) ->
+        {Repaired, Records} = erllama_server_conv_log:recover(
+            C#{open_run => RunId, tools := Tools}
+        ),
+        ok = log(ConvId, Records),
+        Repaired#{active_run := undefined, tools => #{}}
+    end).
+
+do_tool(ConvId, Owner, What) ->
+    owned(ConvId, Owner, fun(#{tools := Tools} = C) ->
+        Rec = tool_record(Owner, What),
+        ok = log(ConvId, [Rec]),
+        C#{tools := track(What, Rec, Tools)}
+    end).
+
+do_compact(ConvId, Owner, Msgs, Info) ->
+    owned(ConvId, Owner, fun(C) ->
+        ok = log(ConvId, [
+            erllama_server_conv_log:snapshot(Msgs, undefined),
+            erllama_server_conv_log:compacted(Owner, Info)
+        ]),
+        C#{
+            messages := Msgs,
+            last_finish_key := undefined,
+            compactions => maps:get(compactions, C, 0) + 1,
+            updated_at := now_ms()
+        }
+    end).
 
 %% Kept as they read back from the log, so a live repair and a repair
 %% at load see the same thing.

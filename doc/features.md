@@ -168,6 +168,18 @@ Validation: `erllama_server_mcp_SUITE` (6 cases against real servers: Streamable
 
 Validation: `erllama_server_conv_tests` (every message shape round trips, unknown keys stay binaries, torn tail, recovery of each tool state, repair durable) and `erllama_server_convs_SUITE` (restart keeps conversations and their continuation, fork, delete and export across a restart, stored responses and their branches across a restart, a killed session and a crashed store each leave the running call unresolved with its command stopped and a resumed session not running it again). Gated real-model case on Qwen2.5 1.5B: the turn after a restart is warm (`partial`).
 
-## Phase 6b and 7
+## Phase 6b: compaction (implemented)
+
+| Feature | State | Notes |
+|---|---|---|
+| automatic | done | before a conversation turn and at the start of a session's turn, the transcript is measured with the model's template; above `compact_threshold` of its context it is compacted first (`compacting`, `compacted` events) |
+| on request | done | `conversation_compact/1` (idle conversation), `agent_compact/1` (idle session), `erllama conversation compact ID` |
+| what is kept | done | system messages verbatim (one leading system message, so strict templates render); the first request verbatim; a summary of the middle by the conversation's model (goal, decisions, state of the work, what remains); recent messages verbatim from a user message, so tool calls keep their results |
+| exact prompts | done | written as a snapshot with no finish key: the next turn is a new exact prompt; nothing about it in the cache |
+| failure and interruption | done | a failed summary leaves the transcript unchanged; an interrupt, a stop or the time budget ends a compaction in progress |
+
+Validation: `erllama_server_compact_tests` (system messages, first request, cuts at user messages, tool pairs, long turns, nothing to drop, rendering) and `erllama_server_compact_SUITE` (a run compacts automatically and goes on, the result survives a restart, on request with nothing to drop and with a middle, refused while a session holds the conversation, a session compacts at the start of a turn and on request, an interrupt stops a compaction in progress and leaves the conversation as it was). Gated real-model case on Qwen2.5 1.5B: six messages compacted to three, and the next turn still knows what was only in the summarised middle.
+
+## Phase 7
 
 Not started.

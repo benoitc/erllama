@@ -10,6 +10,7 @@
 %% model chose.
 
 -export([definitions/0, names/0, class/1, default_policy/1, execute/3]).
+-export([decode_args/1, stop_worker/2]).
 
 -type class() :: read | write.
 -type policy() :: auto | ask | deny.
@@ -197,3 +198,30 @@ job(#{<<"job">> := Id}, #{jobs := Jobs}, Fun) ->
     end;
 job(_Args, _Ctx, _Fun) ->
     {error, <<"missing argument: job">>}.
+
+%% A call's arguments as a map, whatever the model sent.
+-spec decode_args(map() | binary()) -> map().
+decode_args(A) when is_map(A) -> A;
+decode_args(A) when is_binary(A) ->
+    try json:decode(A) of
+        M when is_map(M) -> M;
+        _ -> #{}
+    catch
+        error:_ -> #{}
+    end.
+
+%% Stop the worker running a call (`{Pid, Monitor}'). A running command
+%% is stopped through its job first: killing the worker alone leaves the
+%% group's cleanup to happen later, or never if the release is stopping.
+%% For any other call, MCP ones included, stopping the worker is enough:
+%% an MCP request belongs to the worker that made it, and barrel_mcp's
+%% client cancels it at the server (that request only) when that process
+%% exits.
+-spec stop_worker(binary(), {pid(), reference()}) -> true.
+stop_worker(<<"shell">>, {Pid, Mon}) ->
+    erlang:demonitor(Mon, [flush]),
+    ok = erllama_server_tool_shell:stop_run(Pid),
+    exit(Pid, kill);
+stop_worker(_Name, {Pid, Mon}) ->
+    erlang:demonitor(Mon, [flush]),
+    exit(Pid, kill).

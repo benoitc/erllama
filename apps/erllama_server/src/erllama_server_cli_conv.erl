@@ -35,10 +35,17 @@ conversation(Node, _Info, _Opts, ["rm", Id]) ->
     erllama_server_cli:reply(
         erllama_server_client:call(Node, conversation_delete, [bin(Id)]), fun(_) -> "" end
     );
+conversation(Node, _Info, _Opts, ["compact", Id]) ->
+    erllama_server_cli:reply(
+        erllama_server_client:call(Node, conversation_compact, [bin(Id)]), fun compacted/1
+    );
 conversation(Node, _Info, _Opts, ["attach", Id]) ->
     attach(Node, Id);
 conversation(_, _, _, _) ->
     erllama_server_cli:usage("conversation").
+
+compacted(#{before := B, 'after' := A}) -> io_lib:format("~b messages, now ~b~n", [B, A]);
+compacted(_) -> "nothing to compact\n".
 
 format(Opts) ->
     case maps:get(format, Opts, "json") of

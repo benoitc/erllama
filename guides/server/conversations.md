@@ -41,11 +41,47 @@ $R/bin/erllama agent qwen --conversation conv_19be...
 |---|---|
 | `erllama conversation fork ID` | a new conversation with the same history; the two then go their own ways |
 | `erllama conversation export ID` | the conversation as JSON (`--format md` for Markdown) |
+| `erllama conversation compact ID` | shortens it now (see below) |
 | `erllama conversation rm ID` | deletes it; refused while a run or a session is working in it |
 
 Through the service API: `conversations/0`, `conversation/1`,
 `conversation_fork/1`, `conversation_export/2`,
-`conversation_delete/1`.
+`conversation_compact/1`, `conversation_delete/1`.
+
+## When a conversation gets long
+
+Before a turn, the release measures the conversation with the model's
+own template. Above `compact_threshold` (default 0.75) of the model's
+context, it compacts the conversation first and then runs the turn.
+Compacting keeps:
+
+- every system message, word for word;
+- your first request, word for word;
+- a summary of the middle, written by the conversation's own model:
+  the goal and constraints, the decisions, the state of the work (files
+  read or changed, commands and their outcome) and what remains;
+- the last messages word for word (at least `compact_keep_messages`,
+  default 6), cut at one of your messages, so a tool call always keeps
+  its result.
+
+```bash
+$R/bin/erllama conversation compact conv_7f3a...
+12 messages, now 5
+```
+
+- `conversation compact` compacts an idle conversation now.
+- `agent_compact(Agent)` compacts an idle session's conversation,
+  through the service API.
+- The compacted conversation is what is kept on disk. The next turn
+  starts from it as a fresh prompt.
+- If the summary fails, the conversation stays as it was and the turn
+  goes on.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `compact_threshold` | `0.75` | fraction of the context that triggers compaction; `false` turns it off |
+| `compact_keep_messages` | `6` | recent messages kept word for word |
+| `compact_summary_tokens` | `512` | the longest summary |
 
 ## Where they are kept
 

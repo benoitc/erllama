@@ -38,7 +38,13 @@ defaults() ->
         %% endpoint exposing the release to MCP clients.
         mcp_servers => [],
         mcp_timeout_ms => 60000,
-        mcp_endpoint => false
+        mcp_endpoint => false,
+        %% Compaction: above this fraction of the model's context a
+        %% transcript is compacted before the next turn (`false' never);
+        %% the recent messages kept verbatim; the summary's length.
+        compact_threshold => 0.75,
+        compact_keep_messages => 6,
+        compact_summary_tokens => 512
     }.
 
 -spec validate() -> ok | {error, term()}.
@@ -91,8 +97,14 @@ valid(mcp_servers, V) ->
     is_list(V) andalso lists:all(fun valid_mcp/1, V) andalso unique_names(V);
 valid(mcp_endpoint, V) ->
     is_boolean(V);
+valid(compact_threshold, V) ->
+    valid_fraction(V);
 valid(_, V) ->
     is_integer(V) andalso V > 0.
+
+%% A fraction of the context, or `false' for never.
+valid_fraction(false) -> true;
+valid_fraction(V) -> is_number(V) andalso V > 0 andalso V =< 1.
 
 valid_http(undefined) ->
     true;

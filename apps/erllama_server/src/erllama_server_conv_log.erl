@@ -15,6 +15,7 @@
 %%   run        begin (run, kind, model, workspace), end, release
 %%   tool       intent before a call runs, outcome once it finished
 %%   recovered  what a restart repaired
+%%   compacted  a compaction (the snapshot before it is the result)
 %%
 %% Every write is synced before it returns. A torn last line (a crash
 %% in the middle of a write) is skipped when the log is read.
@@ -25,7 +26,7 @@
 
 -export([dir/0, append/2, read/1, ids/0, delete/1]).
 -export([replay/1, recover/1]).
--export([create/5, msgs/2, snapshot/2, run/2, tool_intent/4, tool_outcome/4]).
+-export([create/5, msgs/2, snapshot/2, run/2, tool_intent/4, tool_outcome/4, compacted/2]).
 
 -define(UNRESOLVED, <<
     "the release stopped while this call was running; its outcome is unknown "
@@ -121,6 +122,10 @@ run(RunId, Info) ->
         maps:map(fun(_, V) -> out(V) end, Info)
     ).
 
+-spec compacted(binary(), map()) -> map().
+compacted(Owner, Info) ->
+    maps:merge(#{t => compacted, run => Owner, at => now_ms()}, maps:with([before, 'after'], Info)).
+
 -spec tool_intent(binary(), binary(), binary(), map()) -> map().
 tool_intent(RunId, CallId, Name, Args) ->
     #{t => tool, phase => intent, run => RunId, call => CallId, name => Name, args => Args}.
@@ -175,17 +180,7 @@ apply_record(#{<<"t">> := <<"msgs">>, <<"msgs">> := Ms} = R, C) ->
 apply_record(#{<<"t">> := <<"snapshot">>, <<"msgs">> := Ms} = R, C) ->
     touch(R, with_key(R, C#{messages := decode_msgs(Ms)}));
 apply_record(#{<<"t">> := <<"run">>, <<"phase">> := <<"begin">>, <<"run">> := Run} = R, C) ->
-    C1 =
-        case maps:get(<<"model">>, R, null) of
-            null -> C;
-            M -> C#{model := M}
-        end,
-    C2 =
-        case maps:get(<<"workspace">>, R, null) of
-            null -> C1;
-            W -> C1#{workspace := W}
-        end,
-    touch(R, C2#{open_run := Run, tools := #{}});
+    touch(R, (run_begin(R, C))#{open_run := Run, tools := #{}});
 apply_record(#{<<"t">> := <<"run">>, <<"run">> := Run} = R, #{open_run := Run} = C) ->
     touch(R, C#{open_run := undefined});
 apply_record(
@@ -195,10 +190,24 @@ apply_record(
 ->
     Prev = maps:get(Id, T, #{}),
     C#{tools := T#{Id => Prev#{phase(P) => R}}};
+apply_record(#{<<"t">> := <<"compacted">>}, C) ->
+    C#{compactions => maps:get(compactions, C, 0) + 1};
 apply_record(#{<<"t">> := <<"recovered">>, <<"unresolved">> := U}, C) when is_list(U) ->
     C#{unresolved := lists:usort(maps:get(unresolved, C) ++ U)};
 apply_record(_Other, C) ->
     C.
+
+%% A run's start: the model it ran on, and an agent's workspace.
+run_begin(R, C) ->
+    C1 =
+        case maps:get(<<"model">>, R, null) of
+            null -> C;
+            M -> C#{model := M}
+        end,
+    case maps:get(<<"workspace">>, R, null) of
+        null -> C1;
+        W -> C1#{workspace := W}
+    end.
 
 phase(<<"intent">>) -> intent;
 phase(<<"outcome">>) -> outcome.

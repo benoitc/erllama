@@ -52,11 +52,13 @@ from `NextSeq`.
     conversation_fork/1,
     conversation_delete/1,
     conversation_export/2,
+    conversation_compact/1,
     agent_start/1,
     agent_send/2,
     agent_approve/3,
     agent_interrupt/1,
     agent_stop/1,
+    agent_compact/1,
     agents/0,
     mcp/0,
     mcp_tools/0,
@@ -446,6 +448,21 @@ conversation_fork(Id) ->
         {error, _} = E -> E
     end.
 
+-doc """
+Compact a conversation now, as happens before a turn when it nears the
+model's context: system messages, the first request and the recent
+messages are kept, the middle is summarised by the conversation's
+model. Refused while a run or a session holds it (`agent_compact/1`
+compacts a session's conversation). Returns the message counts before
+and after, or `compacted => false` when there was nothing to drop.
+""".
+-spec conversation_compact(binary()) -> {ok, map()} | {error, term()}.
+conversation_compact(Id) ->
+    case erllama_server_convs:get(Id) of
+        {ok, #{model := Model}} -> erllama_server_compact:conversation(Id, Model);
+        {error, _} = E -> E
+    end.
+
 -doc "Forget a conversation and its log. Refused while a run or a session holds it.".
 -spec conversation_delete(binary()) -> ok | {error, conversation_busy}.
 conversation_delete(Id) ->
@@ -600,6 +617,11 @@ agent_interrupt(Id) ->
 -spec agent_stop(binary()) -> ok | {error, term()}.
 agent_stop(Id) ->
     with_agent(Id, fun erllama_server_agent:stop/1).
+
+-doc "Compact an idle session's conversation now (see `conversation_compact/1`).".
+-spec agent_compact(binary()) -> {ok, map()} | {error, term()}.
+agent_compact(Id) ->
+    with_agent(Id, fun erllama_server_agent:compact/1).
 
 -doc "The agent sessions the release holds.".
 -spec agents() -> {ok, [map()]}.

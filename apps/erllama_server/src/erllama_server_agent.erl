@@ -14,7 +14,12 @@
 %% without calling a tool, a budget runs out, or the turn is
 %% interrupted. Input that arrives during a turn waits for the next one.
 %%
-%%   idle -> generating -> (approving) -> tools -> generating ... -> idle
+%%   idle -> compacting -> generating -> (approving) -> tools -> generating ... -> idle
+%%
+%% A turn starts in `compacting': a helper holds the model, measures the
+%% transcript and compacts it when it nears the model's context
+%% (erllama_server_compact), then the turn generates. `compact/1' runs
+%% the same step on request while the session is idle.
 %%
 %% Tool calls run in monitored worker processes. Calls that only read
 %% run together; a call that changes the workspace waits for the calls
@@ -33,7 +38,7 @@
 
 -behaviour(gen_statem).
 
--export([start_link/1, send/2, approve/3, interrupt/1, stop/1]).
+-export([start_link/1, send/2, approve/3, interrupt/1, stop/1, compact/1]).
 -export([callback_mode/0, init/1, handle_event/4, terminate/3]).
 
 %% How a session generates (erllama_server_agent_gen; tests script it):
@@ -80,6 +85,9 @@
     queue = [] :: [binary()],
     turn :: map() | undefined,
     gen :: pid() | undefined,
+    %% The compaction helper, and who asked for a compaction on request.
+    compactor :: pid() | undefined,
+    compact_from :: gen_statem:from() | undefined,
     calls = [] :: [#call{}],
     jobs = #{} :: #{binary() => pid()},
     finish_key :: term(),
@@ -107,6 +115,10 @@ approve(Pid, CallId, Decision) -> erllama_server_job:call(Pid, {approve, CallId,
 
 -spec interrupt(pid()) -> ok | {error, term()}.
 interrupt(Pid) -> erllama_server_job:call(Pid, cancel, 5000).
+
+%% Compact the conversation now (the session must be idle).
+-spec compact(pid()) -> {ok, map()} | {error, term()}.
+compact(Pid) -> erllama_server_job:call(Pid, compact, 300000).
 
 %% End the session (its conversation stays).
 -spec stop(pid()) -> ok | {error, term()}.
@@ -165,12 +177,14 @@ handle_event(info, {'EXIT', Gen, Reason}, generating, #d{gen = Gen} = D) when is
     %% The round died without reporting (a crash, or killed from
     %% outside): the turn fails, and its model hold is released.
     end_turn({error, {generator_exited, Reason}}, D#d{gen = undefined}, []);
+handle_event(info, {'EXIT', C, Reason}, compacting, #d{compactor = C} = D) when is_pid(C) ->
+    compaction_done({error, {compactor_exited, Reason}}, D#d{compactor = undefined});
 handle_event(info, {'EXIT', _Pid, _Reason}, _State, _D) ->
     %% Linked generators, workers and shell jobs: their outcome comes
     %% through their own messages or monitors.
     keep_state_and_data;
 handle_event(info, {turn_deadline, Ref}, State, #d{turn = #{deadline_ref := Ref}} = D) when
-    State =:= generating; State =:= tools; State =:= approving
+    State =:= compacting; State =:= generating; State =:= tools; State =:= approving
 ->
     D1 = interrupt(State, <<"the turn ran out of time">>, D),
     end_turn({budget, time}, D1, []);
@@ -181,7 +195,11 @@ handle_event({call, From}, _Req, stopped, _D) ->
     {keep_state_and_data, [{reply, From, {error, stopped}}]};
 %% --- input --------------------------------------------------------------------
 handle_event({call, From}, {send, Text}, idle, D) when is_binary(Text), Text =/= <<>> ->
-    {next_state, generating, start_turn(Text, D), [{reply, From, ok}]};
+    {next_state, compacting, start_turn(Text, D), [{reply, From, ok}]};
+handle_event({call, From}, compact, idle, D) ->
+    {next_state, compacting, start_compaction(#{force => true}, D#d{compact_from = From})};
+handle_event({call, From}, compact, _State, _D) ->
+    {keep_state_and_data, [{reply, From, {error, busy}}]};
 handle_event({call, From}, {send, Text}, _State, #d{queue = Q} = D) when
     is_binary(Text), Text =/= <<>>
 ->
@@ -203,6 +221,11 @@ handle_event({call, From}, {approve, CallId, Decision}, approving, D) ->
     approve_call(CallId, Decision, From, D);
 handle_event({call, From}, {approve, _, _}, _State, _D) ->
     {keep_state_and_data, [{reply, From, {error, nothing_to_approve}}]};
+%% --- compaction ---------------------------------------------------------------
+handle_event(info, {compacting, C}, compacting, #d{compactor = C} = D) ->
+    {keep_state, emit(compacting, #{}, D)};
+handle_event(info, {compact_done, C, Outcome}, compacting, #d{compactor = C} = D) ->
+    compaction_done(Outcome, D#d{compactor = undefined});
 %% --- generation ---------------------------------------------------------------
 handle_event(info, {agent_gen, Gen, {delta, Type, Data}}, generating, #d{gen = Gen} = D) ->
     {keep_state, emit(Type, Data, D)};
@@ -235,7 +258,39 @@ start_turn(Text, #d{budgets = #{max_elapsed_ms := Ms}} = D) ->
     Ref = make_ref(),
     _ = erlang:send_after(Ms, self(), {turn_deadline, Ref}),
     Turn = #{rounds => 0, tokens => 0, deadline => now_ms() + Ms, deadline_ref => Ref},
-    generate(emit(turn_started, #{input => Text}, D1#d{turn = Turn})).
+    start_compaction(#{}, emit(turn_started, #{input => Text}, D1#d{turn = Turn})).
+
+%% Measure the transcript, and compact it when needed (or always, with
+%% `force'), in a helper that holds the model for the session.
+start_compaction(Opts, #d{model = Model, transcript = T} = D) ->
+    D#d{compactor = erllama_server_compact:start(self(), Model, T, Opts)}.
+
+%% A compaction replaces the transcript (and the conversation's); the
+%% next generation is a new exact prompt, with no cache key. Then the
+%% turn goes on, or, on request, the caller is answered.
+compaction_done(Outcome, D0) ->
+    D = apply_compaction(Outcome, D0),
+    case D#d.compact_from of
+        undefined ->
+            {next_state, generating, generate(D)};
+        From ->
+            Reply =
+                case Outcome of
+                    {compacted, _, Info} -> {ok, Info};
+                    none -> {ok, #{compacted => false}};
+                    {error, _} = E -> E
+                end,
+            end_turn(idle, D#d{compact_from = undefined}, [{reply, From, Reply}])
+    end.
+
+apply_compaction({compacted, New, Info}, #d{conv = Conv, id = Id} = D) ->
+    ok = erllama_server_convs:compact(Conv, Id, New, Info),
+    emit(compacted, Info, D#d{transcript = New, finish_key = undefined});
+apply_compaction({error, Reason}, D) ->
+    logger:warning(#{msg => "compaction failed; the session goes on", reason => Reason}),
+    D;
+apply_compaction(none, D) ->
+    D.
 
 generate(#d{generator = G, model = M, transcript = T, turn = Turn, id = Id} = D0) ->
     D = D0#d{mcp = erllama_server_agent_policy:snapshot()},
@@ -302,7 +357,7 @@ plan_calls(Calls, D) ->
     end.
 
 plan_call(I, #{id := Id, function := #{name := Name, arguments := ArgsJson}}, D) ->
-    Args = decode_args(ArgsJson),
+    Args = erllama_server_tools:decode_args(ArgsJson),
     Base = #call{
         index = I,
         id = Id,
@@ -322,15 +377,6 @@ plan_call(I, #{id := Id, function := #{name := Name, arguments := ArgsJson}}, D)
             Base#call{status = pending};
         {true, auto} ->
             Base
-    end.
-
-decode_args(A) when is_map(A) -> A;
-decode_args(A) when is_binary(A) ->
-    try json:decode(A) of
-        M when is_map(M) -> M;
-        _ -> #{}
-    catch
-        error:_ -> #{}
     end.
 
 approve_call(CallId, Decision, From, #d{calls = Calls, policy = Policy} = D) ->
@@ -478,13 +524,8 @@ tool_message(#call{id = Id, name = Name, result = {Status, Text}}) ->
         end,
     #{role => <<"tool">>, tool_call_id => Id, name => Name, content => Content}.
 
-budget_left(#d{turn = #{rounds := R, tokens := T, deadline := Dl}, budgets = B}) ->
-    case {R >= maps:get(max_rounds, B), T >= maps:get(max_tokens, B), now_ms() >= Dl} of
-        {true, _, _} -> {exceeded, rounds};
-        {_, true, _} -> {exceeded, tokens};
-        {_, _, true} -> {exceeded, time};
-        _ -> ok
-    end.
+budget_left(#d{turn = Turn, budgets = B}) ->
+    erllama_server_agent_policy:budget_left(Turn, B, now_ms()).
 
 %% -----------------------------------------------------------------------------
 %% Ending a turn
@@ -493,10 +534,14 @@ budget_left(#d{turn = #{rounds := R, tokens := T, deadline := Dl}, budgets = B})
 end_turn(Reason, D, Actions) ->
     D1 = close_turn(Reason, D),
     case D1#d.queue of
-        [Next | Rest] -> {next_state, generating, start_turn(Next, D1#d{queue = Rest}), Actions};
+        [Next | Rest] -> {next_state, compacting, start_turn(Next, D1#d{queue = Rest}), Actions};
         [] -> {next_state, idle, D1, Actions}
     end.
 
+close_turn(_Reason, #d{turn = undefined, model = M} = D) ->
+    %% A compaction on request: no turn to report, only the model hold.
+    erllama_server_models:release(M, self()),
+    D;
 close_turn(Reason, #d{turn = Turn, model = M} = D) ->
     erllama_server_models:release(M, self()),
     Info = maps:with([rounds, tokens], Turn),
@@ -511,12 +556,20 @@ reason(R) -> R.
 interrupt(State, D) ->
     interrupt(State, <<"interrupted by the user">>, D).
 
+interrupt(compacting, _Why, #d{compactor = C} = D) when is_pid(C) ->
+    unlink(C),
+    exit(C, kill),
+    _ = [gen_statem:reply(F, {error, interrupted}) || F <- [D#d.compact_from], F =/= undefined],
+    D#d{compactor = undefined, compact_from = undefined};
 interrupt(generating, _Why, #d{gen = Gen} = D) when is_pid(Gen) ->
     unlink(Gen),
     exit(Gen, kill),
     D#d{gen = undefined};
 interrupt(State, Why, #d{calls = Calls} = D) when State =:= tools; State =:= approving ->
-    [kill_worker(C) || #call{worker = W} = C <- Calls, W =/= undefined],
+    [
+        erllama_server_tools:stop_worker(N, W)
+     || #call{name = N, worker = W} <- Calls, W =/= undefined
+    ],
     Closed = [
         case C of
             #call{status = done} ->
@@ -534,21 +587,6 @@ interrupt(State, Why, #d{calls = Calls} = D) when State =:= tools; State =:= app
     record(Results, D#d{calls = []});
 interrupt(_State, _Why, D) ->
     D.
-
-%% A running command is stopped through its job first: killing the
-%% worker alone leaves the group's cleanup to happen later, or never if
-%% the release is stopping.
-kill_worker(#call{name = <<"shell">>, worker = {Pid, Mon}}) ->
-    erlang:demonitor(Mon, [flush]),
-    ok = erllama_server_tool_shell:stop_run(Pid),
-    exit(Pid, kill);
-%% Any other call, MCP ones included: stopping the worker is enough. An
-%% MCP request belongs to the worker that made it, and barrel_mcp's
-%% client cancels it at the server (that request only; the connection
-%% stays) when that process exits.
-kill_worker(#call{worker = {Pid, Mon}}) ->
-    erlang:demonitor(Mon, [flush]),
-    exit(Pid, kill).
 
 %% End the session: background jobs stop, the conversation is released.
 shutdown(#d{closed = true} = D) ->

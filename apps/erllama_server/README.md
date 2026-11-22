@@ -110,6 +110,9 @@ the release). A bad value stops the release from starting.
 | `mcp_servers` | `[]` | MCP servers whose tools agent sessions use (see [MCP servers](../../guides/server/mcp.md)) |
 | `mcp_timeout_ms` | `60000` | the longest an MCP call may take |
 | `mcp_endpoint` | `false` | serve the release's models at `/mcp` on the HTTP listener |
+| `compact_threshold` | `0.75` | compact a conversation above this fraction of the model's context (`false`: never) |
+| `compact_keep_messages` | `6` | recent messages a compaction keeps word for word |
+| `compact_summary_tokens` | `512` | the longest compaction summary |
 
 The library's own settings (cache tiers, scheduler) go under `erllama`;
 see the [configuration guide](../../guides/configuration.md).
@@ -145,6 +148,7 @@ see the [configuration guide](../../guides/configuration.md).
 | `erllama_server_cli_agent`, `erllama_server_cli_mcp`, `erllama_server_cli_format` | the CLI's agent and MCP commands and its output formatting |
 | `erllama_server_http_ops` | health, readiness, metrics |
 | `erllama_server_convs` | conversations: history, last cache key, one active run each, persisted and recovered |
+| `erllama_server_compact` | context compaction: what to keep, the summary, when it is needed |
 | `erllama_server_conv_log`, `erllama_server_conv_codec` | a conversation's log on disk: records, replay, repair after a stop; messages to JSON and back |
 | `erllama_server_generate` | renders chat or prompt requests into an erllama stream and parses the result |
 | `erllama_server_client` | the client side, used by the CLI (no erllama module) |

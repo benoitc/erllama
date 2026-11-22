@@ -11,7 +11,7 @@
 %% `always' approvals of MCP tools by their identity `{mcp, Server,
 %% RemoteName}', so such a permission stays with that tool.
 
--export([initial/1, snapshot/0, policy/4, class/2, known/2, grant_key/2]).
+-export([initial/1, snapshot/0, policy/4, class/2, known/2, grant_key/2, budget_left/3]).
 
 -type policy() :: erllama_server_tools:policy().
 -type policies() :: #{binary() | {mcp, binary(), term()} => policy()}.
@@ -77,3 +77,14 @@ known(Name, Catalog) ->
 -spec grant_key(binary(), map() | undefined) -> binary() | {mcp, binary(), term()}.
 grant_key(_Name, #{server := S, remote := R}) -> {mcp, S, R};
 grant_key(Name, undefined) -> Name.
+
+%% What a turn has left of its budgets: rounds, tokens and time
+%% (`Now' on the clock its deadline was set with).
+-spec budget_left(map(), map(), integer()) -> ok | {exceeded, rounds | tokens | time}.
+budget_left(#{rounds := R, tokens := T, deadline := Dl}, B, Now) ->
+    case {R >= maps:get(max_rounds, B), T >= maps:get(max_tokens, B), Now >= Dl} of
+        {true, _, _} -> {exceeded, rounds};
+        {_, true, _} -> {exceeded, tokens};
+        {_, _, true} -> {exceeded, time};
+        _ -> ok
+    end.
