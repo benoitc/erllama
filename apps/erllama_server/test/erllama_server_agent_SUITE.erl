@@ -473,7 +473,12 @@ real_model_reads_a_file(Config) ->
                 name => <<"agent_real">>, n_ctx => 8192
             }),
             {ok, #{agent_id := Id}} = erllama_server_api:agent_start(#{
-                model => Model, workspace => Ws, policy => yes
+                model => Model,
+                workspace => Ws,
+                policy => yes,
+                %% A model with no tool template only writes text: keep its
+                %% turn short (it then skips below).
+                budgets => #{max_tokens => 256}
             }),
             Events = turn(
                 Id,
