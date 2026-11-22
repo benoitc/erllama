@@ -49,6 +49,9 @@ from `NextSeq`.
     runs/0,
     conversation/1,
     conversations/0,
+    conversation_fork/1,
+    conversation_delete/1,
+    conversation_export/2,
     agent_start/1,
     agent_send/2,
     agent_approve/3,
@@ -435,6 +438,30 @@ conversation(Id) ->
 conversations() ->
     {ok, [maps:remove(last_finish_key, C) || C <- erllama_server_convs:list()]}.
 
+-doc "A new conversation with a copy of `Id`'s history; the two then go their own ways.".
+-spec conversation_fork(binary()) -> {ok, #{conversation_id := binary()}} | {error, not_found}.
+conversation_fork(Id) ->
+    case erllama_server_convs:fork(Id) of
+        {ok, New} -> {ok, #{conversation_id => New}};
+        {error, _} = E -> E
+    end.
+
+-doc "Forget a conversation and its log. Refused while a run or a session holds it.".
+-spec conversation_delete(binary()) -> ok | {error, conversation_busy}.
+conversation_delete(Id) ->
+    erllama_server_convs:delete(Id).
+
+-doc """
+A conversation as one document: `json` (its fields and messages, media
+as base64) or `markdown` (readable, one section per message).
+""".
+-spec conversation_export(binary(), json | markdown) -> {ok, binary()} | {error, not_found}.
+conversation_export(Id, Format) ->
+    case erllama_server_convs:get(Id) of
+        {ok, C} -> {ok, erllama_server_conv_export:export(Format, C)};
+        {error, _} = E -> E
+    end.
+
 with_run(RunId, Fun) ->
     case erllama_server_runs:lookup(RunId) of
         {ok, #{pid := Pid}} -> Fun(Pid);
@@ -456,7 +483,8 @@ Start an agent session: a model working with tools in `workspace`, a
 directory on the release machine. `Spec`:
 
 - `model` (registry name or alias; default model when absent) and
-  `workspace` (required);
+  `workspace` (required, unless `conversation_id` names a conversation
+  an agent already worked in: its workspace is used);
 - `conversation_id`: continue that conversation (it must be free);
 - `policy`: `yes` (every tool runs without asking), `read_only` (tools
   that change the workspace are denied), or `#{ToolName => auto | ask |
@@ -487,29 +515,26 @@ agent_start(#{workspace := Dir} = Spec) ->
         {_, {error, R}} ->
             {error, {workspace, R}}
     end;
+agent_start(#{conversation_id := Conv} = Spec) ->
+    %% Resuming: the workspace the conversation was last worked in.
+    case erllama_server_convs:get(to_binary(Conv)) of
+        {ok, #{workspace := Ws}} when is_binary(Ws) -> agent_start(Spec#{workspace => Ws});
+        _ -> {error, {missing, workspace}}
+    end;
 agent_start(_Spec) ->
     {error, {missing, workspace}}.
 
+to_binary(B) when is_binary(B) -> B;
+to_binary(L) -> unicode:characters_to_binary(L).
+
 start_agent(Spec, Model, Ws) ->
     Id = erllama_server_ids:agent(),
-    case erllama_server_convs:begin_run(maps:get(conversation_id, Spec, undefined), Model, Id) of
-        {ok, #{id := Conv, messages := History, parent_key := PK}} ->
-            AgentSpec0 = #{
-                run_id => Id,
-                kind => agent,
-                model => Model,
-                workspace => Ws,
-                conversation_id => Conv,
-                history => [M || #{role := R} = M <- History, R =/= <<"system">>],
-                parent_key => PK,
-                policy => agent_policy(maps:get(policy, Spec, #{})),
-                mode => agent_mode(maps:get(policy, Spec, #{})),
-                budgets => maps:with(
-                    [max_rounds, max_tokens, max_elapsed_ms], maps:get(budgets, Spec, #{})
-                )
-            },
-            AgentSpec = maps:merge(AgentSpec0, maps:with([system, generator], Spec)),
-            case erllama_server_runs:start(AgentSpec) of
+    Info = #{kind => agent, workspace => Ws},
+    case
+        erllama_server_convs:begin_run(maps:get(conversation_id, Spec, undefined), Model, Id, Info)
+    of
+        {ok, #{id := Conv} = Held} ->
+            case erllama_server_runs:start(agent_spec(Spec, Id, Model, Ws, Held)) of
                 {ok, _} ->
                     {ok, #{agent_id => Id, conversation_id => Conv}};
                 {error, _} = E ->
@@ -519,6 +544,23 @@ start_agent(Spec, Model, Ws) ->
         {error, _} = E ->
             E
     end.
+
+agent_spec(Spec, Id, Model, Ws, #{id := Conv, messages := History, parent_key := PK}) ->
+    Base = #{
+        run_id => Id,
+        kind => agent,
+        model => Model,
+        workspace => Ws,
+        conversation_id => Conv,
+        history => [M || #{role := R} = M <- History, R =/= <<"system">>],
+        parent_key => PK,
+        policy => agent_policy(maps:get(policy, Spec, #{})),
+        mode => agent_mode(maps:get(policy, Spec, #{})),
+        budgets => maps:with(
+            [max_rounds, max_tokens, max_elapsed_ms], maps:get(budgets, Spec, #{})
+        )
+    },
+    maps:merge(Base, maps:with([system, generator], Spec)).
 
 agent_mode(P) when P =:= yes; P =:= read_only -> P;
 agent_mode(_) -> default.

@@ -336,3 +336,94 @@ A bad value makes `start_link` fail.
   subprocess running `barrel_mcp:start_stdio/0`.
 - eunit `erllama_server_mcp_tests`: names, rendering, configuration.
 
+
+---
+
+# Phase 6: durable conversations (design)
+
+Two steps: 6a persistence, recovery and the conversation operations;
+6b compaction.
+
+## 6a. Storage
+
+- One append-only log per conversation,
+  `<data_dir>/conversations/<id>.jsonl`, apart from the KV cache
+  directories. One JSON record per line, written with `sync`, before
+  the change is visible in memory. A torn last line (a crash mid-write)
+  is ignored on load.
+- Records (`"t"`):
+  - `create`: id, model, kind (`conversation` or `snapshot`, the frozen
+    copy behind a stored response), parent (fork source), time;
+  - `msgs`: messages appended, with the finish key when it changed;
+  - `snapshot`: the whole transcript and key (a fork's start; later a
+    compaction);
+  - `run`: `begin` (run or agent id, kind, model, workspace for an
+    agent), `end`, `release`;
+  - `tool`: `intent` before a call runs (call id, name, arguments),
+    `outcome` once it finished (status, text), before generation goes
+    on;
+  - `recovered`: what a restart repaired.
+- Messages are encoded by `erllama_server_conv_codec`: known keys
+  become atoms again on load, never others; image and audio bytes are
+  base64; the finish key (a 32-byte binary) is hex.
+- `erllama_server_convs` keeps the in-memory table and is the only
+  writer of the logs. It loads every log at start.
+
+## Recovery
+
+A log whose last `run` is a `begin` was cut by a stop or a crash.
+On load:
+- the run is released;
+- if the last assistant message has tool calls without results, each
+  gets one, so the transcript stays well formed:
+  - an outcome was recorded: that outcome, exactly;
+  - only an intent: marked unresolved ("the release stopped while
+    this call ran; its outcome is unknown and it was not run again");
+  - nothing: "the release stopped before this call ran";
+- unresolved calls are listed on the conversation (`unresolved`) and
+  never repeated.
+
+## KV
+
+The finish key is persisted with the model it belongs to. A turn on
+the same model passes it as `parent_key`: erllama restores the exact
+KV when its cache still holds it and prefills the transcript otherwise
+(a miss is a cold start). Nothing about conversations goes into the
+cache.
+
+## Operations
+
+- API: `conversations/0` (snapshots hidden), `conversation/1`,
+  `conversation_fork/1`, `conversation_delete/1` (refused while a run
+  holds it), `conversation_export/2` (`json` or `markdown`).
+- Resume: `run`, `chat` and `agent --conversation ID`, also after a
+  restart; an agent session reuses the workspace its conversation was
+  last worked in when none is given.
+- Attach: `erllama conversation attach ID` follows the run holding it.
+- CLI: `erllama conversations`, `erllama conversation show | fork |
+  rm | export | attach ID`.
+- Stored responses (`/v1/responses`, `store: true`) are written to
+  `<data_dir>/responses/<id>.json` and their snapshot conversations
+  are persisted like any other, so `previous_response_id` works after
+  a restart.
+
+## Tests
+
+- eunit: the codec (every message shape round trips), log replay with
+  a torn tail, recovery of each tool state.
+- CT `erllama_server_convs_SUITE`: a restart keeps conversations,
+  stored responses and their branches; fork, delete, export; an agent
+  stopped by a restart in the middle of a write tool gets an
+  unresolved result and the call is not run again; a resumed session
+  reuses its workspace.
+- Gated real model: a turn after a restart of erllama_server is warm
+  (the persisted key restores the KV).
+
+## 6b. Compaction (outline, detailed before it starts)
+
+Automatic before a turn when the transcript nears the model's
+context, and on request. Keeps the system messages, the first user
+message, a model-written summary of the middle, and the recent
+messages verbatim with tool calls and results kept in pairs. Written
+as a `snapshot`; the finish key is dropped, so the compacted
+transcript is a new exact prompt.

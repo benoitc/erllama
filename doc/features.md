@@ -155,6 +155,19 @@ The upstream gaps found here are fixed in barrel_mcp 4.7.0 and 4.8.0 and Livery 
 
 Validation: `erllama_server_mcp_SUITE` (6 cases against real servers: Streamable HTTP through livery_mcp in the test node and stdio through an `erl` subprocess; namespaced tools offered and called, media rendering, server and session policies with approvals, tool errors and timeouts, an unreachable server, a server going away and coming back, the release's own endpoint with API keys) and `erllama_server_mcp_tests` (names, rendering, configuration).
 
-## Phases 6 and 7
+## Phase 6a: durable conversations (implemented)
+
+| Feature | State | Notes |
+|---|---|---|
+| persistence | done | one append-only, synced JSON log per conversation (`<data_dir>/conversations/<id>.jsonl`), apart from the KV cache; written before a change is visible; a torn last line is ignored |
+| recovery | done | logs loaded at start; a run cut by a stop or a crash is released and its unanswered tool calls get a result: the recorded outcome, unresolved (may have run, never run again) or not run |
+| tool records | done | intent before a call runs, outcome before the session generates again; a session that dies is repaired the same way at once, and its running tools go with it |
+| KV | done | the finish key is persisted with its model and passed as `parent_key` on the next turn: warm when the cache holds it, transcript prefill otherwise |
+| operations | done | list (snapshots hidden), show, fork, delete (refused while held), export (JSON, Markdown), attach; `agent --conversation` reuses the conversation's workspace |
+| stored responses | done | one file each under `<data_dir>/responses/`; their snapshots are persisted conversations, so `previous_response_id` and branches survive a restart |
+
+Validation: `erllama_server_conv_tests` (every message shape round trips, unknown keys stay binaries, torn tail, recovery of each tool state, repair durable) and `erllama_server_convs_SUITE` (restart keeps conversations and their continuation, fork, delete and export across a restart, stored responses and their branches across a restart, a killed session and a crashed store each leave the running call unresolved with its command stopped and a resumed session not running it again). Gated real-model case on Qwen2.5 1.5B: the turn after a restart is warm (`partial`).
+
+## Phase 6b and 7
 
 Not started.

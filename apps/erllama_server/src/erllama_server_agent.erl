@@ -397,8 +397,11 @@ schedule(#d{calls = Calls} = D0) ->
 
 start_call(
     #call{index = I, name = Name, args = Args, id = Id} = C,
-    #d{workspace = Ws, jobs = Jobs} = D
+    #d{workspace = Ws, jobs = Jobs, conv = Conv, id = Owner} = D
 ) ->
+    %% Durable before the call can do anything: after a crash it is
+    %% known to have maybe run, and is never run again.
+    ok = erllama_server_convs:tool_intent(Conv, Owner, Id, Name, Args),
     Self = self(),
     Ctx0 = #{workspace => Ws, owner => Self, jobs => Jobs},
     Ctx =
@@ -406,9 +409,12 @@ start_call(
             undefined -> Ctx0;
             Entry -> Ctx0#{mcp => Entry}
         end,
-    Worker = spawn_monitor(fun() ->
-        Self ! {tool_done, self(), I, erllama_server_tools:execute(Name, Args, Ctx)}
-    end),
+    %% Linked as well as monitored: a session that dies, even killed,
+    %% takes its running tools (and their commands) with it.
+    Worker = spawn_opt(
+        fun() -> Self ! {tool_done, self(), I, erllama_server_tools:execute(Name, Args, Ctx)} end,
+        [link, monitor]
+    ),
     {
         C#call{status = running, worker = Worker},
         emit(tool_started, #{call_id => Id, name => Name, arguments => Args}, D)
@@ -423,6 +429,8 @@ tool_finished(Worker, Index, Result, #d{calls = Calls, jobs = Jobs} = D) ->
                     {ok, Text, {job, JobId, Pid}} -> {{ok, Text}, Jobs#{JobId => Pid}};
                     _ -> {Result, Jobs}
                 end,
+            {Status, Out} = Res,
+            ok = erllama_server_convs:tool_outcome(D#d.conv, D#d.id, Id, Status, Out),
             D1 = emit(
                 tool_result,
                 #{

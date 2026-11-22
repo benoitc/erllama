@@ -45,6 +45,10 @@
     "  mcp [tools | resources SERVER | read SERVER URI | prompts SERVER\n",
     "      | prompt SERVER NAME [KEY=VALUE ...]]\n",
     "                                the MCP servers agent sessions use\n",
+    "  conversations                 list the conversations (kept across restarts)\n",
+    "  conversation show|export|fork|rm|attach ID [--format json|md]\n",
+    "                                read, export, copy, delete a conversation,\n",
+    "                                or follow what runs in it\n",
     "  runs                          list the runs and downloads the release holds\n",
     "  attach JOB [--from SEQ]       follow a run or download from an event sequence\n",
     "  cancel JOB                    cancel a run or download\n",
@@ -137,6 +141,10 @@ command("agent-stop") ->
     {[], fun erllama_server_cli_agent:stop/4};
 command("mcp") ->
     {[], fun erllama_server_cli_mcp:mcp/4};
+command("conversations") ->
+    {[], fun erllama_server_cli_conv:list/4};
+command("conversation") ->
+    {[{"--format", format, string}], fun erllama_server_cli_conv:conversation/4};
 command("runs") ->
     {[], fun runs/4};
 command("attach") ->
