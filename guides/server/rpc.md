@@ -37,8 +37,54 @@ terminal as the model produces them. Pass `--conversation ID` to add a
 turn to an existing conversation: the release prompts the model with
 the whole history and passes the previous turn's cache key, so the
 cache can restore the shared prefix instead of recomputing it.
-`chat` reads one line per turn until `/quit` or the end of input. A
-conversation runs one turn at a time.
+A conversation runs one turn at a time.
+
+## Chat
+
+```bash
+$R/bin/erllama chat tiny
+> Plan a picnic for four.
+...
+> /fork
+[going on in conv_19be..., a copy of conv_7f3a...]
+> /quit
+```
+
+- A line ending in `\` goes on to the next line; `"""` on its own
+  line starts a block that runs to the next `"""`.
+- In a terminal, the reply streams as it is generated. Reasoning shows
+  dimmed. While the release loads the model, compacts the conversation
+  or prefills the prompt, a status line counts the seconds.
+
+| Command | Does |
+|---|---|
+| `/new` | the next message starts a new conversation |
+| `/sessions` | lists the conversations |
+| `/switch ID` | continues conversation `ID` |
+| `/fork` | goes on in a copy of the current conversation |
+| `/compact` | shortens the current conversation now |
+| `/help` | lists the commands |
+| `/quit` | leaves (so does the end of input) |
+
+## Ctrl-C
+
+In a terminal, Ctrl-C acts on what is running, never on the release:
+
+| While | Ctrl-C |
+|---|---|
+| `run` or a `chat` turn streams | cancels the run; the turn is not added to the conversation |
+| an `agent` turn runs | interrupts the turn; the session stays |
+| `pull` downloads | cancels it; the part already downloaded is kept for the next pull |
+| `attach` follows a run | detaches; the run goes on |
+| you type at a prompt | drops the line |
+| anything else | leaves the CLI |
+
+- During a turn, a second Ctrl-C leaves the CLI. The release keeps
+  what it was doing.
+- Wait for the prompt before you type the next message: keys pressed
+  while a reply streams are not kept.
+- Closing the terminal ends only the CLI. Runs, sessions and loaded
+  models stay on the release.
 
 ## Detach, reattach, cancel
 
@@ -155,5 +201,6 @@ local files.
 - The CLI and the release check each other's API version on every
   connection. The HTTP adapters will use the same service API, through
   the module `erllama_server_api`.
-- Interrupting a generation from the keyboard is not in the CLI yet:
-  Ctrl-C quits the CLI and the run keeps going. Use `erllama cancel`.
+- When the CLI's input is not a terminal (a pipe, a script), Ctrl-C
+  ends the CLI at once and the release keeps any run going; use
+  `erllama cancel` to stop it.

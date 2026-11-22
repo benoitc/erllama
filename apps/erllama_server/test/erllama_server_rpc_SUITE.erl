@@ -32,6 +32,10 @@
     unreachable_release/1,
     concurrent_cli_processes/1,
     cli_cancel_while_another_follows/1,
+    tty_ctrl_c_cancels_a_chat_turn/1,
+    tty_multiline_is_one_message/1,
+    tty_ctrl_c_at_the_prompt_drops_the_line/1,
+    tty_agent_switch_and_approval/1,
     tool_exchange_round_trips_through_the_conversation/1,
     real_model_chat/1,
     real_model_accepts_tool_history/1,
@@ -62,6 +66,10 @@ all() ->
         unreachable_release,
         concurrent_cli_processes,
         cli_cancel_while_another_follows,
+        tty_ctrl_c_cancels_a_chat_turn,
+        tty_multiline_is_one_message,
+        tty_ctrl_c_at_the_prompt_drops_the_line,
+        tty_agent_switch_and_approval,
         tool_exchange_round_trips_through_the_conversation,
         real_model_chat,
         real_model_accepts_tool_history,
@@ -460,6 +468,200 @@ cli_cancel_while_another_follows(Config) ->
     {Code, Out} = cli_wait(Follower, [First]),
     ?assertEqual(1, Code),
     ?assertNotEqual(nomatch, binary:match(Out, <<"[cancelled]">>)).
+
+%% -----------------------------------------------------------------------------
+%% The CLI in a terminal (a pseudo-terminal from script(1)), typed to.
+%% -----------------------------------------------------------------------------
+
+%% The CLI under a pseudo-terminal, as `bin/erllama' runs it in one
+%% (`+Bc'). Keys go in with tty_type/2; the output is collected.
+tty_cli(Config, Args) ->
+    Erl = filename:join([code:root_dir(), "bin", "erl"]),
+    Ebin = filename:dirname(code:which(erllama_server_cli)),
+    Expr = lists:flatten(io_lib:format("erllama_server_cli:main(~p).", [Args])),
+    Cmd = [Erl, "+Bc", "-noshell", "-pa", Ebin, "-eval", Expr],
+    ScriptArgs =
+        case os:type() of
+            {unix, darwin} -> ["-q", "/dev/null" | Cmd];
+            _ -> ["-q", "-e", "-c", lists:join(" ", [shell_quote(A) || A <- Cmd]), "/dev/null"]
+        end,
+    Port = open_port({spawn_executable, os:find_executable("script")}, [
+        {args, ScriptArgs},
+        {env, [
+            {"ERLLAMA_NODE", atom_to_list(?config(rel_node, Config))},
+            {"ERLLAMA_COOKIE", ?COOKIE},
+            {"TERM", "xterm"}
+        ]},
+        exit_status,
+        binary,
+        stderr_to_stdout
+    ]),
+    put({tty_out, Port}, <<>>),
+    Port.
+
+shell_quote(A) -> "'" ++ string:replace(A, "'", "'\\''", all) ++ "'".
+
+tty_type(Port, Keys) ->
+    true = port_command(Port, Keys),
+    ok.
+
+%% Wait until the output holds `Text'.
+tty_wait(Port, Text) ->
+    tty_wait(Port, Text, 300).
+tty_wait(Port, Text, 0) ->
+    ct:fail({tty_never_showed, Text, get({tty_out, Port})});
+tty_wait(Port, Text, N) ->
+    case binary:match(get({tty_out, Port}), Text) of
+        nomatch ->
+            receive
+                {Port, {data, D}} ->
+                    put({tty_out, Port}, <<(get({tty_out, Port}))/binary, D/binary>>),
+                    tty_wait(Port, Text, N);
+                {Port, {exit_status, S}} ->
+                    ct:fail({tty_exited, S, Text, get({tty_out, Port})})
+            after 100 -> tty_wait(Port, Text, N - 1)
+            end;
+        _ ->
+            ok
+    end.
+
+%% Wait until the output matches the regular expression `Re'.
+tty_wait_re(Port, Re) ->
+    tty_wait_re(Port, Re, 300).
+tty_wait_re(Port, Re, 0) ->
+    ct:fail({tty_never_matched, Re, get({tty_out, Port})});
+tty_wait_re(Port, Re, N) ->
+    case re:run(get({tty_out, Port}), Re) of
+        {match, _} ->
+            ok;
+        nomatch ->
+            receive
+                {Port, {data, D}} ->
+                    put({tty_out, Port}, <<(get({tty_out, Port}))/binary, D/binary>>),
+                    tty_wait_re(Port, Re, N)
+            after 100 -> tty_wait_re(Port, Re, N - 1)
+            end
+    end.
+
+tty_exit(Port) ->
+    receive
+        {Port, {data, D}} ->
+            put({tty_out, Port}, <<(get({tty_out, Port}))/binary, D/binary>>),
+            tty_exit(Port);
+        {Port, {exit_status, _}} ->
+            get({tty_out, Port})
+    after 30000 -> ct:fail({tty_did_not_exit, get({tty_out, Port})})
+    end.
+
+skip_without_script(Fun) ->
+    case os:find_executable("script") of
+        false -> {skip, "script(1) is needed for the terminal cases"};
+        _ -> Fun()
+    end.
+
+runs_of(Config) ->
+    {ok, Runs} = ccall(Config, runs, []),
+    Runs.
+
+%% Ctrl-C while a reply streams cancels that turn; the prompt comes back
+%% and the commands work.
+tty_ctrl_c_cancels_a_chat_turn(Config) ->
+    skip_without_script(fun() ->
+        Before = length(runs_of(Config)),
+        P = tty_cli(Config, ["chat", "slow", "--max-tokens", "2000"]),
+        ok = tty_wait(P, <<"> ">>),
+        ok = tty_type(P, "a long story\r"),
+        %% Streaming: the stub's tokens are digits.
+        ok = tty_wait_re(P, "story\r\n[0-9]{4}"),
+        ok = tty_type(P, [3]),
+        ok = tty_wait(P, <<"[cancelled]">>),
+        ok = tty_wait(P, <<"[cancelled]\r\n> ">>),
+        ok = tty_type(P, "/sessions\r"),
+        ok = tty_wait(P, <<" messages ">>),
+        ok = tty_type(P, "/quit\r"),
+        _ = tty_exit(P),
+        New = lists:sublist(lists:reverse(runs_of(Config)), length(runs_of(Config)) - Before),
+        ?assertMatch([#{status := cancelled}], New)
+    end).
+
+%% A line ending in `\' goes on: the two lines are one message.
+tty_multiline_is_one_message(Config) ->
+    skip_without_script(fun() ->
+        P = tty_cli(Config, ["chat", "fast", "--max-tokens", "4"]),
+        ok = tty_wait(P, <<"> ">>),
+        ok = tty_type(P, "first part\\\r"),
+        ok = tty_wait(P, <<"... ">>),
+        ok = tty_type(P, "second part\r"),
+        ok = wait(fun() ->
+            lists:any(
+                fun
+                    (#{conversation_id := C}) when is_binary(C) ->
+                        case ccall(Config, conversation, [C]) of
+                            {ok, #{messages := [#{content := <<"first part\nsecond part">>} | _]}} ->
+                                true;
+                            _ ->
+                                false
+                        end;
+                    (_) ->
+                        false
+                end,
+                runs_of(Config)
+            )
+        end),
+        ok = tty_type(P, "/quit\r"),
+        _ = tty_exit(P)
+    end).
+
+%% Ctrl-C at the prompt drops what was typed: no run starts.
+tty_ctrl_c_at_the_prompt_drops_the_line(Config) ->
+    skip_without_script(fun() ->
+        Before = length(runs_of(Config)),
+        P = tty_cli(Config, ["chat", "fast"]),
+        ok = tty_wait(P, <<"> ">>),
+        ok = tty_type(P, [$n, $o, $p, $e, 3, $\r]),
+        ok = tty_type(P, "/quit\r"),
+        _ = tty_exit(P),
+        ?assertEqual(Before, length(runs_of(Config)))
+    end).
+
+%% /switch to another session, whose turn asks for an approval answered
+%% in the terminal.
+tty_agent_switch_and_approval(Config) ->
+    skip_without_script(fun() ->
+        Ws = filename:join(?config(priv_dir, Config), "tty_ws"),
+        ok = filelib:ensure_path(Ws),
+        {ok, #{agent_id := Agent}} = ccall(Config, agent_start, [
+            #{
+                model => <<"fast">>,
+                workspace => list_to_binary(Ws),
+                generator => erllama_server_agent_script
+            }
+        ]),
+        ok = rcall(?config(rel, Config), erllama_server_agent_script, set, [
+            Agent,
+            [
+                #{
+                    calls => [
+                        {<<"w1">>, <<"write_file">>, #{
+                            <<"path">> => <<"note.txt">>, <<"content">> => <<"hi">>
+                        }}
+                    ]
+                },
+                #{text => <<"written">>}
+            ]
+        ]),
+        P = tty_cli(Config, ["agent", "fast", "--workspace", Ws]),
+        ok = tty_wait(P, <<"you> ">>),
+        ok = tty_type(P, "/switch " ++ binary_to_list(Agent) ++ "\r"),
+        ok = tty_wait(P, <<"[agent ", Agent/binary>>),
+        ok = tty_type(P, "write the note\r"),
+        ok = tty_wait(P, <<"allow write_file">>),
+        ok = tty_type(P, "y\r"),
+        ok = tty_wait(P, <<"written\r\nyou> ">>),
+        ok = tty_type(P, "/quit\r"),
+        _ = tty_exit(P),
+        ?assertEqual({ok, <<"hi">>}, file:read_file(filename:join(Ws, "note.txt")))
+    end).
 
 %% Gated: a real GGUF through llama.cpp's chat template and parser.
 real_model_chat(Config) ->

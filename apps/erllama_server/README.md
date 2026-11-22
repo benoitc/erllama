@@ -145,6 +145,9 @@ see the [configuration guide](../../guides/configuration.md).
 | `erllama_server_mcp` | the MCP clients: connections, tool catalog, calls and their results |
 | `erllama_server_mcp_endpoint` | the opt-in `/mcp` endpoint and its tools |
 | `erllama_server_cli_conv` | the CLI's conversation commands |
+| `erllama_server_cli_chat` | `erllama chat`: the line-by-line conversation and its commands |
+| `erllama_server_cli_term` | the terminal: Ctrl-C as a key, cooked and raw modes, serialised output, the status line |
+| `erllama_server_cli_input` | what is typed at a prompt: continued lines, blocks, commands |
 | `erllama_server_cli_agent`, `erllama_server_cli_mcp`, `erllama_server_cli_format` | the CLI's agent and MCP commands and its output formatting |
 | `erllama_server_http_ops` | health, readiness, metrics |
 | `erllama_server_convs` | conversations: history, last cache key, one active run each, persisted and recovered |

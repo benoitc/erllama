@@ -26,13 +26,25 @@ The build failed because ...
 you> /quit
 ```
 
-- `/prompt SERVER NAME [KEY=VALUE ...]` sends an MCP server's prompt
-  as your input (see [MCP servers](mcp.md)).
-- `/quit` (or the end of input) leaves the session running;
-  `erllama agents` lists sessions, and `erllama agent-stop AGENT` ends
+| Command | Does |
+|---|---|
+| `/new` | a new session on the same model and workspace (the current one keeps running) |
+| `/sessions` | lists the agent sessions |
+| `/switch ID` | goes to session `ID`, or starts one on conversation `ID` |
+| `/fork` | a new session on a copy of this session's conversation |
+| `/compact` | shortens this session's conversation now |
+| `/prompt SERVER NAME [KEY=VALUE ...]` | sends an MCP server's prompt as your input (see [MCP servers](mcp.md)) |
+| `/help` | lists the commands |
+| `/quit` | leaves; the session keeps running (so does the end of input) |
+| `/stop` | ends the session |
+
+- Ctrl-C interrupts the turn (see [Interrupting](#interrupting)); a
+  second one leaves the CLI, and the session goes on.
+- `erllama agents` lists sessions, and `erllama agent-stop AGENT` ends
   one.
 - `--conversation ID` continues an earlier conversation; the session's
-  history is kept in it.
+  history is kept in it. Without `--workspace`, the session works in
+  the workspace that conversation was last worked in.
 - `--max-rounds N` limits how many times the model may call tools in
   one turn.
 
@@ -106,7 +118,8 @@ Input you send during a turn waits and starts the next one.
 
 ## Interrupting
 
-Interrupting a turn (`agent_interrupt`) stops it at once:
+Interrupting a turn (Ctrl-C in `erllama agent`, or `agent_interrupt`)
+stops it at once:
 - the generation is cancelled;
 - every running tool is stopped, and a running command's whole process
   group is killed, including what it started in the background;

@@ -465,3 +465,69 @@ cache.
     dropped. A session compacts at the start of a turn and on request,
     and an interrupt during compaction ends it.
   - Gated: a real model writes a summary and the next turn answers.
+
+---
+
+# Phase 7: terminal and release validation (design)
+
+## Terminal
+
+- **Ctrl-C (checked on OTP 28.3.1 under a pseudo-terminal).** With
+  `+Bc` and the terminal in raw mode
+  (`shell:start_interactive({noshell, raw})`), Ctrl-C arrives as byte 3.
+  Cooked mode (line editing, `io:get_line`) and raw mode can be switched
+  at will, and a key reader blocked in `get_chars` can be killed
+  without losing input.
+  - `rel/erllama` passes `+Bc` when stdin is a terminal and `+Bd`
+    otherwise, so Ctrl-C ends a piped CLI at once.
+- **`erllama_server_cli_term`**: one process that owns the terminal.
+  - Raw mode with a key reader by default. Ctrl-C runs the current
+    handler; the default restores the terminal and exits with 130.
+  - `prompt/1` pauses the reader and reads a line in cooked mode;
+    `interrupt/2` sets the handler while a function runs.
+  - `out/1` and `err/1` serialise every write and turn `\n` into
+    `\r\n` in raw mode.
+  - `status/1` shows a status line (`[thinking 4s]`, `[shell 12s]`)
+    once the output has been quiet for a second, cleared by the next
+    write.
+  - When stdin is not a terminal, all of this is a pass-through.
+- **What Ctrl-C does:** `run` cancels the run; `chat` cancels the turn;
+  `agent` interrupts the turn; `pull` cancels the download (the part
+  file is kept); `attach` detaches and leaves the run going. A second
+  Ctrl-C during a turn leaves the CLI, and the release keeps the work.
+  At a prompt, Ctrl-C drops the line being typed.
+- **Input (`erllama_server_cli_input`, pure):**
+  - a line ending in `\` continues on the next line;
+  - `"""` opens a block that runs until a line with `"""`;
+  - a line starting with `/` is a command.
+- **Commands:**
+  - in `chat`: `/new`, `/sessions` (conversations), `/switch ID`,
+    `/fork`, `/compact`, `/help`, `/quit`;
+  - in `agent`: `/new` (a new session on the same model and
+    workspace), `/sessions` (agent sessions), `/switch ID` (an agent
+    session, or a conversation to start a session on), `/fork` (a
+    session on a copy of the conversation), `/compact`, `/prompt`,
+    `/help`, `/quit` (the session keeps running), `/stop`.
+- **Rendering:** content as it streams, reasoning dimmed (in a
+  terminal), tool calls and results, approvals, and the status line for
+  loading, compacting, prefill and running tools.
+- Closing the terminal ends only the CLI: runs and sessions go on, and
+  models stay loaded.
+
+## Tests
+
+- eunit: input parsing (continuation, blocks, commands, a dropped
+  line) and the raw-mode newline translation.
+- CT, in `erllama_server_rpc_SUITE`, with the CLI under `script(1)`:
+  Ctrl-C during a `chat` turn cancels the run and the next prompt
+  works; Ctrl-C at a prompt drops the line; `/new`, `/sessions` and
+  `/switch`; multiline input reaches the model as one message.
+
+## Release validation
+
+- The full gate, the library package check, and the server suites on
+  Linux.
+- The prod release end to end: pull, run, chat, agent, HTTP and SDKs,
+  MCP, restart and resume, compaction.
+- Gated real-model cases on TinyLlama, Qwen2.5 and SmolVLM.
+- `doc/features.md` records what ran and what was skipped.
