@@ -62,7 +62,10 @@ setup(bad_server_stays_contained, Config) ->
     %% Not started here: the case starts the MCP manager alone.
     Config;
 setup(interrupt_cancels_the_remote_call, Config) ->
+    {Pid, Port} = test_server(),
+    Url = "http://127.0.0.1:" ++ integer_to_list(Port) ++ "/mcp",
     ok = application:set_env(erllama_server, mcp_servers, [
+        #{name => "web", transport => http, url => Url, policy => auto},
         #{
             name => "local",
             transport => stdio,
@@ -73,7 +76,7 @@ setup(interrupt_cancels_the_remote_call, Config) ->
     ]),
     %% Long, so the client's own timeout is not what cancels the call.
     ok = application:set_env(erllama_server, mcp_timeout_ms, 30000),
-    boot(Config);
+    boot([{mcp_server, Pid} | Config]);
 setup(stdio_server, Config) ->
     ok = application:set_env(erllama_server, mcp_servers, [
         #{
@@ -499,17 +502,16 @@ list_or_dead(C) ->
 
 %% Interrupting a session cancels its call at the server: the session
 %% stops the tool worker, barrel_mcp's client cancels the request its
-%% caller left, and the tool is told and skips its side effect. The
-%% connection, shared with other sessions, stays up.
-%%
-%% Over stdio only for now. Over Streamable HTTP on the 2026-07-28
-%% revision the client cancels by closing the request's connection, and
-%% barrel_mcp 4.8.0 does not always close it (about half the time in a
-%% loop of 40, with Livery's side shown correct by closing a raw socket).
-%% Add `web' here once barrel_mcp fixes that.
+%% caller left, and the tool is told and skips its side effect. Both
+%% transports: over stdio the client sends `notifications/cancelled',
+%% over Streamable HTTP (2026-07-28) it closes the request's connection
+%% (at once since hackney 4.12.4). The connection, shared with other
+%% sessions, stays up.
 interrupt_cancels_the_remote_call(Config) ->
-    ok = wait_ready([<<"local">>]),
-    interrupt_one(Config, <<"local">>).
+    ok = wait_ready([<<"web">>, <<"local">>]),
+    lists:foreach(
+        fun(Server) -> interrupt_one(Config, Server) end, [<<"web">>, <<"local">>]
+    ).
 
 interrupt_one(Config, Server) ->
     Marker = filename:join(?config(priv_dir, Config), <<Server/binary, "-effect.txt">>),
