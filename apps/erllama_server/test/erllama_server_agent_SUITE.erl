@@ -478,7 +478,7 @@ real_model_reads_a_file(Config) ->
                 policy => yes,
                 %% A model with no tool template only writes text: keep its
                 %% turn short (it then skips below).
-                budgets => #{max_tokens => 256}
+                budgets => #{max_tokens => 96}
             }),
             Events = turn(
                 Id,
