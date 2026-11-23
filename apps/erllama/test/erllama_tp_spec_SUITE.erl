@@ -20,7 +20,7 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([short_prefix/1, long_prefix/1, cancel_releases_the_spare/1, verify_cost/1]).
--export([profile_verify/1, kv_capacity_cost/1]).
+-export([profile_verify/1, kv_capacity_cost/1, kv_rows_reuse/1]).
 
 -define(MOPTS, #{n_gpu_layers => 999, load_mode => direct_io}).
 -define(COPTS, #{
@@ -36,7 +36,8 @@ all() ->
         long_prefix,
         cancel_releases_the_spare,
         profile_verify,
-        kv_capacity_cost
+        kv_capacity_cost,
+        kv_rows_reuse
     ].
 
 init_per_suite(Config) ->
@@ -194,6 +195,129 @@ kv_case(G, Name) ->
     end,
     {_, ok} = op(G, {drop, 0}),
     S.
+
+%% Case B of kv_capacity_cost (unified, n_ctx 2048, no callback) on
+%% fresh rank nodes, with LLAMA_KV_ROWS_DISABLE unset, then set on
+%% both ranks (llama.cpp tests it by presence): the fused-KV-rows
+%% setting each rank resolved, its graph counters, the decode times and
+%% the argmax of each timed decode, compared between the two. Then,
+%% unset only, reuse inside the padding bucket and across the 1024
+%% boundary (a real change of extent must rebuild).
+kv_rows_reuse(Config) ->
+    COpts = maps:merge(?COPTS, #{kv_unified => true, n_ctx => 2048}),
+    Saved = os:getenv("ERLLAMA_TP_NCCL_ENV", ""),
+    Runs = [
+        begin
+            os:putenv("ERLLAMA_TP_NCCL_ENV", string:trim(Saved ++ " " ++ Env)),
+            R = with_group(Config, COpts, fun(G) -> rows_case(G, Name, Name =:= unset) end),
+            os:putenv("ERLLAMA_TP_NCCL_ENV", Saved),
+            {Name, R}
+        end
+     || {Name, Env} <- [{unset, ""}, {'LLAMA_KV_ROWS_DISABLE=1', "LLAMA_KV_ROWS_DISABLE=1"}]
+    ],
+    [{_, #{trace := T1, dec := D1}}, {_, #{trace := T2, dec := D2}}] = Runs,
+    Same = length([x || {{A, _}, {B, _}} <- lists:zip(T1, T2), A =:= B]),
+    MaxDiff = lists:max([abs(X - Y) || {{_, X}, {_, Y}} <- lists:zip(T1, T2)]),
+    ct:pal(
+        "fixed trace: ~b of ~b argmax tokens agree between unset and set; largest difference of the top logit ~.4g~n"
+        "decode median: unset ~.1f ms, set ~.1f ms (~.1f ms returned)",
+        [Same, length(T1), MaxDiff, pct(D1, 50), pct(D2, 50), pct(D1, 50) - pct(D2, 50)]
+    ),
+    ok.
+
+rows_case(G, Name, Extent) ->
+    P = prompt(G, 90),
+    {_, {ok, _}} = op(G, {decode, 0, P, false}),
+    Toks = [1000 + I || I <- lists:seq(1, ?KV_WARM + ?KV_TIMED)],
+    {Warm, Timed} = lists:split(?KV_WARM, Toks),
+    _ = [run_t(G, [T], false) || T <- Warm],
+    Perf0 = perf_ranks(G),
+    Trace = [trace_t(G, T) || T <- Timed],
+    Perf1 = perf_ranks(G),
+    Dec = lists:sort([maps:get(dec, R) || {_, R} <- Trace]),
+    ct:pal(
+        "~p: fused KV rows as resolved on each rank: ~p~ndecode median ~.1f ms, p95 ~.1f ms; graph counters per rank over the 40 timed decodes: ~p",
+        [
+            Name, kv_rows_lines(G), pct(Dec, 50), pct(Dec, 95), perf_delta(Perf0, Perf1)
+        ]
+    ),
+    case Extent of
+        true -> extent_change(G);
+        false -> ok
+    end,
+    {_, ok} = op(G, {drop, 0}),
+    #{trace => [{Tok, Top} || {{Tok, Top}, _} <- Trace], dec => Dec}.
+
+%% Decodes that stay below position 1024, then 8 that cross it: the
+%% first part must reuse every graph, the crossing must rebuild.
+extent_change(G) ->
+    {_, Pos} = op(G, {pos_max, 0}),
+    Below = 1023 - Pos,
+    Pa = perf_ranks(G),
+    _ = [run_t(G, [1500], false) || _ <- lists:seq(1, Below)],
+    Pb = perf_ranks(G),
+    _ = [run_t(G, [1500], false) || _ <- lists:seq(1, 8)],
+    Pc = perf_ranks(G),
+    ct:pal("extent: ~b decodes inside the bucket (to position 1023): ~p; 8 crossing 1024: ~p", [
+        Below, perf_delta(Pa, Pb), perf_delta(Pb, Pc)
+    ]).
+
+%% The argmax token and the top logit of one timed decode, with its time.
+trace_t(G, T) ->
+    {Ms, {ok, L}, PerRank} = op_t(G, {decode, 0, [T], false}),
+    F = [V || <<V:32/float-native>> <= L],
+    Top = lists:max(F),
+    Dec = lists:max([D || {_, D, _} <- PerRank]) / 1000,
+    {{argmax(L), Top}, #{e2e => Ms, dec => Dec}}.
+
+perf_ranks(#{ranks := Ranks}) ->
+    [
+        element(2, peer:call(P, erllama_tp_rank, seq_op, [R, {diag, perf}], 60000))
+     || {P, R} <- Ranks
+    ].
+
+perf_delta(As, Bs) ->
+    [
+        maps:with(
+            [n_reused, n_reallocs_same, n_reallocs_diff, n_eval],
+            maps:map(fun(K, V) -> V - maps:get(K, A) end, B)
+        )
+     || {A, B} <- lists:zip(As, Bs)
+    ].
+
+kv_rows_lines(#{ranks := Ranks}) ->
+    [
+        case peer:call(P, file, read_file, ["/tmp/erllama_tp_spec.log"]) of
+            {ok, Bin} ->
+                [
+                    L
+                 || L <- binary:split(Bin, <<"\n">>, [global]),
+                    binary:match(L, [<<"kv_rows">>, <<"K/V rows">>]) =/= nomatch
+                ];
+            _ ->
+                []
+        end
+     || {P, _} <- Ranks
+    ].
+
+%% Native llama.cpp lines at info, to a file on the rank's host.
+native_log(P) ->
+    _ = peer:call(P, file, delete, ["/tmp/erllama_tp_spec.log"]),
+    ok = peer:call(P, application, set_env, [erllama, native_log_level, info]),
+    ok = peer:call(P, supervisor, terminate_child, [erllama_sup, erllama_log]),
+    {ok, _} = peer:call(P, supervisor, restart_child, [erllama_sup, erllama_log]),
+    _ = peer:call(P, logger, set_primary_config, [level, info]),
+    _ = peer:call(P, logger, add_handler, [
+        tp_spec,
+        logger_std_h,
+        #{
+            level => info,
+            config => #{file => "/tmp/erllama_tp_spec.log"},
+            filter_default => stop,
+            filters => [{native, {fun logger_filters:domain/2, {log, sub, [erllama, native]}}}]
+        }
+    ]),
+    ok.
 
 -define(ROUNDS, 4).
 -define(BLOCK, 6).
@@ -510,6 +634,7 @@ with_group(Config, COpts, Fun) ->
         #{rank_peers := Peers, rank_pids := Pids} = erllama_tp_hosts:form(Hosts, S, 1),
         Ranks = lists:zip(Peers, Pids),
         try
+            _ = [native_log(P) || P <- Peers],
             Before = [avail(P) || P <- Peers],
             [
                 ok = R
