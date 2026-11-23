@@ -1122,16 +1122,6 @@ long erllama_safe_memory_seq_pos_max(struct llama_context *c,
     }
 }
 
-// Speculative-decoding helper. Build a llama_batch with logits[i]=1
-// for every position, decode, fill out_argmax[i] with argmax over
-// the model vocab at each position. Used by erllama:verify/4.
-//
-// Sampler state is intentionally untouched: this path goes
-// straight through llama_get_logits_ith / argmax and bypasses any
-// configured sampler chain, so the caller's c->smpl stays clean.
-//
-// Returns 0 ok; -1 on llama_decode failure; -2 on batch_init OOM
-// or invalid n_tokens; -3 on C++ exception.
 // Decode `tokens' at positions start_pos.. on seq 0 and copy the last
 // token's logits (n_vocab floats) into `out'. 0 on success, -1 decode
 // failed, -2 bad arguments or allocation, -3 exception.
@@ -1170,6 +1160,16 @@ int erllama_safe_forward_last_logits(struct llama_context *c, const llama_token 
     }
 }
 
+// Speculative-decoding helper. Build a llama_batch with logits[i]=1
+// for every position, decode, fill out_argmax[i] with argmax over
+// the model vocab at each position. Used by erllama:verify/4.
+//
+// Sampler state is intentionally untouched: this path goes
+// straight through llama_get_logits_ith / argmax and bypasses any
+// configured sampler chain, so the caller's c->smpl stays clean.
+//
+// Returns 0 ok; -1 on llama_decode failure; -2 on batch_init OOM
+// or invalid n_tokens; -3 on C++ exception.
 int erllama_safe_forward_with_argmax(struct llama_context *c,
                                      const llama_token *tokens,
                                      int32_t n_tokens,

@@ -495,12 +495,19 @@ bool comm_allreduce(void *ctx, struct ggml_tensor **tensors) {
     tp_group *g = c->g;
     tp_rank *r = g->rank;
     ggml_tensor *t = tensors[g->slot];
-    ggml_backend_event_record(c->before, c->compute);
-    ggml_backend_event_wait(r->backend, c->before);
-    ggml_tensor *mine[1] = {t};
-    bool ok = r->allreduce(r->comm, mine);
-    ggml_backend_event_record(c->after, r->backend);
-    ggml_backend_event_wait(c->compute, c->after);
+    /* The communicator serves one caller at a time: a reduction from
+     * another process of this node (erllama_tp:reduce/2) waits. */
+    pthread_mutex_lock(&r->mu);
+    bool ok = false;
+    if (r->comm) {
+        ggml_backend_event_record(c->before, c->compute);
+        ggml_backend_event_wait(r->backend, c->before);
+        ggml_tensor *mine[1] = {t};
+        ok = r->allreduce(r->comm, mine);
+        ggml_backend_event_record(c->after, r->backend);
+        ggml_backend_event_wait(c->compute, c->after);
+    }
+    pthread_mutex_unlock(&r->mu);
     g->reductions++;
     {
         std::lock_guard<std::mutex> l(g->log_mu);
