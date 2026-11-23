@@ -81,10 +81,11 @@ static ERL_NIF_TERM tp_batch_cmd(ErlNifEnv *menv, struct llama_batch *b) {
         menv, sizeof(int32_t) * (1 + 4 * (size_t) b->n_tokens), &bin);
     p[0] = b->n_tokens;
     for (int32_t i = 0; i < b->n_tokens; i++) {
-        p[1 + 4 * i] = b->token[i];
-        p[2 + 4 * i] = b->pos[i];
-        p[3 + 4 * i] = b->seq_id[i][0];
-        p[4 + 4 * i] = b->logits[i];
+        int32_t *row = p + 1 + 4 * (size_t) i;
+        row[0] = b->token[i];
+        row[1] = b->pos[i];
+        row[2] = b->seq_id[i][0];
+        row[3] = b->logits[i] ? 1 : 0;
     }
     return enif_make_tuple2(menv, enif_make_atom(menv, "decode"), bin);
 }
@@ -1402,11 +1403,12 @@ ERL_NIF_TERM nif_tp_follow(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
             return erllama_error(env, atom_oom);
         }
         for (int32_t i = 0; i < n; i++) {
-            batch.token[i] = p[1 + 4 * i];
-            batch.pos[i] = p[2 + 4 * i];
+            const int32_t *row = p + 1 + 4 * (size_t) i;
+            batch.token[i] = row[0];
+            batch.pos[i] = row[1];
             batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = p[3 + 4 * i];
-            batch.logits[i] = (int8_t) p[4 + 4 * i];
+            batch.seq_id[i][0] = row[2];
+            batch.logits[i] = (int8_t) row[3];
         }
         batch.n_tokens = n;
         rc = erllama_ctx_decode(env, c, batch);
