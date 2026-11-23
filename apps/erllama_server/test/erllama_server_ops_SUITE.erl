@@ -17,6 +17,7 @@
     slow_tool_leaves_other_conversations_alone/1,
     cancel_ends_only_its_run/1,
     tool_timeout_is_recorded/1,
+    tool_crash_stays_with_its_call/1,
     model_crash_stays_with_its_model/1,
     session_crash_stays_with_its_session/1
 ]).
@@ -27,6 +28,7 @@ all() ->
         slow_tool_leaves_other_conversations_alone,
         cancel_ends_only_its_run,
         tool_timeout_is_recorded,
+        tool_crash_stays_with_its_call,
         model_crash_stays_with_its_model,
         session_crash_stays_with_its_session
     ].
@@ -126,6 +128,37 @@ tool_timeout_is_recorded(Config) ->
         [F || #{kind := tool_timed_out} = F <- failures()]
     ),
     ok = erllama_server_api:agent_stop(Agent).
+
+%% The process running a tool call dies: that call gets an error
+%% result, the turn goes on to its end, and the failure is recorded.
+tool_crash_stays_with_its_call(Config) ->
+    M = add_model(Config, <<"crashes">>, #{}),
+    Agent = agent(Config, M, [
+        #{calls => [{<<"c1">>, <<"shell">>, #{<<"command">> => <<"sleep 3">>}}]},
+        #{text => <<"the tool crashed">>}
+    ]),
+    ok = erllama_server_api:agent_send(Agent, <<"go">>),
+    ok = wait(fun() -> running_tools(Agent) =:= [<<"shell">>] end),
+    {ok, #{pid := Pid}} = erllama_server_runs:lookup(Agent),
+    [Worker] = tool_workers(Pid),
+    exit(Worker, kill),
+    ok = wait(fun() -> agent_state(Agent) =:= idle end, 400),
+    ?assertMatch(
+        [#{subject := Agent, reason := <<"#{reason => killed", _/binary>>}],
+        [F || #{kind := tool_crashed} = F <- failures()]
+    ),
+    ok = erllama_server_api:agent_stop(Agent).
+
+%% The session's tool workers: linked processes running a tool.
+tool_workers(Session) ->
+    {links, Links} = erlang:process_info(Session, links),
+    [
+        P
+     || P <- Links,
+        is_pid(P),
+        {current_stacktrace, Stack} <- [erlang:process_info(P, current_stacktrace)],
+        lists:any(fun({Mod, _, _, _}) -> Mod =:= erllama_server_tools end, Stack)
+    ].
 
 %% A model process that dies ends the runs on it, with an error; a run
 %% on another model goes on; the next request loads the model again.
