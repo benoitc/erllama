@@ -1,0 +1,31 @@
+#!/bin/sh
+# erllama CLI launcher. Runs the CLI escript (bin/erllama_cli) on the
+# runtime bundled with the release when there is one, otherwise on the
+# escript found in PATH. The CLI connects to the running release; it
+# never starts the inference application itself.
+#
+# ERLLAMA_DIST_OPTFILE: an -ssl_dist_optfile; when set the client
+# node uses TLS distribution, for a release started the same way.
+set -e
+BIN_DIR=$(cd "$(dirname "$0")" && pwd -P)
+REL_ROOT=$(dirname "$BIN_DIR")
+ESCRIPT=escript
+for d in "$REL_ROOT"/erts-*/bin; do
+    if [ -x "$d/escript" ]; then
+        ESCRIPT="$d/escript"
+    fi
+done
+# Ctrl-C: in a terminal the CLI reads it as a key (cancel a run,
+# interrupt a turn; erllama_server_cli_term); otherwise it ends the CLI
+# at once.
+if [ -t 0 ]; then
+    ERL_FLAGS="${ERL_FLAGS:-} +Bc"
+else
+    ERL_FLAGS="${ERL_FLAGS:-} +Bd"
+fi
+export ERL_FLAGS
+if [ -n "${ERLLAMA_DIST_OPTFILE:-}" ]; then
+    ERL_FLAGS="${ERL_FLAGS:-} -proto_dist inet_tls -ssl_dist_optfile $ERLLAMA_DIST_OPTFILE"
+    export ERL_FLAGS
+fi
+exec "$ESCRIPT" "$BIN_DIR/erllama_cli" "$@"

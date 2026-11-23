@@ -728,7 +728,7 @@ behaviour (`cache_hit_kind`, `cache_delta`) hold across runs.
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
-    rebar3 ct --suite=test/erllama_real_model_SUITE
+    rebar3 ct --dir apps/erllama/test --suite erllama_real_model_SUITE
 ```
 
 The 6-case suite covers cold prefill, warm restore, multi-turn

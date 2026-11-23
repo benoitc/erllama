@@ -8,15 +8,25 @@ erllama is a native Erlang/OTP wrapper around llama.cpp providing
 OpenAI-compatible inference with full supervision and a tiered KV
 cache. Requires Erlang/OTP 28 and rebar3 3.25+.
 
-Single application, flat layout:
+A rebar3 umbrella. Run every rebar3 command from the repository root.
 
 ```
-src/        Erlang sources (erllama_*, erllama_cache_*, erllama_nif)
-include/    Shared headers (erllama_cache.hrl)
-c_src/      C sources for the single NIF (erllama_nif.so)
-test/       eunit + PropEr property tests
-priv/       Build artefact: erllama_nif.so
-config/     sys.config
+apps/erllama/          the library (published to Hex)
+  src/                 Erlang sources (erllama_*, erllama_cache_*, erllama_nif)
+  include/             Shared headers (erllama_cache.hrl)
+  c_src/               C sources for the single NIF (erllama_nif.so)
+  test/                eunit, PropEr and Common Test suites
+  priv/                Build artefact: erllama_nif.so
+  config/              sys.config for `rebar3 shell`
+  rebar.config         NIF build hooks, Hex and ex_doc config
+apps/erllama_server/   the server release and the CLI
+                       (erllama_server_cli, built as the `erllama` escript)
+config/                release sys.config and vm.args.src
+rel/erllama            CLI launcher copied into the release's bin/
+scripts/               check_library_package.sh: erllama standalone from Hex
+guides/, internals/    documentation, published with the library
+rebar.config           shared tooling: plugins, profiles, fmt, dialyzer,
+                       the release and the CLI escript
 ```
 
 The KV cache is logically a subsystem (its own supervisor, modules
@@ -128,9 +138,9 @@ response.
 
 ### Test Organization
 
-- `test/<mod>_tests.erl`: EUnit unit tests
-- `test/prop_<mod>.erl`: PropEr property-based tests
-- `test/<feature>_SUITE.erl`: Common Test suites
+- `apps/<app>/test/<mod>_tests.erl`: EUnit unit tests
+- `apps/<app>/test/prop_<mod>.erl`: PropEr property-based tests
+- `apps/<app>/test/<feature>_SUITE.erl`: Common Test suites
 
 ### Real-model CT suite
 
@@ -140,7 +150,7 @@ model:
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-q4_k_m.gguf rebar3 ct \
-    --suite=test/erllama_real_model_SUITE
+    --dir apps/erllama/test --suite erllama_real_model_SUITE
 ```
 
 Without the env var the suite skips so default `rebar3 ct` runs stay

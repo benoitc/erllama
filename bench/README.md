@@ -137,7 +137,7 @@ the cache speedup on a single binary. For external comparisons:
 | `multi_agent` p50/p99 | Latency under shared-prefix concurrency, the agent-loop scenario. |
 
 For an apples-to-apples run against unwrapped llama.cpp, time
-`./c_src/llama.cpp/build/bin/llama-cli -m $MODEL -n 1 -p '<same prompt>'`
+`llama-cli -m $MODEL -n 1 -p '<same prompt>'` (built from upstream llama.cpp at the tag in `apps/erllama/c_src/llama.cpp/.version`)
 and compare against the cold column. The warm column / cold column
 ratio is the headline cache benefit.
 

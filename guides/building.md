@@ -1,8 +1,8 @@
 # Building erllama
 
 erllama is a single OTP application with a single NIF
-(`erllama_nif.so`). The first compile builds the vendored
-`c_src/llama.cpp/` (~3 minutes on a fast machine), then compiles the
+(`erllama_nif.so`), in `apps/erllama/` of this repository. The first
+compile builds the vendored `c_src/llama.cpp/` (~3 minutes on a fast machine), then compiles the
 small NIF surface and a CRC table. Subsequent builds reuse the cmake
 cache and finish in seconds.
 
@@ -94,7 +94,7 @@ takes precedence (useful for cross-compilation or pinned headers).
   the vendored `c_src/llama.cpp` (libllama, libggml, ggml-cpu, plus
   the platform GPU/BLAS backends) and `c_src/crc32c.c`.
 - `_build/default/lib/erllama/ebin/*.beam` - Erlang modules.
-- `_build/cmake/` - CMake build dir; cached for incremental builds.
+- `_build/cmake/` (under `apps/erllama/` in this repository) - CMake build dir; cached for incremental builds.
 
 ## Common build issues
 
@@ -113,7 +113,7 @@ takes precedence (useful for cross-compilation or pinned headers).
   `llama_backend_init` runs on the first `erllama:load_model/1` call
   and discovers Metal devices. eunit cases that load a model need
   a generator timeout >5 s; see
-  `test/erllama_nif_tests.erl:load_model_rejects_non_existent_path_test_/0`
+  `apps/erllama/test/erllama_nif_tests.erl:load_model_rejects_non_existent_path_test_/0`
   for the pattern.
 
 ## Verifying the build
@@ -132,7 +132,7 @@ End-to-end against a real GGUF:
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.gguf \
-    rebar3 ct --suite=test/erllama_real_model_SUITE
+    rebar3 ct --dir apps/erllama/test --suite erllama_real_model_SUITE
 ```
 
 Without the env var the suite skips, so default `rebar3 ct` stays
@@ -140,4 +140,4 @@ green on machines without a model file.
 
 ## Bumping the vendored llama.cpp
 
-See [UPDATE_LLAMA.md](../UPDATE_LLAMA.md) at the project root.
+See [UPDATE_LLAMA.md](../apps/erllama/UPDATE_LLAMA.md).

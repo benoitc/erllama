@@ -1,0 +1,6 @@
+## erllama_server node. Distribution listens on loopback only; remote
+## administration needs an explicit TLS distribution setup.
+-name erllama_server@127.0.0.1
+-kernel inet_dist_use_interface {127,0,0,1}
++K true
++A 64
