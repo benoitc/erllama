@@ -244,3 +244,44 @@ Tests that fail before the fix and pass after it:
 - Where the 20 ms went: the request rendered its chat template, tokenised its prompt and was admitted through three calls to the model process, one after another, and each waited for the decode step in progress (about 6.6 ms). Tokenising and rendering now run in the caller's process: the second user's first token comes in 54 ms (66 ms before, measured back to back), and the first user's speed is unchanged.
 - The rest: the first token is sampled one step after the prompt's prefill, where llama-server samples right after it. Changing that touches the cache invariant that a token handed back is already in the KV, so it is left for review.
 - Not measured here: a cache checkpoint of a long conversation pauses the model's other streams while it is saved (the save reads a paused context, an invariant of the cache). Its length depends on the conversation's size.
+
+## Work that outlives its client, and what an operator sees (2026-11-23)
+
+The audit behind this section is in [differentiation.md](differentiation.md).
+
+| Feature | State | Notes |
+|---|---|---|
+| runtime view | done | `erllama status`, `erllama inspect JOB`, `GET /status` (JSON) and `/metrics`: loaded models with busy sequences and requests waiting for one, runs by phase, agent sessions with pending approvals, running tools and background jobs, MCP servers, cache activity, memory, recent failures |
+| waiting runs | fixed | a run waiting for a free sequence blocked in admission: it could not be inspected, and cancelling it timed out. It now starts its stream from a helper, answers at once, shows the phase `waiting` and cancels at once |
+| failure log | done | a bounded log of the latest failures (run, model down, turn, tool crash or timeout, session down, MCP down or failed call, conversation repaired), each with what the release did next; `erllama_server_failures_total{kind}` in `/metrics` |
+| reattach | done | `erllama agent --attach ID` from any terminal: the session's state, approvals and jobs, then its latest turn replayed from the event buffer (a gap is reported) and followed live; replayed approvals are asked only if still pending |
+| MCP outages | done | a call that fails without an answer is recorded and makes the release check the server; an outage is recorded once. Status catches up within the client's own timeouts (about 30 s in the test) |
+| malformed requests | fixed | a request the native code rejects crashed the shared model process; the caller now gets `{error, badarg}` |
+| examples | done | `examples/embedded_app` (erllama in a supervised OTP application) and `examples/service_client` (a node using the release over distribution) |
+
+Tests (stub models and scripted agents, repeatable):
+- `erllama_server_models_SUITE:waiting_run_answers_and_cancels` (fails before the fix: `info` on a waiting run timed out).
+- `erllama_server_ops_SUITE`: status shows running and waiting; a slow tool leaves another conversation alone (its turn took 21 ms while the tool ran); cancelling one run ends only that run; a tool timeout is recorded; a killed model ends its runs with `model_down` while a run on another model finishes and the next request reloads it; a killed session is recorded, its conversation freed and resumed, and another session goes on.
+- `erllama_server_rpc_SUITE:tty_agent_attach_shows_what_happened`: a real terminal attaches to a session stopped at an approval, sees the output produced while nobody was attached, approves, and follows the turn to its end.
+- `erllama_server_mcp_SUITE:server_down_and_back`: the failed call and the outage are each recorded, the outage once.
+- Gated `erllama_real_model_SUITE:bad_request_leaves_the_model_running`.
+
+### Benchmark: sharing one model and its cache
+
+`scripts/bench_cache.py` over HTTP, Apple M4 Pro (48 GiB, Metal), Qwen2.5 1.5B Instruct Q4_K_M, `n_ctx 4096`, `parallel 4`, RAM cache tier only, greedy, one client at a time. Two runs on fresh releases agree within 30 ms; run 2:
+
+| Step | First token | Total | Prompt tokens | Cache |
+|---|---|---|---|---|
+| 1. first request, the model loads on demand | 207 ms | 266 ms | 32 | miss |
+| 2. same model, loaded | 30 ms | 88 ms | 32 | miss |
+| 3. a 2737-token system prompt, cold | 1459 ms | 1517 ms | 2737 | miss, saves its first 2048 tokens |
+| 4. same system prompt, another question | 429 ms | 487 ms | 2738 | prefix hit (2048 tokens) |
+| 5. the same after the cache dropped its rows | 1454 ms | 1504 ms | 2738 | miss |
+| 6. turn 2 sent whole by a stateless client | 50 ms | 101 ms | 2756 | prefix hit (turn 1 with its reply) |
+| 7. turn 2 through the Responses API (`previous_response_id`) | n/a | 94 ms | 2756 | resumed from turn 1's key |
+
+- The model is loaded once and every client uses it; step 1 includes its load (the file was already in the page cache).
+- Unrelated requests share a prefix only at the cache's boundaries (multiples of `boundary_align_tokens`, 2048): a 1937-token system prompt in an earlier run was never reused.
+- A later turn finds the previous turn's saved context whether its client links it or sends the whole history; linked turns (conversations, agent sessions, `previous_response_id`) resume from the exact key.
+- After an eviction the request is prefilled again: slower, same answer.
+- Admission under limited sequences is measured in the shared-serving benchmark above.
