@@ -32,6 +32,7 @@
     unreachable_release/1,
     concurrent_cli_processes/1,
     cli_cancel_while_another_follows/1,
+    cli_output_closed_leaves_quietly/1,
     tty_ctrl_c_cancels_a_chat_turn/1,
     tty_multiline_is_one_message/1,
     tty_ctrl_c_at_the_prompt_drops_the_line/1,
@@ -67,6 +68,7 @@ all() ->
         unreachable_release,
         concurrent_cli_processes,
         cli_cancel_while_another_follows,
+        cli_output_closed_leaves_quietly,
         tty_ctrl_c_cancels_a_chat_turn,
         tty_multiline_is_one_message,
         tty_ctrl_c_at_the_prompt_drops_the_line,
@@ -470,6 +472,35 @@ cli_cancel_while_another_follows(Config) ->
     {Code, Out} = cli_wait(Follower, [First]),
     ?assertEqual(1, Code),
     ?assertNotEqual(nomatch, binary:match(Out, <<"[cancelled]">>)).
+
+%% `erllama attach RUN | head': once the reader stops, the CLI leaves
+%% quietly with status 0, and the run goes on.
+cli_output_closed_leaves_quietly(Config) ->
+    Run = start(Config, turn(<<"slow">>, <<"to a pipe">>, #{response_tokens => 500})),
+    Erl = filename:join([code:root_dir(), "bin", "erl"]),
+    Ebin = filename:dirname(code:which(erllama_server_cli)),
+    Err = filename:join(?config(priv_dir, Config), "pipe_err.txt"),
+    Expr = lists:flatten(io_lib:format("erllama_server_cli:main([\"attach\", \"~s\"]).", [Run])),
+    Cmd = lists:flatten(
+        io_lib:format(
+            "'~s' -noshell -pa '~s' -eval '~s' 2>'~s' | head -c 1 >/dev/null; echo \"status=${PIPESTATUS[0]}\"",
+            [Erl, Ebin, Expr, Err]
+        )
+    ),
+    Port = open_port({spawn_executable, os:find_executable("bash")}, [
+        {args, ["-c", Cmd]},
+        {env, [
+            {"ERLLAMA_NODE", atom_to_list(?config(rel_node, Config))},
+            {"ERLLAMA_COOKIE", ?COOKIE}
+        ]},
+        exit_status,
+        binary
+    ]),
+    {0, Out} = cli_wait(Port),
+    ?assertEqual(<<"status=0\n">>, Out),
+    ?assertEqual({ok, <<>>}, file:read_file(Err)),
+    ?assertMatch({ok, #{status := running}}, ccall(Config, run, [Run])),
+    ok = ccall(Config, cancel, [Run]).
 
 %% -----------------------------------------------------------------------------
 %% The CLI in a terminal (a pseudo-terminal from script(1)), typed to.

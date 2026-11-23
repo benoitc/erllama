@@ -65,12 +65,23 @@
 
 -spec main([string()]) -> no_return().
 main(Args) ->
+    ok = log_to_stderr(),
     %% A terminal: Ctrl-C is handled here (see erllama_server_cli_term).
     _ = erllama_server_cli_term:start(),
     {Code, Output} = run(Args),
     ok = erllama_server_cli_term:finish(),
-    io:put_chars(Output),
+    ok = erllama_server_cli_term:safe_put(standard_io, Output),
     halt(Code).
+
+%% Diagnostics go to standard error: standard output is the command's
+%% result, and may be a pipe its reader closes.
+log_to_stderr() ->
+    _ = logger:remove_handler(default),
+    %% The CLI reports its own errors; of OTP's reports, only the
+    %% critical ones (a closed output pipe is logged as an error).
+    logger:add_handler(default, logger_std_h, #{
+        level => critical, config => #{type => standard_error}
+    }).
 
 %% Run one command and return its exit code and remaining output, so
 %% commands can be tested without halting the VM. Streaming commands

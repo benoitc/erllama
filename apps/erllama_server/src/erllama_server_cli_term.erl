@@ -21,7 +21,7 @@
 -export([
     start/0, interactive/0, finish/0, out/1, err/1, prompt/1, interrupt/2, status/1, dim/1, tty/0
 ]).
--export([crlf/1]).
+-export([crlf/1, safe_put/2]).
 
 -define(NAME, erllama_cli_term).
 -define(QUIET_MS, 1000).
@@ -102,7 +102,7 @@ err(Data) -> write(standard_error, Data).
 
 write(Dev, Data) ->
     case whereis(?NAME) of
-        undefined -> io:put_chars(Dev, Data);
+        undefined -> safe_put(Dev, Data);
         _ -> call({write, Dev, Data})
     end.
 
@@ -243,15 +243,30 @@ leave(T) ->
 do_write(standard_io, Data, #t{raw = true} = T) ->
     %% Raw mode: standard output is not translated (standard error is).
     T1 = clear(T),
-    io:put_chars(standard_io, crlf(Data)),
+    ok = safe_put(standard_io, crlf(Data)),
     T1#t{last_out = now_ms()};
 do_write(Dev, Data, #t{raw = true} = T) ->
     T1 = clear(T),
-    io:put_chars(Dev, Data),
+    ok = safe_put(Dev, Data),
     T1#t{last_out = now_ms()};
 do_write(Dev, Data, T) ->
-    io:put_chars(Dev, Data),
+    ok = safe_put(Dev, Data),
     T#t{last_out = now_ms()}.
+
+%% Output that nobody reads any more (`erllama attach RUN | head'):
+%% the reader is done, like a detach. Leave quietly; the release keeps
+%% what it was doing.
+-spec safe_put(io:device(), iodata()) -> ok.
+safe_put(Dev, Data) ->
+    try
+        io:put_chars(Dev, Data)
+    catch
+        error:_ -> output_closed()
+    end.
+
+-spec output_closed() -> no_return().
+output_closed() ->
+    erlang:halt(0, [{flush, false}]).
 
 tick(#t{raw = true, status = {Label, Since}} = T) ->
     Now = now_ms(),
