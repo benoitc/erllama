@@ -360,3 +360,30 @@ Run on the two GB10 hosts over RoCE, TinyLlama 1.1B Chat Q4, `n_ctx 1024`, flash
 - The split runs vary between runs (39 to 53 ms first token); the one-GPU runs do not. Only these configurations were measured.
 
 Not done: failure handling during generation (a rank lost mid-stream, a stale or duplicate step, cancel during a collective), coordinated checkpoints and cache hits, a model larger than one GPU, more than two hosts, Metal.
+
+## Tensor parallelism over plain TCP (2026-11-23)
+
+Experimental. A group runs over ordinary Ethernet with NCCL's socket transport: set `NCCL_NET=Socket` and `NCCL_SOCKET_IFNAME` in each rank node's environment. Nothing in erllama changed; the launch recipe, the diagnostics and the checks are in [internals/tensor-parallel.md](../internals/tensor-parallel.md).
+
+Same two GB10 hosts, same build, TinyLlama 1.1B Chat Q4, `n_ctx 1024`, a 242-token prompt and 128 streamed tokens, rank 0 serving (`erllama_tp_nccl_SUITE`, all 9 cases passed in each configuration). Three configurations: TCP over the two 200 Gb/s links (`NCCL_SOCKET_IFNAME==enp1s0f0np0,enP2p1s0f0np0`), TCP over the 2.5 Gb/s management port (`==enP7s7`), and RoCE (no NCCL variable set).
+
+| What NCCL used | TCP, 200 Gb/s links | TCP, 2.5 Gb/s port | RoCE |
+|---|---|---|---|
+| network | `Using network Socket` | `Using network Socket` | `Using network IB` |
+| devices | `[0]enp1s0f0np0 [1]enP2p1s0f0np0` | `[0]enP7s7` | `[0]rocep1s0f0 [1]roceP2p1s0f0` (RoCE) |
+| channels | 8, `via NET/Socket/0` and `/1` alternating | 4, `via NET/Socket/0` | 8, `via NET/IB/0` and `/1` alternating |
+| bytes sent per host by 17 reductions of 2M values (BF16) | 37.4 and 37.3 MB, nothing on the 2.5 Gb/s port | 74.7 MB | none in the interface counters (RDMA) |
+| one such reduction | 7.2 ms | 18.7 ms | 4.5 ms |
+
+| Two runs each | First token | Decode tokens/s | Median gap | 2048-value reduction |
+|---|---|---|---|---|
+| TCP, 200 Gb/s links | 132.8 and 126.8 ms | 65.6 and 55.8 | 14.90 and 18.18 ms | 342 and 581 µs |
+| TCP, 2.5 Gb/s port | 197.5 and 213.8 ms | 43.3 and 47.5 | 24.24 and 21.54 ms | 421 and 492 µs |
+| RoCE | 45.2 and 48.7 ms | 177.1 and 228.9 | 5.70 and 4.35 ms | 163 and 118 µs |
+| one GB10, no split | 21.3 to 22.9 ms | 283.9 to 289.5 | 3.42 to 3.50 ms | |
+
+- In every configuration the greedy completion was identical to one GPU for all 32 tokens, the 128-token stream finished, a cancel after 10 tokens ended cleanly and the next request gave the same tokens, and both ranks made 9196 reductions in the same order.
+- Decoding is bound by the latency of the 44 small reductions per token, not by bandwidth: TCP over the 200 Gb/s links is only 1.2 to 1.5 times faster than over the 2.5 Gb/s port, and 3 to 4 times slower than RoCE.
+- The NIC speeds are the hosts' reported link speeds (`/sys/class/net/*/speed`). The two hosts' GPUs are shared with another workload; the runs vary.
+
+Not run over TCP: the rank-loss, stale-command and checkpoint cases, which come with milestone 4.

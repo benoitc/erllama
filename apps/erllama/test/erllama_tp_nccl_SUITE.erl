@@ -18,8 +18,17 @@
 %%   ERLLAMA_TP_HOSTS=gx10-fa8e.local,gx10-e25e.local \
 %%     rebar3 ct --dir apps/erllama/test --suite erllama_tp_nccl_SUITE
 %%
-%% ERLLAMA_TP_NCCL_ENV adds environment for the ranks (space-separated
-%% K=V, e.g. "NCCL_IB_HCA=rocep1s0f0").
+%% ERLLAMA_TP_NCCL_ENV adds environment for every rank (space-separated
+%% K=V, e.g. "NCCL_IB_HCA=rocep1s0f0"), ERLLAMA_TP_NCCL_ENV_<Rank> for
+%% one rank (e.g. its NCCL_SOCKET_IFNAME). Plain TCP:
+%%
+%%   ERLLAMA_TP_NCCL_ENV="NCCL_NET=Socket NCCL_SOCKET_IFNAME==enp1s0f0np0" \
+%%   ERLLAMA_TP_EXPECT_NET=Socket ERLLAMA_TP_EXPECT_IF=enp1s0f0np0 ...
+%%
+%% ERLLAMA_TP_EXPECT_NET (Socket or IB) and ERLLAMA_TP_EXPECT_IF (the
+%% interfaces, comma-separated, the same on every host) make
+%% transport_in_use and data_path_bytes check that the reductions went
+%% that way; without them those cases only log what NCCL chose.
 -module(erllama_tp_nccl_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
@@ -35,7 +44,8 @@
     model_matches_one_gpu/1,
     uneven_split_matches_one_gpu/1,
     serve_through_erllama/1,
-    transport_in_use/1
+    transport_in_use/1,
+    data_path_bytes/1
 ]).
 
 -define(T, "$HOME/erllama-tp").
@@ -50,7 +60,8 @@ all() ->
         model_matches_one_gpu,
         uneven_split_matches_one_gpu,
         serve_through_erllama,
-        transport_in_use
+        transport_in_use,
+        data_path_bytes
     ].
 
 init_per_suite(Config) ->
@@ -380,11 +391,107 @@ median(L) -> lists:nth((length(L) + 1) div 2, lists:sort(L)).
 
 %% What NCCL chose for the data path, from each rank's INIT/NET log.
 transport_in_use(Config) ->
-    Lines = lists:append([nccl_lines(P) || {_, P, _} <- ?config(peers, Config)]),
+    PerRank = [nccl_lines(P) || {_, P, _} <- ?config(peers, Config)],
+    Lines = lists:append(PerRank),
     ct:pal("NCCL transport and network lines:~n~ts", [lists:join("\n", Lines)]),
-    ?assertNotEqual([], Lines).
+    ?assertNotEqual([], Lines),
+    case os:getenv("ERLLAMA_TP_EXPECT_NET") of
+        false -> ok;
+        Net -> [expect_net(Net, L) || L <- PerRank]
+    end,
+    ok.
 
-%% -----------------------------------------------------------------------------
+%% Every channel the reductions use goes through `Net', and NCCL's
+%% devices for it are the expected interfaces, in order.
+expect_net(Net, Lines) ->
+    Channels = [L || L <- Lines, string:find(L, " via ") =/= nomatch],
+    ?assertNotEqual([], Channels),
+    [?assertNotEqual(nomatch, string:find(L, "via NET/" ++ Net ++ "/"), L) || L <- Channels],
+    case expected_ifs() of
+        [] ->
+            ok;
+        Ifs ->
+            Using = [L || L <- Lines, string:find(L, "NET/" ++ Net ++ " : Using [") =/= nomatch],
+            ?assertNotEqual([], Using),
+            [
+                ?assertEqual(Ifs, used_ifs(L), L)
+             || L <- Using
+            ]
+    end.
+
+%% `NET/Socket : Using [0]enp1s0f0np0:10.100.168.2<0> [1]...' -> names.
+used_ifs(Line) ->
+    {match, Ms} = re:run(Line, "\\[[0-9]+\\]([^:\\s/]+)", [global, {capture, all_but_first, list}]),
+    [N || [N] <- Ms].
+
+%% The reductions' bytes, from each host's interface counters around a
+%% burst of 17 prefill-sized reductions (BF16, about 4 MB per rank
+%% each): with ERLLAMA_TP_EXPECT_IF, the expected interfaces must carry
+%% at least 80% of what every interface sent, control traffic included.
+%% RDMA traffic does not show in these counters.
+data_path_bytes(Config) ->
+    Ranks = rank_pids(Config),
+    Peers = [P || {P, _} <- Ranks],
+    Before = [if_bytes(P) || P <- Peers],
+    %% The values are made on each rank's node: only the reductions
+    %% cross the network.
+    Us = parallel([
+        fun() -> peer:call(P, erllama_tp_rank, time_reduce, [R, 512 * 4096, 16], 300000) end
+     || {P, R} <- Ranks
+    ]),
+    ct:pal("16 reductions of 512 x 4096 values (BF16): ~w us each", [Us]),
+    After = [if_bytes(P) || P <- Peers],
+    Deltas = [
+        [{If, Tx1 - Tx0, Speed} || {If, Tx1, Speed} <- A, {If0, Tx0, _} <- B, If0 =:= If]
+     || {B, A} <- lists:zip(Before, After)
+    ],
+    [
+        ct:pal("rank ~b sent: ~ts", [
+            R,
+            lists:join(", ", [
+                io_lib:format("~s ~.1f MB (~s Mb/s)", [If, D / 1.0e6, Sp])
+             || {If, D, Sp} <- Ds, D > 0
+            ])
+        ])
+     || {R, Ds} <- lists:enumerate(0, Deltas)
+    ],
+    case expected_ifs() of
+        [] ->
+            ok;
+        Ifs ->
+            [
+                begin
+                    Total = lists:sum([D || {_, D, _} <- Ds]),
+                    Mine = lists:sum([D || {If, D, _} <- Ds, lists:member(If, Ifs)]),
+                    ?assert(Mine >= 0.8 * Total, {Mine, Total})
+                end
+             || Ds <- Deltas
+            ]
+    end,
+    ok.
+
+%% Every physical or bonded interface's sent bytes and speed on the
+%% peer's host (loopback, docker and veth left out).
+if_bytes(P) ->
+    {ok, All} = peer:call(P, file, list_dir, ["/sys/class/net"]),
+    Ifs = [
+        If
+     || If <- All,
+        not lists:any(fun(Pre) -> lists:prefix(Pre, If) end, ["lo", "docker", "veth", "br-"])
+    ],
+    [{If, sys_int(P, If, "statistics/tx_bytes"), sys_str(P, If, "speed")} || If <- Ifs].
+
+sys_int(P, If, What) ->
+    list_to_integer(sys_str(P, If, What)).
+
+sys_str(P, If, What) ->
+    case peer:call(P, file, read_file, ["/sys/class/net/" ++ If ++ "/" ++ What]) of
+        {ok, B} -> string:trim(binary_to_list(B));
+        _ -> "0"
+    end.
+
+expected_ifs() ->
+    string:lexemes(os:getenv("ERLLAMA_TP_EXPECT_IF", ""), ",").
 
 reduce_case(Config, N, Tol, Path) ->
     Ranks = rank_pids(Config),
@@ -424,7 +531,9 @@ worst(Got, Exact, Scale, Tol) ->
     lists:max([abs(G - E) / (Tol * S + 1.0e-6) || {G, E, S} <- lists:zip3(Gs, Exact, Scale)]).
 
 start_peer(Rank, Host, Cookie) ->
-    Extra = string:lexemes(os:getenv("ERLLAMA_TP_NCCL_ENV", ""), " "),
+    Extra =
+        string:lexemes(os:getenv("ERLLAMA_TP_NCCL_ENV", ""), " ") ++
+            string:lexemes(os:getenv("ERLLAMA_TP_NCCL_ENV_" ++ integer_to_list(Rank), ""), " "),
     Env = [
         "LD_LIBRARY_PATH=" ?T "/nccl/lib:" ?T "/openssl/lib",
         "NCCL_DEBUG=INFO",
