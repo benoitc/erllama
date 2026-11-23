@@ -1437,13 +1437,17 @@ ERL_NIF_TERM nif_tp_follow(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
 }
 
 /* =========================================================================
- * nif_tp_decode_seq(Ctx, SeqId, Tokens, AllRows) -> {ok, LogitsF32Bin} | {error, Reason}
+ * nif_tp_decode_seq(Ctx, SeqId, Tokens, AllRows) ->
+ *     {ok, LogitsF32Bin, DecodeUs, ReduceUs} | {error, Reason}
  *
  * Experimental, for tensor-parallel models: nif_tp_decode on any
  * sequence, returning the logits of every row of the batch (AllRows)
  * or of the last one, summed over the group (every rank makes the same
  * call). Positions continue the sequence. Used to verify a draft on a
- * spare sequence.
+ * spare sequence. DecodeUs: llama_decode until this rank holds the
+ * logits (its share of the compute and the collectives inside the
+ * graph); ReduceUs: summing the logits over the group through host
+ * buffers.
  * ========================================================================= */
 ERL_NIF_TERM nif_tp_decode_seq(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
@@ -1477,8 +1481,10 @@ ERL_NIF_TERM nif_tp_decode_seq(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
     const size_t rows = all ? (size_t) n : 1;
     ERL_NIF_TERM bin;
     float *out = (float *) enif_make_new_binary(env, sizeof(float) * rows * (size_t) n_vocab, &bin);
+    ErlNifTime t0 = enif_monotonic_time(ERL_NIF_USEC);
     int frc = erllama_safe_forward_rows(c->ctx, seq, tokens, n, n_vocab, pos_max < 0 ? 0 : pos_max + 1,
                                         all, out);
+    ErlNifTime t1 = enif_monotonic_time(ERL_NIF_USEC);
     enif_free(tokens);
     if (frc == 0) {
         c->decode_ready = 1;
@@ -1487,6 +1493,7 @@ ERL_NIF_TERM nif_tp_decode_seq(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
             frc = -4;
         }
     }
+    ErlNifTime t2 = enif_monotonic_time(ERL_NIF_USEC);
     pthread_mutex_unlock(&c->mu);
     if (frc != 0) {
         ERL_NIF_TERM why = frc == -2   ? atom_oom
@@ -1495,5 +1502,6 @@ ERL_NIF_TERM nif_tp_decode_seq(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
                                        : atom_decode_failed;
         return erllama_error(env, why);
     }
-    return enif_make_tuple2(env, atom_ok, bin);
+    return enif_make_tuple4(env, atom_ok, bin, enif_make_int64(env, (int64_t) (t1 - t0)),
+                            enif_make_int64(env, (int64_t) (t2 - t1)));
 }

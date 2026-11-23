@@ -798,9 +798,10 @@ nif_tp_stats(_Rank) -> erlang:nif_error(nif_not_loaded).
 nif_tp_decode(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 
 %% tp_decode/2 on sequence `Seq', with the logits of every row (`true')
-%% or of the last one, summed over the group.
+%% or of the last one, summed over the group; and the microseconds the
+%% decode took on this rank, then the logits reduction.
 -spec tp_decode_seq(context_ref(), non_neg_integer(), [token_id()], boolean()) ->
-    {ok, binary()} | {error, atom()}.
+    {ok, binary(), non_neg_integer(), non_neg_integer()} | {error, atom()}.
 tp_decode_seq(Ctx, Seq, Tokens, All) -> nif_tp_decode_seq(Ctx, Seq, Tokens, All).
 
 nif_tp_decode_seq(_Ctx, _Seq, _Tokens, _All) -> erlang:nif_error(nif_not_loaded).

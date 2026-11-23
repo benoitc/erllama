@@ -20,6 +20,7 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([short_prefix/1, long_prefix/1, cancel_releases_the_spare/1, verify_cost/1]).
+-export([profile_verify/1]).
 
 -define(MOPTS, #{n_gpu_layers => 999, load_mode => direct_io}).
 -define(COPTS, #{
@@ -29,7 +30,7 @@
 -define(AFTER, 8).
 
 all() ->
-    [verify_cost, short_prefix, long_prefix, cancel_releases_the_spare].
+    [verify_cost, short_prefix, long_prefix, cancel_releases_the_spare, profile_verify].
 
 init_per_suite(Config) ->
     case {erllama_tp_hosts:hosts(), os:getenv("ERLLAMA_TP_GLM_REF")} of
@@ -95,6 +96,119 @@ verify_cost(Config) ->
         ],
         ok
     end).
+
+%% Where a verify's time goes, under both KV layouts, on the live
+%% sequence of a 901-token prompt with two sequence slots: one token
+%% with one logit row, three tokens with the last row only (a
+%% diagnostic), three tokens with every row. The three cases alternate
+%% in blocks; the first run of each block (after a change of batch
+%% shape) is reported apart, the others give the median and p95 of the
+%% end-to-end time, of the decode (this rank's compute and the
+%% collectives inside the graph) and of the host-buffer logits
+%% reduction. The copy a per-sequence layout defers to the next decode
+%% is measured on its own.
+profile_verify(Config) ->
+    [
+        with_group(Config, COpts, fun(G) -> profile_layout(G, Layout) end)
+     || {Layout, COpts} <- [{per_sequence, ?COPTS}, {unified, maps:put(kv_unified, true, ?COPTS)}]
+    ],
+    ok.
+
+-define(ROUNDS, 4).
+-define(BLOCK, 6).
+
+profile_layout(G, Layout) ->
+    P = prompt(G, 90),
+    {_, {ok, L0}} = op(G, {decode, 0, P, false}),
+    T = argmax(L0),
+    Cases = [
+        {one_token, [T], false},
+        {three_last_row, [T, 13, 13], false},
+        {three_every_row, [T, 13, 13], true}
+    ],
+    Runs = lists:append([
+        [{Name, I =:= 1, run_t(G, Toks, All)} || I <- lists:seq(1, ?BLOCK)]
+     || _ <- lists:seq(1, ?ROUNDS), {Name, Toks, All} <- Cases
+    ]),
+    {_, End} = op(G, {pos_max, 0}),
+    ct:pal("~p KV: prefix ~b to ~b tokens over the runs", [Layout, length(P), End + 1]),
+    Stats = [
+        {Name, summarize([X || {N, false, X} <- Runs, N =:= Name]),
+            summarize([X || {N, true, X} <- Runs, N =:= Name])}
+     || {Name, _, _} <- Cases
+    ],
+    [
+        ct:pal(
+            "~p KV, ~p (~b runs; first after a change of shape apart):~n  end to end ~s~n  decode ~s~n  logits reduction ~s~n  the rest (calls, Erlang) ~s~n  first run of a block: end to end ~s",
+            [
+                Layout,
+                Name,
+                maps:get(n, S),
+                fmt(e2e, S),
+                fmt(dec, S),
+                fmt(red, S),
+                fmt(rest, S),
+                fmt(e2e, F)
+            ]
+        )
+     || {Name, S, F} <- Stats
+    ],
+    [S1, S3L, S3A] = [S || {_, S, _} <- Stats],
+    ct:pal(
+        "~p KV, medians: 3 tokens last row vs 1 token: +~.1f ms decode; every row vs last row: +~.1f ms decode, +~.1f ms reduction, +~.1f ms end to end",
+        [
+            Layout,
+            med(dec, S3L) - med(dec, S1),
+            med(dec, S3A) - med(dec, S3L),
+            med(red, S3A) - med(red, S3L),
+            med(e2e, S3A) - med(e2e, S3L)
+        ]
+    ),
+    Reductions = [{Name, collectives(G, Toks, All)} || {Name, Toks, All} <- Cases],
+    ct:pal("~p KV, collectives inside the graph per decode: ~p", [Layout, Reductions]),
+    Copies = [deferred_copy(G) || _ <- lists:seq(1, 5)],
+    ct:pal("~p KV, a copy to the spare then two 1-token decodes on it, ms end to end: ~w", [
+        Layout, Copies
+    ]),
+    {_, ok} = op(G, {drop, 0}),
+    ok.
+
+%% One decode on the live sequence: the slowest rank's times, in ms.
+run_t(G, Toks, All) ->
+    {Ms, {ok, _}, PerRank} = op_t(G, {decode, 0, Toks, All}),
+    Dec = lists:max([D || {_, D, _} <- PerRank]) / 1000,
+    Red = lists:max([R || {_, _, R} <- PerRank]) / 1000,
+    #{e2e => Ms, dec => Dec, red => Red, rest => Ms - Dec - Red}.
+
+collectives(#{ranks := [{P, R} | _]} = G, Toks, All) ->
+    {ok, #{reductions := N0}} = peer:call(P, erllama_tp_rank, stats, [R]),
+    _ = run_t(G, Toks, All),
+    {ok, #{reductions := N1}} = peer:call(P, erllama_tp_rank, stats, [R]),
+    N1 - N0.
+
+deferred_copy(G) ->
+    {_, ok} = op(G, {cp, 0, 1}),
+    {First, {ok, _}} = op(G, {decode, 1, [13], false}),
+    {Second, {ok, _}} = op(G, {decode, 1, [13], false}),
+    {_, ok} = op(G, {drop, 1}),
+    {round(First), round(Second)}.
+
+summarize(Xs) ->
+    maps:from_list(
+        [{n, length(Xs)}] ++
+            [{K, lists:sort([maps:get(K, X) || X <- Xs])} || K <- [e2e, dec, red, rest]]
+    ).
+
+med(K, S) -> pct(maps:get(K, S), 50).
+
+fmt(K, S) ->
+    L = maps:get(K, S),
+    io_lib:format("median ~.1f ms, p95 ~.1f ms", [pct(L, 50), pct(L, 95)]).
+
+pct([], _) ->
+    0.0;
+pct(Sorted, P) ->
+    lists:nth(max(1, min(length(Sorted), round(P / 100 * length(Sorted) + 0.5))), Sorted).
 
 %% A round cut after the verify (a cancel): the spare is dropped, the
 %% live sequence is as before, and the spare serves the next request.
@@ -306,6 +420,9 @@ report_times(Rounds, DecMs) ->
 %% -----------------------------------------------------------------------------
 
 with_group(Config, Fun) ->
+    with_group(Config, copts(), Fun).
+
+with_group(Config, COpts, Fun) ->
     Hosts = ?config(hosts, Config),
     Model = ?config(model, Config),
     erllama_tp_hosts:with_serving(Hosts, fun(S) ->
@@ -321,7 +438,7 @@ with_group(Config, Fun) ->
                             P,
                             erllama_tp_rank,
                             load,
-                            [R, erllama_tp_hosts:home(P, Model), {?MOPTS, copts()}],
+                            [R, erllama_tp_hosts:home(P, Model), {?MOPTS, COpts}],
                             3600000
                         )
                     end
@@ -356,14 +473,26 @@ copts() ->
 
 %% Every rank makes the call; the results must agree. The slowest rank's
 %% time and the (common) result.
-op(#{ranks := Ranks}, Op) ->
+op(G, Op) ->
+    {Ms, Result, _PerRank} = op_t(G, Op),
+    {Ms, Result}.
+
+%% op/2 with each rank's own times: `{Ms, Result, [{EndToEndMs, DecodeUs,
+%% ReduceUs}]}' for a decode (decode and reduction as the NIF measured
+%% them), `{Ms, Result, [{EndToEndMs}]}' otherwise. A decode's result is
+%% `{ok, Logits}'.
+op_t(#{ranks := Ranks}, Op) ->
     Res = erllama_tp_hosts:parallel([
         fun() -> peer:call(P, erllama_tp_rank, seq_op, [R, Op], 600000) end
      || {P, R} <- Ranks
     ]),
-    [{_, First} | _] = Res,
-    [?assertEqual(First, X, Op) || {_, X} <- Res],
-    {lists:max([Ms || {Ms, _} <- Res]), First}.
+    Split = [split_times(R) || R <- Res],
+    [{First, _} | _] = Split,
+    [?assertEqual(First, X, Op) || {X, _} <- Split],
+    {lists:max([Ms || {Ms, _} <- Res]), First, [T || {_, T} <- Split]}.
+
+split_times({Ms, {ok, Bin, DecUs, RedUs}}) -> {{ok, Bin}, {Ms, DecUs, RedUs}};
+split_times({Ms, Other}) -> {Other, {Ms}}.
 
 prompt(#{peer0 := P, path := Path}, N) ->
     Text = iolist_to_binary([
