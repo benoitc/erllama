@@ -27,6 +27,8 @@ this project adheres to [Semantic Versioning](https://semver.org).
   the template renderer rejects or an invalid token id, crashed the
   model process, so every request on that model failed with it. The
   caller now gets `{error, badarg}` and the model keeps serving.
+- The cache counters `bytes_ram`, `bytes_ramfile` and `bytes_disk`
+  were always 0. They now report the bytes each tier holds.
 - A model loaded again under the same id could render chat prompts
   with the template of its previous load. Each load now uses its own.
 - A streaming request kept generating until its token limit when the
