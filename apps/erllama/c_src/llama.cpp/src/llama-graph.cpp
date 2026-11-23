@@ -1278,7 +1278,11 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
-    res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    // build_attn_inp_k_impl always builds a dense mask (no K/V rows), so
+    // validate that representation; can_reuse_attn_mask would expect rows
+    // whenever fused_kv_rows is on and refuse every reuse
+    res &= inp_attn->self_attn_mask.rows == nullptr;
+    res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, mctx->get_attn(), params.ubatch, params.cparams);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 

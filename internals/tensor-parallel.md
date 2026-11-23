@@ -93,7 +93,10 @@ So each rank holds and computes only its slices, from the same split
 rules (`llama_meta_device_get_split_state`), in the split backend's
 order, and each all-reduce the split backend asks for is this rank's
 tensor through the rank's communicator, at the same point on every
-rank. No vendored file is changed.
+rank. The split itself needs no change to the vendored llama.cpp; one
+local fix there (`apps/erllama/scripts/patches/hybrid-k-graph-reuse.patch`)
+lets hybrid models such as GLM-5.3-Flash reuse their decode graph with a
+unified KV cache.
 
 Two things the split backend does not do across processes:
 
