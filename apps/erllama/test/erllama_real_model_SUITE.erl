@@ -82,7 +82,8 @@
     apply_chat_template_large_input/1,
     tokenize_over_text_cap/1,
     shared_reads_during_generation/1,
-    shared_reads_during_unload/1
+    shared_reads_during_unload/1,
+    bad_request_leaves_the_model_running/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -150,7 +151,8 @@ all() ->
         apply_chat_template_large_input,
         tokenize_over_text_cap,
         shared_reads_during_generation,
-        shared_reads_during_unload
+        shared_reads_during_unload,
+        bad_request_leaves_the_model_running
     ].
 
 init_per_suite(Config) ->
@@ -1508,3 +1510,21 @@ read_until_gone(Id, Msgs, Counts) ->
         true -> Counts1;
         false -> read_until_gone(Id, Msgs, Counts1)
     end.
+
+%% Requests the native code rejects answer `{error, badarg}` to their
+%% caller; the model process, shared by everyone, keeps running.
+bad_request_leaves_the_model_running(Config) ->
+    Model = ?config(model, Config),
+    Pid = erllama_registry:whereis_name(Model),
+    %% Atom roles: the legacy renderer wants binaries.
+    ?assertEqual(
+        {error, badarg},
+        erllama:render_chat_template(Model, #{messages => [#{role => user, content => <<"hi">>}]})
+    ),
+    ?assertMatch({error, _}, erllama:detokenize(Pid, [-1])),
+    ?assertMatch({error, _}, erllama:detokenize(Model, [-1])),
+    ?assertEqual(Pid, erllama_registry:whereis_name(Model)),
+    ?assertMatch(
+        {ok, #{generated := [_ | _]}},
+        erllama:complete(Model, ?SHORT_PROMPT, #{response_tokens => 2})
+    ).

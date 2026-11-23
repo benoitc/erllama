@@ -23,6 +23,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- A malformed request to a loaded model, such as a chat message list
+  the template renderer rejects or an invalid token id, crashed the
+  model process, so every request on that model failed with it. The
+  caller now gets `{error, badarg}` and the model keeps serving.
 - A model loaded again under the same id could render chat prompts
   with the template of its previous load. Each load now uses its own.
 - A streaming request kept generating until its token limit when the
