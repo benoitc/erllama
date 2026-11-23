@@ -93,10 +93,11 @@ So each rank holds and computes only its slices, from the same split
 rules (`llama_meta_device_get_split_state`), in the split backend's
 order, and each all-reduce the split backend asks for is this rank's
 tensor through the rank's communicator, at the same point on every
-rank. The split itself needs no change to the vendored llama.cpp; one
-local fix there (`apps/erllama/scripts/patches/hybrid-k-graph-reuse.patch`)
-lets hybrid models such as GLM-5.3-Flash reuse their decode graph with a
-unified KV cache.
+rank. The split itself needs no change to the vendored llama.cpp. Two
+local fixes there (`apps/erllama/scripts/patches/`) serve hybrid models
+such as GLM-5.3-Flash: one lets them reuse their decode graph with a
+unified KV cache, the other lets the split backend split their
+recurrent-state snapshots.
 
 Two things the split backend does not do across processes:
 
@@ -184,15 +185,17 @@ state, a sparse-attention indexer). llama.cpp splits the KDA and
 attention heads over the ranks and keeps the MLA latent cache and the
 indexer whole on every rank. Two things differ from a dense model:
 
-- **No recurrent-state snapshots.** erllama normally keeps one snapshot
-  per sequence on hybrid models (`n_rs_seq => 1`), so the last token can
-  be removed. The split backend cannot split the snapshot's view of the
-  recurrent cache: every rank aborts at its first decode. Split loads
-  therefore default to `n_rs_seq => 0` on every rank
-  (`erllama_tp_rank`). Without a snapshot the last token cannot be
-  removed: a cache hit on a prefix followed by new tokens restores as
-  usual, a hit on the whole prompt is served cold, and speculative
-  decoding cannot roll back a rejected draft.
+- **Recurrent-state snapshots.** A snapshot keeps the recurrent state a
+  few tokens back, so the last tokens can be removed (`n_rs_seq` of them;
+  a batch of n tokens keeps n - 1, so a 3-token batch takes back at most
+  2). The split backend needs the local fix
+  (`meta-recurrent-snapshot-view.patch`) to split the snapshot's view of
+  the recurrent cache; without it every rank aborts at its first
+  decode. Split loads still default to `n_rs_seq => 0` on every rank
+  (`erllama_tp_rank`): without a snapshot a cache hit on a whole prompt
+  is served cold. Set `n_rs_seq` to keep them: with 2, a round can
+  verify one known token and two drafted ones in one batch and take back
+  the rejected ones.
 - **Every rank opens the same context.** Rank 0 derives context options
   from the model's family (`erllama_model_llama:family_context_opts/2`);
   the other ranks apply the same function.
@@ -302,6 +305,11 @@ formed again, under a new coordinator (a new generation).
   a checkpoint restored by a new group, and a save missing a rank's
   share that publishes nothing. `test/erllama_tp_checkpoint_tests.erl`
   checks the frame everywhere.
+- `test/erllama_tp_rollback_SUITE.erl` is opt-in on the same hosts:
+  snapshots on a split GLM-5.3-Flash rolled back by 1 and 2 against
+  decoding without drafts (even split at sequence 0, 3:1 at sequence
+  1), and rounds of one known token and two drafted ones, timed against
+  ordinary decoding.
 - `test/erllama_tp_glm_SUITE.erl` is opt-in on the same hosts, with
   their GPUs free: GLM-5.3-Flash split against the same file whole on
   one GB10 (`ERLLAMA_TP_GLM_REF`, a quant small enough for one host),

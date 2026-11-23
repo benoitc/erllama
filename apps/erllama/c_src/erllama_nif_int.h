@@ -117,6 +117,9 @@ typedef struct erllama_context_s {
     int tp_sink_set;
     ErlNifPid tp_sink;
     uint64_t tp_seq;
+    /* `diag_inputs' option: the graph's input tensors seen during an
+     * armed decode (erllama_nif_context.c). NULL when off. */
+    struct erllama_diag_s *diag;
     int decode_ready;              /* set after llama_decode; cleared after kv ops */
     /* Decode interrupt/budget. The abort callback (installed on the
      * llama_context at new_context time) reads these from ggml worker
@@ -283,6 +286,10 @@ ERL_NIF_TERM nif_tp_send(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_tp_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_tp_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_tp_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_decode_seq(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_kv_seq_pos_max(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_ctx_diag(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+void erllama_diag_free(struct erllama_diag_s *d);
 void context_drops_model(erllama_model_t *m);
 
 /* Decode guards (definitions in erllama_nif_context.c). */

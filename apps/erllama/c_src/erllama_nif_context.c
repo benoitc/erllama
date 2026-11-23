@@ -10,6 +10,118 @@
 #include <string.h>
 
 /* =========================================================================
+ * Graph input diagnostics (`diag_inputs' context option)
+ *
+ * A ggml eval callback that, while armed, records the name, type and
+ * shape of every input tensor of the nodes it is asked about (the
+ * attention masks give the KV extent a decode attends over). It never
+ * asks for a node's data, so the scheduler still computes each split
+ * in one piece. Armed and read by nif_ctx_diag; used by benchmarks.
+ * ========================================================================= */
+
+#define ERLLAMA_DIAG_MAX 128
+
+typedef struct erllama_diag_s {
+    int on;
+    int n;
+    struct {
+        char name[64];
+        int type;
+        int64_t ne[4];
+    } rec[ERLLAMA_DIAG_MAX];
+} erllama_diag_t;
+
+static void diag_record(erllama_diag_t *d, const struct ggml_tensor *s) {
+    for (int i = 0; i < d->n; i++) {
+        if (d->rec[i].type == (int) s->type && strncmp(d->rec[i].name, s->name, sizeof(d->rec[i].name)) == 0 &&
+            memcmp(d->rec[i].ne, s->ne, sizeof(d->rec[i].ne)) == 0) {
+            return;
+        }
+    }
+    if (d->n >= ERLLAMA_DIAG_MAX) {
+        return;
+    }
+    snprintf(d->rec[d->n].name, sizeof(d->rec[d->n].name), "%s", s->name);
+    d->rec[d->n].type = (int) s->type;
+    memcpy(d->rec[d->n].ne, s->ne, sizeof(d->rec[d->n].ne));
+    d->n++;
+}
+
+static bool erllama_diag_cb(struct ggml_tensor *t, bool ask, void *user_data) {
+    erllama_diag_t *d = (erllama_diag_t *) user_data;
+    if (!ask) {
+        return true;
+    }
+    if (d->on) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const struct ggml_tensor *s = t->src[i];
+            if (s && (s->flags & GGML_TENSOR_FLAG_INPUT)) {
+                diag_record(d, s);
+            }
+        }
+    }
+    return false;
+}
+
+void erllama_diag_free(struct erllama_diag_s *d) {
+    enif_free(d);
+}
+
+/* nif_ctx_diag(Ctx, arm | read | perf):
+ *   arm  -> ok: clear the records and record during the next decodes;
+ *   read -> [{Name, Type, [Ne0, Ne1, Ne2, Ne3]}], and disarm;
+ *   perf -> #{n_reused, n_reallocs_same, n_reallocs_diff, n_eval, n_p_eval}
+ *           (llama_perf_context; works without `diag_inputs'). */
+ERL_NIF_TERM nif_ctx_diag(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    char op[8];
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c) ||
+        !enif_get_atom(env, argv[1], op, sizeof(op), ERL_NIF_LATIN1)) {
+        return enif_make_badarg(env);
+    }
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
+    }
+    ERL_NIF_TERM out;
+    if (strcmp(op, "perf") == 0) {
+        struct llama_perf_context_data p = llama_perf_context(c->ctx);
+        out = enif_make_new_map(env);
+        enif_make_map_put(env, out, enif_make_atom(env, "n_reused"), enif_make_int(env, p.n_reused), &out);
+        enif_make_map_put(env, out, enif_make_atom(env, "n_reallocs_same"), enif_make_int(env, p.n_reallocs_same), &out);
+        enif_make_map_put(env, out, enif_make_atom(env, "n_reallocs_diff"), enif_make_int(env, p.n_reallocs_diff), &out);
+        enif_make_map_put(env, out, enif_make_atom(env, "n_eval"), enif_make_int(env, p.n_eval), &out);
+        enif_make_map_put(env, out, enif_make_atom(env, "n_p_eval"), enif_make_int(env, p.n_p_eval), &out);
+    } else if (!c->diag) {
+        out = erllama_error(env, atom_not_supported);
+    } else if (strcmp(op, "arm") == 0) {
+        c->diag->n = 0;
+        c->diag->on = 1;
+        out = atom_ok;
+    } else if (strcmp(op, "read") == 0) {
+        c->diag->on = 0;
+        out = enif_make_list(env, 0);
+        for (int i = c->diag->n - 1; i >= 0; i--) {
+            ERL_NIF_TERM ne = enif_make_list4(env, enif_make_int64(env, c->diag->rec[i].ne[0]),
+                                              enif_make_int64(env, c->diag->rec[i].ne[1]),
+                                              enif_make_int64(env, c->diag->rec[i].ne[2]),
+                                              enif_make_int64(env, c->diag->rec[i].ne[3]));
+            ERL_NIF_TERM name;
+            size_t len = strnlen(c->diag->rec[i].name, sizeof(c->diag->rec[i].name));
+            memcpy(enif_make_new_binary(env, len, &name), c->diag->rec[i].name, len);
+            out = enif_make_list_cell(
+                env,
+                enif_make_tuple3(env, name, enif_make_string(env, ggml_type_name((enum ggml_type) c->diag->rec[i].type), ERL_NIF_LATIN1), ne),
+                out);
+        }
+    } else {
+        out = enif_make_badarg(env);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return out;
+}
+
+/* =========================================================================
  * Context
  * ========================================================================= */
 
@@ -104,6 +216,19 @@ ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     if (!erllama_parse_cparams(env, argv[1], &params)) {
         return enif_make_badarg(env);
     }
+    erllama_diag_t *diag = NULL;
+    {
+        int b;
+        if (get_map_bool(env, argv[1], "diag_inputs", &b) && b) {
+            diag = enif_alloc(sizeof(*diag));
+            if (!diag) {
+                return erllama_error(env, atom_oom);
+            }
+            memset(diag, 0, sizeof(*diag));
+            params.cb_eval = erllama_diag_cb;
+            params.cb_eval_user_data = diag;
+        }
+    }
     /* `tp_sink => Pid': only for a model split over a tensor-parallel
      * rank (see erllama_ctx_decode). */
     ErlNifPid tp_sink;
@@ -112,6 +237,7 @@ ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         ERL_NIF_TERM v;
         if (enif_get_map_value(env, argv[1], enif_make_atom(env, "tp_sink"), &v)) {
             if (!enif_get_local_pid(env, v, &tp_sink) || !m->tp_rank) {
+                if (diag) enif_free(diag);
                 return enif_make_badarg(env);
             }
             tp_sink_set = 1;
@@ -124,20 +250,26 @@ ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
      * {ok, deferred} return is a release contract: no new contexts
      * allowed past that point. */
     if (!erllama_lock_model_live(m)) {
+        if (diag) enif_free(diag);
         return erllama_error(env, atom_released);
     }
     struct llama_context *ctx = erllama_safe_init_from_model(m->model, params);
     if (!ctx) {
         pthread_mutex_unlock(&m->mu);
+        if (diag) enif_free(diag);
         return erllama_error(env, atom_context_failed);
     }
     erllama_context_t *res = enif_alloc_resource(CTX_RT, sizeof(*res));
     if (!res) {
         (void) erllama_safe_free(ctx);
         pthread_mutex_unlock(&m->mu);
+        if (diag) enif_free(diag);
         return erllama_error(env, atom_oom);
     }
     memset(res, 0, sizeof(*res));
+    /* Owned by the resource from here: ctx_dtor frees it, after the
+     * context (the callback's only user). */
+    res->diag = diag;
     /* per_seq[].last_logits_idx must start at -1 so the first
      * nif_step decode tick refuses to sample a seq that has no
      * prefill behind it (memset of int32_t -> 0 would be a valid

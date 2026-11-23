@@ -122,7 +122,9 @@ split_against(Ranks, Model, Prompt, Ref) ->
     %% Every rank's answer must agree; rank 0's is returned.
     Trim = fun(Keep) ->
         [First | Rest] = erllama_tp_hosts:parallel([
-            fun() -> peer:call(Pr, erllama_tp_rank, kv_trim, [R, Keep], 120000) end
+            fun() ->
+                element(2, peer:call(Pr, erllama_tp_rank, seq_op, [R, {trim, 0, Keep}], 120000))
+            end
          || {Pr, R} <- Ranks
         ]),
         [?assertEqual(First, X) || X <- Rest],

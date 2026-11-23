@@ -6,9 +6,8 @@
 #
 #   scripts/vendor_llama.sh v1.0.0
 #
-# The vendored tree is upstream with one local fix applied
-# (scripts/patches/hybrid-k-graph-reuse.patch, until upstream carries
-# it). Only whole directories are removed (backends we never build,
+# The vendored tree is upstream with the local fixes in scripts/patches/
+# applied in name order (each until upstream carries it). Only whole directories are removed (backends we never build,
 # unused vendor libs, repo dotfiles). The script ends by diffing the
 # result against the patched tarball and fails if any file differs.
 set -euo pipefail
@@ -29,7 +28,9 @@ echo "fetching $URL"
 curl -fsSL "$URL" | tar -xz -C "$WORK"
 # GitHub drops the leading `v' of a semver tag in the tarball's top dir.
 SRC="$WORK/llama.cpp-${TAG#v}"
-patch -f -F 0 -p1 -d "$SRC" < "$ROOT/scripts/patches/hybrid-k-graph-reuse.patch"
+for P in "$ROOT"/scripts/patches/*.patch; do
+    patch -f -F 0 -p1 -d "$SRC" < "$P"
+done
 
 # Paths we vendor wholesale.
 KEEP="cmake CMakeLists.txt common ggml include src LICENSE vendor tools/mtmd"

@@ -22,7 +22,8 @@
 -behaviour(gen_server).
 
 -export([start/1, matvec/3, reduce/2, info/1, stop/1]).
--export([load/3, decode/2, kv_trim/2, stats/1, ref_load/3, ref_decode/2]).
+-export([load/3, decode/2, stats/1, ref_load/3, ref_decode/2]).
+-export([seq_op/2]).
 -export([host/3, backend/3, free_ref/2, follow_stats/1, describe/3, time_reduce/3, kill/1]).
 -export([checkpoint_stats/1, fault/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -89,10 +90,13 @@ load(Pid, Path, Opts) -> gen_server:call(Pid, {load, Path, Opts}, infinity).
 -spec decode(pid(), [non_neg_integer()]) -> {ok, binary()} | {error, term()}.
 decode(Pid, Tokens) -> gen_server:call(Pid, {decode, Tokens}, infinity).
 
-%% Keep the first `Keep' positions of the split context's sequence 0
-%% (every rank makes the same call).
--spec kv_trim(pid(), non_neg_integer()) -> ok | {error, term()}.
-kv_trim(Pid, Keep) -> gen_server:call(Pid, {kv_trim, Keep}, infinity).
+%% An operation on the split context's sequences (every rank makes the
+%% same call): `{decode, Seq, Tokens, AllRows}' (logits summed over the
+%% group), `{cp, Src, Dst}', `{drop, Seq}', `{trim, Seq, Keep}' (keep
+%% the first Keep positions), `{pos_max, Seq}', `{diag, arm | read |
+%% perf}' (erllama_nif:ctx_diag/2). Returns `{Ms, Result}'.
+-spec seq_op(pid(), tuple()) -> {number(), term()}.
+seq_op(Pid, Op) -> gen_server:call(Pid, {seq_op, Op}, infinity).
 
 %% What the placeholders reserve and the reductions made so far.
 -spec stats(pid()) -> {ok, map()}.
@@ -192,8 +196,8 @@ handle_call({load, Path, {MOpts, COpts}}, _From, #state{handle = H} = S) ->
     reply_loaded(load_with(Path, MOpts#{tp_rank => H}, split_context_opts(COpts)), split, S);
 handle_call({decode, Tokens}, _From, #state{ctx = C} = S) when C =/= undefined ->
     {reply, erllama_nif:tp_decode(C, Tokens), S};
-handle_call({kv_trim, Keep}, _From, #state{ctx = C} = S) when C =/= undefined ->
-    {reply, erllama_nif:kv_seq_rm(C, 0, Keep, -1), S};
+handle_call({seq_op, Op}, _From, #state{ctx = C} = S) when C =/= undefined ->
+    {reply, timed(fun() -> seq_op_ctx(C, Op) end), S};
 handle_call({hosting, Req}, _From, S) ->
     hosting(Req, S);
 handle_call(follow_stats, _From, #state{seq = Seq, stale = St, duplicates = D} = S) ->
@@ -357,6 +361,13 @@ follow_kv({kv_pack, _SeqId, _Tag, _To}, #state{drop_kv_pack = true} = S) ->
 follow_kv(Cmd, #state{ctx = C, rank = R} = S) ->
     ok = erllama_tp_checkpoint:answer(Cmd, C, R),
     S.
+
+seq_op_ctx(C, {decode, Seq, Tokens, All}) -> erllama_nif:tp_decode_seq(C, Seq, Tokens, All);
+seq_op_ctx(C, {cp, Src, Dst}) -> erllama_nif:kv_seq_cp(C, Src, Dst);
+seq_op_ctx(C, {drop, Seq}) -> erllama_nif:kv_seq_rm(C, Seq, 0, -1);
+seq_op_ctx(C, {trim, Seq, Keep}) -> erllama_nif:kv_seq_rm(C, Seq, Keep, -1);
+seq_op_ctx(C, {pos_max, Seq}) -> erllama_nif:kv_seq_pos_max(C, Seq);
+seq_op_ctx(C, {diag, Op}) -> erllama_nif:ctx_diag(C, Op).
 
 timed(Fun) ->
     {Us, R} = timer:tc(Fun),
