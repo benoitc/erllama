@@ -5,7 +5,7 @@
 %% node: stream one request through erllama and time it.
 -module(erllama_tp_stream).
 
--export([run/4, run_with/5, kill/2]).
+-export([run/4, run_with/5, run_many/4, chat_tokens/2, kill/2]).
 
 %% Stream `Prompt' on `Model' (greedy, at most `Max' tokens); cancel
 %% after `CancelAfter' tokens (`infinity' to let it finish). Returns the
@@ -73,6 +73,42 @@ now_us() -> erlang:monotonic_time(microsecond).
 
 %% For run_with/5: kill a rank's OS process.
 kill(RankPid, _Ref) -> erllama_tp_rank:kill(RankPid).
+
+%% Stream every prompt of `Prompts' at once (greedy, at most `Max'
+%% tokens each); the one at index `CancelIdx' (1-based, or `none') is
+%% cancelled after `CancelAfter' tokens. Returns each stream's result as
+%% run/4 does, in order, and the wall time and total tokens.
+run_many(Model, Prompts, Max, {CancelIdx, CancelAfter}) ->
+    Self = self(),
+    T0 = erlang:monotonic_time(microsecond),
+    Pids = [
+        spawn_link(fun() ->
+            After =
+                case I of
+                    CancelIdx -> CancelAfter;
+                    _ -> infinity
+                end,
+            Self ! {self(), run(Model, P, Max, After)}
+        end)
+     || {I, P} <- lists:enumerate(Prompts)
+    ],
+    Runs = [
+        receive
+            {Pid, R} -> R
+        end
+     || Pid <- Pids
+    ],
+    Ms = (erlang:monotonic_time(microsecond) - T0) / 1000,
+    #{runs => Runs, wall_ms => Ms, tokens => lists:sum([maps:get(tokens, R) || R <- Runs])}.
+
+%% `Text' as one user turn through the model's chat template, thinking
+%% off, as token ids (the template's markers as special tokens).
+chat_tokens(Model, Text) ->
+    {ok, #{prompt := P}} = erllama:chat_apply(
+        Model, [#{role => user, content => Text}], #{enable_thinking => false}
+    ),
+    {ok, Toks} = erllama:tokenize(Model, P, #{parse_special => true, add_special => false}),
+    Toks.
 
 %% Drain to the request's end after a cancel.
 finish(Ref, T0, Times, Text, How) ->

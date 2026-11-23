@@ -449,3 +449,31 @@ Experimental. Llama 3.3 70B Instruct in F16 (four GGUF parts, 131.4 GiB, 80 laye
 - The one-host case runs only with `ERLLAMA_TP_CAPACITY_ONE_HOST=1`: on hosts whose GPU shares the host's memory it ends with the node killed.
 
 Not done: more than two hosts, Metal.
+
+## Tensor parallelism: GLM-5.3-Flash over two GB10s (2026-11-23)
+
+Experimental. GLM-5.3-Flash (`glm5-next`, 320B parameters with 18B active, 45 layers; MLA and KDA linear attention, a sparse-attention indexer) split over the two GB10 hosts with llama.cpp's own tensor split and served through `erllama_model_tp`, over RoCE, drafting off. Files: `ggml-org/GLM-5.3-Flash-GGUF` Q4_K (181 GB, revision `93ae818`) for speed and capacity, `unsloth/GLM-5.3-Flash-GGUF` UD-IQ2_XXS (102 GB, revision `a38483c`, small enough for one GB10) for correctness (`erllama_tp_glm_SUITE`). See [internals/tensor-parallel.md](../internals/tensor-parallel.md).
+
+What it took:
+
+- The other ranks now open the same context as rank 0: rank 0 adds recurrent-state snapshots for hybrid models, the others did not.
+- Split loads keep no recurrent-state snapshots: with one, llama.cpp's split backend aborts every rank at the first decode (a view of the recurrent cache it cannot split). A hit on a cached prefix followed by new tokens still restores; a hit on a whole prompt is served cold.
+- `load_mode => direct_io`: on a GB10 the page cache of a buffered load is not given back to CUDA, and a CUDA init failed with out of memory while the host showed 117 GB available.
+
+| Correctness (UD-IQ2_XXS, split against one GB10) | Result |
+|---|---|
+| next token at the prompt and three decodes | identical at every step; top 5 identical or 4 of 5 |
+| largest logit difference | 4.4% at the prompt (its reductions go through BF16), growing to 7.1% by the third decode |
+| 32-token greedy replies to four prompts, alone | 3 of 4 byte-identical; the fourth is a near-tie that batching alone changes on one GB10 |
+| reductions | 360 on each rank, same sizes, same order |
+| four prompts at once | replies differ from the solo ones, and between two batched runs, on one GB10 as on the split model (when each request is admitted changes what a step computes); a cancel midway ends only that request |
+| checkpoint, then a new group | the same prompt resumes from it (`partial`, 256 tokens restored on both ranks) with the same 32 tokens; 318 MB, 1.55 s to pack, 0.73 s to restore |
+
+| Q4_K, 250 tokens, TensorFold's four prompts (`docs/dec.py`), 3 trials | erllama split, no drafts | TensorFold, no drafts | TensorFold, MTP | TensorFold, DFlash2 |
+|---|---|---|---|---|
+| 1 stream | 19.9 to 20.5 tokens/s (first token about 295 ms) | 28.8 | 41.3 | 40.9 |
+| 4 streams, total | 39.7 to 40.6 tokens/s | 28.5 | 61.9 | 78.5 |
+
+- Memory with Q4_K loaded, `n_ctx 8192`, 4 sequences: 30 to 32 GB left available on each GB10 (125 to 126 before).
+- TensorFold runs a 4-bit EXL3 quant with FP8 KV and its own kernels; tokens are compared within one engine, never across.
+- Not done: speculative decoding (TensorFold's single-stream lead is mostly drafts), a longer context, vision, and FP8 KV (refused by the pin for this model).
