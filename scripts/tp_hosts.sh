@@ -84,6 +84,8 @@ T=$HOME/erllama-tp
 export PATH=$T/otp-28.3.1/bin:/usr/local/cuda/bin:$PATH
 export LD_LIBRARY_PATH=$T/nccl/lib:$T/openssl/lib:${LD_LIBRARY_PATH:-}
 export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET
+# Plain TCP instead of RDMA (the interface on the link between the hosts):
+# export NCCL_NET=Socket NCCL_SOCKET_IFNAME==enp1s0f0np0
 EOF
         ;;
     *)

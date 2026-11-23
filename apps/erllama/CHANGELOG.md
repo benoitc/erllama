@@ -15,7 +15,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
   share (`tp_rank` load option), and served through the usual
   `complete`, `stream` and `cancel` calls from one machine while the
   others follow it step by step. A split model does not use the KV
-  cache yet. This needs a CUDA build with NCCL.
+  cache yet. This needs a CUDA build with NCCL. The machines can be
+  joined by RDMA or by ordinary Ethernet (TCP); the tensor-parallel
+  page shows how to choose TCP and the network interface on each
+  machine.
 
 - `media_add_special`, a request option for streams with media: set it
   to `false` when the prompt comes from a chat template, so the BOS

@@ -144,6 +144,37 @@ API (`complete`, `stream`, `cancel`); this rank samples, once per step.
   speculative decoding, the argmax forward and media prefill also
   answer `not_supported` on a split model.
 
+## Plain TCP, without RDMA
+
+NCCL picks the network itself: RDMA (`NET/IB`, RoCE included) when the
+hosts have it, otherwise its socket transport. To run a group over
+ordinary Ethernet, or to force TCP on hosts that have RDMA, set the
+transport and the interface in each rank node's environment before the
+node's first `erllama_tp:open/5` (NCCL reads them once per OS process).
+Nothing in erllama changes.
+
+```bash
+# host A, rank 0: the interface on the link to the other hosts
+NCCL_NET=Socket NCCL_SOCKET_IFNAME==enp1s0f0np0 \
+    erl -name rank0@hostA -setcookie "$COOKIE" ...
+# host B, rank 1: its own interface name
+NCCL_NET=Socket NCCL_SOCKET_IFNAME==enp1s0f0np0 \
+    erl -name rank1@hostB -setcookie "$COOKIE" ...
+```
+
+- `NCCL_SOCKET_IFNAME` takes a comma-separated list; a leading `=`
+  matches names exactly. With two interfaces NCCL spreads its channels
+  over both.
+- The interface carries both NCCL's own bootstrap and the reductions.
+  Erlang distribution, which forms the group and carries the serving
+  rank's commands, keeps its own route.
+- Check what NCCL chose in the rank's log (`NCCL_DEBUG=INFO
+  NCCL_DEBUG_SUBSYS=INIT,NET`): `Using network Socket`, then
+  `NET/Socket : Using [0]enp1s0f0np0:...` (device 0 is that interface),
+  then one line per channel, `via NET/Socket/0`. The channel lines are
+  the data path; the bootstrap connection alone says nothing about it.
+- Unset, the default is unchanged: RoCE hosts keep using RDMA.
+
 ## What a failure does
 
 | Failure | Result |
@@ -180,6 +211,21 @@ scripts/tp_hosts.sh build gx10-fa8e.local gx10-e25e.local   # CUDA + NCCL
 ERLLAMA_TP_HOSTS=gx10-fa8e.local,gx10-e25e.local \
     rebar3 ct --dir apps/erllama/test --suite erllama_tp_nccl_SUITE
 ```
+
+Over plain TCP, with the transport and the interfaces checked (from
+NCCL's channel lines and from each host's interface byte counters
+around a burst of reductions):
+
+```bash
+ERLLAMA_TP_NCCL_ENV="NCCL_NET=Socket NCCL_SOCKET_IFNAME==enp1s0f0np0" \
+ERLLAMA_TP_EXPECT_NET=Socket ERLLAMA_TP_EXPECT_IF=enp1s0f0np0 \
+ERLLAMA_TP_HOSTS=gx10-fa8e.local,gx10-e25e.local \
+    rebar3 ct --dir apps/erllama/test --suite erllama_tp_nccl_SUITE
+```
+
+`ERLLAMA_TP_NCCL_ENV_<Rank>` sets one rank's environment, for hosts
+whose interfaces are named differently. `ERLLAMA_TP_EXPECT_NET=IB`
+checks RDMA; RDMA traffic does not show in the interface counters.
 
 The suite runs on any machine with ssh access to the hosts. The hosts
 must reach each other by the names given (rank 0's node runs the
