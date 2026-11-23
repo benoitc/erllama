@@ -53,6 +53,9 @@ one_host(Config) ->
     try
         native_log(P),
         Path = erllama_tp_hosts:home(P, ?config(model, Config)),
+        ok = erllama_tp_hosts:load_module(P, erllama_tp_glm_ref),
+        #{n_layer := NLayer} = Family = peer:call(P, erllama_tp_glm_ref, family, [Path], 600000),
+        ct:pal("model family: ~p", [maps:with([arch, n_layer, recurrent, hybrid], Family)]),
         Size = model_bytes(P, Path),
         Before = mem(P),
         Sampler = sampler([P]),
@@ -91,8 +94,9 @@ one_host(Config) ->
             {ok, M, #{n_gpu_layers := N} = Fit} ->
                 ct:pal("llama.cpp placement:~n~ts", [placement(P)]),
                 _ = peer:call(P, erllama_nif, free_model, [M]),
-                %% Llama 3.3 70B has 80 layers.
-                ?assert(N < 80, Fit)
+                %% llama.cpp counts the output layer too: n_layer + 1
+                %% means the whole model is on the GPU.
+                ?assert(N < NLayer + 1, {Fit, NLayer})
         end
     after
         catch peer:stop(P)

@@ -210,13 +210,16 @@ form(Hosts, S, Gen) ->
 load(
     #{gen := Gen, rank_peers := Peers, rank_pids := RankPids, serving := S} = G,
     Policy,
-    Extra,
+    Extra0,
     Timeout
 ) ->
     [{P0, R0} | Followers] = lists:zip(Peers, RankPids),
     Model = model(),
-    MOpts = #{n_gpu_layers => 99},
-    COpts = #{n_ctx => 2048, n_batch => 512, flash_attn => enabled},
+    %% `model_opts' and `context_opts' in Extra replace the defaults, on
+    %% every rank.
+    MOpts = maps:get(model_opts, Extra0, #{n_gpu_layers => 99}),
+    COpts = maps:get(context_opts, Extra0, #{n_ctx => 2048, n_batch => 512, flash_attn => enabled}),
+    Extra = maps:without([model_opts, context_opts], Extra0),
     Loaded = parallel([
         fun() ->
             peer:call(P, erllama_tp_rank, load, [R, home(P, Model), {MOpts, COpts}], Timeout)

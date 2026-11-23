@@ -22,7 +22,7 @@
 -behaviour(gen_server).
 
 -export([start/1, matvec/3, reduce/2, info/1, stop/1]).
--export([load/3, decode/2, stats/1, ref_load/3, ref_decode/2]).
+-export([load/3, decode/2, kv_trim/2, stats/1, ref_load/3, ref_decode/2]).
 -export([host/3, backend/3, free_ref/2, follow_stats/1, describe/3, time_reduce/3, kill/1]).
 -export([checkpoint_stats/1, fault/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -88,6 +88,11 @@ load(Pid, Path, Opts) -> gen_server:call(Pid, {load, Path, Opts}, infinity).
 %% logits, summed over the group (every rank makes the same call).
 -spec decode(pid(), [non_neg_integer()]) -> {ok, binary()} | {error, term()}.
 decode(Pid, Tokens) -> gen_server:call(Pid, {decode, Tokens}, infinity).
+
+%% Keep the first `Keep' positions of the split context's sequence 0
+%% (every rank makes the same call).
+-spec kv_trim(pid(), non_neg_integer()) -> ok | {error, term()}.
+kv_trim(Pid, Keep) -> gen_server:call(Pid, {kv_trim, Keep}, infinity).
 
 %% What the placeholders reserve and the reductions made so far.
 -spec stats(pid()) -> {ok, map()}.
@@ -184,9 +189,11 @@ handle_call({matvec, W, X}, _From, #state{handle = H} = S) ->
 handle_call({reduce, V}, _From, #state{handle = H} = S) ->
     {reply, erllama_tp:reduce(H, V), S};
 handle_call({load, Path, {MOpts, COpts}}, _From, #state{handle = H} = S) ->
-    reply_loaded(load_with(Path, MOpts#{tp_rank => H}, COpts), split, S);
+    reply_loaded(load_with(Path, MOpts#{tp_rank => H}, split_context_opts(COpts)), split, S);
 handle_call({decode, Tokens}, _From, #state{ctx = C} = S) when C =/= undefined ->
     {reply, erllama_nif:tp_decode(C, Tokens), S};
+handle_call({kv_trim, Keep}, _From, #state{ctx = C} = S) when C =/= undefined ->
+    {reply, erllama_nif:kv_seq_rm(C, 0, Keep, -1), S};
 handle_call({hosting, Req}, _From, S) ->
     hosting(Req, S);
 handle_call(follow_stats, _From, #state{seq = Seq, stale = St, duplicates = D} = S) ->
@@ -260,6 +267,17 @@ reply_loaded({ok, M, C}, split, S) -> {reply, ok, S#state{model = M, ctx = C}};
 reply_loaded({ok, M, C}, ref, S) -> {reply, ok, S#state{ref_model = M, ref_ctx = C}};
 reply_loaded({error, _} = E, _, S) -> {reply, E, S}.
 
+%% A split model keeps no recurrent-state snapshots unless the caller
+%% asks: llama.cpp's split backend cannot split the snapshot's view of a
+%% hybrid model's recurrent cache (GLM-5.3-Flash: every rank aborts at
+%% its first decode). Without snapshots a hybrid model cannot drop its
+%% last token: a cache hit on the whole prompt is served cold (a hit on
+%% a prefix, followed by new tokens, still restores), and a rejected
+%% draft cannot be rolled back. Dense models ignore the option. Every
+%% rank applies the same default.
+split_context_opts(COpts) ->
+    maps:merge(#{n_rs_seq => 0}, COpts).
+
 %% Every follower must hold the same model as this rank; then this
 %% rank's context sends to a forwarder that keeps them in step.
 host_model(Config, Followers, #state{handle = H, world = W, gen = Gen}) ->
@@ -273,7 +291,7 @@ host_model(Config, Followers, #state{handle = H, world = W, gen = Gen}) ->
             Fwd = spawn_link(fun() -> forward(Gen, Pids) end),
             erllama_model_llama:init(Config#{
                 model_opts => MOpts#{tp_rank => H},
-                context_opts => COpts#{tp_sink => Fwd}
+                context_opts => (split_context_opts(COpts))#{tp_sink => Fwd}
             });
         Bad ->
             {error, {incompatible_ranks, Bad}}
@@ -387,7 +405,11 @@ load_with(Path, MOpts, COpts) ->
         {error, _} = E -> E
     end.
 
-load_with_ctx(M, COpts) ->
+%% The context options erllama_model_llama derives from the model's
+%% family (rank 0 opens its context through it), so every rank holds the
+%% same kind of state.
+load_with_ctx(M, COpts0) ->
+    COpts = erllama_model_llama:family_context_opts(COpts0, M),
     case erllama_nif:new_context(M, COpts) of
         {ok, C} ->
             {ok, M, C};

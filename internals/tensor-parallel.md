@@ -173,6 +173,32 @@ serving VM.
 - **Embeddings, speculative decoding, the argmax forward and media
   prefill** answer `not_supported` on a split model.
 
+## Hybrid models (GLM-5.3-Flash)
+
+A hybrid model mixes attention layers with recurrent ones
+(GLM-5.3-Flash: MLA attention, KDA linear attention with a recurrent
+state, a sparse-attention indexer). llama.cpp splits the KDA and
+attention heads over the ranks and keeps the MLA latent cache and the
+indexer whole on every rank. Two things differ from a dense model:
+
+- **No recurrent-state snapshots.** erllama normally keeps one snapshot
+  per sequence on hybrid models (`n_rs_seq => 1`), so the last token can
+  be removed. The split backend cannot split the snapshot's view of the
+  recurrent cache: every rank aborts at its first decode. Split loads
+  therefore default to `n_rs_seq => 0` on every rank
+  (`erllama_tp_rank`). Without a snapshot the last token cannot be
+  removed: a cache hit on a prefix followed by new tokens restores as
+  usual, a hit on the whole prompt is served cold, and speculative
+  decoding cannot roll back a rejected draft.
+- **Every rank opens the same context.** Rank 0 derives context options
+  from the model's family (`erllama_model_llama:family_context_opts/2`);
+  the other ranks apply the same function.
+
+On a GB10, whose GPU shares the host's memory, load large models with
+`load_mode => direct_io`: the page cache a buffered load leaves behind
+is not given back to CUDA, whose allocations can then fail although
+the host shows the memory as available.
+
 ## Checkpoints of a split model
 
 Each rank holds its share of the KV, so a checkpoint is every rank's
@@ -273,6 +299,12 @@ formed again, under a new coordinator (a new generation).
   a checkpoint restored by a new group, and a save missing a rank's
   share that publishes nothing. `test/erllama_tp_checkpoint_tests.erl`
   checks the frame everywhere.
+- `test/erllama_tp_glm_SUITE.erl` is opt-in on the same hosts, with
+  their GPUs free: GLM-5.3-Flash split against the same file whole on
+  one GB10 (`ERLLAMA_TP_GLM_REF`, a quant small enough for one host),
+  four streams on one GB10 and split, the decode sweep of TensorFold's
+  recipe, and a checkpoint restored by a new group
+  (`ERLLAMA_TP_GLM`).
 - `test/erllama_tp_capacity_SUITE.erl` is opt-in on the same hosts,
   with their GPUs free and `ERLLAMA_TP_BIG_MODEL` naming a GGUF larger
   than one GPU: the model split over the group and served, each rank's

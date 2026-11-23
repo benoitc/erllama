@@ -39,6 +39,14 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- A model split over several machines now opens the same kind of
+  context on every machine. The machines that follow the first one
+  missed the extra state erllama keeps for hybrid models (those mixing
+  attention and recurrent layers, such as GLM-5.3-Flash), so the first
+  removal of a token would fail on them. Split hybrid models now keep
+  no such state at all, since llama.cpp cannot split it: a cache hit
+  on a whole prompt is then served from scratch.
+
 - A malformed request to a loaded model, such as a chat message list
   the template renderer rejects or an invalid token id, crashed the
   model process, so every request on that model failed with it. The

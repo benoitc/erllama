@@ -70,7 +70,8 @@
     reset_context/1,
     abort_handle/1,
     get_model_ref/1,
-    get_context_ref/1
+    get_context_ref/1,
+    family_context_opts/2
 ]).
 
 -record(s, {
@@ -287,7 +288,11 @@ fit_context_opts(COpts, _MOpts, undefined) ->
 %% when the arch supports recurrent-state rollback AND the context
 %% keeps at least one rollback snapshot. Default n_rs_seq to 1 for
 %% those families (an explicit user value wins); dense models are
-%% untouched.
+%% untouched. Exported so the other ranks of a split model open the
+%% same context as the one this backend opens (erllama_tp_rank).
+-spec family_context_opts(map(), map() | erllama_nif:model_ref()) -> map().
+family_context_opts(COpts, Model) when is_reference(Model) ->
+    family_context_opts(COpts, probe_family(Model));
 family_context_opts(COpts, Family) ->
     Recurrent = maps:get(recurrent, Family, false),
     Hybrid = maps:get(hybrid, Family, false),
