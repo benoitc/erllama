@@ -49,6 +49,10 @@ demand, or omitted for the default model.
 | `max_http_requests` | 64 | requests in flight; more get `429` with `Retry-After` |
 | `max_active_runs` | 64 | generations at once across HTTP and CLI; more get `429` |
 
+Requests on the same model run together, up to the model's `parallel`
+(default 4); past that they wait for a free one. See
+[Serve several clients at once](models.md#serve-several-clients-at-once).
+
 `/health` and `/ready` never need a key, so probes work behind an
 authenticated listener.
 

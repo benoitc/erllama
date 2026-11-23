@@ -26,7 +26,7 @@
     "                                ollama://NAME[:TAG] or NAME[:TAG]\n",
     "  show MODEL                    a model's entry and GGUF metadata\n",
     "  ps                            loaded models, holders and keep-alive\n",
-    "  load MODEL|PATH.gguf [--name NAME] [--n-ctx N] [--gpu-layers N] [--mmproj PATH]\n",
+    "  load MODEL|PATH.gguf [--name NAME] [--n-ctx N] [--gpu-layers N] [--parallel N] [--mmproj PATH]\n",
     "                                load a model (registering a file first)\n",
     "  unload MODEL                  unload a model\n",
     "  cp SRC DST                    a second name for a model\n",
@@ -101,6 +101,7 @@ command("load") ->
             {"--id", name, string},
             {"--n-ctx", n_ctx, int},
             {"--gpu-layers", n_gpu_layers, int},
+            {"--parallel", parallel, int},
             {"--mmproj", mmproj, string}
         ],
         fun load/4

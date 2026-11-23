@@ -99,6 +99,46 @@ downloaded file that no other name uses is deleted.
 - The context size is the model entry's `n_ctx`, else `default_n_ctx`
   capped at the context length the model was trained for.
 
+## Serve several clients at once
+
+A model serves several requests at the same time: by default 4, set by
+`parallel`. llama.cpp batches them into one decode per step, so a short
+question from an HTTP client gets its first token while an agent is in
+the middle of a long reply on the same model, instead of waiting for
+the reply to end.
+
+```bash
+$R/bin/erllama load ~/Models/qwen2.5-1.5b-instruct-q4_k_m.gguf --name qwen --n-ctx 8192 --parallel 4
+$R/bin/erllama ps
+qwen:latest  generating  ctx 8192  q4_k_m  2 of 4 sequences busy  in use by 2
+```
+
+```erlang
+%% config/sys.config
+{erllama_server, [
+    {default_parallel, 4},   %% requests a model serves at once (1 to 64)
+    {kv_unified, true}       %% one shared KV pool (see below)
+]}
+```
+
+- `parallel` is set when a model is registered (`erllama load PATH
+  --parallel N`, `register_model/2`, or the `models` list in the
+  config); without it, `default_parallel` applies.
+- With `kv_unified` (the default), the requests share one pool of
+  `n_ctx` cells, and each one may use up to `n_ctx`. Size `n_ctx` for
+  the requests you expect at the same time. Long agent conversations
+  take most of it, and a request that does not fit ends with an error.
+- With `kv_unified => false`, each request gets a fixed
+  `n_ctx / parallel`.
+- `parallel => 1` serves one request at a time: the others wait for
+  it, which keeps the whole context for one long conversation.
+- While a request is being prefilled, and while a cache checkpoint is
+  saved, the model's other streams pause briefly (tens of milliseconds
+  for a short prompt on a 1.5B model).
+- Changing `parallel` or `kv_unified` changes the KV layout, so cache
+  rows saved under the old layout are no longer used: the first turns
+  after the change start cold.
+
 ## Memory pressure
 
 The release turns on erllama's scheduler: when memory runs short it

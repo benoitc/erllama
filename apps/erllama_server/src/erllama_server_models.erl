@@ -116,7 +116,17 @@ ps() ->
     [
         maps:merge(
             maps:with(
-                [id, status, backend, context_size, quant_tag, vram_estimate_b, n_seq_max], Info
+                [
+                    id,
+                    status,
+                    backend,
+                    context_size,
+                    quant_tag,
+                    vram_estimate_b,
+                    n_seq_max,
+                    available_seqs
+                ],
+                Info
             ),
             maps:get(maps:get(id, Info), Managed, #{managed => false})
         )
@@ -272,20 +282,36 @@ load_model(#{name := Id} = Entry) ->
 
 %% The erllama load config of a registry entry. `context_size' is the
 %% cache's copy of `n_ctx' and must match it.
+%%
+%% A model serves `parallel' sequences at once (default
+%% `default_parallel'), batched into one decode per step, so a request
+%% is not queued behind another one's generation. With `kv_unified' the
+%% sequences share one KV pool of `n_ctx' cells and each may use up to
+%% `n_ctx' (as llama-server with automatic slots); without it each
+%% sequence gets `n_ctx / parallel'.
 load_config(#{path := Path} = Entry) ->
     Load = maps:get(load, Entry, #{}),
     NCtx = n_ctx(Entry, Load),
     Base = #{
         model_path => Path,
         model_opts => maps:with([n_gpu_layers], Load),
-        context_opts => #{n_ctx => NCtx},
+        context_opts => #{
+            n_ctx => NCtx,
+            n_seq_max => maps:get(parallel, Load, erllama_server_config:get(default_parallel)),
+            kv_unified => maps:get(kv_unified, Load, erllama_server_config:get(kv_unified))
+        },
         context_size => NCtx
     },
     with_extras(Base, Entry, Load).
 
-with_extras(_Base, _Entry, #{backend := erllama_model_stub} = Load) ->
-    %% Tests: the same entry on erllama's stub backend.
-    #{backend => erllama_model_stub, step_delay_ms => maps:get(step_delay_ms, Load, 0)};
+with_extras(Base, _Entry, #{backend := erllama_model_stub} = Load) ->
+    %% Tests: the same entry on erllama's stub backend, with the same
+    %% sequences.
+    #{
+        backend => erllama_model_stub,
+        step_delay_ms => maps:get(step_delay_ms, Load, 0),
+        context_opts => maps:with([n_seq_max], maps:get(context_opts, Base))
+    };
 with_extras(Base, Entry, Load) ->
     WithProj =
         case Entry of

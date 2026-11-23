@@ -46,7 +46,12 @@ config_rejects_bad_values_test() ->
         {error, {invalid_config, max_active_runs, many}},
         erllama_server_config:validate(#{max_active_runs => many})
     ),
-    ?assertEqual(ok, erllama_server_config:validate(#{run_retention_ms => 0})).
+    ?assertEqual(ok, erllama_server_config:validate(#{run_retention_ms => 0})),
+    V = fun erllama_server_config:validate/1,
+    ?assertEqual(ok, V(#{default_parallel => 1, kv_unified => false})),
+    ?assertMatch({error, {invalid_config, default_parallel, 0}}, V(#{default_parallel => 0})),
+    ?assertMatch({error, {invalid_config, default_parallel, 65}}, V(#{default_parallel => 65})),
+    ?assertMatch({error, {invalid_config, kv_unified, yes}}, V(#{kv_unified => yes})).
 
 bad_config_fails_the_start_test() ->
     application:set_env(erllama_server, run_buffer_events, -1),
