@@ -41,7 +41,7 @@ static void diag_record(erllama_diag_t *d, const struct ggml_tensor *s) {
     if (d->n >= ERLLAMA_DIAG_MAX) {
         return;
     }
-    snprintf(d->rec[d->n].name, sizeof(d->rec[d->n].name), "%s", s->name);
+    (void) snprintf(d->rec[d->n].name, sizeof(d->rec[d->n].name), "%s", s->name);
     d->rec[d->n].type = (int) s->type;
     memcpy(d->rec[d->n].ne, s->ne, sizeof(d->rec[d->n].ne));
     d->n++;
