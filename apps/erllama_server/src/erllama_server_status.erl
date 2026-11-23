@@ -49,10 +49,12 @@ status(Api, ServerVsn, ErllamaVsn) ->
 -spec inspect(binary()) -> {ok, map()} | {error, term()}.
 inspect(Id) ->
     case erllama_server_runs:lookup(Id) of
-        {ok, #{pid := Pid, started_at := At, phase := Phase} = Row} ->
-            Base = (maps:with([run_id, kind, conversation_id, model, status], Row))#{
-                started_at => At, phase => Phase
-            },
+        {ok, #{pid := Pid, started_at := At} = Row} ->
+            %% A phase only while the job runs.
+            Keys =
+                [run_id, kind, conversation_id, model, status] ++
+                    [phase || maps:get(status, Row) =:= running],
+            Base = (maps:with(Keys, Row))#{started_at => At},
             case catch_info(Pid) of
                 {ok, Info} -> {ok, maps:merge(Base, Info)};
                 {error, _} -> {ok, Base}

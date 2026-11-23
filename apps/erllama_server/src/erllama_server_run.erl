@@ -355,12 +355,15 @@ emit(Type, Data, #state{events = Ev} = St) ->
     St#state{events = erllama_server_events:emit(Type, Data, Ev)}.
 
 summary(#state{id = Id, conv = Conv, model = Model, status = Status, phase = Phase, events = Ev}) ->
-    #{
+    Base = #{
         run_id => Id,
         kind => run,
         conversation_id => Conv,
         model => Model,
         status => Status,
-        phase => Phase,
         next_seq => erllama_server_events:next_seq(Ev)
-    }.
+    },
+    case Status of
+        running -> Base#{phase => Phase};
+        _ -> Base
+    end.
