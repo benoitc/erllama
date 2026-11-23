@@ -1,0 +1,586 @@
+/* Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+ * See the LICENSE file at the project root. */
+
+/* Rank-local tensor parallelism (experimental): one OS process per
+ * rank, each with its own GPU backend, joined into the backend's
+ * communicator.
+ *
+ * The communicator's bootstrap (`ggml_backend_comm_init_rank') calls a
+ * callback that must gather `world_size * size' bytes in rank order
+ * from every rank before the communicator exists. The callback runs
+ * inside nif_tp_open on its dirty thread: it sends this rank's bytes
+ * to an Erlang agent process (`{erllama_tp_bootstrap, Bridge, Round,
+ * Bin}'), which exchanges them with the other ranks through a
+ * coordinator and answers with nif_tp_bootstrap_reply/3. The callback
+ * waits for that answer until the open's deadline, then fails, so no
+ * rank waits forever and every rank either joins or fails.
+ *
+ * Inside a collective, the backend aborts the process on error
+ * (NCCL_CHECK): ranks are separate OS processes so a failure ends one
+ * rank, not the coordinator. */
+
+#include "erllama_tp_nif.h"
+
+#include <errno.h>
+#include <pthread.h>
+#include <string.h>
+#include <time.h>
+
+#include <cstdint>
+#include <new>
+#include <string>
+#include <vector>
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "erllama_safe.h"
+
+namespace {
+
+ErlNifResourceType *TP_BRIDGE_RT = nullptr;
+ErlNifResourceType *TP_RANK_RT = nullptr;
+
+ERL_NIF_TERM mk_atom(ErlNifEnv *env, const char *name) {
+    ERL_NIF_TERM a;
+    if (enif_make_existing_atom(env, name, &a, ERL_NIF_UTF8)) {
+        return a;
+    }
+    return enif_make_atom(env, name);
+}
+
+ERL_NIF_TERM mk_error(ErlNifEnv *env, const char *reason) {
+    return enif_make_tuple2(env, mk_atom(env, "error"), mk_atom(env, reason));
+}
+
+ERL_NIF_TERM mk_ok(ErlNifEnv *env, ERL_NIF_TERM v) {
+    return enif_make_tuple2(env, mk_atom(env, "ok"), v);
+}
+
+int64_t now_ms() {
+    return (int64_t) enif_monotonic_time(ERL_NIF_MSEC);
+}
+
+/* ---------------------------------------------------------------- */
+/* Bootstrap bridge                                                  */
+/* ---------------------------------------------------------------- */
+
+struct tp_bridge {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    ErlNifPid agent;
+    int world = 0;
+    /* Round being waited on (1, 2, ...); 0 before the first. */
+    uint64_t round = 0;
+    size_t expect = 0;
+    bool have_reply = false;
+    bool rejected = false;
+    bool closed = false;
+    std::vector<uint8_t> reply;
+    int64_t deadline_ms = 0;
+    /* The NIF call's env while the callback can run in it (it runs
+     * synchronously inside that call). */
+    ErlNifEnv *caller_env = nullptr;
+    const char *error = "bootstrap_failed";
+};
+
+void bridge_dtor(ErlNifEnv *, void *obj) {
+    auto *b = static_cast<tp_bridge *>(obj);
+    pthread_cond_destroy(&b->cv);
+    pthread_mutex_destroy(&b->mu);
+    b->~tp_bridge();
+}
+
+tp_bridge *bridge_new(ErlNifPid agent, int world, int timeout_ms) {
+    void *mem = enif_alloc_resource(TP_BRIDGE_RT, sizeof(tp_bridge));
+    if (!mem) {
+        return nullptr;
+    }
+    auto *b = new (mem) tp_bridge();
+    pthread_mutex_init(&b->mu, nullptr);
+    pthread_cond_init(&b->cv, nullptr);
+    b->agent = agent;
+    b->world = world;
+    b->deadline_ms = now_ms() + timeout_ms;
+    return b;
+}
+
+/* Wait on the condition variable until `deadline_ms' (monotonic) as a
+ * realtime absolute timespec. Returns ETIMEDOUT past the deadline. */
+int bridge_wait(tp_bridge *b) {
+    int64_t left = b->deadline_ms - now_ms();
+    if (left <= 0) {
+        return ETIMEDOUT;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += left / 1000;
+    ts.tv_nsec += (left % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+    return pthread_cond_timedwait(&b->cv, &b->mu, &ts);
+}
+
+/* The communicator's bootstrap callback: this rank's `size' bytes out,
+ * every rank's bytes (rank order) into `recv'. */
+bool bootstrap_cb(void *user_data, const void *send_buf, void *recv_buf, size_t size) {
+    auto *b = static_cast<tp_bridge *>(user_data);
+    uint64_t round;
+    pthread_mutex_lock(&b->mu);
+    if (b->closed) {
+        b->error = "closed";
+        pthread_mutex_unlock(&b->mu);
+        return false;
+    }
+    round = ++b->round;
+    b->expect = size * (size_t) b->world;
+    b->have_reply = false;
+    b->rejected = false;
+    pthread_mutex_unlock(&b->mu);
+
+    ErlNifEnv *menv = enif_alloc_env();
+    ERL_NIF_TERM bin;
+    unsigned char *p = enif_make_new_binary(menv, size, &bin);
+    if (size > 0) {
+        memcpy(p, send_buf, size);
+    }
+    ERL_NIF_TERM msg = enif_make_tuple4(menv, mk_atom(menv, "erllama_tp_bootstrap"),
+                                        enif_make_resource(menv, b), enif_make_uint64(menv, round), bin);
+    int sent = enif_send(b->caller_env, &b->agent, menv, msg);
+    enif_free_env(menv);
+    if (!sent) {
+        b->error = "agent_down";
+        return false;
+    }
+
+    bool ok = false;
+    pthread_mutex_lock(&b->mu);
+    while (!b->have_reply && !b->rejected && !b->closed) {
+        if (bridge_wait(b) == ETIMEDOUT) {
+            b->error = "timeout";
+            break;
+        }
+    }
+    if (b->have_reply && !b->closed) {
+        memcpy(recv_buf, b->reply.data(), b->expect);
+        /* A failure after a good exchange is the backend's own (a
+         * rank's checks, or the communicator's init). */
+        b->error = "init_failed";
+        ok = true;
+    } else if (b->rejected) {
+        b->error = "rejected";
+    } else if (b->closed) {
+        b->error = "closed";
+    }
+    pthread_mutex_unlock(&b->mu);
+    return ok;
+}
+
+/* ---------------------------------------------------------------- */
+/* Rank                                                              */
+/* ---------------------------------------------------------------- */
+
+struct tp_rank {
+    pthread_mutex_t mu;
+    ggml_backend_t backend = nullptr;
+    void *comm = nullptr;
+    ggml_backend_comm_free_t comm_free = nullptr;
+    ggml_backend_comm_allreduce_tensor_t allreduce = nullptr;
+    int rank = 0;
+    int world = 0;
+};
+
+void rank_release(tp_rank *r) {
+    if (r->comm && r->comm_free) {
+        try {
+            r->comm_free(r->comm);
+        } catch (...) {
+        }
+    }
+    r->comm = nullptr;
+    if (r->backend) {
+        try {
+            ggml_backend_free(r->backend);
+        } catch (...) {
+        }
+    }
+    r->backend = nullptr;
+}
+
+void rank_dtor(ErlNifEnv *, void *obj) {
+    auto *r = static_cast<tp_rank *>(obj);
+    rank_release(r);
+    pthread_mutex_destroy(&r->mu);
+    r->~tp_rank();
+}
+
+/* The `idx'-th GPU device (integrated GPUs count), or null. */
+ggml_backend_dev_t gpu_device(int idx) {
+    int seen = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        enum ggml_backend_dev_type t = ggml_backend_dev_type(d);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            if (seen == idx) {
+                return d;
+            }
+            seen++;
+        }
+    }
+    return nullptr;
+}
+
+void *reg_proc(ggml_backend_dev_t dev, const char *name) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+bool get_rank(ErlNifEnv *env, ERL_NIF_TERM t, tp_rank **out) {
+    return enif_get_resource(env, t, TP_RANK_RT, (void **) out);
+}
+
+/* Upload `data' into a 1-D or 2-D F32 tensor on the rank's backend. */
+struct tensor_scope {
+    ggml_context *ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ~tensor_scope() {
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+        }
+        if (ctx) {
+            ggml_free(ctx);
+        }
+    }
+};
+
+ggml_context *small_ctx(size_t n_tensors) {
+    struct ggml_init_params p = {
+        ggml_tensor_overhead() * n_tensors + ggml_graph_overhead(),
+        nullptr,
+        true,
+    };
+    return ggml_init(p);
+}
+
+/* All-reduce `t' in place (sum over ranks) and read it back. */
+bool reduce_into(tp_rank *r, ggml_tensor *t, std::vector<float> &out) {
+    t->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_tensor *tensors[1] = {t};
+    if (!r->allreduce(r->comm, tensors)) {
+        return false;
+    }
+    ggml_backend_synchronize(r->backend);
+    out.resize((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
+    return true;
+}
+
+ERL_NIF_TERM f32_binary(ErlNifEnv *env, const std::vector<float> &v) {
+    ERL_NIF_TERM bin;
+    unsigned char *p = enif_make_new_binary(env, v.size() * sizeof(float), &bin);
+    if (!v.empty()) {
+        memcpy(p, v.data(), v.size() * sizeof(float));
+    }
+    return bin;
+}
+
+} // namespace
+
+/* ---------------------------------------------------------------- */
+/* Entry points                                                      */
+/* ---------------------------------------------------------------- */
+
+extern "C" int tp_nif_load(ErlNifEnv *env) {
+    TP_BRIDGE_RT = enif_open_resource_type(env, nullptr, "erllama_tp_bridge", bridge_dtor,
+                                           ERL_NIF_RT_CREATE, nullptr);
+    TP_RANK_RT = enif_open_resource_type(env, nullptr, "erllama_tp_rank", rank_dtor,
+                                         ERL_NIF_RT_CREATE, nullptr);
+    return (TP_BRIDGE_RT && TP_RANK_RT) ? 0 : -1;
+}
+
+/* nif_tp_caps() -> {ok, #{gpus, init_rank, allreduce}}: the number of
+ * GPU devices, and whether the first one's backend can join a
+ * per-process communicator (built with NCCL) and all-reduce. */
+extern "C" ERL_NIF_TERM nif_tp_caps(ErlNifEnv *env, int, const ERL_NIF_TERM[]) {
+    if (erllama_safe_backend_init_once() != 0) {
+        return mk_error(env, "exception");
+    }
+    try {
+        int gpus = 0;
+        while (gpu_device(gpus)) {
+            gpus++;
+        }
+        ggml_backend_dev_t dev = gpu_device(0);
+        bool init_rank = dev && reg_proc(dev, "ggml_backend_comm_init_rank");
+        bool allreduce = dev && reg_proc(dev, "ggml_backend_comm_allreduce_tensor");
+        ERL_NIF_TERM m = enif_make_new_map(env);
+        enif_make_map_put(env, m, mk_atom(env, "gpus"), enif_make_int(env, gpus), &m);
+        enif_make_map_put(env, m, mk_atom(env, "init_rank"), mk_atom(env, init_rank ? "true" : "false"), &m);
+        enif_make_map_put(env, m, mk_atom(env, "allreduce"), mk_atom(env, allreduce ? "true" : "false"), &m);
+        if (dev) {
+            enif_make_map_put(env, m, mk_atom(env, "device"),
+                              enif_make_string(env, ggml_backend_dev_name(dev), ERL_NIF_UTF8), &m);
+        }
+        return mk_ok(env, m);
+    } catch (...) {
+        return mk_error(env, "exception");
+    }
+}
+
+/* nif_tp_open(GpuIndex, Rank, World, AgentPid, TimeoutMs) ->
+ *     {ok, RankRef} | {error, Reason}
+ * Blocks (dirty IO) until every rank joined, the bootstrap failed or
+ * the deadline passed. Reason: not_supported (no GPU, or a backend
+ * without per-process communicators), timeout, agent_down, rejected
+ * (the coordinator answered an error), init_failed. */
+extern "C" ERL_NIF_TERM nif_tp_open(ErlNifEnv *env, int, const ERL_NIF_TERM argv[]) {
+    int gpu, rank, world, timeout_ms;
+    ErlNifPid agent;
+    if (!enif_get_int(env, argv[0], &gpu) || !enif_get_int(env, argv[1], &rank) ||
+        !enif_get_int(env, argv[2], &world) || !enif_get_local_pid(env, argv[3], &agent) ||
+        !enif_get_int(env, argv[4], &timeout_ms) || world < 1 || rank < 0 || rank >= world ||
+        timeout_ms < 0) {
+        return enif_make_badarg(env);
+    }
+    if (erllama_safe_backend_init_once() != 0) {
+        return mk_error(env, "exception");
+    }
+    try {
+        ggml_backend_dev_t dev = gpu_device(gpu);
+        if (!dev) {
+            return mk_error(env, "not_supported");
+        }
+        auto init_rank = (ggml_backend_comm_init_rank_t) reg_proc(dev, "ggml_backend_comm_init_rank");
+        auto allreduce =
+            (ggml_backend_comm_allreduce_tensor_t) reg_proc(dev, "ggml_backend_comm_allreduce_tensor");
+        auto comm_free = (ggml_backend_comm_free_t) reg_proc(dev, "ggml_backend_comm_free");
+        if (!init_rank || !allreduce || !comm_free) {
+            return mk_error(env, "not_supported");
+        }
+        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        if (!backend) {
+            return mk_error(env, "init_failed");
+        }
+        tp_bridge *b = bridge_new(agent, world, timeout_ms);
+        if (!b) {
+            ggml_backend_free(backend);
+            return mk_error(env, "oom");
+        }
+        b->caller_env = env;
+        void *comm = init_rank(backend, rank, world, bootstrap_cb, b);
+        pthread_mutex_lock(&b->mu);
+        b->caller_env = nullptr;
+        b->closed = true;
+        const char *err = b->round > 0 ? b->error : "init_failed";
+        pthread_mutex_unlock(&b->mu);
+        enif_release_resource(b);
+        if (!comm) {
+            ggml_backend_free(backend);
+            return mk_error(env, err);
+        }
+        void *mem = enif_alloc_resource(TP_RANK_RT, sizeof(tp_rank));
+        if (!mem) {
+            comm_free(comm);
+            ggml_backend_free(backend);
+            return mk_error(env, "oom");
+        }
+        auto *r = new (mem) tp_rank();
+        pthread_mutex_init(&r->mu, nullptr);
+        r->backend = backend;
+        r->comm = comm;
+        r->comm_free = comm_free;
+        r->allreduce = allreduce;
+        r->rank = rank;
+        r->world = world;
+        ERL_NIF_TERM t = enif_make_resource(env, r);
+        enif_release_resource(r);
+        return mk_ok(env, t);
+    } catch (...) {
+        return mk_error(env, "exception");
+    }
+}
+
+/* nif_tp_bootstrap_reply(Bridge, Round, AllBin | error) -> ok | {error, stale}
+ * The agent's answer to `{erllama_tp_bootstrap, Bridge, Round, _}':
+ * every rank's bytes in rank order, or `error' when the exchange
+ * failed. A reply to a round no longer waited on is stale. */
+extern "C" ERL_NIF_TERM nif_tp_bootstrap_reply(ErlNifEnv *env, int, const ERL_NIF_TERM argv[]) {
+    tp_bridge *b;
+    ErlNifUInt64 round;
+    if (!enif_get_resource(env, argv[0], TP_BRIDGE_RT, (void **) &b) ||
+        !enif_get_uint64(env, argv[1], &round)) {
+        return enif_make_badarg(env);
+    }
+    ErlNifBinary bin;
+    bool is_bin = enif_inspect_binary(env, argv[2], &bin);
+    pthread_mutex_lock(&b->mu);
+    if (b->closed || round != b->round || b->have_reply || b->rejected) {
+        pthread_mutex_unlock(&b->mu);
+        return mk_error(env, "stale");
+    }
+    if (is_bin && bin.size == b->expect) {
+        b->reply.assign(bin.data, bin.data + bin.size);
+        b->have_reply = true;
+    } else {
+        b->rejected = true;
+    }
+    pthread_cond_broadcast(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+    return mk_atom(env, "ok");
+}
+
+/* nif_tp_matvec(Rank, Rows, ColsLocal, WBin, XBin) ->
+ *     {ok, PartialBin, ReducedBin} | {error, Reason}
+ * Computes y = W·x on this rank's GPU (W: Rows x ColsLocal F32, row
+ * major; x: ColsLocal F32), reads the partial y, all-reduces it with
+ * the other ranks, and reads the sum. */
+extern "C" ERL_NIF_TERM nif_tp_matvec(ErlNifEnv *env, int, const ERL_NIF_TERM argv[]) {
+    tp_rank *r;
+    int rows, cols;
+    ErlNifBinary w, x;
+    if (!get_rank(env, argv[0], &r) || !enif_get_int(env, argv[1], &rows) ||
+        !enif_get_int(env, argv[2], &cols) || !enif_inspect_binary(env, argv[3], &w) ||
+        !enif_inspect_binary(env, argv[4], &x) || rows < 1 || cols < 1 ||
+        w.size != (size_t) rows * cols * sizeof(float) || x.size != (size_t) cols * sizeof(float)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&r->mu);
+    if (!r->comm) {
+        pthread_mutex_unlock(&r->mu);
+        return mk_error(env, "closed");
+    }
+    ERL_NIF_TERM result;
+    try {
+        tensor_scope s;
+        s.ctx = small_ctx(4);
+        ggml_tensor *tw = ggml_new_tensor_2d(s.ctx, GGML_TYPE_F32, cols, rows);
+        ggml_tensor *tx = ggml_new_tensor_2d(s.ctx, GGML_TYPE_F32, cols, 1);
+        ggml_tensor *ty = ggml_mul_mat(s.ctx, tw, tx);
+        ggml_cgraph *gf = ggml_new_graph(s.ctx);
+        ggml_build_forward_expand(gf, ty);
+        s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, r->backend);
+        if (!s.buf) {
+            pthread_mutex_unlock(&r->mu);
+            return mk_error(env, "oom");
+        }
+        ggml_backend_tensor_set(tw, w.data, 0, w.size);
+        ggml_backend_tensor_set(tx, x.data, 0, x.size);
+        if (ggml_backend_graph_compute(r->backend, gf) != GGML_STATUS_SUCCESS) {
+            pthread_mutex_unlock(&r->mu);
+            return mk_error(env, "compute_failed");
+        }
+        std::vector<float> partial((size_t) rows);
+        ggml_backend_tensor_get(ty, partial.data(), 0, ggml_nbytes(ty));
+        std::vector<float> reduced;
+        if (!reduce_into(r, ty, reduced)) {
+            result = mk_error(env, "reduce_failed");
+        } else {
+            result = enif_make_tuple3(env, mk_atom(env, "ok"), f32_binary(env, partial),
+                                      f32_binary(env, reduced));
+        }
+    } catch (...) {
+        result = mk_error(env, "exception");
+    }
+    pthread_mutex_unlock(&r->mu);
+    return result;
+}
+
+/* nif_tp_reduce(Rank, F32Bin) -> {ok, SumBin} | {error, Reason}
+ * All-reduces the given values with the other ranks (the backend picks
+ * FP32 or BF16 by size, as for a graph's partial sums). */
+extern "C" ERL_NIF_TERM nif_tp_reduce(ErlNifEnv *env, int, const ERL_NIF_TERM argv[]) {
+    tp_rank *r;
+    ErlNifBinary in;
+    if (!get_rank(env, argv[0], &r) || !enif_inspect_binary(env, argv[1], &in) || in.size == 0 ||
+        in.size % sizeof(float) != 0) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&r->mu);
+    if (!r->comm) {
+        pthread_mutex_unlock(&r->mu);
+        return mk_error(env, "closed");
+    }
+    ERL_NIF_TERM result;
+    try {
+        tensor_scope s;
+        s.ctx = small_ctx(1);
+        ggml_tensor *t = ggml_new_tensor_1d(s.ctx, GGML_TYPE_F32, (int64_t) (in.size / sizeof(float)));
+        s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, r->backend);
+        if (!s.buf) {
+            pthread_mutex_unlock(&r->mu);
+            return mk_error(env, "oom");
+        }
+        ggml_backend_tensor_set(t, in.data, 0, in.size);
+        std::vector<float> out;
+        result = reduce_into(r, t, out) ? mk_ok(env, f32_binary(env, out)) : mk_error(env, "reduce_failed");
+    } catch (...) {
+        result = mk_error(env, "exception");
+    }
+    pthread_mutex_unlock(&r->mu);
+    return result;
+}
+
+/* nif_tp_close(Rank) -> ok: frees the communicator and the backend
+ * (idempotent; the resource destructor does it otherwise). */
+extern "C" ERL_NIF_TERM nif_tp_close(ErlNifEnv *env, int, const ERL_NIF_TERM argv[]) {
+    tp_rank *r;
+    if (!get_rank(env, argv[0], &r)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&r->mu);
+    rank_release(r);
+    pthread_mutex_unlock(&r->mu);
+    return mk_atom(env, "ok");
+}
+
+/* nif_tp_bootstrap_selftest(World, PayloadBin, Rounds, AgentPid, TimeoutMs)
+ *     -> {ok, [AllBin]} | {error, Reason}
+ * Runs the bootstrap callback `Rounds' times with `PayloadBin' as this
+ * rank's bytes, exactly as a communicator's init would, without a GPU:
+ * the portable test of the bridge, the agent and the coordinator. */
+extern "C" ERL_NIF_TERM nif_tp_bootstrap_selftest(ErlNifEnv *env, int, const ERL_NIF_TERM argv[]) {
+    int world, rounds, timeout_ms;
+    ErlNifBinary payload;
+    ErlNifPid agent;
+    if (!enif_get_int(env, argv[0], &world) || !enif_inspect_binary(env, argv[1], &payload) ||
+        !enif_get_int(env, argv[2], &rounds) || !enif_get_local_pid(env, argv[3], &agent) ||
+        !enif_get_int(env, argv[4], &timeout_ms) || world < 1 || rounds < 1 || timeout_ms < 0) {
+        return enif_make_badarg(env);
+    }
+    std::vector<uint8_t> send(payload.data, payload.data + payload.size);
+    tp_bridge *b = bridge_new(agent, world, timeout_ms);
+    if (!b) {
+        return mk_error(env, "oom");
+    }
+    b->caller_env = env;
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    std::vector<ERL_NIF_TERM> all;
+    const char *err = nullptr;
+    std::vector<uint8_t> recv(send.size() * (size_t) world);
+    for (int i = 0; i < rounds; i++) {
+        if (!bootstrap_cb(b, send.data(), recv.data(), send.size())) {
+            err = b->error;
+            break;
+        }
+        ERL_NIF_TERM bin;
+        unsigned char *p = enif_make_new_binary(env, recv.size(), &bin);
+        if (!recv.empty()) {
+            memcpy(p, recv.data(), recv.size());
+        }
+        all.push_back(bin);
+    }
+    pthread_mutex_lock(&b->mu);
+    b->caller_env = nullptr;
+    b->closed = true;
+    pthread_mutex_unlock(&b->mu);
+    enif_release_resource(b);
+    if (err) {
+        return mk_error(env, err);
+    }
+    for (size_t i = all.size(); i > 0; i--) {
+        list = enif_make_list_cell(env, all[i - 1], list);
+    }
+    return mk_ok(env, list);
+}

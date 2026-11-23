@@ -77,8 +77,19 @@
     media_prefill/6,
     chat_templates_init/2,
     chat_templates_apply/2,
-    chat_parse/3
+    chat_parse/3,
+    tp_caps/0,
+    tp_open/5,
+    tp_bootstrap_reply/3,
+    tp_matvec/5,
+    tp_reduce/2,
+    tp_close/1,
+    tp_bootstrap_selftest/5
 ]).
+
+-export_type([tp_rank_ref/0, tp_bridge_ref/0]).
+-type tp_rank_ref() :: reference().
+-type tp_bridge_ref() :: reference().
 
 -export_type([chat_templates_ref/0, chat_params_ref/0]).
 -type chat_templates_ref() :: reference().
@@ -730,3 +741,41 @@ nif_media_prefill(_Ctx, _Mtmd, _Prompt, _Media, _SeqId, _Opts) ->
 nif_chat_templates_init(_Model, _Override) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_apply(_Templates, _Inputs) -> erlang:nif_error(nif_not_loaded).
 nif_chat_parse(_Params, _Input, _IsPartial) -> erlang:nif_error(nif_not_loaded).
+
+%% =============================================================================
+%% Tensor parallelism (experimental, rank-local; see erllama_tp)
+%% =============================================================================
+
+-spec tp_caps() -> {ok, map()} | {error, atom()}.
+tp_caps() -> nif_tp_caps().
+
+-spec tp_open(non_neg_integer(), non_neg_integer(), pos_integer(), pid(), non_neg_integer()) ->
+    {ok, tp_rank_ref()} | {error, atom()}.
+tp_open(Gpu, Rank, World, Agent, TimeoutMs) -> nif_tp_open(Gpu, Rank, World, Agent, TimeoutMs).
+
+-spec tp_bootstrap_reply(tp_bridge_ref(), pos_integer(), binary() | error) -> ok | {error, stale}.
+tp_bootstrap_reply(Bridge, Round, Reply) -> nif_tp_bootstrap_reply(Bridge, Round, Reply).
+
+-spec tp_matvec(tp_rank_ref(), pos_integer(), pos_integer(), binary(), binary()) ->
+    {ok, binary(), binary()} | {error, atom()}.
+tp_matvec(Rank, Rows, Cols, W, X) -> nif_tp_matvec(Rank, Rows, Cols, W, X).
+
+-spec tp_reduce(tp_rank_ref(), binary()) -> {ok, binary()} | {error, atom()}.
+tp_reduce(Rank, F32) -> nif_tp_reduce(Rank, F32).
+
+-spec tp_close(tp_rank_ref()) -> ok.
+tp_close(Rank) -> nif_tp_close(Rank).
+
+-spec tp_bootstrap_selftest(pos_integer(), binary(), pos_integer(), pid(), non_neg_integer()) ->
+    {ok, [binary()]} | {error, atom()}.
+tp_bootstrap_selftest(World, Payload, Rounds, Agent, TimeoutMs) ->
+    nif_tp_bootstrap_selftest(World, Payload, Rounds, Agent, TimeoutMs).
+
+nif_tp_caps() -> erlang:nif_error(nif_not_loaded).
+nif_tp_open(_Gpu, _Rank, _World, _Agent, _TimeoutMs) -> erlang:nif_error(nif_not_loaded).
+nif_tp_bootstrap_reply(_Bridge, _Round, _Reply) -> erlang:nif_error(nif_not_loaded).
+nif_tp_matvec(_Rank, _Rows, _Cols, _W, _X) -> erlang:nif_error(nif_not_loaded).
+nif_tp_reduce(_Rank, _F32) -> erlang:nif_error(nif_not_loaded).
+nif_tp_close(_Rank) -> erlang:nif_error(nif_not_loaded).
+nif_tp_bootstrap_selftest(_World, _Payload, _Rounds, _Agent, _TimeoutMs) ->
+    erlang:nif_error(nif_not_loaded).
