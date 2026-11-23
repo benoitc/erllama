@@ -38,6 +38,8 @@
     "  chat MODEL [--conversation ID] [--max-tokens N]\n",
     "                                chat line by line; /help lists the commands\n",
     "  agent MODEL --workspace PATH | --conversation ID [--yes | --read-only] [--max-rounds N]\n",
+    "  agent --attach AGENT          go back to a running session: its pending\n",
+    "                                approvals and tools, then its latest turn\n",
     "                                work with tools in PATH on the release machine;\n",
     "                                /help lists the commands of a session\n",
     "  agents                        list the agent sessions\n",
@@ -135,6 +137,7 @@ command("agent") ->
         [
             {"--workspace", workspace, string},
             {"--conversation", conversation_id, string},
+            {"--attach", attach, string},
             {"--yes", yes, flag},
             {"--read-only", read_only, flag},
             {"--max-rounds", max_rounds, int}

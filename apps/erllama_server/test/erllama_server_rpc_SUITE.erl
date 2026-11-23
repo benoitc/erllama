@@ -36,6 +36,7 @@
     tty_multiline_is_one_message/1,
     tty_ctrl_c_at_the_prompt_drops_the_line/1,
     tty_agent_switch_and_approval/1,
+    tty_agent_attach_shows_what_happened/1,
     tool_exchange_round_trips_through_the_conversation/1,
     real_model_chat/1,
     real_model_accepts_tool_history/1,
@@ -70,6 +71,7 @@ all() ->
         tty_multiline_is_one_message,
         tty_ctrl_c_at_the_prompt_drops_the_line,
         tty_agent_switch_and_approval,
+        tty_agent_attach_shows_what_happened,
         tool_exchange_round_trips_through_the_conversation,
         real_model_chat,
         real_model_accepts_tool_history,
@@ -669,6 +671,54 @@ tty_agent_switch_and_approval(Config) ->
         ok = tty_type(P, "/quit\r"),
         _ = tty_exit(P),
         ?assertEqual({ok, <<"hi">>}, file:read_file(filename:join(Ws, "note.txt")))
+    end).
+
+%% A session works while no client is attached and stops at an
+%% approval. `agent --attach' from a new terminal shows it waiting,
+%% replays the turn's output, asks for the approval and follows the
+%% rest of the turn.
+tty_agent_attach_shows_what_happened(Config) ->
+    skip_without_script(fun() ->
+        Ws = filename:join(?config(priv_dir, Config), "tty_attach_ws"),
+        ok = filelib:ensure_path(Ws),
+        {ok, #{agent_id := Agent}} = ccall(Config, agent_start, [
+            #{
+                model => <<"fast">>,
+                workspace => list_to_binary(Ws),
+                generator => erllama_server_agent_script
+            }
+        ]),
+        ok = rcall(?config(rel, Config), erllama_server_agent_script, set, [
+            Agent,
+            [
+                #{
+                    text => <<"looking first">>,
+                    calls => [
+                        {<<"w1">>, <<"write_file">>, #{
+                            <<"path">> => <<"away.txt">>, <<"content">> => <<"done">>
+                        }}
+                    ]
+                },
+                #{text => <<"written while you were away">>}
+            ]
+        ]),
+        ok = ccall(Config, agent_send, [Agent, <<"write the note">>]),
+        ok = wait(fun() ->
+            case ccall(Config, inspect, [Agent]) of
+                {ok, #{state := approving, approvals := [_]}} -> true;
+                _ -> false
+            end
+        end),
+        P = tty_cli(Config, ["agent", "--attach", binary_to_list(Agent)]),
+        ok = tty_wait(P, <<"[approving, 1 approval(s) pending]">>),
+        ok = tty_wait(P, <<"looking first">>),
+        ok = tty_wait(P, <<"allow write_file">>),
+        ok = tty_type(P, "y\r"),
+        ok = tty_wait(P, <<"written while you were away">>),
+        ok = tty_wait(P, <<"you> ">>),
+        ok = tty_type(P, "/quit\r"),
+        _ = tty_exit(P),
+        ?assertEqual({ok, <<"done">>}, file:read_file(filename:join(Ws, "away.txt")))
     end).
 
 %% Gated: a real GGUF through llama.cpp's chat template and parser.
