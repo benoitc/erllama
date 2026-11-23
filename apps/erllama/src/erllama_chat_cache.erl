@@ -5,7 +5,14 @@
 -moduledoc false.
 %% LRU cache for `erllama_chat' templates refs.
 %%
-%% One slot per model: `{templates, ModelIdBin}` → `templates_ref'.
+%% One slot per loaded model: `{templates, ModelIdBin, Owner}` →
+%% `templates_ref', where `Owner' is the model process. A model loaded
+%% again under the same id (maybe with another file or template) is a
+%% new process, so it never gets the previous load's templates.
+%%
+%% Only the model process builds an entry (`get_or_init/4'); other
+%% processes read it with `cached/2' and render with it directly, so a
+%% build never races the model being freed.
 %% The autoparser's `templates_init' is heavy (jinja parse + setup);
 %% amortise by caching the resulting `templates_ref' per `ModelIdBin'.
 %% Per-request work (`erllama_chat:apply/2`) is not cached.
@@ -28,7 +35,8 @@
 %% Public API
 -export([
     start_link/0,
-    get_or_init/3,
+    get_or_init/4,
+    cached/2,
     purge/1
 ]).
 
@@ -59,21 +67,27 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% Initialise (or retrieve) the templates_ref for a model. Caches by
-%% ModelIdBin; calling twice with the same id returns the SAME ref.
+%% Initialise (or retrieve) the templates_ref for a loaded model.
+%% Calling twice with the same id and owner returns the SAME ref.
 -spec get_or_init(
     ModelIdBin :: binary(),
+    Owner :: pid(),
     ModelRef :: erllama_nif:model_ref(),
     TemplateOverride :: binary() | undefined
 ) ->
     {ok, erllama_chat:templates_ref()} | {error, term()}.
-get_or_init(ModelIdBin, ModelRef, TemplateOverride) when
-    is_binary(ModelIdBin)
+get_or_init(ModelIdBin, Owner, ModelRef, TemplateOverride) when
+    is_binary(ModelIdBin), is_pid(Owner)
 ->
     cached_or_build(
-        {templates, ModelIdBin},
+        {templates, ModelIdBin, Owner},
         fun() -> erllama_chat:init(ModelRef, TemplateOverride) end
     ).
+
+%% The templates_ref built for this loaded model, if any.
+-spec cached(binary(), pid()) -> {ok, erllama_chat:templates_ref()} | not_found.
+cached(ModelIdBin, Owner) when is_binary(ModelIdBin), is_pid(Owner) ->
+    lookup(?TAB, {templates, ModelIdBin, Owner}).
 
 %% Shared cache fast path: return the cached ref on hit, or run the
 %% builder fun and insert its result on miss.
@@ -149,7 +163,7 @@ handle_call({purge, ModelIdBin}, _From, S) ->
     ets:foldl(
         fun({Key, _V, _Seq}, _Acc) ->
             case Key of
-                {templates, MId} when MId =:= ModelIdBin ->
+                {templates, MId, _Owner} when MId =:= ModelIdBin ->
                     ets:delete(?TAB, Key);
                 _ ->
                     ok

@@ -80,7 +80,9 @@
     continue_multi_turn_cache_delta/1,
     tokenize_large_input/1,
     apply_chat_template_large_input/1,
-    tokenize_over_text_cap/1
+    tokenize_over_text_cap/1,
+    shared_reads_during_generation/1,
+    shared_reads_during_unload/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -146,7 +148,9 @@ all() ->
         continue_multi_turn_cache_delta,
         tokenize_large_input,
         apply_chat_template_large_input,
-        tokenize_over_text_cap
+        tokenize_over_text_cap,
+        shared_reads_during_generation,
+        shared_reads_during_unload
     ].
 
 init_per_suite(Config) ->
@@ -1420,3 +1424,87 @@ fit_returns_info_and_generates(Config) ->
     ?assert(is_integer(maps:get(n_gpu_layers, Fit))),
     ?assert(is_integer(maps:get(n_ctx, Fit))),
     ok.
+
+%% =============================================================================
+%% Tokenising and rendering from the caller's process
+%% =============================================================================
+
+%% While the model generates, tokenise, detokenise and render a chat
+%% template from this process: the answers match the idle ones.
+shared_reads_during_generation(Config) ->
+    Model = ?config(model, Config),
+    Msgs = [#{role => user, content => <<"What is the capital of France?">>}],
+    {ok, #{prompt := Prompt}} = erllama:chat_apply(Model, Msgs, #{}),
+    {ok, Tokens} = erllama:tokenize(Model, Prompt, #{parse_special => true}),
+    {ok, Text} = erllama:detokenize(Model, Tokens),
+    %% The first render built the templates in the model process; the
+    %% next ones read them from the cache.
+    Pid = erllama_registry:whereis_name(Model),
+    ?assertMatch({ok, _}, erllama_chat_cache:cached(Model, Pid)),
+    {ok, Ref} = erllama:stream(Model, Tokens, #{response_tokens => 48}),
+    receive
+        {erllama, Ref, {token, _}} -> ok
+    after 60000 -> ct:fail(no_first_token)
+    end,
+    [
+        begin
+            ?assertMatch({ok, #{prompt := Prompt}}, erllama:chat_apply(Model, Msgs, #{})),
+            ?assertEqual({ok, Tokens}, erllama:tokenize(Model, Prompt, #{parse_special => true})),
+            ?assertEqual({ok, Text}, erllama:detokenize(Model, Tokens))
+        end
+     || _ <- lists:seq(1, 5)
+    ],
+    ok = erllama:cancel(Ref),
+    ?assertNotEqual(timeout, drain(Ref, 60000)).
+
+%% Readers racing an unload get an answer or `not_loaded`, never a
+%% crash: the model's lock keeps a free from overlapping a read.
+shared_reads_during_unload(Config) ->
+    Path = ?config(model_path, Config),
+    DiskSrv = ?config(disk_srv, Config),
+    Id = <<"shared_reads_unload">>,
+    Msgs = [#{role => user, content => <<"Hello">>}],
+    {ok, _} = erllama:load_model(Id, model_config(Path, DiskSrv)),
+    {ok, _} = erllama:chat_apply(Id, Msgs, #{}),
+    Self = self(),
+    Readers = [
+        spawn_link(fun() -> Self ! {reader, self(), read_until_gone(Id, Msgs, #{})} end)
+     || _ <- lists:seq(1, 4)
+    ],
+    timer:sleep(50),
+    ok = erllama:unload(Id),
+    Seen = lists:foldl(
+        fun(R, Acc) ->
+            receive
+                {reader, R, Counts} -> maps:merge_with(fun(_, A, B) -> A + B end, Acc, Counts)
+            after 30000 -> ct:fail(reader_stuck)
+            end
+        end,
+        #{},
+        Readers
+    ),
+    ct:log("results by kind while unloading: ~p", [Seen]),
+    ?assertEqual([], maps:keys(Seen) -- [ok, not_loaded]),
+    ?assert(maps:get(ok, Seen, 0) > 0).
+
+read_until_gone(Id, Msgs, Counts) ->
+    Results = [
+        erllama:tokenize(Id, <<"The quick brown fox">>),
+        erllama:detokenize(Id, [1, 2, 3]),
+        erllama:chat_apply(Id, Msgs, #{})
+    ],
+    Kinds = [
+        case R of
+            {ok, _} -> ok;
+            {error, not_loaded} -> not_loaded;
+            Other -> Other
+        end
+     || R <- Results
+    ],
+    Counts1 = lists:foldl(
+        fun(K, C) -> maps:update_with(K, fun(N) -> N + 1 end, 1, C) end, Counts, Kinds
+    ),
+    case lists:member(not_loaded, Kinds) of
+        true -> Counts1;
+        false -> read_until_gone(Id, Msgs, Counts1)
+    end.

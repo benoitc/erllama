@@ -39,6 +39,13 @@ inference, etc.) can plug in via this same surface.
 %% omit it; the engine then returns `{error, not_supported}`.
 -callback vocab_info(state()) -> {ok, map()} | {error, term()}.
 
+%% Optional. A copy of the state that tokenize/2,3, detokenize/2,3
+%% and get_model_ref/1 can be called with from any process, while the
+%% model process runs step/2. With it, callers tokenise and render
+%% chat templates without waiting for the model's decode step.
+%% Backends without it keep those calls in the model process.
+-callback shared_state(state()) -> state().
+
 -callback prefill(state(), [erllama:token_id()]) -> ok | {error, term()}.
 
 -callback decode_one(state(), ContextTokens :: [erllama:token_id()]) ->
@@ -273,6 +280,7 @@ inference, etc.) can plug in via this same surface.
 -callback abort_handle(state()) -> {ok, term()} | undefined.
 
 -optional_callbacks([
+    shared_state/1,
     detokenize/3,
     vocab_info/1,
     kv_pack/3,

@@ -26,6 +26,7 @@
 -export([
     init/1,
     terminate/1,
+    shared_state/1,
     kv_format/1,
     tokenize/2,
     tokenize/3,
@@ -73,7 +74,8 @@
 
 -record(s, {
     model :: erllama_nif:model_ref(),
-    ctx :: erllama_nif:context_ref(),
+    %% `undefined` only in the shared state (shared_state/1).
+    ctx :: erllama_nif:context_ref() | undefined,
     %% Context options passed to erllama_nif:new_context/2. Retained
     %% so reset_context/1 can rebuild the context in place after a
     %% wedged/aborted decode without reloading the model.
@@ -522,12 +524,16 @@ media_prefill(#s{}, _Prompt, _Media, _Opts) ->
 
 %% Surface the underlying NIF model resource for callers that need to
 %% hand it to `erllama_chat:init/2' (the autoparser
-%% templates init expects a model_ref). The scheduler holds the
-%% backend state; the chat-API path goes through a model gen_statem
-%% call (`erllama_model:chat_apply/2') so the resource
-%% lifetime is tied to the model the same way it is for other ops.
+%% templates init expects a model_ref).
 -spec get_model_ref(#s{}) -> erllama_nif:model_ref().
 get_model_ref(#s{model = Model}) -> Model.
+
+%% Only the model: tokenising reads the vocabulary under the model's
+%% own lock, never the context, so other processes can do it while a
+%% decode step runs. Leaving the context out also keeps the shared
+%% copy from holding a context that reset_context/1 replaced.
+-spec shared_state(#s{}) -> #s{}.
+shared_state(#s{model = Model}) -> #s{model = Model}.
 
 %% Build a per-request sampler chain. The opaque sampler_ref is held
 %% by the scheduler for the request's lifetime and freed when the

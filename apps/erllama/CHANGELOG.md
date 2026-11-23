@@ -13,8 +13,18 @@ this project adheres to [Semantic Versioning](https://semver.org).
   token is not added a second time. `chat/3` already did this; streamed
   multimodal chat can now do the same.
 
+### Changed
+
+- Tokenising, detokenising and rendering a chat template no longer wait
+  for a model that is generating. They used to queue behind its decode
+  step, so a new request on a busy model waited about one step for each
+  of them before its prompt was even admitted. They now run in the
+  caller's process, alongside the running requests.
+
 ### Fixed
 
+- A model loaded again under the same id could render chat prompts
+  with the template of its previous load. Each load now uses its own.
 - A streaming request kept generating until its token limit when the
   process receiving its events exited, holding a sequence and compute
   that nobody would use. erllama now watches the receiver of every
