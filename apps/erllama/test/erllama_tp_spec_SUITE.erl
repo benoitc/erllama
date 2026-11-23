@@ -381,9 +381,8 @@ spec_rounds_run(G) ->
     rand:seed(exsss, {7, 11, 13}),
     St0 = #{live => 0, spare => 1, logits => L1, committed => [], times => []},
     PerfC = perf_ranks(G),
-    T0 = erlang:monotonic_time(microsecond),
     St = spec_loop(G, RefToks, RefList, St0),
-    Wall = (erlang:monotonic_time(microsecond) - T0) / 1000,
+    Wall = lists:sum([Ms || {_, Ms, _} <- maps:get(times, St)]),
     PerfD = perf_ranks(G),
     Rounds = lists:reverse(maps:get(times, St)),
     Committed = length(maps:get(committed, St)),
@@ -411,7 +410,7 @@ spec_rounds_run(G) ->
      || {A, P} <- W, proplists:get_value(A, ByA) =/= []
     ]),
     ct:pal(
-        "speculative rounds: ~b rounds, ~b committed in ~.1f ms (~.1f tokens/s measured); weighted by the distribution: ~.2f tokens a round, ~.1f ms a round, ~.1f tokens/s; ordinary decoding ~.1f tokens/s; graph counters per rank ~p",
+        "speculative rounds (the ranks' time): ~b rounds, ~b committed in ~.1f ms (~.1f tokens/s measured); weighted by the distribution: ~.2f tokens a round, ~.1f ms a round, ~.1f tokens/s; ordinary decoding ~.1f tokens/s; graph counters per rank ~p",
         [
             length(Rounds),
             Committed,
@@ -452,23 +451,24 @@ draw_accepted(N) ->
 
 %% One timed round, as `round/5' without the reference comparisons.
 spec_round(G, Want, Draft, #{live := Live, spare := Spare, logits := L, committed := C} = S) ->
-    T0 = erlang:monotonic_time(microsecond),
-    {_, ok} = op(G, {cp, Live, Spare}),
-    {_, {ok, V}} = op(G, {decode, Spare, Draft, true}),
+    %% The round's time is the ranks' own (each call's slowest rank):
+    %% the test's argmax over the vocabulary is left out.
+    {CpMs, ok} = op(G, {cp, Live, Spare}),
+    {VMs, {ok, V}} = op(G, {decode, Spare, Draft, true}),
     Rows = rows(V),
     A = accepted(Draft, [L | Rows]),
     {Commit, Logits, S1} =
         case A =:= length(Draft) of
             true ->
-                {_, ok} = op(G, {drop, Live}),
-                {Draft, lists:last(Rows), S#{live := Spare, spare := Live}};
+                {DMs, ok} = op(G, {drop, Live}),
+                {Draft, lists:last(Rows), S#{live := Spare, spare := Live, phase_ms => DMs}};
             false ->
-                {_, ok} = op(G, {drop, Spare}),
+                {DMs, ok} = op(G, {drop, Spare}),
                 Replay = lists:sublist(Draft, A) ++ [argmax(lists:nth(A + 1, [L | Rows]))],
-                {_, {ok, L1}} = op(G, {decode, Live, Replay, false}),
-                {Replay, L1, S}
+                {RMs, {ok, L1}} = op(G, {decode, Live, Replay, false}),
+                {Replay, L1, S#{phase_ms => DMs + RMs}}
         end,
-    Ms = (erlang:monotonic_time(microsecond) - T0) / 1000,
+    Ms = CpMs + VMs + maps:get(phase_ms, S1),
     case A =:= Want of
         true -> ok;
         false -> ct:pal("a round drawn for ~b accepted took ~b (a near-tie)", [Want, A])
