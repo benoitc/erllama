@@ -8,6 +8,11 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Experimental: a node's GPU can join a group of ranks on other hosts
+  and sum buffers with them on the GPUs' own network path
+  (`erllama_tp`). This is the first step towards running one model
+  across several machines; it needs a CUDA build with NCCL.
+
 - `media_add_special`, a request option for streams with media: set it
   to `false` when the prompt comes from a chat template, so the BOS
   token is not added a second time. `chat/3` already did this; streamed

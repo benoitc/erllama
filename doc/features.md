@@ -283,3 +283,38 @@ Tests (stub models and scripted agents, repeatable):
 - A later turn finds the previous turn's saved context whether its client links it or sends the whole history; linked turns (conversations, agent sessions, `previous_response_id`) resume from the exact key.
 - After an eviction the request is prefilled again: slower, same answer.
 - Admission under limited sequences is measured in the shared-serving benchmark above.
+
+## Tensor parallelism, milestone 1: a reduction between hosts (2026-11-23)
+
+Experimental. See [internals/tensor-parallel.md](../internals/tensor-parallel.md).
+
+| Feature | State | Notes |
+|---|---|---|
+| rank-local API | done | `erllama_tp`: open this node's GPU as one rank, matvec, reduce, close; `erllama_tp_rank` holds a handle in a process for a remote coordinator |
+| bootstrap bridge | done | the communicator's bootstrap callback (`ggml_backend_comm_init_rank`) goes through an Erlang agent and a coordinator, rank-ordered, bounded by the open's deadline |
+| test coordinator | done | `test/erllama_tp_coordinator.erl`; group formation belongs to erllama_cluster |
+| portable tests | done | `erllama_tp_bootstrap_SUITE`, in CI |
+| hardware tests | done on two hosts | `erllama_tp_nccl_SUITE`, opt-in; hosts prepared with `scripts/tp_hosts.sh` |
+
+Hardware run: two ASUS GX10 (NVIDIA GB10, compute capability 12.1, about 121 GB unified memory, driver 580.178.04, CUDA 13.0), one rank each; llama.cpp pin v1.0.0; NCCL 2.32.6 (pip wheel `nvidia-nccl-cu13`); OTP 28.3.1.
+
+| Case | Result |
+|---|---|
+| fixture: rows `[1,2,3,4]`, `[4,3,2,1]`, input `[1,2,3,4]`, columns split | partials `[5,10]` and `[25,10]`; both ranks `[30,20]`, exact |
+| 4096 values per rank (FP32 path) | tolerance 1e-6 of the summed magnitudes + 1e-6; worst error 0.02 of the bound |
+| 2,097,152 values per rank (BF16 path) | tolerance 1.6e-2 of the summed magnitudes + 1e-6; worst error 0.29 of the bound |
+| rank 0 alone | `{error, join_timeout}` after 2031 ms (coordinator deadline 2000 ms); the node stays usable |
+| open, reduce, close three times | each round correct; free device memory flat (rank 0 about 5.2 GB free, rank 1 about 7.7 GB, another process holding the rest) |
+| data path | NCCL `NET/IB` over RoCE, `rocep1s0f0` and `roceP2p1s0f0` at 200 Gb/s each (back-to-back links), out-of-band on `enP7s7`; GPU Direct RDMA disabled on GB10 |
+
+The run is from a third machine:
+
+```bash
+scripts/tp_hosts.sh setup gx10-fa8e.local gx10-e25e.local
+scripts/tp_hosts.sh sync  gx10-fa8e.local gx10-e25e.local
+scripts/tp_hosts.sh build gx10-fa8e.local gx10-e25e.local
+ERLLAMA_TP_HOSTS=gx10-fa8e.local,gx10-e25e.local \
+    rebar3 ct --dir apps/erllama/test --suite erllama_tp_nccl_SUITE
+```
+
+Not done: a transformer block split across ranks (milestone 2), a full model (milestone 3), failure handling during generation and coordinated checkpoints (milestone 4), three or more hosts, Metal. No throughput or latency is claimed: nothing was measured beyond correctness.

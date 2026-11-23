@@ -23,6 +23,7 @@
  */
 #include <erl_nif.h>
 #include "erllama_chat_nif.h"
+#include "erllama_tp_nif.h"
 #include "erllama_spec_nif.h"
 #include "erllama_mtmd_nif.h"
 
@@ -341,6 +342,12 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
         return -1;
     }
 
+    /* Register the tensor-parallel bridge and rank resources (defined
+     * in erllama_tp_nif.cpp). */
+    if (tp_nif_load(env) != 0) {
+        return -1;
+    }
+
     /* Register the ngram-speculator resource (defined in
      * erllama_spec_nif.cpp). */
     if (spec_nif_load(env) != 0) {
@@ -527,7 +534,16 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_mtmd_free",      1, nif_mtmd_free,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_mtmd_caps",      1, nif_mtmd_caps,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_mtmd_caps_file", 1, nif_mtmd_caps_file, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_media_prefill",  6, nif_media_prefill,  ERL_NIF_DIRTY_JOB_CPU_BOUND}
+    {"nif_media_prefill",  6, nif_media_prefill,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    /* Tensor parallelism (experimental): open, matvec, reduce and the
+     * self-test block on other ranks, so they run on dirty IO. */
+    {"nif_tp_caps",            0, nif_tp_caps,            ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_tp_open",            5, nif_tp_open,            ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_bootstrap_reply", 3, nif_tp_bootstrap_reply, 0},
+    {"nif_tp_matvec",          5, nif_tp_matvec,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_reduce",          2, nif_tp_reduce,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_close",           1, nif_tp_close,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_tp_bootstrap_selftest", 5, nif_tp_bootstrap_selftest, ERL_NIF_DIRTY_JOB_IO_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)
