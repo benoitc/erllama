@@ -273,6 +273,11 @@ formed again, under a new coordinator (a new generation).
   a checkpoint restored by a new group, and a save missing a rank's
   share that publishes nothing. `test/erllama_tp_checkpoint_tests.erl`
   checks the frame everywhere.
+- `test/erllama_tp_capacity_SUITE.erl` is opt-in on the same hosts,
+  with their GPUs free and `ERLLAMA_TP_BIG_MODEL` naming a GGUF larger
+  than one GPU: the model split over the group and served, each rank's
+  peak memory and llama.cpp's placement. Its one-host case
+  (`ERLLAMA_TP_CAPACITY_ONE_HOST=1`) can run a host out of memory.
 - `test/erllama_tp_nccl_SUITE.erl` is opt-in, on CUDA hosts prepared
   with `scripts/tp_hosts.sh`. The plan's matrix fixture, a
   decode-sized FP32 reduction and a prefill-sized BF16 one with stated
@@ -321,5 +326,4 @@ every bump.
 
 ## Not done yet
 
-A model too large for one GPU (the test hosts' GPUs are shared with
-another workload), groups of more than two hosts, and Metal.
+Groups of more than two hosts, and Metal.

@@ -23,6 +23,8 @@
     with_serving/2,
     serve/4,
     serve/5,
+    form/3,
+    load/4,
     complete/3,
     complete_stats/3,
     stop_group/1,
@@ -187,6 +189,11 @@ serve(Hosts, S, Gen, Policy) ->
 
 %% `Extra' adds to the load config (e.g. tp_kv_timeout).
 serve(Hosts, S, Gen, Policy, Extra) ->
+    load(form(Hosts, S, Gen), Policy, Extra, 600000).
+
+%% A group of generation `Gen' on fresh rank nodes, one per host,
+%% watched by a coordinator on node `S'.
+form(Hosts, S, Gen) ->
     Peers = [
         element(
             1, start_peer(name("erllama_tp" ++ integer_to_list(R)), H, get(cookie), R)
@@ -197,19 +204,22 @@ serve(Hosts, S, Gen, Policy, Extra) ->
     Ranks = form_group(Peers, Coord, Gen, 60000),
     RankPids = [R || {_, R} <- Ranks],
     ok = peer:call(S, erllama_tp_coordinator, watch, [Coord, RankPids]),
-    [{P0, R0} | Followers] = Ranks,
+    #{gen => Gen, coord => Coord, rank_peers => Peers, rank_pids => RankPids, serving => S}.
+
+%% The model (model/0) loaded on the group and served from its node.
+load(
+    #{gen := Gen, rank_peers := Peers, rank_pids := RankPids, serving := S} = G,
+    Policy,
+    Extra,
+    Timeout
+) ->
+    [{P0, R0} | Followers] = lists:zip(Peers, RankPids),
     Model = model(),
     MOpts = #{n_gpu_layers => 99},
     COpts = #{n_ctx => 2048, n_batch => 512, flash_attn => enabled},
     Loaded = parallel([
         fun() ->
-            peer:call(
-                P,
-                erllama_tp_rank,
-                load,
-                [R, home(P, Model), {MOpts, COpts}],
-                600000
-            )
+            peer:call(P, erllama_tp_rank, load, [R, home(P, Model), {MOpts, COpts}], Timeout)
         end
      || {P, R} <- Followers
     ]),
@@ -217,7 +227,7 @@ serve(Hosts, S, Gen, Policy, Extra) ->
     Descs = [
         {R,
             peer:call(P, erllama_tp_rank, describe, [
-                home(P, Model), {MOpts, COpts}, length(Hosts)
+                home(P, Model), {MOpts, COpts}, length(Peers)
             ])}
      || {P, R} <- Followers
     ],
@@ -238,9 +248,9 @@ serve(Hosts, S, Gen, Policy, Extra) ->
                 tp_followers => Descs
             }
         ],
-        600000
+        Timeout
     ),
-    #{id => Id, coord => Coord, rank_peers => Peers, rank_pids => RankPids, serving => S}.
+    G#{id => Id}.
 
 %% 32 greedy tokens after `Prompt', and the request's stats.
 complete(S, G, Prompt) ->

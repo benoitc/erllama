@@ -428,4 +428,24 @@ Run on the two GB10 hosts over RoCE, TinyLlama 1.1B Chat Q4, `n_ctx 2048`, a 330
 - Timed apart from decoding, in rank 0's process; the cache's own framing and publication come on top.
 - Over TCP (`NCCL_NET=Socket` on the two 200 Gb/s links) both cases pass too, with the same hits and misses (checkpoint 81 to 93 ms).
 
-Not done: a model larger than one GPU, more than two hosts, Metal.
+## Tensor parallelism: a model larger than one GPU (2026-11-23)
+
+Experimental. Llama 3.3 70B Instruct in F16 (four GGUF parts, 131.4 GiB, 80 layers) on the two GB10 hosts, each with 121 GB of memory shared by its CPU and GPU, the hosts' other workload stopped for the run (`erllama_tp_capacity_SUITE`). `n_ctx 2048`, flash attention on, over RoCE, served from its own node through `erllama_model_tp`.
+
+| | One GB10 | Split over the two |
+|---|---|---|
+| placement | auto-fit (8 GiB margin) chose 68 of 81 layers on the GPU, 13 on the CPU | 81 of 81 layers on the GPU of each rank, each holding its share; only the 2.0 GB token embedding table in CPU memory, as llama.cpp always places it |
+| result | the load ran the host out of memory: the kernel killed the node (`Out of memory: Killed process ... beam.smp`, 144.6 GB of address space) | loaded and served |
+| memory available before | 117 GB | 125.4 and 125.5 GB |
+| peak use during load and generation | (killed) | 74.3 GB on rank 0, 73.9 GB on rank 1 |
+| per rank | | 66,287 MiB of weights (its half), 320 MiB of KV, 317 MiB of compute buffers; the other rank's share (70.2 GB) reserved as address space only |
+
+| Streamed completion, 64 tokens after a 220-token prompt (two runs) | First token | Decode | Median gap |
+|---|---|---|---|
+| split over the two GB10s | 1635 and 1582 ms | 3.34 and 3.33 tokens/s | 299.5 and 300.0 ms |
+
+- Both streams ended `length` with 64 tokens. There is no one-GPU reference to compare the tokens with: no single host holds the model.
+- Decoding reads each rank's 66 GB of F16 weights once per token, so the rate is bound by memory bandwidth, not by the reductions; a quantized file would be faster and smaller.
+- The one-host case runs only with `ERLLAMA_TP_CAPACITY_ONE_HOST=1`: on hosts whose GPU shares the host's memory it ends with the node killed.
+
+Not done: more than two hosts, Metal.
