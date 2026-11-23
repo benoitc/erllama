@@ -407,3 +407,25 @@ Serving from the separate node, `erllama_tp_nccl_SUITE` (same model, `n_ctx 1024
 Over TCP (`NCCL_NET=Socket` on the two 200 Gb/s links) the three cases pass too: the terminal error came 6.3 ms after the kill, the request after a gap failed once in 119 ms, and the cancel during prefill ended once, 68 ms after the cancel.
 
 Not done: coordinated checkpoints and cache hits, a model larger than one GPU, more than two hosts, Metal.
+
+## Tensor parallelism, milestone 4b: checkpoints of a split model (2026-11-23)
+
+Experimental. A split model's cache entry holds every rank's share of the KV, packed at the same committed token: rank 0 puts the pack in the stream the other ranks follow, after every batch it decoded, and frames the shares (size and CRC32C each) into one payload, so the cache publishes all of them or none. A share that does not come within `tp_kv_timeout` fails the save and nothing is published. The world size and `tensor_split` are part of the KV identity. See [internals/tensor-parallel.md](../internals/tensor-parallel.md).
+
+Run on the two GB10 hosts over RoCE, TinyLlama 1.1B Chat Q4, `n_ctx 2048`, a 330-token prompt, 32 greedy tokens; one cold save at the 320-token boundary and a finish save (`erllama_tp_checkpoint_SUITE`, two runs).
+
+| Case | Result |
+|---|---|
+| a checkpoint, then the group unloaded and a new one formed on new nodes | the same prompt resumes from it (`partial`, 320 tokens read, restored on both ranks), same 32 tokens as the first group |
+| rank 1 sends no share for the cold save | that save fails and the finish save is made (rank 0: 1 failed, 1 made); a new group misses on the same prompt (`cold`, nothing read) and gives the same tokens |
+
+| | Time on rank 0 | Size |
+|---|---|---|
+| checkpoint (pack on both ranks, gather, frame) | 78 to 105 ms | 17.8 MB |
+| restore (check, unpack on both ranks) | 49 and 68 ms | |
+
+- Each rank's share is the size of the whole sequence's KV: the split backend reads the other ranks' slices as zeros. The checkpoint is twice the single-GPU size with two ranks.
+- Timed apart from decoding, in rank 0's process; the cache's own framing and publication come on top.
+- Over TCP (`NCCL_NET=Socket` on the two 200 Gb/s links) both cases pass too, with the same hits and misses (checkpoint 81 to 93 ms).
+
+Not done: a model larger than one GPU, more than two hosts, Metal.

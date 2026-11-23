@@ -47,7 +47,8 @@
     %% erllama_model_tp (experimental tensor parallelism)
     tp_worker,
     tp_followers,
-    tp_call_timeout
+    tp_call_timeout,
+    tp_kv_timeout
 ]).
 
 -define(MODEL_OPT_KEYS, [
@@ -293,7 +294,8 @@ base_load_checks() ->
         {mmproj_opts, fun mmproj_opts_check/1},
         {tp_worker, fun is_pid/1},
         {tp_followers, fun is_list/1},
-        {tp_call_timeout, fun(V) -> V =:= infinity orelse pos_int(V) end}
+        {tp_call_timeout, fun(V) -> V =:= infinity orelse pos_int(V) end},
+        {tp_kv_timeout, fun pos_int/1}
     ].
 
 %% Stub-backend test knobs.

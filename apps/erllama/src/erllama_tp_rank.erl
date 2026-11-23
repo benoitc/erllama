@@ -24,6 +24,7 @@
 -export([start/1, matvec/3, reduce/2, info/1, stop/1]).
 -export([load/3, decode/2, stats/1, ref_load/3, ref_decode/2]).
 -export([host/3, backend/3, free_ref/2, follow_stats/1, describe/3, time_reduce/3, kill/1]).
+-export([checkpoint_stats/1, fault/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(state, {
@@ -46,7 +47,13 @@
     %% references (samplers) it handed out, by id.
     host :: term() | undefined,
     refs = #{} :: #{pos_integer() => reference()},
-    next_ref = 1 :: pos_integer()
+    next_ref = 1 :: pos_integer(),
+    %% On rank 0: how long the last checkpoint and restore took (ms).
+    ckpt = #{} :: #{atom() => number()},
+    %% How long rank 0 waits for the other ranks' shares (ms).
+    kv_timeout = 30000 :: timeout(),
+    %% Tests only: drop this rank's share of the next checkpoint.
+    drop_kv_pack = false :: boolean()
 }).
 -type state() :: #state{}.
 
@@ -111,6 +118,15 @@ backend(Pid, Fn, Args) ->
 -spec free_ref(pid(), pos_integer()) -> ok | {error, term()}.
 free_ref(Pid, Id) ->
     gen_server:call(Pid, {hosting, {free_ref, Id}}, infinity).
+
+%% On rank 0: how long the last checkpoint and restore took, in ms.
+-spec checkpoint_stats(pid()) -> #{atom() => number()}.
+checkpoint_stats(Pid) -> gen_server:call(Pid, {hosting, checkpoint_stats}, infinity).
+
+%% Tests only: `drop_kv_pack' makes this rank send no share for the next
+%% checkpoint, as if the save were interrupted after the other shares.
+-spec fault(pid(), drop_kv_pack) -> ok.
+fault(Pid, drop_kv_pack) -> gen_server:call(Pid, {hosting, {fault, drop_kv_pack}}, infinity).
 
 %% The serving rank's commands this rank applied and dropped.
 -spec follow_stats(pid()) -> #{atom() => non_neg_integer()}.
@@ -206,6 +222,11 @@ handle_info({erllama_tp, _Gen, Seq, _Cmd}, #state{seq = Last, duplicates = N} = 
 ->
     {noreply, S#state{duplicates = N + 1}};
 handle_info({erllama_tp, _Gen, Seq, Cmd}, #state{ctx = C, seq = Last} = S) when
+    C =/= undefined, Seq =:= Last + 1, element(1, Cmd) =:= kv_pack;
+    C =/= undefined, Seq =:= Last + 1, element(1, Cmd) =:= kv_unpack
+->
+    {noreply, follow_kv(Cmd, S#state{seq = Seq})};
+handle_info({erllama_tp, _Gen, Seq, Cmd}, #state{ctx = C, seq = Last} = S) when
     C =/= undefined, Seq =:= Last + 1
 ->
     case erllama_nif:tp_follow(C, Cmd) of
@@ -259,11 +280,22 @@ host_model(Config, Followers, #state{handle = H, world = W, gen = Gen}) ->
     end.
 
 %% Rank 0 hosting erllama_model_tp's backend.
-hosting({host, Config, Followers}, #state{host = undefined} = S) ->
+hosting({host, Config0, Followers}, #state{host = undefined} = S) ->
+    Config = maps:remove(tp_kv_timeout, Config0),
     case host_model(Config, Followers, S) of
-        {ok, B} -> {reply, ok, S#state{host = B}};
-        {error, _} = E -> {reply, E, S}
+        {ok, B} ->
+            {reply, ok, S#state{host = B, kv_timeout = maps:get(tp_kv_timeout, Config0, 30000)}};
+        {error, _} = E ->
+            {reply, E, S}
     end;
+hosting({kv_pack, _} = Req, S) ->
+    checkpointing(Req, S);
+hosting({kv_unpack, _, _} = Req, S) ->
+    checkpointing(Req, S);
+hosting(checkpoint_stats, #state{ckpt = C} = S) ->
+    {reply, C, S};
+hosting({fault, drop_kv_pack}, S) ->
+    {reply, ok, S#state{drop_kv_pack = true}};
 hosting({backend, Fn, Args}, #state{host = B} = S) when B =/= undefined ->
     {Args1, S1} = to_local(Args, S),
     hosted(apply(erllama_model_llama, Fn, [B | Args1]), Fn, S1);
@@ -274,6 +306,43 @@ hosting({free_ref, Id}, #state{refs = Refs} = S) ->
     end;
 hosting(_Req, S) ->
     {reply, {error, not_loaded}, S}.
+
+%% -----------------------------------------------------------------------------
+%% Checkpoints
+%%
+%% Rank 0 puts the command in the stream the other ranks follow, after
+%% every batch it decoded, then packs (or restores) its own share; each
+%% other rank does the same with its share when it reaches the command,
+%% and answers rank 0. The shares are framed into one binary
+%% (erllama_tp_checkpoint), checked before any rank restores them.
+
+checkpointing({kv_pack, SeqId}, #state{host = B, world = W, kv_timeout = T} = S) when
+    B =/= undefined
+->
+    {Ms, R} = timed(fun() ->
+        erllama_tp_checkpoint:pack(erllama_model_llama:get_context_ref(B), SeqId, W, T)
+    end),
+    {reply, R, S#state{ckpt = erllama_tp_checkpoint:record(pack, Ms, R, S#state.ckpt)}};
+checkpointing({kv_unpack, Bin, SeqId}, #state{host = B, world = W, kv_timeout = T} = S) when
+    B =/= undefined
+->
+    {Ms, R} = timed(fun() ->
+        erllama_tp_checkpoint:restore(erllama_model_llama:get_context_ref(B), Bin, SeqId, W, T)
+    end),
+    {reply, R, S#state{ckpt = erllama_tp_checkpoint:record(unpack, Ms, R, S#state.ckpt)}};
+checkpointing(_Req, S) ->
+    {reply, {error, not_loaded}, S}.
+
+%% A follower's share of a checkpoint or restore, answered to rank 0.
+follow_kv({kv_pack, _SeqId, _Tag, _To}, #state{drop_kv_pack = true} = S) ->
+    S#state{drop_kv_pack = false};
+follow_kv(Cmd, #state{ctx = C, rank = R} = S) ->
+    ok = erllama_tp_checkpoint:answer(Cmd, C, R),
+    S.
+
+timed(Fun) ->
+    {Us, R} = timer:tc(Fun),
+    {Us / 1000, R}.
 
 %% A backend callback's result: the callbacks that return a new state
 %% keep it here and answer `ok'; references go out as handles.

@@ -87,7 +87,10 @@
     tp_bootstrap_selftest/5,
     tp_stats/1,
     tp_decode/2,
-    tp_follow/2
+    tp_follow/2,
+    tp_send/2,
+    tp_kv_pack/2,
+    tp_kv_unpack/3
 ]).
 
 -export_type([tp_rank_ref/0, tp_bridge_ref/0]).
@@ -796,3 +799,19 @@ nif_tp_decode(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 tp_follow(Ctx, Cmd) -> nif_tp_follow(Ctx, Cmd).
 
 nif_tp_follow(_Ctx, _Cmd) -> erlang:nif_error(nif_not_loaded).
+
+%% On the serving rank of a split model: put `Cmd' in the stream the
+%% other ranks follow, after every batch decoded so far.
+-spec tp_send(context_ref(), term()) -> ok | {error, atom()}.
+tp_send(Ctx, Cmd) -> nif_tp_send(Ctx, Cmd).
+
+%% This rank's share of a split model's KV for `SeqId', and its restore.
+-spec tp_kv_pack(context_ref(), non_neg_integer()) -> binary() | {error, atom()}.
+tp_kv_pack(Ctx, SeqId) -> nif_tp_kv_pack(Ctx, SeqId).
+
+-spec tp_kv_unpack(context_ref(), binary(), non_neg_integer()) -> ok | {error, atom()}.
+tp_kv_unpack(Ctx, Bin, SeqId) -> nif_tp_kv_unpack(Ctx, Bin, SeqId).
+
+nif_tp_send(_Ctx, _Cmd) -> erlang:nif_error(nif_not_loaded).
+nif_tp_kv_pack(_Ctx, _SeqId) -> erlang:nif_error(nif_not_loaded).
+nif_tp_kv_unpack(_Ctx, _Bin, _SeqId) -> erlang:nif_error(nif_not_loaded).

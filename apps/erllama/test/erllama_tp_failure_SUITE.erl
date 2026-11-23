@@ -150,97 +150,19 @@ cancel_during_prefill(Config) ->
 %% -----------------------------------------------------------------------------
 
 with_serving(Config, Fun) ->
-    [Host0 | _] = ?config(hosts, Config),
-    Cookie = cookie(),
-    {S, _} = erllama_tp_hosts:start_peer(name("erllama_tps"), Host0, Cookie),
-    put(cookie, Cookie),
-    [ok = erllama_tp_hosts:load_module(S, M) || M <- [erllama_tp_coordinator, erllama_tp_stream]],
-    try
-        Fun(S)
-    after
-        peer:stop(S)
-    end.
+    erllama_tp_hosts:with_serving(?config(hosts, Config), Fun).
 
-%% A group of generation `Gen' on fresh rank nodes, serving the model
-%% from node `S' through erllama_model_tp.
 serve(Config, S, Gen) ->
-    Hosts = ?config(hosts, Config),
-    Peers = [
-        element(
-            1,
-            erllama_tp_hosts:start_peer(name("erllama_tp" ++ integer_to_list(R)), H, get(cookie), R)
-        )
-     || {R, H} <- lists:enumerate(0, Hosts)
-    ],
-    {ok, Coord} = peer:call(S, erllama_tp_coordinator, start, [length(Hosts), 60000]),
-    Ranks = erllama_tp_hosts:form_group(Peers, Coord, Gen, 60000),
-    RankPids = [R || {_, R} <- Ranks],
-    ok = peer:call(S, erllama_tp_coordinator, watch, [Coord, RankPids]),
-    [{P0, R0} | Followers] = Ranks,
-    Model = erllama_tp_hosts:model(),
-    MOpts = #{n_gpu_layers => 99},
-    COpts = #{n_ctx => 2048, n_batch => 512, flash_attn => enabled},
-    Loaded = erllama_tp_hosts:parallel([
-        fun() ->
-            peer:call(
-                P,
-                erllama_tp_rank,
-                load,
-                [R, erllama_tp_hosts:home(P, Model), {MOpts, COpts}],
-                600000
-            )
-        end
-     || {P, R} <- Followers
-    ]),
-    [ok = L || L <- Loaded],
-    Descs = [
-        {R,
-            peer:call(P, erllama_tp_rank, describe, [
-                erllama_tp_hosts:home(P, Model), {MOpts, COpts}, length(Hosts)
-            ])}
-     || {P, R} <- Followers
-    ],
-    Id = iolist_to_binary(["tp_gen", integer_to_list(Gen)]),
-    {ok, Id} = peer:call(
-        S,
-        erllama,
-        load_model,
-        [
-            Id,
-            #{
-                backend => erllama_model_tp,
-                model_path => erllama_tp_hosts:home(P0, Model),
-                model_opts => MOpts,
-                context_opts => COpts,
-                policy => ?NO_CACHE,
-                tp_worker => R0,
-                tp_followers => Descs
-            }
-        ],
-        600000
-    ),
-    #{id => Id, coord => Coord, rank_peers => Peers, rank_pids => RankPids, serving => S}.
+    erllama_tp_hosts:serve(?config(hosts, Config), S, Gen, ?NO_CACHE).
 
-complete(S, #{id := Id}) ->
-    {ok, #{generated := G}} = peer:call(
-        S, erllama, complete, [Id, ?PROMPT, #{response_tokens => 32, temperature => 0.0}], 120000
-    ),
-    G.
+complete(S, G) ->
+    erllama_tp_hosts:complete(S, G, ?PROMPT).
 
-stop_group(#{id := Id, coord := C, rank_peers := Peers, serving := S}) ->
-    _ = catch peer:call(S, erllama, unload, [Id], 60000),
-    _ = catch peer:call(S, erllama_tp_coordinator, stop, [C], 10000),
-    [catch peer:stop(P) || P <- Peers],
-    ok.
+stop_group(G) ->
+    erllama_tp_hosts:stop_group(G).
 
 model_id(#{id := Id}) -> Id.
 coord(#{coord := C}) -> C.
 
 long_prompt(N) ->
-    iolist_to_binary(lists:duplicate(N, <<"The quick brown fox jumps over the lazy dog. ">>)).
-
-cookie() ->
-    "erllama_tp_" ++ integer_to_list(erlang:unique_integer([positive])).
-
-name(Base) ->
-    list_to_atom(Base ++ "_" ++ integer_to_list(erlang:unique_integer([positive]))).
+    erllama_tp_hosts:long_prompt(N).

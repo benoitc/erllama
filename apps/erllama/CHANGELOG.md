@@ -17,11 +17,12 @@ this project adheres to [Semantic Versioning](https://semver.org).
   part of it (`erllama_model_tp` backend). If one machine is lost while
   a request streams, the request ends with a single error, the serving
   node keeps running, and a group formed again serves the next request.
-  A cancel never interrupts a step halfway through. A split model does
-  not use the KV cache yet. This needs a CUDA build with NCCL. The
-  machines can be joined by RDMA or by ordinary Ethernet (TCP); the
-  tensor-parallel page shows how to choose TCP and the network
-  interface on each machine.
+  A cancel never interrupts a step halfway through. A split model's KV
+  cache entry holds every machine's share, saved at the same point, so
+  a group formed again resumes from it; a save missing a share is not
+  kept. This needs a CUDA build with NCCL. The machines can be joined
+  by RDMA or by ordinary Ethernet (TCP); the tensor-parallel page shows
+  how to choose TCP and the network interface on each machine.
 
 - `media_add_special`, a request option for streams with media: set it
   to `false` when the prompt comes from a chat template, so the BOS

@@ -279,6 +279,9 @@ void erllama_tp_send(ErlNifEnv *env, erllama_context_t *c, ErlNifEnv *menv, ERL_
  * ranks in step. */
 #define ERLLAMA_IS_TP(c) ((c)->model_res && (c)->model_res->tp_rank)
 ERL_NIF_TERM nif_tp_follow(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_send(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_tp_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 void context_drops_model(erllama_model_t *m);
 

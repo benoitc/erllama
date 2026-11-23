@@ -4377,6 +4377,14 @@ fire_save_if(true, Reason, Tokens, Req, Data) ->
     Payload = backend_kv_pack(Tokens, Req#req.seq_id, Data),
     Elapsed = erlang:monotonic_time(nanosecond) - T0,
     erllama_cache_counters:add(?C_PACK_TOTAL_NS, max(Elapsed, 0)),
+    publish_packed(Payload, BuildMeta, Data).
+
+%% A pack that failed (`{error, _}', e.g. a split model's checkpoint
+%% missing a rank's share) publishes nothing.
+publish_packed(Payload, _BuildMeta, _Data) when not is_binary(Payload) ->
+    erllama_cache_counters:incr(?C_SAVES_DROPPED),
+    not_fired;
+publish_packed(Payload, BuildMeta, Data) ->
     case
         erllama_cache_writer:save(
             Data#data.tier_srv, Data#data.tier, BuildMeta, Payload, 0

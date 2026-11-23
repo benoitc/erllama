@@ -17,7 +17,9 @@
 %% Config, on top of erllama_model_llama's: `tp_worker' (rank 0's
 %% erllama_tp_rank pid, joined to its group), `tp_followers' (the other
 %% ranks' pids with their erllama_tp_rank:describe/3, every one loaded
-%% with load/3), and `tp_call_timeout' (ms, default 120000).
+%% with load/3), `tp_call_timeout' (ms, default 120000) and
+%% `tp_kv_timeout' (how long rank 0 waits for the other ranks' shares of
+%% a checkpoint, ms, default 30000).
 %%
 %% A rank lost (its node down, or a call past the timeout) makes every
 %% call answer `{error, {tp_rank_lost, Why}}': the model fails its
@@ -40,7 +42,9 @@
     prefill/2,
     decode_one/2,
     kv_pack/2,
+    kv_pack/3,
     kv_unpack/2,
+    kv_unpack/3,
     seq_clear/1,
     seq_rm/2,
     seq_cp/3,
@@ -62,6 +66,9 @@
     vocab :: erllama_nif:model_ref() | undefined,
     %% Rank 0's process; `undefined' in the shared state.
     worker :: pid() | undefined,
+    %% The split, part of the KV's identity: a checkpoint restores only
+    %% into a group split the same way.
+    layout = <<>> :: binary(),
     timeout = 120000 :: timeout()
 }).
 
@@ -70,7 +77,10 @@ init(#{model_path := Path, tp_worker := Worker} = Config) when is_pid(Worker) ->
     case erllama_nif:load_model(Path, #{vocab_only => true}) of
         {ok, Vocab} ->
             S = #tp{
-                vocab = Vocab, worker = Worker, timeout = maps:get(tp_call_timeout, Config, 120000)
+                vocab = Vocab,
+                worker = Worker,
+                layout = layout(Config),
+                timeout = maps:get(tp_call_timeout, Config, 120000)
             },
             Hosted = maps:without([tp_worker, tp_followers, tp_call_timeout], Config),
             case call(S, {hosting, {host, Hosted, maps:get(tp_followers, Config, [])}}, infinity) of
@@ -123,8 +133,13 @@ apply_chat_template(#tp{vocab = M}, Request) ->
 
 prefill(S, Tokens) -> remote(S, prefill, [Tokens]).
 decode_one(S, ContextTokens) -> remote(S, decode_one, [ContextTokens]).
-kv_pack(S, Tokens) -> remote(S, kv_pack, [Tokens]).
-kv_unpack(S, Bin) -> remote(S, kv_unpack, [Bin]).
+%% A checkpoint holds every rank's share, packed at the same token
+%% (erllama_tp_rank:kv_pack/2); one share missing fails the save, so
+%% nothing is published.
+kv_pack(S, Tokens) -> kv_pack(S, Tokens, 0).
+kv_pack(#tp{timeout = T} = S, _Tokens, SeqId) -> call(S, {hosting, {kv_pack, SeqId}}, T).
+kv_unpack(S, Bin) -> kv_unpack(S, Bin, 0).
+kv_unpack(#tp{timeout = T} = S, Bin, SeqId) -> call(S, {hosting, {kv_unpack, Bin, SeqId}}, T).
 seq_clear(S) -> remote(S, seq_clear, []).
 seq_rm(S, SeqId) -> remote(S, seq_rm, [SeqId]).
 seq_cp(S, Src, Dst) -> remote(S, seq_cp, [Src, Dst]).
@@ -132,7 +147,11 @@ seq_rm_last(S, N) -> remote(S, seq_rm_last, [N]).
 seq_rm_last(S, SeqId, N) -> remote(S, seq_rm_last, [SeqId, N]).
 step(S, Ops) -> remote(S, step, [Ops]).
 sampler_new(S, Cfg) -> remote(S, sampler_new, [Cfg]).
-extra_metadata(S) -> remote(S, extra_metadata, []).
+extra_metadata(#tp{layout = L} = S) ->
+    case remote(S, extra_metadata, []) of
+        #{kv_format := F} = Meta -> Meta#{kv_format => <<F/binary, "/tp=", L/binary>>};
+        Other -> Other
+    end.
 
 sampler_free({erllama_tp_ref, Worker, Id}) ->
     case call(#tp{worker = Worker}, {hosting, {free_ref, Id}}, 30000) of
@@ -149,6 +168,12 @@ thinking_signature(_S, SeqId, Bytes) ->
     erllama_model_llama:thinking_signature(undefined, SeqId, Bytes).
 
 %% -----------------------------------------------------------------------------
+
+%% The ranks and the share of each split tensor each holds.
+layout(Config) ->
+    World = 1 + length(maps:get(tp_followers, Config, [])),
+    Split = maps:get(tensor_split, maps:get(model_opts, Config, #{}), even),
+    iolist_to_binary(io_lib:format("~b:~w", [World, Split])).
 
 remote(#tp{worker = undefined}, _Fn, _Args) ->
     {error, not_supported};

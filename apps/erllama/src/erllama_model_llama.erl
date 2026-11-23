@@ -69,7 +69,8 @@
     thinking_signature/3,
     reset_context/1,
     abort_handle/1,
-    get_model_ref/1
+    get_model_ref/1,
+    get_context_ref/1
 ]).
 
 -record(s, {
@@ -527,6 +528,10 @@ media_prefill(#s{}, _Prompt, _Media, _Opts) ->
 %% templates init expects a model_ref).
 -spec get_model_ref(#s{}) -> erllama_nif:model_ref().
 get_model_ref(#s{model = Model}) -> Model.
+
+%% The context, for erllama_tp_rank's checkpoints of a split model.
+-spec get_context_ref(#s{}) -> erllama_nif:context_ref().
+get_context_ref(#s{ctx = Ctx}) -> Ctx.
 
 %% Only the model: tokenising reads the vocabulary under the model's
 %% own lock, never the context, so other processes can do it while a

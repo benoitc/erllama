@@ -133,8 +133,6 @@ serving VM.
     model_path => Path,
     model_opts => MOpts,
     context_opts => COpts,
-    policy => #{min_tokens => infinity, cold_min_tokens => infinity,
-                continued_interval => infinity},
     tp_worker => Rank0Pid,                     %% rank 0's erllama_tp_rank
     tp_followers => [{Pid, erllama_tp_rank:describe(Path, {MOpts, COpts}, World)}]
 }).
@@ -172,11 +170,40 @@ serving VM.
   callback on its context): a step stopped on one rank and not on the
   others would leave them waiting in a collective. A cancel takes
   effect between steps, once every rank finished the step in flight.
-- **No KV cache yet.** Until checkpoints are coordinated across ranks, a
-  split model saves and restores no KV (`kv_pack`/`kv_unpack` answer
-  `not_supported`; load it with a policy that never saves, as above).
-  Embeddings, speculative decoding, the argmax forward and media
-  prefill also answer `not_supported`.
+- **Embeddings, speculative decoding, the argmax forward and media
+  prefill** answer `not_supported` on a split model.
+
+## Checkpoints of a split model
+
+Each rank holds its share of the KV, so a checkpoint is every rank's
+share at the same committed token, and the cache must never expose
+part of one.
+
+- **Same token on every rank.** To save, rank 0 puts a `kv_pack`
+  command in the stream the other ranks follow, after every batch it
+  decoded (`erllama_nif:tp_send/2`), then packs its own share
+  (`erllama_nif:tp_kv_pack/2`). Each other rank packs its share when it
+  reaches the command, so after the same batches, and sends it to rank
+  0. A restore goes the same way with `kv_unpack`.
+- **One entry, all or nothing.** Rank 0 frames the shares into one
+  binary, each with its size and CRC32C
+  (`src/erllama_tp_checkpoint.erl`), and `erllama_model_tp:kv_pack/3`
+  hands that to the model like any payload, so the cache's own
+  reservation and publication rules apply unchanged. A share that does
+  not come within `tp_kv_timeout` (default 30 s) fails the pack, and the
+  model publishes nothing for a pack that failed: a later lookup misses.
+- **Checked before any rank restores.** A frame of another world size,
+  a share of the wrong size or CRC fails the restore before any rank
+  applies it; a rank that fails its own share fails it after. The model
+  then clears the sequence on every rank and serves the request cold.
+- **Part of the KV identity.** The world size and `tensor_split` are
+  appended to the KV format (`/tp=2:even`), so a checkpoint restores
+  only into a group split the same way.
+- **Size.** Each rank's share is the size of the whole sequence's KV:
+  the split backend reads the other ranks' slices from the placeholders,
+  as zeros. A checkpoint is the world size times the single-GPU size.
+- `erllama_tp_rank:checkpoint_stats/1` (rank 0) gives the last pack's
+  and restore's time and size.
 
 ## Plain TCP, without RDMA
 
@@ -242,6 +269,10 @@ formed again, under a new coordinator (a new generation).
   fresh nodes for each case: a rank killed mid-stream, stale, duplicate
   and out-of-order commands, and a cancel during prefill, each followed
   by a request served.
+- `test/erllama_tp_checkpoint_SUITE.erl` is opt-in on the same hosts:
+  a checkpoint restored by a new group, and a save missing a rank's
+  share that publishes nothing. `test/erllama_tp_checkpoint_tests.erl`
+  checks the frame everywhere.
 - `test/erllama_tp_nccl_SUITE.erl` is opt-in, on CUDA hosts prepared
   with `scripts/tp_hosts.sh`. The plan's matrix fixture, a
   decode-sized FP32 reduction and a prefill-sized BF16 one with stated
@@ -254,7 +285,8 @@ scripts/tp_hosts.sh setup gx10-fa8e.local gx10-e25e.local   # once: NCCL, OpenSS
 scripts/tp_hosts.sh sync  gx10-fa8e.local gx10-e25e.local
 scripts/tp_hosts.sh build gx10-fa8e.local gx10-e25e.local   # CUDA + NCCL
 ERLLAMA_TP_HOSTS=gx10-fa8e.local,gx10-e25e.local \
-    rebar3 ct --dir apps/erllama/test --suite erllama_tp_nccl_SUITE,erllama_tp_failure_SUITE
+    rebar3 ct --dir apps/erllama/test \
+    --suite erllama_tp_nccl_SUITE,erllama_tp_failure_SUITE,erllama_tp_checkpoint_SUITE
 ```
 
 Over plain TCP, with the transport and the interfaces checked (from
@@ -289,6 +321,5 @@ every bump.
 
 ## Not done yet
 
-Coordinated cache checkpoints, a model too large for one GPU (the test
-hosts' GPUs are shared with another workload), groups of more than two
-hosts, and Metal.
+A model too large for one GPU (the test hosts' GPUs are shared with
+another workload), groups of more than two hosts, and Metal.
