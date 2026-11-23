@@ -109,6 +109,15 @@ static int model_unreferenced(const erllama_model_t *m) {
            m->active_mtmd == 0;
 }
 
+/* A model split over a tensor-parallel rank lets the rank go once
+ * llama has freed it (or never loaded it). */
+void model_release_tp(erllama_model_t *m) {
+    if (m->tp_rank) {
+        erllama_tp_model_released(m->tp_rank);
+        m->tp_rank = NULL;
+    }
+}
+
 void context_drops_model(erllama_model_t *m) {
     pthread_mutex_lock(&m->mu);
     if (m->active_contexts > 0) {
@@ -117,6 +126,7 @@ void context_drops_model(erllama_model_t *m) {
     if (m->release_pending && model_unreferenced(m) && m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
+        model_release_tp(m);
         m->release_pending = 0;
     }
     pthread_mutex_unlock(&m->mu);
@@ -130,6 +140,7 @@ static void model_drops_adapter(erllama_model_t *m) {
     if (m->release_pending && model_unreferenced(m) && m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
+        model_release_tp(m);
         m->release_pending = 0;
     }
     pthread_mutex_unlock(&m->mu);
@@ -145,6 +156,7 @@ void model_drops_mtmd(erllama_model_t *m) {
     if (m->release_pending && model_unreferenced(m) && m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
+        model_release_tp(m);
         m->release_pending = 0;
     }
     pthread_mutex_unlock(&m->mu);
@@ -181,11 +193,13 @@ static void model_dtor(ErlNifEnv *env, void *obj) {
     if (m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
+        model_release_tp(m);
     }
     if (m->tbo) {
         enif_free(m->tbo);
         m->tbo = NULL;
     }
+    model_release_tp(m);
     if (m->mu_inited) {
         pthread_mutex_destroy(&m->mu);
         m->mu_inited = 0;
@@ -543,7 +557,9 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_tp_matvec",          5, nif_tp_matvec,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_tp_reduce",          2, nif_tp_reduce,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_tp_close",           1, nif_tp_close,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_tp_bootstrap_selftest", 5, nif_tp_bootstrap_selftest, ERL_NIF_DIRTY_JOB_IO_BOUND}
+    {"nif_tp_bootstrap_selftest", 5, nif_tp_bootstrap_selftest, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_stats",           1, nif_tp_stats,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_tp_decode",          2, nif_tp_decode,          ERL_NIF_DIRTY_JOB_IO_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)

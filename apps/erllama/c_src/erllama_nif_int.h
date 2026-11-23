@@ -259,6 +259,8 @@ int get_map_int32(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
                   int32_t *out);
 
 /* Deferred-free protocol (definition in erllama_nif.c). */
+void model_release_tp(erllama_model_t *m);
+ERL_NIF_TERM nif_tp_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 void context_drops_model(erllama_model_t *m);
 
 /* Decode guards (definitions in erllama_nif_context.c). */

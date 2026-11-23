@@ -318,3 +318,21 @@ ERLLAMA_TP_HOSTS=gx10-fa8e.local,gx10-e25e.local \
 ```
 
 Not done: a transformer block split across ranks (milestone 2), a full model (milestone 3), failure handling during generation and coordinated checkpoints (milestone 4), three or more hosts, Metal. No throughput or latency is claimed: nothing was measured beyond correctness.
+
+## Tensor parallelism, milestone 2: a model split over the hosts (2026-11-23)
+
+Experimental. A GGUF loaded with `tp_rank => Rank` is split with llama.cpp's own tensor split over one device per rank: this rank's GPU, wrapped, and placeholders for the others that hold and compute nothing. Collectives go through the rank's communicator; the logits are summed over the ranks exactly. No vendored file is changed. See [internals/tensor-parallel.md](../internals/tensor-parallel.md).
+
+Run on the two GB10 hosts (pin v1.0.0, NCCL 2.32.6 over RoCE), TinyLlama 1.1B Chat (Llama architecture, Q4), `n_ctx 512`, flash attention on, prompt "The quick brown fox jumps over the lazy dog" (12 tokens), then one greedy token from the cache. Reference: the same file on one GB10.
+
+| Case | Prompt | Next token from the cache | Reductions | Placeholders reserve (the other rank's share) | Free GPU memory used by the load |
+|---|---|---|---|---|---|
+| even split | max \|logit − one GPU\| 0.272 (largest \|logit\| 13.96), top 5 identical | 0.220 (largest 14.41), top 5 identical | 88 on each rank, same sizes in the same order | 385.3 MiB on each | 436 MiB and 412 MiB |
+| uneven split (`tensor_split => [3.0, 1.0]`) | 0.246, top 5 identical | 0.213, top 5 identical | 88 on each, same order | 232.5 MiB on rank 0, 538.1 MiB on rank 1 | 605 MiB and 303 MiB |
+
+- Tolerance, set before comparing: the same argmax, and a largest logit difference within 2% of the largest logit. Both ranks hold identical logits.
+- 88 reductions: two per layer (attention output and feed-forward output) over 22 layers, for each of the two decodes.
+- Memory is the free memory reported by the GPU before and after the load (unified memory shared with another process), so it is approximate; the placeholder figure is exact.
+- The differences come from the split itself (matrix shapes change the CUDA kernels used); they are not shown to be rounding only. Throughput and latency were not measured.
+
+Not done: serving through the normal erllama path with one sampling rank driving the others, failure handling during generation, coordinated checkpoints, a model larger than one GPU, more than two hosts, Metal.

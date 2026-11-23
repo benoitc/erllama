@@ -11,6 +11,9 @@
 #define ERLLAMA_TP_NIF_H
 
 #include "erl_nif.h"
+#include <stddef.h>
+
+struct ggml_backend_device;
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,6 +29,18 @@ ERL_NIF_TERM nif_tp_matvec(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_tp_reduce(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_tp_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_tp_bootstrap_selftest(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+
+/* For the model loader: the rank's group devices (world entries, then
+ * NULL) and a reference keeping the rank alive while the model lives;
+ * the device count, or -1 when `rank' is not an open rank. */
+int erllama_tp_model_devices(ErlNifEnv *env, ERL_NIF_TERM rank, struct ggml_backend_device **out,
+                             size_t cap, void **keep);
+/* Drops the reference erllama_tp_model_devices took (model freed). */
+void erllama_tp_model_released(void *keep);
+/* Sums `n' floats in place over every rank of `keep''s group, exactly.
+ * 0 on success. */
+int erllama_tp_reduce_host(void *keep, float *data, size_t n);
 
 #ifdef __cplusplus
 } /* extern "C" */

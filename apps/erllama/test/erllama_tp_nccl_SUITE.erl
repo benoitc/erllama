@@ -32,6 +32,8 @@
     prefill_sized_bf16/1,
     missing_rank_fails_within_the_deadline/1,
     open_and_close_repeat/1,
+    model_matches_one_gpu/1,
+    uneven_split_matches_one_gpu/1,
     transport_in_use/1
 ]).
 
@@ -44,6 +46,8 @@ all() ->
         prefill_sized_bf16,
         missing_rank_fails_within_the_deadline,
         open_and_close_repeat,
+        model_matches_one_gpu,
+        uneven_split_matches_one_gpu,
         transport_in_use
     ].
 
@@ -148,6 +152,112 @@ open_and_close_repeat(Config) ->
         end,
         [1, 2, 3]
     ).
+
+%% A GGUF split over the group with llama.cpp's tensor split, each rank
+%% holding and computing its slices (ERLLAMA_TP_MODEL, a path on every
+%% host, default the TinyLlama the setup copies). Its logits for a
+%% prompt, and for the next token from the cache, against the same
+%% model on one GPU.
+model_matches_one_gpu(Config) ->
+    split_model(Config, #{}).
+
+%% The same with an uneven split: rank 0 takes three quarters of each
+%% split tensor and rank 1 one quarter (llama.cpp rotates the
+%% proportions from layer to layer).
+uneven_split_matches_one_gpu(Config) ->
+    2 = ?config(world, Config),
+    split_model(Config, #{tensor_split => [3.0, 1.0]}).
+
+split_model(Config, Split) ->
+    Model = os:getenv("ERLLAMA_TP_MODEL", "erllama-tp/tinyllama-1.1b-chat.gguf"),
+    Ranks = rank_pids(Config),
+    [{P0, R0} | _] = Ranks,
+    MOpts = #{n_gpu_layers => 99},
+    CtxOpts = #{n_ctx => 512, n_batch => 512, flash_attn => enabled},
+    Opts = {maps:merge(MOpts, Split), CtxOpts},
+    Before = [peer:call(P, erllama_tp_rank, info, [R]) || {P, R} <- Ranks],
+    Loaded = parallel([
+        fun() -> peer:call(P, erllama_tp_rank, load, [R, home(P, Model), Opts], 600000) end
+     || {P, R} <- Ranks
+    ]),
+    ct:pal("split load: ~p", [Loaded]),
+    [ok = L || L <- Loaded],
+    After = [peer:call(P, erllama_tp_rank, info, [R]) || {P, R} <- Ranks],
+    ok = peer:call(P0, erllama_tp_rank, ref_load, [R0, home(P0, Model), {MOpts, CtxOpts}], 600000),
+    %% "The quick brown fox jumps over the lazy dog" in the Llama vocabulary.
+    Prompt = [1, 450, 4996, 17354, 1701, 29916, 432, 17204, 975, 278, 17366, 11203],
+    Step1 = compare_step(Ranks, P0, R0, Prompt, "prompt"),
+    Next = argmax(Step1),
+    _ = compare_step(Ranks, P0, R0, [Next], "next token from the cache"),
+    Stats = [element(2, peer:call(P, erllama_tp_rank, stats, [R])) || {P, R} <- Ranks],
+    [
+        ct:pal(
+            "rank ~b: ~b reductions; placeholders reserve ~.1f MiB (the other ranks' share); free GPU memory ~p -> ~p MiB",
+            [
+                I,
+                maps:get(reductions, St),
+                maps:get(remote_bytes, St) / 1048576,
+                free_mib(B),
+                free_mib(A)
+            ]
+        )
+     || {I, St, {B, A}} <- lists:zip3(
+            lists:seq(0, length(Ranks) - 1), Stats, lists:zip(Before, After)
+        )
+    ],
+    %% Every rank made the same reductions, of the same sizes, in order.
+    [Sizes0 | Others] = [maps:get(sizes, St) || St <- Stats],
+    [?assertEqual(Sizes0, Sz) || Sz <- Others],
+    ?assert(length(Sizes0) > 0).
+
+compare_step(Ranks, P0, R0, Tokens, What) ->
+    Got = parallel([
+        fun() -> peer:call(P, erllama_tp_rank, decode, [R, Tokens], 120000) end
+     || {P, R} <- Ranks
+    ]),
+    {ok, Ref} = peer:call(P0, erllama_tp_rank, ref_decode, [R0, Tokens], 120000),
+    RefL = f32s(Ref),
+    lists:foreach(
+        fun({I, {ok, Bin}}) ->
+            L = f32s(Bin),
+            MaxDiff = lists:max([abs(A - B) || {A, B} <- lists:zip(L, RefL)]),
+            Scale = lists:max([abs(B) || B <- RefL]),
+            ct:pal(
+                "~s, rank ~b: max |logit - one GPU| = ~.4g (largest |logit| ~.4g); top 5 ~w vs ~w",
+                [
+                    What, I, MaxDiff, Scale, top(L, 5), top(RefL, 5)
+                ]
+            ),
+            ?assertEqual(argmax(RefL), argmax(L)),
+            ?assert(MaxDiff =< 2.0e-2 * Scale)
+        end,
+        lists:enumerate(0, Got)
+    ),
+    RefL.
+
+f32s(Bin) -> [V || <<V:32/float-native>> <= Bin].
+
+argmax(L) ->
+    {_, I} = lists:max(lists:zip(L, lists:seq(0, length(L) - 1))),
+    I.
+
+top(L, N) ->
+    [
+        I
+     || {_, I} <- lists:sublist(
+            lists:reverse(lists:sort(lists:zip(L, lists:seq(0, length(L) - 1)))), N
+        )
+    ].
+
+free_mib(#{devices := [#{free_b := F} | _]}) -> F div 1048576;
+free_mib(_) -> undefined.
+
+%% `Path' relative to the home directory of the peer's host.
+home(P, Path) ->
+    case Path of
+        "/" ++ _ -> Path;
+        _ -> filename:join(peer:call(P, os, getenv, ["HOME"]), Path)
+    end.
 
 %% What NCCL chose for the data path, from each rank's INIT/NET log.
 transport_in_use(Config) ->

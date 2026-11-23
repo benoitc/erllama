@@ -6,6 +6,7 @@
 
 #include "erllama_nif_int.h"
 #include "erllama_safe.h"
+#include "erllama_tp_nif.h"
 
 #include <math.h>
 #include <string.h>
@@ -1203,4 +1204,69 @@ ERL_NIF_TERM nif_media_prefill(ErlNifEnv *env, int argc,
     pthread_mutex_unlock(&c->mu);
     return enif_make_tuple3(env, atom_ok, enif_make_int(env, n_tokens),
                             enif_make_int(env, new_n_past - n_past));
+}
+
+/* =========================================================================
+ * nif_tp_decode(Ctx, Tokens) -> {ok, LogitsF32Bin} | {error, Reason}
+ *
+ * Experimental, for tensor-parallel models: decodes `Tokens' on seq 0
+ * after what the context already holds and returns the last token's
+ * logits. For a model split over a tensor-parallel rank (`tp_rank'
+ * load option) each rank computes only its slice of the vocabulary,
+ * so the logits are summed over the group, exactly; every rank of the
+ * group must make the same call. For any other model it is a plain
+ * decode, the single-device reference.
+ * ========================================================================= */
+ERL_NIF_TERM nif_tp_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    llama_token *tokens = NULL;
+    int32_t n = 0;
+    int rc = read_token_list(env, argv[1], &tokens, &n);
+    if (rc != 1) return token_list_error(env, rc);
+    if (n == 0) {
+        if (tokens) enif_free(tokens);
+        return enif_make_badarg(env);
+    }
+    if (!erllama_lock_ctx(c)) {
+        enif_free(tokens);
+        return erllama_error(env, atom_released);
+    }
+    int32_t n_vocab = 0;
+    (void) erllama_ctx_vocab(c, &n_vocab);
+    long pos_max = erllama_safe_memory_seq_pos_max(c->ctx, 0);
+    if (n_vocab <= 0 || pos_max == -2) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return erllama_error(env, atom_exception);
+    }
+    if (erllama_first_oob_token(tokens, n, n_vocab) >= 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return erllama_error(env, atom_invalid_token);
+    }
+    ERL_NIF_TERM bin;
+    float *out = (float *) enif_make_new_binary(env, sizeof(float) * (size_t) n_vocab, &bin);
+    int frc = erllama_safe_forward_last_logits(c->ctx, tokens, n, n_vocab,
+                                               pos_max < 0 ? 0 : pos_max + 1, out);
+    enif_free(tokens);
+    if (frc == 0) {
+        c->decode_ready = 1;
+        void *tp = c->model_res ? c->model_res->tp_rank : NULL;
+        if (tp && erllama_tp_reduce_host(tp, out, (size_t) n_vocab) != 0) {
+            frc = -4;
+        }
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (frc != 0) {
+        ERL_NIF_TERM why = frc == -2   ? atom_oom
+                           : frc == -3 ? atom_exception
+                           : frc == -4 ? enif_make_atom(env, "reduce_failed")
+                                       : atom_decode_failed;
+        return erllama_error(env, why);
+    }
+    return enif_make_tuple2(env, atom_ok, bin);
 }

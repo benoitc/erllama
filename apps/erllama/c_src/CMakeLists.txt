@@ -197,6 +197,12 @@ target_include_directories(erllama_nif PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/vendor
 )
 
+# The tensor-parallel devices implement ggml's backend interfaces,
+# declared in its internal header (ggml/src/ggml-backend-impl.h): only
+# that source sees ggml/src.
+set_source_files_properties(erllama_tp_nif.cpp PROPERTIES
+    INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/ggml/src)
+
 # pthread is used by erllama_nif.c for per-resource mutexes; depend
 # on the standard CMake Threads find module so toolchains that need
 # -pthread (e.g. some Linux distros) get it added.
