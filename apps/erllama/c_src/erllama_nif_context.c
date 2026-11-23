@@ -163,8 +163,14 @@ ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     /* Install the per-step interrupt. data = res stays valid for the
      * context's lifetime (the context is freed before the resource in
      * ctx_dtor / free_context) and the callback only runs during a
-     * llama_decode on this very context. */
-    erllama_safe_set_abort_callback(ctx, erllama_decode_abort_cb, res);
+     * llama_decode on this very context.
+     * Not on a split model: a decode interrupted on one rank and not on
+     * the others leaves them waiting in a collective it never reaches.
+     * A cancel there takes effect between steps, when every rank has
+     * finished the step. */
+    if (!m->tp_rank) {
+        erllama_safe_set_abort_callback(ctx, erllama_decode_abort_cb, res);
+    }
     m->active_contexts++;
     enif_keep_resource(m);
     pthread_mutex_unlock(&m->mu);

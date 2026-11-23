@@ -1,11 +1,11 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% Test helper for erllama_tp_nccl_SUITE, loaded onto the serving
-%% rank's node: stream one request through erllama and time it.
+%% Test helper for the tensor-parallel suites, loaded onto the serving
+%% node: stream one request through erllama and time it.
 -module(erllama_tp_stream).
 
--export([run/4]).
+-export([run/4, run_with/5, kill/2]).
 
 %% Stream `Prompt' on `Model' (greedy, at most `Max' tokens); cancel
 %% after `CancelAfter' tokens (`infinity' to let it finish). Returns the
@@ -30,6 +30,49 @@ collect(Ref, T0, CancelAfter, Times, Text) ->
     after 120000 ->
         result(T0, Times, Text, timeout)
     end.
+
+%% Stream `Prompt' and call `{M, F, A}' with the request's ref appended
+%% once `At' tokens arrived (0: right after the request started); then collect every message the request
+%% sends until `QuietMs' pass without one. Returns the tokens, the
+%% terminal messages (there must be one), and the time from `Fun' to
+%% the first terminal message.
+run_with(Model, Prompt, Max, {At, Fun}, QuietMs) ->
+    {ok, Ref} = erllama:stream(Model, Prompt, #{response_tokens => Max, temperature => 0.0}),
+    T = maybe_fire(0, At, Fun, Ref, undefined),
+    drain(Ref, At, Fun, QuietMs, 0, T, []).
+
+drain(Ref, At, Fun, QuietMs, N, T, Terminals) ->
+    receive
+        {erllama, Ref, {token, _}} ->
+            drain(Ref, At, Fun, QuietMs, N + 1, maybe_fire(N + 1, At, Fun, Ref, T), Terminals);
+        {erllama, Ref, {done, Stats}} ->
+            drain(Ref, At, Fun, QuietMs, N, T, [{done, Stats, now_us()} | Terminals]);
+        {erllama, Ref, {error, Why}} ->
+            drain(Ref, At, Fun, QuietMs, N, T, [{error, Why, now_us()} | Terminals])
+    after QuietMs ->
+        Ts = lists:reverse(Terminals),
+        #{
+            tokens => N,
+            terminals => [{K, V} || {K, V, _} <- Ts],
+            to_terminal_ms =>
+                case {T, Ts} of
+                    {undefined, _} -> undefined;
+                    {_, []} -> undefined;
+                    {_, [{_, _, At1} | _]} -> (At1 - T) / 1000
+                end
+        }
+    end.
+
+maybe_fire(N, N, {M, F, A}, Ref, undefined) ->
+    _ = apply(M, F, A ++ [Ref]),
+    now_us();
+maybe_fire(_, _, _, _, T) ->
+    T.
+
+now_us() -> erlang:monotonic_time(microsecond).
+
+%% For run_with/5: kill a rank's OS process.
+kill(RankPid, _Ref) -> erllama_tp_rank:kill(RankPid).
 
 %% Drain to the request's end after a cancel.
 finish(Ref, T0, Times, Text, How) ->

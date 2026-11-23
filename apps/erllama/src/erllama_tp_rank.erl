@@ -11,23 +11,20 @@
 %% decode/2 in lockstep with the other ranks) and, for comparisons, a
 %% single-GPU reference copy of a model (ref_load/3, ref_decode/2).
 %%
-%% Serving: the serving rank loads the model through erllama
-%% (serve/5), so it is used like any loaded model (complete, stream,
-%% cancel), and samples. Its context sends every batch and KV change to
-%% a forwarder that sends them, in order, to the other ranks, which have
-%% loaded the same file with load/3 and apply them (tp_follow).
+%% Serving: rank 0 hosts the model's backend (host/3) for
+%% erllama_model_tp, the backend a serving VM loads the model with, so
+%% it is used like any loaded model (complete, stream, cancel) while
+%% the GPUs stay in other OS processes. Rank 0 samples. Its context
+%% sends every batch and KV change to a forwarder that sends them, in
+%% order and tagged with the group's generation, to the other ranks,
+%% which have loaded the same file with load/3 and apply them
+%% (tp_follow).
 -behaviour(gen_server).
 
 -export([start/1, matvec/3, reduce/2, info/1, stop/1]).
 -export([load/3, decode/2, stats/1, ref_load/3, ref_decode/2]).
--export([serve/5, describe/3, time_reduce/3]).
+-export([host/3, backend/3, free_ref/2, follow_stats/1, describe/3, time_reduce/3, kill/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
-
-%% A split model's KV is not saved or restored yet (checkpoints must be
-%% coordinated across the ranks).
--define(NO_CACHE, #{
-    min_tokens => infinity, cold_min_tokens => infinity, continued_interval => infinity
-}).
 
 -record(state, {
     handle :: erllama_tp:rank(),
@@ -37,15 +34,26 @@
     ctx :: erllama_nif:context_ref() | undefined,
     ref_model :: erllama_nif:model_ref() | undefined,
     ref_ctx :: erllama_nif:context_ref() | undefined,
-    %% The last command applied from the serving rank.
+    %% The group's generation: commands of another one are stale.
+    gen = 0 :: non_neg_integer(),
+    %% The last command applied from the serving rank, and the commands
+    %% dropped before any GPU work (another generation, or applied
+    %% already).
     seq = 0 :: non_neg_integer(),
-    serving :: binary() | undefined
+    stale = 0 :: non_neg_integer(),
+    duplicates = 0 :: non_neg_integer(),
+    %% On rank 0: the backend state hosted for erllama_model_tp, and the
+    %% references (samplers) it handed out, by id.
+    host :: term() | undefined,
+    refs = #{} :: #{pos_integer() => reference()},
+    next_ref = 1 :: pos_integer()
 }).
 -type state() :: #state{}.
 
 %% Joins the group before returning: `{ok, Pid}' once every rank joined,
 %% `{error, Reason}' as erllama_tp:open/5 gives it. Opts: gpu (default
-%% 0), rank, world, join, timeout (ms, default 60000).
+%% 0), rank, world, join, timeout (ms, default 60000), generation (the
+%% group's, default 0).
 -spec start(map()) -> {ok, pid()} | {error, term()}.
 start(Opts) ->
     gen_server:start(?MODULE, Opts, []).
@@ -85,14 +93,36 @@ ref_load(Pid, Path, Opts) -> gen_server:call(Pid, {ref_load, Path, Opts}, infini
 -spec ref_decode(pid(), [non_neg_integer()]) -> {ok, binary()} | {error, term()}.
 ref_decode(Pid, Tokens) -> gen_server:call(Pid, {ref_decode, Tokens}, infinity).
 
-%% On the serving rank: load `Path' through erllama as `ModelId',
-%% split over the group, once every rank in `Followers' (pids of the
-%% other ranks' processes, which have run load/3 with the same file and
-%% options) has been checked to hold the same model.
--spec serve(pid(), binary(), string(), {map(), map()}, [{pid(), map()}]) ->
-    {ok, binary()} | {error, term()}.
-serve(Pid, ModelId, Path, Opts, Followers) ->
-    gen_server:call(Pid, {serve, ModelId, Path, Opts, Followers}, infinity).
+%% On rank 0: load the model of `Config' (erllama_model_llama's) split
+%% over the group and host its backend, once every rank in `Followers'
+%% (pids of the other ranks' processes, which have run load/3 with the
+%% same file and options) has been checked to hold the same model.
+-spec host(pid(), map(), [{pid(), map()}]) -> ok | {error, term()}.
+host(Pid, Config, Followers) ->
+    gen_server:call(Pid, {hosting, {host, Config, Followers}}, infinity).
+
+%% Run backend callback `Fn' on the hosted state (references in `Args'
+%% and in the result travel as `{erllama_tp_ref, Pid, Id}').
+-spec backend(pid(), atom(), [term()]) -> term().
+backend(Pid, Fn, Args) ->
+    gen_server:call(Pid, {hosting, {backend, Fn, Args}}, infinity).
+
+%% Release a reference handed out by backend/3 (a sampler).
+-spec free_ref(pid(), pos_integer()) -> ok | {error, term()}.
+free_ref(Pid, Id) ->
+    gen_server:call(Pid, {hosting, {free_ref, Id}}, infinity).
+
+%% The serving rank's commands this rank applied and dropped.
+-spec follow_stats(pid()) -> #{atom() => non_neg_integer()}.
+follow_stats(Pid) -> gen_server:call(Pid, follow_stats, infinity).
+
+%% End the rank's OS process at once, even if a native call holds it:
+%% the way out of a collective that lost a peer.
+-spec kill(pid() | node()) -> ok.
+kill(Pid) when is_pid(Pid) -> kill(node(Pid));
+kill(Node) when is_atom(Node) ->
+    _ = erpc:cast(Node, fun() -> os:cmd("kill -9 " ++ os:getpid()) end),
+    ok.
 
 %% `K' reductions of `N' values in a row, timed in this rank's process:
 %% the mean in microseconds (every rank makes the same call).
@@ -125,8 +155,12 @@ describe(Path, {MOpts, COpts}, World) ->
 init(#{rank := Rank, world := World, join := Join} = Opts) ->
     Gpu = maps:get(gpu, Opts, 0),
     case erllama_tp:open(Gpu, Rank, World, Join, maps:get(timeout, Opts, 60000)) of
-        {ok, H} -> {ok, #state{handle = H, rank = Rank, world = World}};
-        {error, Why} -> {stop, Why}
+        {ok, H} ->
+            {ok, #state{
+                handle = H, rank = Rank, world = World, gen = maps:get(generation, Opts, 0)
+            }};
+        {error, Why} ->
+            {stop, Why}
     end.
 
 handle_call({matvec, W, X}, _From, #state{handle = H} = S) ->
@@ -137,11 +171,10 @@ handle_call({load, Path, {MOpts, COpts}}, _From, #state{handle = H} = S) ->
     reply_loaded(load_with(Path, MOpts#{tp_rank => H}, COpts), split, S);
 handle_call({decode, Tokens}, _From, #state{ctx = C} = S) when C =/= undefined ->
     {reply, erllama_nif:tp_decode(C, Tokens), S};
-handle_call({serve, ModelId, Path, Opts, Followers}, _From, S) ->
-    case serve_model(ModelId, Path, Opts, Followers, S) of
-        {ok, Id} -> {reply, {ok, Id}, S#state{serving = Id}};
-        {error, _} = E -> {reply, E, S}
-    end;
+handle_call({hosting, Req}, _From, S) ->
+    hosting(Req, S);
+handle_call(follow_stats, _From, #state{seq = Seq, stale = St, duplicates = D} = S) ->
+    {reply, #{applied => Seq, stale => St, duplicates => D}, S};
 handle_call({time_reduce, N, K}, _From, #state{handle = H} = S) ->
     Vals = <<<<1.0:32/float-native>> || _ <- lists:seq(1, N)>>,
     {ok, _} = erllama_tp:reduce(H, Vals),
@@ -162,32 +195,42 @@ handle_call(_Req, _From, S) ->
 handle_cast(_Msg, S) ->
     {noreply, S}.
 
-%% A command from the serving rank: applied in order. A gap or a repeat
-%% means this rank no longer has the serving rank's KV state.
-handle_info({erllama_tp, Seq, Cmd}, #state{ctx = C, seq = Last} = S) when
+%% A command from the serving rank, decided before any GPU work: one of
+%% another generation is stale and one applied already is a duplicate
+%% (both dropped and counted); the next one is applied; a gap means
+%% this rank no longer has the serving rank's KV state, so it stops.
+handle_info({erllama_tp, Gen, _Seq, _Cmd}, #state{gen = G, stale = N} = S) when Gen =/= G ->
+    {noreply, S#state{stale = N + 1}};
+handle_info({erllama_tp, _Gen, Seq, _Cmd}, #state{seq = Last, duplicates = N} = S) when
+    Seq =< Last
+->
+    {noreply, S#state{duplicates = N + 1}};
+handle_info({erllama_tp, _Gen, Seq, Cmd}, #state{ctx = C, seq = Last} = S) when
     C =/= undefined, Seq =:= Last + 1
 ->
     case erllama_nif:tp_follow(C, Cmd) of
         ok -> {noreply, S#state{seq = Seq}};
         {error, Why} -> {stop, {follow_failed, Seq, Why}, S}
     end;
-handle_info({erllama_tp, Seq, _Cmd}, #state{seq = Last} = S) ->
+handle_info({erllama_tp, _Gen, Seq, _Cmd}, #state{seq = Last} = S) ->
     {stop, {out_of_order, Last, Seq}, S};
 handle_info(_Msg, S) ->
     {noreply, S}.
 
-%% The serving rank's sink: every command to every other rank, in order.
-forward(Followers) ->
+%% The serving rank's sink: every command to every other rank, in order,
+%% tagged with the group's generation.
+forward(Gen, Followers) ->
     receive
-        {erllama_tp, _Seq, _Cmd} = M ->
+        {erllama_tp, Seq, Cmd} ->
+            M = {erllama_tp, Gen, Seq, Cmd},
             _ = [F ! M || F <- Followers],
-            forward(Followers)
+            forward(Gen, Followers)
     after 3600000 ->
-        forward(Followers)
+        forward(Gen, Followers)
     end.
 
-terminate(_Reason, #state{handle = H, serving = Id} = S) ->
-    _ = Id =/= undefined andalso erllama:unload(Id),
+terminate(_Reason, #state{handle = H, host = B} = S) ->
+    _ = B =/= undefined andalso erllama_model_llama:terminate(B),
     _ = [erllama_nif:free_context(C) || C <- [S#state.ctx, S#state.ref_ctx], C =/= undefined],
     _ = [erllama_nif:free_model(M) || M <- [S#state.model, S#state.ref_model], M =/= undefined],
     erllama_tp:close(H).
@@ -198,22 +241,69 @@ reply_loaded({error, _} = E, _, S) -> {reply, E, S}.
 
 %% Every follower must hold the same model as this rank; then this
 %% rank's context sends to a forwarder that keeps them in step.
-serve_model(ModelId, Path, {MOpts, COpts} = Opts, Followers, #state{handle = H, world = W}) ->
-    Mine = describe(Path, Opts, W),
+host_model(Config, Followers, #state{handle = H, world = W, gen = Gen}) ->
+    #{model_path := Path} = Config,
+    MOpts = maps:get(model_opts, Config, #{}),
+    COpts = maps:get(context_opts, Config, #{}),
+    Mine = describe(Path, {MOpts, COpts}, W),
     case [F || {F, Desc} <- Followers, Desc =/= Mine] of
         [] ->
             Pids = [F || {F, _} <- Followers],
-            Fwd = spawn_link(fun() -> forward(Pids) end),
-            erllama:load_model(ModelId, #{
-                backend => erllama_model_llama,
-                model_path => Path,
+            Fwd = spawn_link(fun() -> forward(Gen, Pids) end),
+            erllama_model_llama:init(Config#{
                 model_opts => MOpts#{tp_rank => H},
-                context_opts => COpts#{tp_sink => Fwd},
-                policy => ?NO_CACHE
+                context_opts => COpts#{tp_sink => Fwd}
             });
         Bad ->
             {error, {incompatible_ranks, Bad}}
     end.
+
+%% Rank 0 hosting erllama_model_tp's backend.
+hosting({host, Config, Followers}, #state{host = undefined} = S) ->
+    case host_model(Config, Followers, S) of
+        {ok, B} -> {reply, ok, S#state{host = B}};
+        {error, _} = E -> {reply, E, S}
+    end;
+hosting({backend, Fn, Args}, #state{host = B} = S) when B =/= undefined ->
+    {Args1, S1} = to_local(Args, S),
+    hosted(apply(erllama_model_llama, Fn, [B | Args1]), Fn, S1);
+hosting({free_ref, Id}, #state{refs = Refs} = S) ->
+    case maps:take(Id, Refs) of
+        {Ref, Rest} -> {reply, erllama_model_llama:sampler_free(Ref), S#state{refs = Rest}};
+        error -> {reply, {error, released}, S}
+    end;
+hosting(_Req, S) ->
+    {reply, {error, not_loaded}, S}.
+
+%% A backend callback's result: the callbacks that return a new state
+%% keep it here and answer `ok'; references go out as handles.
+hosted({ok, B}, Fn, S) when
+    Fn =:= set_grammar; Fn =:= configure_sampler; Fn =:= clear_sampler; Fn =:= reset_context
+->
+    {reply, ok, S#state{host = B}};
+hosted(Result, _Fn, S) ->
+    {Out, S1} = to_remote(Result, S),
+    {reply, Out, S1}.
+
+to_remote(R, #state{refs = Refs, next_ref = N} = S) when is_reference(R) ->
+    {{erllama_tp_ref, self(), N}, S#state{refs = Refs#{N => R}, next_ref = N + 1}};
+to_remote(L, S) when is_list(L) ->
+    lists:mapfoldl(fun to_remote/2, S, L);
+to_remote(T, S) when is_tuple(T) ->
+    {L, S1} = to_remote(tuple_to_list(T), S),
+    {list_to_tuple(L), S1};
+to_remote(X, S) ->
+    {X, S}.
+
+to_local({erllama_tp_ref, Pid, Id}, #state{refs = Refs} = S) when Pid =:= self() ->
+    {maps:get(Id, Refs, released), S};
+to_local(L, S) when is_list(L) ->
+    lists:mapfoldl(fun to_local/2, S, L);
+to_local(T, S) when is_tuple(T) ->
+    {L, S1} = to_local(tuple_to_list(T), S),
+    {list_to_tuple(L), S1};
+to_local(X, S) ->
+    {X, S}.
 
 gpus() ->
     case erllama:list_devices() of

@@ -10,10 +10,16 @@
 %% not complete within `TimeoutMs' of its first record fails: every
 %% rank that joined gets `{error, join_timeout}', and so does any later
 %% call, because the group is then failed.
+%%
+%% Once formed, the coordinator watches the group's rank processes
+%% (watch/2): when one fails, the others are killed (a rank left in a
+%% collective with a lost peer never returns) and lost/1 says which
+%% went and why. When one stops normally (its model unloaded), the
+%% others are stopped.
 -module(erllama_tp_coordinator).
 -behaviour(gen_server).
 
--export([start/2, stop/1, join_fun/2]).
+-export([start/2, stop/1, join_fun/2, watch/2, lost/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -record(state, {
@@ -22,7 +28,9 @@
     %% Round => #{Rank => {From, Bytes}}
     rounds = #{} :: #{pos_integer() => #{non_neg_integer() => {gen_server:from(), binary()}}},
     timers = #{} :: #{pos_integer() => reference()},
-    failed :: term()
+    failed :: term(),
+    watched = [] :: [pid()],
+    lost :: {pid(), term()} | undefined
 }).
 
 start(World, TimeoutMs) ->
@@ -35,6 +43,14 @@ stop(Coord) ->
 %% coordinator may be on another node.
 join_fun(Coord, Rank) ->
     fun(Round, Bytes) -> gen_server:call(Coord, {exchange, Rank, Round, Bytes}, infinity) end.
+
+%% Watch the formed group's rank processes.
+watch(Coord, RankPids) ->
+    gen_server:call(Coord, {watch, RankPids}).
+
+%% `{Pid, Reason}' of the first rank process lost, or `undefined'.
+lost(Coord) ->
+    gen_server:call(Coord, lost).
 
 init({World, TimeoutMs}) ->
     {ok, #state{world = World, timeout = TimeoutMs}}.
@@ -59,7 +75,12 @@ handle_call({exchange, Rank, Round, Bytes}, From, #state{world = W, rounds = Rs}
             end
     end;
 handle_call({exchange, _Rank, _Round, _Bytes}, _From, S) ->
-    {reply, {error, bad_rank}, S}.
+    {reply, {error, bad_rank}, S};
+handle_call({watch, Pids}, _From, S) ->
+    _ = [erlang:monitor(process, P) || P <- Pids],
+    {reply, ok, S#state{watched = Pids}};
+handle_call(lost, _From, #state{lost = L} = S) ->
+    {reply, L, S}.
 
 handle_cast(_Msg, S) ->
     {noreply, S}.
@@ -67,6 +88,12 @@ handle_cast(_Msg, S) ->
 handle_info({round_timeout, Round}, #state{rounds = Rs} = S) ->
     [gen_server:reply(From, {error, join_timeout}) || _ := {From, _} <- maps:get(Round, Rs, #{})],
     {noreply, S#state{rounds = maps:remove(Round, Rs), failed = join_timeout}};
+handle_info({'DOWN', _, process, Pid, normal}, #state{watched = Ws, lost = undefined} = S) ->
+    _ = [spawn(fun() -> catch erllama_tp_rank:stop(W) end) || W <- Ws, W =/= Pid],
+    {noreply, S#state{lost = {Pid, normal}}};
+handle_info({'DOWN', _, process, Pid, Why}, #state{watched = Ws, lost = undefined} = S) ->
+    _ = [erllama_tp_rank:kill(W) || W <- Ws, W =/= Pid],
+    {noreply, S#state{lost = {Pid, Why}}};
 handle_info(_Msg, S) ->
     {noreply, S}.
 

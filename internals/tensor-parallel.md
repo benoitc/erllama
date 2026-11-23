@@ -118,31 +118,65 @@ copy (`ref_load/3`, `ref_decode/2`).
 
 ## Serving a split model
 
-The serving rank (rank 0) loads the model through erllama like any
-other (`erllama_tp_rank:serve/5`): `model_opts.tp_rank` is its handle
-and `context_opts.tp_sink` a forwarder process. Callers use the normal
-API (`complete`, `stream`, `cancel`); this rank samples, once per step.
+The model is served from a node that is no rank: the serving VM loads
+it with `backend => erllama_model_tp` (`src/erllama_model_tp.erl`), so
+callers use the normal API (`complete`, `stream`, `cancel`), and every
+rank, the sampling one included, is a separate OS process. A
+collective that fails or hangs then takes down a rank, never the
+serving VM.
 
-- Before every `llama_decode` (`erllama_ctx_decode` in
-  `c_src/erllama_nif_decode.c`), the context sends the exact batch to
-  the sink, and every KV change (`kv_seq_rm`, `kv_seq_cp`) too, as
-  `{erllama_tp, Seq, Cmd}` numbered from 1. The forwarder sends them,
-  in order, to the other ranks' `erllama_tp_rank` processes, which
-  have loaded the same file with `load/3` and apply each command with
-  `erllama_nif:tp_follow/2`: the same batch, the same KV change. The
-  ranks meet in the decode's first collective.
-- After each decode, every rank sums the output logits over the group,
-  so the serving rank samples from the full logits.
-- Before serving, every rank describes its model (file size, hash of
-  its first MiB, options, world size, engine build); a rank that
+```erlang
+%% On the serving node, once the group is formed and every rank but 0
+%% has run erllama_tp_rank:load/3 with the same file and options:
+{ok, Id} = erllama:load_model(<<"split">>, #{
+    backend => erllama_model_tp,
+    model_path => Path,
+    model_opts => MOpts,
+    context_opts => COpts,
+    policy => #{min_tokens => infinity, cold_min_tokens => infinity,
+                continued_interval => infinity},
+    tp_worker => Rank0Pid,                     %% rank 0's erllama_tp_rank
+    tp_followers => [{Pid, erllama_tp_rank:describe(Path, {MOpts, COpts}, World)}]
+}).
+```
+
+- **What runs where.** Tokenizing, detokenizing and chat templates run
+  on the serving node, on a copy of the GGUF's vocabulary (no weights;
+  the file must be readable there). Decoding, sampling and KV changes
+  run on rank 0, which hosts `erllama_model_llama` for the serving node
+  (`erllama_tp_rank:host/3`); samplers stay on rank 0 and travel as
+  handles.
+- **Rank 0 keeps the others in step.** Before every `llama_decode`
+  (`erllama_ctx_decode` in `c_src/erllama_nif_decode.c`) its context
+  sends the exact batch to a forwarder, and every KV change
+  (`kv_seq_rm`, `kv_seq_cp`) too, numbered from 1. The forwarder tags
+  each with the group's generation (`{erllama_tp, Gen, Seq, Cmd}`) and
+  sends it to the other ranks, which apply it with
+  `erllama_nif:tp_follow/2`. The ranks meet in the decode's first
+  collective, and after it every rank sums the output logits, so rank 0
+  samples from the full logits.
+- **Before serving**, every rank describes its model (file size, hash
+  of its first MiB, options, world size, engine build); a rank that
   differs is refused (`{error, {incompatible_ranks, _}}`).
-- A follower that sees a gap or a repeat in the sequence stops: it no
-  longer holds the serving rank's KV state.
-- Until checkpoints are coordinated across ranks, a split model saves
-  and restores no KV (`kv_pack`/`kv_unpack` answer `not_supported`;
-  the serving rank's cache policy never saves). Embeddings,
-  speculative decoding, the argmax forward and media prefill also
-  answer `not_supported` on a split model.
+- **A command that does not fit**, decided before any GPU work:
+
+  | Command | Result |
+  |---|---|
+  | of another generation | stale: dropped and counted |
+  | already applied (`Seq` at or below the last) | duplicate: dropped and counted |
+  | the next one | applied |
+  | past a gap | the follower stops: it no longer holds rank 0's KV state |
+
+  `erllama_tp_rank:follow_stats/1` gives the counts.
+- **Cancel.** A split model's decode is never interrupted (no abort
+  callback on its context): a step stopped on one rank and not on the
+  others would leave them waiting in a collective. A cancel takes
+  effect between steps, once every rank finished the step in flight.
+- **No KV cache yet.** Until checkpoints are coordinated across ranks, a
+  split model saves and restores no KV (`kv_pack`/`kv_unpack` answer
+  `not_supported`; load it with a policy that never saves, as above).
+  Embeddings, speculative decoding, the argmax forward and media
+  prefill also answer `not_supported`.
 
 ## Plain TCP, without RDMA
 
@@ -183,8 +217,15 @@ NCCL_NET=Socket NCCL_SOCKET_IFNAME==enp1s0f0np0 \
 | the coordinator never answers | each rank's wait ends at its open deadline: `{error, timeout}` |
 | a rank fails its local checks, or NCCL's init fails | every rank's `init_rank` returns no communicator: `{error, init_failed}` |
 | a build without per-process communicators | `{error, not_supported}`; `erllama_tp:caps/0` reports it |
-| a failure inside a collective (a lost peer) | the backend aborts that rank's OS process; its node goes down |
+| a failure inside a collective (a lost peer) | the backend aborts that rank's OS process, or the collective waits forever |
 | a rank blocked in a native call | ended by stopping its node; an Erlang timeout never ends a native call |
+| a rank lost while serving | the coordinator kills the other ranks; `erllama_model_tp` answers `{error, {tp_rank_lost, Why}}`, the model fails its requests once and stops; the serving VM is unaffected |
+| rank 0 silent past `tp_call_timeout` (default 120 s) | the same, and rank 0 is killed |
+
+Watching the group is the coordinator's job (`erllama_tp_coordinator:watch/2`
+in the tests): when a rank process goes, it kills the others with
+`erllama_tp_rank:kill/1`, because a rank left in a collective with a
+lost peer never returns.
 
 After any failure the communicator is discarded and the group is
 formed again, under a new coordinator (a new generation).
@@ -197,6 +238,10 @@ formed again, under a new coordinator (a new generation).
   rounds as a communicator's init without a GPU. Ranks in rank order,
   a missing rank, a silent coordinator, a rank lost between rounds, a
   duplicate rank, and `not_supported` without a communicator.
+- `test/erllama_tp_failure_SUITE.erl` is opt-in on the same hosts, with
+  fresh nodes for each case: a rank killed mid-stream, stale, duplicate
+  and out-of-order commands, and a cancel during prefill, each followed
+  by a request served.
 - `test/erllama_tp_nccl_SUITE.erl` is opt-in, on CUDA hosts prepared
   with `scripts/tp_hosts.sh`. The plan's matrix fixture, a
   decode-sized FP32 reduction and a prefill-sized BF16 one with stated
@@ -209,7 +254,7 @@ scripts/tp_hosts.sh setup gx10-fa8e.local gx10-e25e.local   # once: NCCL, OpenSS
 scripts/tp_hosts.sh sync  gx10-fa8e.local gx10-e25e.local
 scripts/tp_hosts.sh build gx10-fa8e.local gx10-e25e.local   # CUDA + NCCL
 ERLLAMA_TP_HOSTS=gx10-fa8e.local,gx10-e25e.local \
-    rebar3 ct --dir apps/erllama/test --suite erllama_tp_nccl_SUITE
+    rebar3 ct --dir apps/erllama/test --suite erllama_tp_nccl_SUITE,erllama_tp_failure_SUITE
 ```
 
 Over plain TCP, with the transport and the interfaces checked (from
@@ -244,8 +289,6 @@ every bump.
 
 ## Not done yet
 
-Failure handling during generation (a rank lost mid-stream, a duplicate
-or stale step reaching a follower, cancel during a collective),
-coordinated cache checkpoints, a model too large for one GPU (the test
+Coordinated cache checkpoints, a model too large for one GPU (the test
 hosts' GPUs are shared with another workload), groups of more than two
 hosts, and Metal.
