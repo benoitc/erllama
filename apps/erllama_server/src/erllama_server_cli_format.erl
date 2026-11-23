@@ -3,11 +3,11 @@
 %%
 -module(erllama_server_cli_format).
 -moduledoc false.
-%% How the CLI shows what the release answers: status, models, loaded
-%% models, a model's details, jobs, results and download progress.
+%% How the CLI shows what the release answers: models, loaded models, a
+%% model's details, jobs, results and download progress (status and
+%% inspect are in erllama_server_cli_status).
 
 -export([
-    format_status/1,
     format_models/1,
     format_ps/1,
     format_show/1,
@@ -16,26 +16,6 @@
     progress_line/3,
     size_text/1
 ]).
-
-format_status(S) ->
-    #{node := Node, server_vsn := Sv, erllama_vsn := Ev, api := Api, active_runs := N, models := Ms} =
-        S,
-    [
-        io_lib:format("release   ~s~n", [Node]),
-        io_lib:format("versions  erllama_server ~s, erllama ~s, api ~b~n", [Sv, Ev, Api]),
-        io_lib:format("runs      ~b active~n", [N]),
-        format_pressure(maps:get(pressure, S, undefined)),
-        "models\n",
-        case Ms of
-            [] -> "  (none loaded)\n";
-            _ -> [["  ", L] || L <- model_lines(Ms)]
-        end
-    ].
-
-format_pressure(#{used_b := U, total_b := T, source := Src}) when T > 0 ->
-    io_lib:format("memory    ~b of ~b MiB used (~p)~n", [U bsr 20, T bsr 20, Src]);
-format_pressure(_) ->
-    "".
 
 format_models([]) ->
     "no model registered or loaded\n";
@@ -131,17 +111,6 @@ progress_line(File, Done, Total) when Total > 0 ->
 progress_line(File, Done, _) ->
     progress_line(File, Done, undefined).
 
-model_lines(Ms) ->
-    [
-        io_lib:format("~s  ~p  ctx ~p  ~s~n", [
-            maps:get(id, M),
-            maps:get(status, M, unknown),
-            maps:get(context_size, M, 0),
-            maps:get(quant_tag, M, <<"-">>)
-        ])
-     || M <- Ms
-    ].
-
 format_runs([]) ->
     "no runs\n";
 format_runs(Rs) ->
@@ -149,7 +118,7 @@ format_runs(Rs) ->
         io_lib:format("~s  ~p  ~p  ~ts  ~ts~n", [
             Id,
             maps:get(kind, R, run),
-            Status,
+            run_state(Status, maps:get(phase, R, running)),
             Model,
             case Conv of
                 undefined -> <<"-">>;
@@ -158,6 +127,10 @@ format_runs(Rs) ->
         ])
      || #{run_id := Id, status := Status, model := Model, conversation_id := Conv} = R <- Rs
     ].
+
+%% A running run's phase says more than `running'.
+run_state(running, Phase) when Phase =/= running -> Phase;
+run_state(Status, _Phase) -> Status.
 
 format_result(#{status := error, error := R}) ->
     io_lib:format("error: ~p~n", [R]);

@@ -24,7 +24,8 @@
     two_models_at_once/1,
     load_failure_reaches_every_waiter/1,
     acquire_waits_for_eviction/1,
-    second_request_is_not_queued/1
+    second_request_is_not_queued/1,
+    waiting_run_answers_and_cancels/1
 ]).
 
 all() ->
@@ -39,7 +40,8 @@ all() ->
         two_models_at_once,
         load_failure_reaches_every_waiter,
         acquire_waits_for_eviction,
-        second_request_is_not_queued
+        second_request_is_not_queued,
+        waiting_run_answers_and_cancels
     ].
 
 init_per_testcase(TC, Config) ->
@@ -266,6 +268,35 @@ second_request_is_not_queued(Config) ->
     Waited = erlang:monotonic_time(millisecond) - T0,
     ct:log("the short request took ~b ms (~p)", [Waited, Done]),
     ?assertMatch(#{status := done}, Done),
+    ?assertMatch({ok, #{status := running}}, erllama_server_api:run(Long)),
+    ok = erllama_server_api:cancel(Long).
+
+%% With every sequence busy, a run waits for one. It still answers
+%% (its phase is `waiting', in the job table too), and cancelling it ends it at once without
+%% touching the run that holds the sequence.
+waiting_run_answers_and_cancels(Config) ->
+    M = add_model(Config, <<"single">>, #{step_delay_ms => 20, parallel => 1}),
+    Long = run(M, #{opts => #{response_tokens => 2000}}),
+    ok = wait(fun() -> lists:member(token, events(Long)) end),
+    Waiting = run(M, #{conversation_id => none, opts => #{response_tokens => 3}}),
+    ok = wait(fun() ->
+        case erllama_server_api:run(Waiting) of
+            {ok, #{status := running, phase := waiting}} -> true;
+            _ -> false
+        end
+    end),
+    ?assertMatch(
+        [#{phase := waiting}], [
+            R
+         || #{run_id := Id} = R <- erllama_server_runs:list(), Id =:= Waiting
+        ]
+    ),
+    T0 = erlang:monotonic_time(millisecond),
+    ok = erllama_server_api:cancel(Waiting),
+    ?assertMatch({ok, #{status := cancelled}}, erllama_server_api:result(Waiting)),
+    Took = erlang:monotonic_time(millisecond) - T0,
+    ct:log("cancelling the waiting run took ~b ms", [Took]),
+    ?assert(Took < 1000),
     ?assertMatch({ok, #{status := running}}, erllama_server_api:run(Long)),
     ok = erllama_server_api:cancel(Long).
 

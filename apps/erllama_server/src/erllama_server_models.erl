@@ -128,10 +128,19 @@ ps() ->
                 ],
                 Info
             ),
-            maps:get(maps:get(id, Info), Managed, #{managed => false})
+            (maps:get(maps:get(id, Info), Managed, #{managed => false}))#{
+                waiting => waiting(maps:get(id, Info))
+            }
         )
      || Info <- erllama:list_models()
     ].
+
+%% Requests queued for a free sequence (read without the model process).
+waiting(Id) ->
+    case erllama:pending_len(Id) of
+        {ok, N} -> N;
+        {error, _} -> 0
+    end.
 
 %% erllama_model_evictor: called by erllama's scheduler process.
 -spec evict_one() -> {unloaded, binary()} | none.

@@ -18,7 +18,8 @@
     "\n",
     "commands:\n",
     "  ping                          check that the release is running\n",
-    "  status                        versions, loaded models, active jobs\n",
+    "  status                        what runs, waits and failed: models, runs,\n",
+    "                                agents, MCP servers, cache, recent failures\n",
     "  models                        the registry's models and what is loaded\n",
     "  pull SOURCE [--name NAME] [--sha256 HEX] [--detach]\n",
     "                                download a model: hf://ORG/REPO[:QUANT],\n",
@@ -49,6 +50,8 @@
     "                                read, export, copy, shorten or delete a\n",
     "                                conversation, or follow what runs in it\n",
     "  runs                          list the runs and downloads the release holds\n",
+    "  inspect JOB                   a run or agent session in detail: phase,\n",
+    "                                approvals, tools, background jobs, budgets\n",
     "  attach JOB [--from SEQ]       follow a run or download from an event sequence\n",
     "  cancel JOB                    cancel a run or download\n",
     "  result JOB                    print a finished run's or download's result\n",
@@ -150,6 +153,8 @@ command("conversation") ->
     {[{"--format", format, string}], fun erllama_server_cli_conv:conversation/4};
 command("runs") ->
     {[], fun runs/4};
+command("inspect") ->
+    {[], fun inspect/4};
 command("attach") ->
     {[{"--from", from, int}], fun attach/4};
 command("cancel") ->
@@ -180,7 +185,7 @@ ping(_, _, _, _) ->
 
 status(Node, _Info, _Opts, []) ->
     reply(
-        erllama_server_client:call(Node, status, []), fun erllama_server_cli_format:format_status/1
+        erllama_server_client:call(Node, status, []), fun erllama_server_cli_status:format_status/1
     );
 status(_, _, _, _) ->
     usage("status").
@@ -292,6 +297,14 @@ runs(Node, _Info, _Opts, []) ->
     reply(erllama_server_client:call(Node, runs, []), fun erllama_server_cli_format:format_runs/1);
 runs(_, _, _, _) ->
     usage("runs").
+
+inspect(Node, _Info, _Opts, [Id]) ->
+    reply(
+        erllama_server_client:call(Node, inspect, [list_to_binary(Id)]),
+        fun erllama_server_cli_status:format_inspect/1
+    );
+inspect(_, _, _, _) ->
+    usage("inspect").
 
 attach(Node, _Info, Opts, [RunId]) ->
     %% Ctrl-C detaches: the run goes on.

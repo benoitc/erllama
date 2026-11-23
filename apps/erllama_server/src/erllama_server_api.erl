@@ -27,6 +27,8 @@ from `NextSeq`.
     api_version/0,
     hello/1,
     status/0,
+    inspect/1,
+    failures/1,
     models/0,
     show/1,
     ps/0,
@@ -92,37 +94,33 @@ hello(?API_VSN) ->
 hello(Client) ->
     {error, {incompatible_api, #{server => ?API_VSN, client => Client}}}.
 
--doc "Versions, loaded models, active jobs, memory pressure and VRAM.".
+-doc """
+What the release is doing: versions; loaded models with their
+sequences in use and requests waiting for one; runs by phase; agent
+sessions with pending approvals, running tools and background jobs; MCP
+servers; cache activity; memory pressure and VRAM; and the latest
+failures with what happened next. Cheap enough to poll: it reads
+tables, and asks each agent session for a summary.
+""".
 -spec status() -> {ok, map()}.
 status() ->
-    Pressure =
-        case erllama:pressure() of
-            {ok, P} -> P;
-            {error, _} -> undefined
-        end,
-    {ok, #{
-        api => ?API_VSN,
-        server_vsn => app_vsn(erllama_server),
-        erllama_vsn => app_vsn(erllama),
-        node => node(),
-        models => ps_or_empty(),
-        active_runs => erllama_server_runs:active_count(run),
-        active_pulls => erllama_server_runs:active_count(pull),
-        pressure => Pressure,
-        vram => vram()
-    }}.
+    {ok, erllama_server_status:status(?API_VSN, app_vsn(erllama_server), app_vsn(erllama))}.
 
-ps_or_empty() ->
-    {ok, Ps} = ps(),
-    Ps.
+-doc """
+One job in detail: a run (its phase, model, conversation, the next
+event sequence), an agent session (its state, pending approvals with
+their arguments, running tools, background jobs, budgets and the
+current turn's use of them, and `turn_seq`, where its latest turn
+starts in the event stream) or a download.
+""".
+-spec inspect(binary()) -> {ok, map()} | {error, term()}.
+inspect(Id) ->
+    erllama_server_status:inspect(Id).
 
-vram() ->
-    try erllama:vram_info() of
-        {ok, V} -> V;
-        _ -> undefined
-    catch
-        _:_ -> undefined
-    end.
+-doc "The last `N` failures, newest first: kind, subject, reason, outcome.".
+-spec failures(non_neg_integer()) -> {ok, [map()]}.
+failures(N) when is_integer(N), N >= 0 ->
+    {ok, erllama_server_failures:recent(N)}.
 
 -doc """
 The registry's models, with whether each is loaded, plus models loaded

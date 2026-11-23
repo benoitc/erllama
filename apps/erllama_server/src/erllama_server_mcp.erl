@@ -430,6 +430,7 @@ catalog_result(Name, Pid, {error, not_ready}, #srv{pid = Pid, status = connectin
 catalog_result(Name, Pid, {error, R}, #srv{pid = Pid} = S) ->
     %% Up but not answering: try again later, keep the old catalog out.
     _ = erlang:send_after(backoff(S#srv.attempts), self(), {refresh, Name, Pid}),
+    ok = went_down(Name, R, S),
     S#srv{status = down, error = R, tools = [], attempts = S#srv.attempts + 1};
 catalog_result(_Name, _Pid, _Result, S) ->
     S.
@@ -486,7 +487,14 @@ lost(Name, Reason, S) ->
 
 retry(Name, Reason, #srv{attempts = A} = S) ->
     _ = erlang:send_after(backoff(A), self(), {connect, Name}),
+    ok = went_down(Name, Reason, S),
     S#srv{status = down, error = Reason, attempts = A + 1}.
+
+%% Recorded once per outage, not at every retry.
+went_down(_Name, _Reason, #srv{status = down}) ->
+    ok;
+went_down(Name, Reason, _S) ->
+    erllama_server_failures:record(mcp_down, Name, Reason).
 
 backoff(A) -> min(?MAX_BACKOFF_MS, 1000 bsl min(A, 6)).
 

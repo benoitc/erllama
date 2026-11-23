@@ -11,7 +11,7 @@
 %% `always' approvals of MCP tools by their identity `{mcp, Server,
 %% RemoteName}', so such a permission stays with that tool.
 
--export([initial/1, snapshot/0, policy/4, class/2, known/2, grant_key/2, budget_left/3]).
+-export([initial/1, snapshot/0, policy/4, class/2, known/2, grant_key/2, decide/4, budget_left/3]).
 
 -type policy() :: erllama_server_tools:policy().
 -type policies() :: #{binary() | {mcp, binary(), term()} => policy()}.
@@ -77,6 +77,19 @@ known(Name, Catalog) ->
 -spec grant_key(binary(), map() | undefined) -> binary() | {mcp, binary(), term()}.
 grant_key(_Name, #{server := S, remote := R}) -> {mcp, S, R};
 grant_key(Name, undefined) -> Name.
+
+%% The user's answer to an approval request for tool `Name' (`Mcp' its
+%% catalog entry, or undefined): `{done, Result}' for a declined call,
+%% `queued' for one to run; `always' also allows the tool for the rest
+%% of the session.
+-spec decide(allow | deny | always, binary(), map() | undefined, policies()) ->
+    {queued | {done, {error, binary()}}, policies()}.
+decide(deny, _Name, _Mcp, Policies) ->
+    {{done, {error, <<"the user declined this call">>}}, Policies};
+decide(allow, _Name, _Mcp, Policies) ->
+    {queued, Policies};
+decide(always, Name, Mcp, Policies) ->
+    {queued, Policies#{grant_key(Name, Mcp) => auto}}.
 
 %% What a turn has left of its budgets: rounds, tokens and time
 %% (`Now' on the clock its deadline was set with).
