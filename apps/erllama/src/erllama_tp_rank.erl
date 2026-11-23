@@ -93,7 +93,8 @@ decode(Pid, Tokens) -> gen_server:call(Pid, {decode, Tokens}, infinity).
 %% An operation on the split context's sequences (every rank makes the
 %% same call): `{decode, Seq, Tokens, AllRows}' (logits summed over the
 %% group), `{cp, Src, Dst}', `{drop, Seq}', `{trim, Seq, Keep}' (keep
-%% the first Keep positions), `{pos_max, Seq}'. Returns `{Ms, Result}'.
+%% the first Keep positions), `{pos_max, Seq}', `{diag, arm | read |
+%% perf}' (erllama_nif:ctx_diag/2). Returns `{Ms, Result}'.
 -spec seq_op(pid(), tuple()) -> {number(), term()}.
 seq_op(Pid, Op) -> gen_server:call(Pid, {seq_op, Op}, infinity).
 
@@ -365,7 +366,8 @@ seq_op_ctx(C, {decode, Seq, Tokens, All}) -> erllama_nif:tp_decode_seq(C, Seq, T
 seq_op_ctx(C, {cp, Src, Dst}) -> erllama_nif:kv_seq_cp(C, Src, Dst);
 seq_op_ctx(C, {drop, Seq}) -> erllama_nif:kv_seq_rm(C, Seq, 0, -1);
 seq_op_ctx(C, {trim, Seq, Keep}) -> erllama_nif:kv_seq_rm(C, Seq, Keep, -1);
-seq_op_ctx(C, {pos_max, Seq}) -> erllama_nif:kv_seq_pos_max(C, Seq).
+seq_op_ctx(C, {pos_max, Seq}) -> erllama_nif:kv_seq_pos_max(C, Seq);
+seq_op_ctx(C, {diag, Op}) -> erllama_nif:ctx_diag(C, Op).
 
 timed(Fun) ->
     {Us, R} = timer:tc(Fun),

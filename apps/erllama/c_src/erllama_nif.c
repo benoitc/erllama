@@ -223,6 +223,10 @@ static void ctx_dtor(ErlNifEnv *env, void *obj) {
         enif_release_resource(c->model_res);
         c->model_res = NULL;
     }
+    if (c->diag) {
+        erllama_diag_free(c->diag);
+        c->diag = NULL;
+    }
     if (c->mu_inited) {
         pthread_mutex_destroy(&c->mu);
         c->mu_inited = 0;
@@ -562,6 +566,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_tp_decode",          2, nif_tp_decode,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_tp_decode_seq",      4, nif_tp_decode_seq,      ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_kv_seq_pos_max",     2, nif_kv_seq_pos_max,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_ctx_diag",           2, nif_ctx_diag,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_tp_follow",          2, nif_tp_follow,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_tp_send",            2, nif_tp_send,            ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_tp_kv_pack",         2, nif_tp_kv_pack,         ERL_NIF_DIRTY_JOB_CPU_BOUND},

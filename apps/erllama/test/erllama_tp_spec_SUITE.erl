@@ -20,7 +20,7 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([short_prefix/1, long_prefix/1, cancel_releases_the_spare/1, verify_cost/1]).
--export([profile_verify/1]).
+-export([profile_verify/1, kv_capacity_cost/1]).
 
 -define(MOPTS, #{n_gpu_layers => 999, load_mode => direct_io}).
 -define(COPTS, #{
@@ -30,7 +30,14 @@
 -define(AFTER, 8).
 
 all() ->
-    [verify_cost, short_prefix, long_prefix, cancel_releases_the_spare, profile_verify].
+    [
+        verify_cost,
+        short_prefix,
+        long_prefix,
+        cancel_releases_the_spare,
+        profile_verify,
+        kv_capacity_cost
+    ].
 
 init_per_suite(Config) ->
     case {erllama_tp_hosts:hosts(), os:getenv("ERLLAMA_TP_GLM_REF")} of
@@ -113,6 +120,80 @@ profile_verify(Config) ->
      || {Layout, COpts} <- [{per_sequence, ?COPTS}, {unified, maps:put(kv_unified, true, ?COPTS)}]
     ],
     ok.
+
+%% How much of the unified cache's cost on a single-token decode comes
+%% from the layout and how much from the capacity of the active stream:
+%%   A  one KV stream per sequence, n_ctx 4096 (2048 cells a stream)
+%%   B  unified, n_ctx 2048 (2048 cells in the shared stream)
+%%   C  unified, n_ctx 4096 (4096 cells in the shared stream)
+%% and A again without the diagnostic callback, as a control. Two
+%% configured sequence slots, one live sequence, the same 901-token
+%% prompt and the same token ids; 8 warm decodes, then 40 timed ones at
+%% positions 909 to 948, so the active KV extent stays in one padding
+%% bucket. Then one armed decode for the graph's input shapes.
+-define(KV_WARM, 8).
+-define(KV_TIMED, 40).
+
+kv_capacity_cost(Config) ->
+    Base = maps:merge(?COPTS, #{n_ctx => 4096}),
+    Cases = [
+        {'A per-sequence 4096', maps:put(diag_inputs, true, Base)},
+        {'B unified 2048',
+            maps:merge(Base, #{diag_inputs => true, kv_unified => true, n_ctx => 2048})},
+        {'C unified 4096', maps:merge(Base, #{diag_inputs => true, kv_unified => true})},
+        {'A per-sequence 4096, no callback', Base}
+    ],
+    Res = [
+        {Name, with_group(Config, COpts, fun(G) -> kv_case(G, Name) end)}
+     || {Name, COpts} <- Cases
+    ],
+    Med = fun(Name) -> pct(maps:get(dec, proplists:get_value(Name, Res)), 50) end,
+    ct:pal(
+        "single-token decode medians: A ~.1f ms, B ~.1f ms, C ~.1f ms, A without callback ~.1f ms~n"
+        "C - B (capacity within unified) ~.1f ms; B - A (layout at matched per-stream capacity) ~.1f ms",
+        [
+            Med('A per-sequence 4096'),
+            Med('B unified 2048'),
+            Med('C unified 4096'),
+            Med('A per-sequence 4096, no callback'),
+            Med('C unified 4096') - Med('B unified 2048'),
+            Med('B unified 2048') - Med('A per-sequence 4096')
+        ]
+    ),
+    ok.
+
+kv_case(G, Name) ->
+    P = prompt(G, 90),
+    {_, {ok, _}} = op(G, {decode, 0, P, false}),
+    Toks = [1000 + I || I <- lists:seq(1, ?KV_WARM + ?KV_TIMED + 1)],
+    {Warm, Rest} = lists:split(?KV_WARM, Toks),
+    {Timed, [Last]} = lists:split(?KV_TIMED, Rest),
+    _ = [run_t(G, [T], false) || T <- Warm],
+    {_, Perf0} = op(G, {diag, perf}),
+    Runs = [run_t(G, [T], false) || T <- Timed],
+    {_, Perf1} = op(G, {diag, perf}),
+    {_, Pos} = op(G, {pos_max, 0}),
+    Inputs =
+        case op(G, {diag, arm}) of
+            {_, ok} ->
+                _ = run_t(G, [Last], false),
+                element(2, op(G, {diag, read}));
+            {_, {error, not_supported}} ->
+                none
+        end,
+    S = summarize(Runs),
+    Reuse = maps:map(fun(K, V) -> V - maps:get(K, Perf0) end, Perf1),
+    ct:pal(
+        "~s: positions ~b to ~b; decode ~s; end to end ~s; graph counters over the timed runs ~p", [
+            Name, length(P) + ?KV_WARM, Pos, fmt(dec, S), fmt(e2e, S), Reuse
+        ]
+    ),
+    case Inputs of
+        none -> ok;
+        _ -> ct:pal("~s: graph inputs (name, type, shape):~n~p", [Name, Inputs])
+    end,
+    {_, ok} = op(G, {drop, 0}),
+    S.
 
 -define(ROUNDS, 4).
 -define(BLOCK, 6).

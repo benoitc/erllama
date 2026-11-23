@@ -89,6 +89,7 @@
     tp_decode/2,
     tp_decode_seq/4,
     kv_seq_pos_max/2,
+    ctx_diag/2,
     tp_follow/2,
     tp_send/2,
     tp_kv_pack/2,
@@ -811,6 +812,15 @@ nif_tp_decode_seq(_Ctx, _Seq, _Tokens, _All) -> erlang:nif_error(nif_not_loaded)
 kv_seq_pos_max(Ctx, Seq) -> nif_kv_seq_pos_max(Ctx, Seq).
 
 nif_kv_seq_pos_max(_Ctx, _Seq) -> erlang:nif_error(nif_not_loaded).
+
+%% Diagnostics of a context opened with `diag_inputs => true': `arm'
+%% records the input tensors of the next decodes' graphs, `read' returns
+%% them as `{Name, Type, [Ne0, Ne1, Ne2, Ne3]}' and disarms. `perf'
+%% (any context): llama.cpp's graph reuse and reallocation counters.
+-spec ctx_diag(context_ref(), arm | read | perf) -> ok | list() | map() | {error, atom()}.
+ctx_diag(Ctx, Op) -> nif_ctx_diag(Ctx, Op).
+
+nif_ctx_diag(_Ctx, _Op) -> erlang:nif_error(nif_not_loaded).
 
 -spec tp_follow(context_ref(), tuple()) -> ok | {error, atom()}.
 tp_follow(Ctx, Cmd) -> nif_tp_follow(Ctx, Cmd).
