@@ -20,7 +20,7 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([short_prefix/1, long_prefix/1, cancel_releases_the_spare/1, verify_cost/1]).
--export([profile_verify/1, kv_capacity_cost/1, kv_rows_reuse/1]).
+-export([profile_verify/1, kv_capacity_cost/1, kv_rows_reuse/1, spec_rounds/1]).
 
 -define(MOPTS, #{n_gpu_layers => 999, load_mode => direct_io}).
 -define(COPTS, #{
@@ -37,7 +37,8 @@ all() ->
         cancel_releases_the_spare,
         profile_verify,
         kv_capacity_cost,
-        kv_rows_reuse
+        kv_rows_reuse,
+        spec_rounds
     ].
 
 init_per_suite(Config) ->
@@ -325,6 +326,158 @@ native_log(P) ->
         }
     ]),
     ok.
+
+%% Whole speculative rounds against ordinary decoding, on the model in
+%% ERLLAMA_TP_GLM (or ERLLAMA_TP_GLM_REF), unified KV, two slots, the
+%% 901-token prefix. The reference: 100 greedy one-token decodes,
+%% timed (ordinary decoding) and used as the drafts. Then rounds of 3
+%% drafts; how many are accepted is drawn (seeded) from a geometric
+%% distribution, each draft accepted with probability 0.632 (TensorFold's
+%% MTP rate on the pair) until the first rejection. Each round is timed
+%% whole: copy, verify, adopt or drop, replay, and the graph rebuilds a
+%% change of batch shape brings. Committed tokens are checked against the
+%% reference.
+-define(SPEC_P, 0.632).
+-define(SPEC_REF, 100).
+
+spec_rounds(Config) ->
+    Config1 =
+        case os:getenv("ERLLAMA_TP_GLM") of
+            false -> Config;
+            M -> lists:keystore(model, 1, Config, {model, M})
+        end,
+    COpts = maps:merge(?COPTS, #{kv_unified => true}),
+    with_group(Config1, COpts, fun(G) -> spec_rounds_run(G) end).
+
+spec_rounds_run(G) ->
+    Prompt = prompt(G, 90),
+    {_, {ok, L0}} = op(G, {decode, 0, Prompt, false}),
+    PerfA = perf_ranks(G),
+    {RefMs, Ref} = lists:foldl(
+        fun(_, {Ms, [{_, L} | _] = Acc}) ->
+            T = argmax(L),
+            {D, {ok, L1}} = op(G, {decode, 0, [T], false}),
+            {[D | Ms], [{T, L1} | Acc]}
+        end,
+        {[], [{none, L0}]},
+        lists:seq(1, ?SPEC_REF)
+    ),
+    PerfB = perf_ranks(G),
+    RefList = tl(lists:reverse(Ref)),
+    RefToks = [T || {T, _} <- RefList],
+    Plain = lists:sort(RefMs),
+    ct:pal(
+        "ordinary decoding: ~b tokens, median ~.1f ms, p95 ~.1f ms (~.1f tokens/s); graph counters per rank ~p",
+        [
+            ?SPEC_REF,
+            pct(Plain, 50),
+            pct(Plain, 95),
+            1000 / pct(Plain, 50),
+            perf_delta(PerfA, PerfB)
+        ]
+    ),
+    {_, ok} = op(G, {drop, 0}),
+    {_, {ok, L1}} = op(G, {decode, 0, Prompt, false}),
+    rand:seed(exsss, {7, 11, 13}),
+    St0 = #{live => 0, spare => 1, logits => L1, committed => [], times => []},
+    PerfC = perf_ranks(G),
+    T0 = erlang:monotonic_time(microsecond),
+    St = spec_loop(G, RefToks, RefList, St0),
+    Wall = (erlang:monotonic_time(microsecond) - T0) / 1000,
+    PerfD = perf_ranks(G),
+    Rounds = lists:reverse(maps:get(times, St)),
+    Committed = length(maps:get(committed, St)),
+    ByA = [{A, lists:sort([Ms || {A1, Ms, _} <- Rounds, A1 =:= A])} || A <- [0, 1, 2, 3]],
+    [
+        ct:pal("~b of 3 accepted: ~b rounds, round median ~.1f ms, p95 ~.1f ms", [
+            A, length(L), pct(L, 50), pct(L, 95)
+        ])
+     || {A, L} <- ByA, L =/= []
+    ],
+    %% The distribution's own weights, with the measured medians.
+    W = [
+        {0, 1 - ?SPEC_P},
+        {1, ?SPEC_P * (1 - ?SPEC_P)},
+        {2, ?SPEC_P * ?SPEC_P * (1 - ?SPEC_P)},
+        {3, ?SPEC_P * ?SPEC_P * ?SPEC_P}
+    ],
+    Cmt = fun
+        (3) -> 3;
+        (A) -> A + 1
+    end,
+    ExpTok = lists:sum([P * Cmt(A) || {A, P} <- W]),
+    ExpMs = lists:sum([
+        P * pct(proplists:get_value(A, ByA), 50)
+     || {A, P} <- W, proplists:get_value(A, ByA) =/= []
+    ]),
+    ct:pal(
+        "speculative rounds: ~b rounds, ~b committed in ~.1f ms (~.1f tokens/s measured); weighted by the distribution: ~.2f tokens a round, ~.1f ms a round, ~.1f tokens/s; ordinary decoding ~.1f tokens/s; graph counters per rank ~p",
+        [
+            length(Rounds),
+            Committed,
+            Wall,
+            Committed / Wall * 1000,
+            ExpTok,
+            ExpMs,
+            ExpTok / ExpMs * 1000,
+            1000 / pct(Plain, 50),
+            perf_delta(PerfC, PerfD)
+        ]
+    ),
+    ?assertEqual(lists:sublist(RefToks, Committed), maps:get(committed, St)).
+
+%% Rounds until fewer than 4 reference tokens are left.
+spec_loop(G, RefToks, RefList, #{committed := C} = S) ->
+    Next = lists:nthtail(length(C), RefToks),
+    case length(Next) >= ?K + 1 of
+        false ->
+            S;
+        true ->
+            A = draw_accepted(),
+            Draft =
+                lists:sublist(Next, A) ++ [wrong(lists:nth(A + 1, Next)) || A < ?K] ++
+                    lists:sublist(lists:nthtail(min(A + 1, ?K), Next), max(0, ?K - A - 1)),
+            spec_loop(G, RefToks, RefList, spec_round(G, A, lists:sublist(Draft, ?K), S))
+    end.
+
+draw_accepted() ->
+    draw_accepted(0).
+draw_accepted(?K) ->
+    ?K;
+draw_accepted(N) ->
+    case rand:uniform() < ?SPEC_P of
+        true -> draw_accepted(N + 1);
+        false -> N
+    end.
+
+%% One timed round, as `round/5' without the reference comparisons.
+spec_round(G, Want, Draft, #{live := Live, spare := Spare, logits := L, committed := C} = S) ->
+    T0 = erlang:monotonic_time(microsecond),
+    {_, ok} = op(G, {cp, Live, Spare}),
+    {_, {ok, V}} = op(G, {decode, Spare, Draft, true}),
+    Rows = rows(V),
+    A = accepted(Draft, [L | Rows]),
+    {Commit, Logits, S1} =
+        case A =:= length(Draft) of
+            true ->
+                {_, ok} = op(G, {drop, Live}),
+                {Draft, lists:last(Rows), S#{live := Spare, spare := Live}};
+            false ->
+                {_, ok} = op(G, {drop, Spare}),
+                Replay = lists:sublist(Draft, A) ++ [argmax(lists:nth(A + 1, [L | Rows]))],
+                {_, {ok, L1}} = op(G, {decode, Live, Replay, false}),
+                {Replay, L1, S}
+        end,
+    Ms = (erlang:monotonic_time(microsecond) - T0) / 1000,
+    case A =:= Want of
+        true -> ok;
+        false -> ct:pal("a round drawn for ~b accepted took ~b (a near-tie)", [Want, A])
+    end,
+    S1#{
+        logits := Logits,
+        committed := C ++ Commit,
+        times := [{A, Ms, length(Commit)} | maps:get(times, S)]
+    }.
 
 -define(ROUNDS, 4).
 -define(BLOCK, 6).
