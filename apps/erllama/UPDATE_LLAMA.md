@@ -1,6 +1,6 @@
 # Updating the vendored llama.cpp
 
-erllama vendors a pinned, unmodified copy of llama.cpp under
+erllama vendors a pinned copy of llama.cpp under
 `c_src/llama.cpp/`. The pinned tag is in `c_src/llama.cpp/.version`
 (currently **v1.0.0**). You need this page when you bump that pin.
 Paths on this page are relative to `apps/erllama/`; run the commands
@@ -30,7 +30,15 @@ and then removes whole directories we never build:
 the upstream `LLAMA_BUILD_MTMD` standalone hook with `MTMD_VIDEO`
 forced off, and it links `vendor/{stb,miniaudio,hash,sheredom}`.
 
-No file is edited. `common/` is needed for the chat template pipeline
+The vendor script applies [the hybrid K-only graph-reuse patch](scripts/patches/hybrid-k-graph-reuse.patch)
+to the extracted tarball before copying it. The patch checks the dense
+attention mask built for this input, so GLM can reuse its decode graph
+with unified KV and fused K/V rows enabled. When updating the pin, check
+whether upstream has fixed the builder and reuse check. Once the fix is
+upstream, remove the patch and its invocation. A patch failure leaves the
+current vendored tree intact.
+
+`common/` is needed for the chat template pipeline
 (`common_chat_*`, the PEG autoparser, the jinja runtime). It links
 `vendor/cpp-httplib` for its Hugging Face download helpers, which the
 NIF never calls; `c_src/CMakeLists.txt` sets `LLAMA_OPENSSL=OFF` so that
@@ -53,8 +61,8 @@ rebar3 eunit && rebar3 proper
 LLAMA_TEST_MODEL=/path/to/small.gguf rebar3 ct
 ```
 
-The script fails if any vendored file differs from the tarball, so a
-clean run proves the tree is upstream. Update the tag in this page and
+The script checks the retained files against the patched tarball.
+Update the tag in this page and
 add a CHANGELOG line, then commit with a message naming the new tag.
 
 ## Build knobs
