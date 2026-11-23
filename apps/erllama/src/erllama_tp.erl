@@ -171,7 +171,12 @@ agent(Join, Why) ->
                     agent(Join, Why);
                 {error, Reason} ->
                     _ = erllama_nif:tp_bootstrap_reply(Bridge, Round, error),
-                    agent(Join, Reason)
+                    agent(Join, Reason);
+                Other ->
+                    %% Answer at once rather than leave the rank waiting
+                    %% until its deadline.
+                    _ = erllama_nif:tp_bootstrap_reply(Bridge, Round, error),
+                    agent(Join, {bad_join_reply, Other})
             end;
         stop ->
             exit({done, Why})

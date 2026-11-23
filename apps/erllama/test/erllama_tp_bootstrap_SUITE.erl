@@ -17,6 +17,7 @@
     ranks_gather_in_rank_order/1,
     missing_rank_fails_within_the_deadline/1,
     silent_coordinator_hits_the_native_deadline/1,
+    bad_join_reply_fails_at_once/1,
     rank_lost_between_rounds/1,
     duplicate_rank_is_refused/1,
     no_communicator_in_this_build/1
@@ -27,6 +28,7 @@ all() ->
         ranks_gather_in_rank_order,
         missing_rank_fails_within_the_deadline,
         silent_coordinator_hits_the_native_deadline,
+        bad_join_reply_fails_at_once,
         rank_lost_between_rounds,
         duplicate_rank_is_refused,
         no_communicator_in_this_build
@@ -59,6 +61,14 @@ silent_coordinator_hits_the_native_deadline(_Config) ->
     {Ms, Result} = timed(fun() -> erllama_tp:bootstrap_selftest(2, <<"x">>, 1, Never, 300) end),
     ?assertEqual({error, timeout}, Result),
     ?assert(Ms < 3000, Ms).
+
+%% A join that answers neither `{ok, _}' nor `{error, _}': the rank
+%% fails at once with what it got, not at its deadline.
+bad_join_reply_fails_at_once(_Config) ->
+    Bad = fun(_Round, _Bytes) -> nonsense end,
+    {Ms, Result} = timed(fun() -> erllama_tp:bootstrap_selftest(2, <<"x">>, 1, Bad, 10000) end),
+    ?assertEqual({error, {bad_join_reply, nonsense}}, Result),
+    ?assert(Ms < 2000, Ms).
 
 %% Rank 1 completes round 1, then its agent dies: rank 0 fails at the
 %% coordinator's deadline for round 2, rank 1 at its native deadline.
