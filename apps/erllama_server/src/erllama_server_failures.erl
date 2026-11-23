@@ -34,6 +34,7 @@
     | tool_timed_out
     | agent_down
     | mcp_down
+    | mcp_call_failed
     | recovered.
 -export_type([kind/0]).
 
@@ -60,6 +61,8 @@ outcome(tool_timed_out) ->
     <<"its process group was killed; the call got an error result">>;
 outcome(agent_down) ->
     <<"the session ended; its conversation was released and other jobs went on">>;
+outcome(mcp_call_failed) ->
+    <<"the call got an error result; the server's state is checked at its next refresh">>;
 outcome(mcp_down) ->
     <<"its tools were withdrawn; the release reconnects with backoff">>;
 outcome(recovered) ->

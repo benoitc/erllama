@@ -314,6 +314,10 @@ wait(Fun, N) ->
             wait(Fun, N - 1)
     end.
 
+failures(Kind) ->
+    {ok, Fs} = erllama_server_api:failures(50),
+    [F || #{kind := K} = F <- Fs, K =:= Kind].
+
 pending_requests(Id) ->
     {ok, #{replay := Replay}} = erllama_server_api:attach(Id, self(), 0),
     ok = erllama_server_api:detach(Id, self()),
@@ -431,6 +435,7 @@ server_down_and_back(Config) ->
     {ok, Tools} = erllama_server_api:mcp_tools(),
     ?assertEqual([], [N || #{server := <<"nowhere">>, name := N} <- Tools]),
     stop_server(?config(mcp_server, Config)),
+    put(t_stop, erlang:monotonic_time(millisecond)),
     %% The release notices at its next call or refresh; a session meanwhile
     %% gets an error result, never a hang.
     Id = start(Config, [
@@ -441,6 +446,18 @@ server_down_and_back(Config) ->
     ?assertMatch(#{data := #{reason := stop}}, lists:last(Events)),
     [{<<"web__echo">>, Shown}] = last_tool_results(Id),
     ?assertMatch(<<"Error: ", _/binary>>, Shown),
+    %% The failed call is in the release's recent failures at once, and
+    %% makes the release check the server: the outage is recorded once
+    %% that check fails (within the client's own timeouts), and once.
+    ?assertMatch([#{subject := <<"web">>} | _], failures(mcp_call_failed)),
+    wait(
+        fun() ->
+            Seen = failures(mcp_down),
+            [S || #{subject := S} <- Seen, S =:= <<"web">>] =:= [<<"web">>]
+        end,
+        2500
+    ),
+    ct:log("the outage was noticed after ~b ms", [erlang:monotonic_time(millisecond) - get(t_stop)]),
     %% A server on the same port again: the client reconnects.
     Port = ?config(mcp_port, Config),
     {ok, Pid2} = livery:start_service(#{

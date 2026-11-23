@@ -50,7 +50,9 @@
     status = connecting :: connecting | ready | down,
     error :: term(),
     tools = [] :: [map()],
-    attempts = 0 :: non_neg_integer()
+    attempts = 0 :: non_neg_integer(),
+    %% The current outage is in the failure log (cleared when ready).
+    reported = false :: boolean()
 }).
 
 -record(state, {
@@ -99,12 +101,23 @@ call(Server, Tool, Args, Timeout) ->
             {ok, Result} ->
                 render(Result);
             {error, R} ->
+                ok = maybe_unavailable(Server, R),
                 {error,
                     iolist_to_binary(
                         io_lib:format("the MCP server answered with an error: ~0p", [R])
                     )}
         end
     end).
+
+%% A JSON-RPC error is the server answering; anything else (a timeout,
+%% a transport error) may be the server being unavailable: recorded, and
+%% the server is checked now (a catalog refresh) instead of at its next
+%% periodic one.
+maybe_unavailable(_Server, #{<<"code">> := _}) ->
+    ok;
+maybe_unavailable(Server, Reason) ->
+    ok = erllama_server_failures:record(mcp_call_failed, Server, Reason),
+    gen_server:cast(?MODULE, {check, Server}).
 
 -spec resources(binary()) -> {ok | error, binary()}.
 resources(Server) ->
@@ -336,6 +349,9 @@ handle_call({pid, Name}, _From, #state{servers = Ss} = St) ->
 handle_call(_Req, _From, St) ->
     {reply, {error, unknown_call}, St}.
 
+handle_cast({check, Name}, #state{servers = Ss} = St) ->
+    _ = [self() ! {refresh, Name, P} || #{Name := #srv{pid = P}} <- [Ss], is_pid(P)],
+    {noreply, St};
 handle_cast(refresh, #state{servers = Ss} = St) ->
     _ = [self() ! {refresh, N, P} || N := #srv{pid = P} <- Ss, is_pid(P)],
     {noreply, St};
@@ -405,22 +421,13 @@ refresh(_Name, _Pid, S) ->
 catalog_result(Name, Pid, {ok, Tools, Caps}, #srv{pid = Pid, spec = Spec} = S) ->
     _ = erlang:send_after(?REFRESH_MS, self(), {refresh, Name, Pid}),
     Policy = maps:get(policy, Spec, ask),
-    Entries = [
-        #{
-            server => Name,
-            remote => N,
-            description => text_or_empty(maps:get(<<"description">>, T, <<>>)),
-            parameters => schema(maps:get(<<"inputSchema">>, T, undefined)),
-            class => class(T),
-            policy => Policy
-        }
-     || #{<<"name">> := N} = T <- Tools, is_binary(N)
-    ],
+    Entries = [entry(Name, N, T, Policy) || #{<<"name">> := N} = T <- Tools, is_binary(N)],
     S#srv{
         status = ready,
         tools = Entries ++ resource_tools(Name, Policy, Caps),
         error = undefined,
-        attempts = 0
+        attempts = 0,
+        reported = false
     };
 catalog_result(Name, Pid, {error, not_ready}, #srv{pid = Pid, status = connecting} = S) ->
     %% Still in its handshake (the client stops itself if that never
@@ -430,10 +437,21 @@ catalog_result(Name, Pid, {error, not_ready}, #srv{pid = Pid, status = connectin
 catalog_result(Name, Pid, {error, R}, #srv{pid = Pid} = S) ->
     %% Up but not answering: try again later, keep the old catalog out.
     _ = erlang:send_after(backoff(S#srv.attempts), self(), {refresh, Name, Pid}),
-    ok = went_down(Name, R, S),
-    S#srv{status = down, error = R, tools = [], attempts = S#srv.attempts + 1};
+    (went_down(Name, R, S))#srv{
+        status = down, error = R, tools = [], attempts = S#srv.attempts + 1
+    };
 catalog_result(_Name, _Pid, _Result, S) ->
     S.
+
+entry(Server, Name, Tool, Policy) ->
+    #{
+        server => Server,
+        remote => Name,
+        description => text_or_empty(maps:get(<<"description">>, Tool, <<>>)),
+        parameters => schema(maps:get(<<"inputSchema">>, Tool, undefined)),
+        class => class(Tool),
+        policy => Policy
+    }.
 
 capabilities(Pid) ->
     try barrel_mcp_client:server_capabilities(Pid) of
@@ -487,14 +505,14 @@ lost(Name, Reason, S) ->
 
 retry(Name, Reason, #srv{attempts = A} = S) ->
     _ = erlang:send_after(backoff(A), self(), {connect, Name}),
-    ok = went_down(Name, Reason, S),
-    S#srv{status = down, error = Reason, attempts = A + 1}.
+    (went_down(Name, Reason, S))#srv{status = down, error = Reason, attempts = A + 1}.
 
-%% Recorded once per outage, not at every retry.
-went_down(_Name, _Reason, #srv{status = down}) ->
-    ok;
-went_down(Name, Reason, _S) ->
-    erllama_server_failures:record(mcp_down, Name, Reason).
+%% Recorded once per outage, not at every reconnection attempt.
+went_down(_Name, _Reason, #srv{reported = true} = S) ->
+    S;
+went_down(Name, Reason, S) ->
+    ok = erllama_server_failures:record(mcp_down, Name, Reason),
+    S#srv{reported = true}.
 
 backoff(A) -> min(?MAX_BACKOFF_MS, 1000 bsl min(A, 6)).
 
