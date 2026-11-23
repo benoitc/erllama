@@ -34,6 +34,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* FreeBSD has no MAP_NORESERVE; a PROT_NONE mapping commits no memory
+ * there anyway. */
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <mutex>
