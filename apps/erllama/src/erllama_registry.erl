@@ -20,6 +20,12 @@
 %% The registry is a tiny gen_server that owns a public ETS table.
 %% Lookups happen straight from ETS in the caller process, so the
 %% gen_server is never on the hot path.
+%%
+%% A row also carries the model's shared state (`set_shared/2`): what
+%% a caller needs to tokenise or render a chat template without
+%% waiting for the model process, which is busy in its decode step
+%% while it generates. The row, and so the shared state, goes away
+%% when the model process exits.
 -behaviour(gen_server).
 
 -export([
@@ -28,7 +34,9 @@
     unregister_name/1,
     whereis_name/1,
     send/2,
-    all/0
+    all/0,
+    set_shared/2,
+    shared/1
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -48,13 +56,13 @@
 %% own DOWN). A name still held by a dead process is taken over.
 -spec register_name(model_id(), pid()) -> yes | no.
 register_name(Name, Pid) when is_binary(Name), is_pid(Pid) ->
-    case ets:insert_new(?TABLE, {Name, Pid, undefined}) of
+    case ets:insert_new(?TABLE, {Name, Pid, undefined, undefined}) of
         true ->
             gen_server:cast(?MODULE, {monitor, Name, Pid}),
             yes;
         false ->
             case ets:lookup(?TABLE, Name) of
-                [{Name, Old, _} = Stale] when Old =/= Pid ->
+                [{Name, Old, _, _} = Stale] when Old =/= Pid ->
                     case is_process_alive(Old) of
                         true ->
                             no;
@@ -75,7 +83,7 @@ unregister_name(Name) when is_binary(Name) ->
 -spec whereis_name(model_id()) -> pid() | undefined.
 whereis_name(Name) when is_binary(Name) ->
     case ets:lookup(?TABLE, Name) of
-        [{Name, Pid, _}] when is_pid(Pid) ->
+        [{Name, Pid, _, _}] when is_pid(Pid) ->
             case is_process_alive(Pid) of
                 true -> Pid;
                 false -> undefined
@@ -100,9 +108,29 @@ send(Name, Msg) when is_binary(Name) ->
 all() ->
     [
         {Name, Pid}
-     || {Name, Pid, _Mon} <- ets:tab2list(?TABLE),
+     || {Name, Pid, _Mon, _Shared} <- ets:tab2list(?TABLE),
         is_process_alive(Pid)
     ].
+
+%% Called by the registered model process itself once its backend is
+%% up. A no-op when `Name` is not registered to the caller.
+-spec set_shared(model_id(), term()) -> ok.
+set_shared(Name, Shared) when is_binary(Name) ->
+    Self = self(),
+    case ets:lookup(?TABLE, Name) of
+        [{Name, Self, _, _}] -> true = ets:update_element(?TABLE, Name, {4, Shared});
+        _ -> ok
+    end,
+    ok.
+
+%% The shared state of `Name` and the pid that published it, or
+%% `undefined` when the model is not registered or published none.
+-spec shared(model_id()) -> {pid(), term()} | undefined.
+shared(Name) when is_binary(Name) ->
+    case ets:lookup(?TABLE, Name) of
+        [{Name, Pid, _, Shared}] when Shared =/= undefined -> {Pid, Shared};
+        _ -> undefined
+    end.
 
 %% =============================================================================
 %% gen_server
@@ -125,7 +153,7 @@ handle_call(_, _, S) -> {reply, {error, unknown_call}, S}.
 handle_cast({monitor, Name, Pid}, S) ->
     Ref = monitor(process, Pid),
     case ets:lookup(?TABLE, Name) of
-        [{Name, Pid, _}] -> true = ets:update_element(?TABLE, Name, {3, Ref});
+        [{Name, Pid, _, _}] -> true = ets:update_element(?TABLE, Name, {3, Ref});
         _ -> demonitor(Ref, [flush])
     end,
     {noreply, S};
@@ -133,7 +161,7 @@ handle_cast(_, S) ->
     {noreply, S}.
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason}, S) ->
-    _ = ets:match_delete(?TABLE, {'_', Pid, '_'}),
+    _ = ets:match_delete(?TABLE, {'_', Pid, '_', '_'}),
     {noreply, S};
 handle_info(_, S) ->
     {noreply, S}.

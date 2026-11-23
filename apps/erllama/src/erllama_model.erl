@@ -828,16 +828,29 @@ model_info(Model) ->
 Tokenise a string using the model's tokenizer. Returns a list of
 token IDs. Safe to call concurrently with `complete/2,3`; tokenisation
 runs against the model's static vocabulary, not the live KV cache.
+
+With a model id and a backend that shares its state (the llama.cpp
+backend does), it runs in the caller's process, so it does not wait
+for the decode step of a model that is generating. With a pid, it goes
+through the model process.
 """.
 -spec tokenize(model(), binary()) ->
     {ok, [non_neg_integer()]} | {error, term()}.
 tokenize(Model, Text) when is_binary(Text) ->
-    call(Model, {tokenize, Text}, infinity).
+    case shared(Model) of
+        {_Pid, {Mod, S}} -> shared_result(wrap_ok(Mod:tokenize(S, Text)));
+        undefined -> call(Model, {tokenize, Text}, infinity)
+    end.
 
 -spec tokenize(model(), binary(), map()) ->
     {ok, [non_neg_integer()]} | {error, term()}.
 tokenize(Model, Text, Opts) when is_binary(Text), is_map(Opts) ->
-    call(Model, {tokenize, Text, Opts}, infinity).
+    case shared(Model) of
+        {_Pid, {Mod, S}} ->
+            shared_result(wrap_ok(backend_tokenize_with_opts(Mod, S, Text, Opts)));
+        undefined ->
+            call(Model, {tokenize, Text, Opts}, infinity)
+    end.
 
 -doc """
 Detokenise a list of token IDs back to a string. Safe to call
@@ -846,7 +859,10 @@ concurrently with `complete/2,3`.
 -spec detokenize(model(), [non_neg_integer()]) ->
     {ok, binary()} | {error, term()}.
 detokenize(Model, Tokens) when is_list(Tokens) ->
-    call(Model, {detokenize, Tokens}, infinity).
+    case shared(Model) of
+        {_Pid, {Mod, S}} -> shared_result(wrap_ok(Mod:detokenize(S, Tokens)));
+        undefined -> call(Model, {detokenize, Tokens}, infinity)
+    end.
 
 -doc """
 Detokenise with options: `remove_special` strips a leading BOS /
@@ -857,7 +873,12 @@ arity-2 form drops them).
 -spec detokenize(model(), [non_neg_integer()], map()) ->
     {ok, binary()} | {error, term()}.
 detokenize(Model, Tokens, Opts) when is_list(Tokens), is_map(Opts) ->
-    call(Model, {detokenize, Tokens, Opts}, infinity).
+    case shared(Model) of
+        {_Pid, {Mod, S}} ->
+            shared_result(wrap_ok(backend_detokenize_with_opts(Mod, S, Tokens, Opts)));
+        undefined ->
+            call(Model, {detokenize, Tokens, Opts}, infinity)
+    end.
 
 -doc """
 Special / FIM vocab token map for the loaded model; see
@@ -887,8 +908,38 @@ apply_chat_template(Model, Request) when is_map(Request) ->
 %% stops, generation prompt, thinking tags) for this model. `Inputs'
 %% is the map fed verbatim to `erllama_chat:apply/2'. Returns
 %% `{ok, ParamsRef, Render}'.
+%%
+%% Once the model process has built the templates (its first
+%% chat_apply), later renders run in the caller's process.
 chat_apply(Model, Inputs) when is_map(Inputs) ->
-    call(Model, {chat_apply, Inputs}, infinity).
+    Cached =
+        case shared(Model) of
+            {Pid, _} -> erllama_chat_cache:cached(Model, Pid);
+            undefined -> not_found
+        end,
+    case Cached of
+        {ok, Templates} -> erllama_chat:apply(Templates, Inputs);
+        not_found -> call(Model, {chat_apply, Inputs}, infinity)
+    end.
+
+%% The state the backend shares for calls from other processes
+%% (shared_state/1), published in the registry at init.
+shared(ModelId) when is_binary(ModelId) -> erllama_registry:shared(ModelId);
+shared(_Pid) -> undefined.
+
+%% The model was freed between the registry lookup and the call (an
+%% unload in progress): the same answer the model process gives once
+%% it is gone.
+shared_result({error, released}) -> {error, not_loaded};
+shared_result(Result) -> Result.
+
+publish_shared(ModelId, Backend, BState) ->
+    case erlang:function_exported(Backend, shared_state, 1) of
+        true ->
+            erllama_registry:set_shared(ModelId, {Backend, Backend:shared_state(BState)});
+        false ->
+            ok
+    end.
 
 %% Drop every chat-cache entry for this model. Called on model
 %% terminate so the cache does not extend templates_ref / params_ref
@@ -1027,6 +1078,7 @@ init([ModelId, Config0]) ->
             Data = build_init_data(ModelId, Config, Backend, BState),
             ok = obs_install_initial(Data),
             ok = publish_abort_handle(Data),
+            ok = publish_shared(ModelId, Backend, BState),
             {ok, idle, Data};
         {error, Reason} ->
             {stop, Reason}
@@ -1152,6 +1204,12 @@ terminate(Reason, _State, #data{model_id = ModelId, backend = B, backend_state =
                 ok
         end,
     B:terminate(S),
+    _ =
+        try
+            erllama_chat_cache:purge(ModelId)
+        catch
+            exit:_ -> ok
+        end,
     ok;
 terminate(_Reason, _State, _Data) ->
     ok.
@@ -2224,12 +2282,16 @@ handle_common(_State, {call, From}, {reset_session, SessionId}, Data) ->
     reply(From, {ok, Outcome}, NewData);
 handle_common(_State, {call, From}, {tokenize, Text}, Data) ->
     reply(From, wrap_ok(backend_call(Data, tokenize, [Text])), Data);
-handle_common(_State, {call, From}, {tokenize, Text, Opts}, Data) ->
-    reply(From, wrap_ok(backend_tokenize_with_opts(Data, Text, Opts)), Data);
+handle_common(
+    _State, {call, From}, {tokenize, Text, Opts}, #data{backend = Mod, backend_state = S} = Data
+) ->
+    reply(From, wrap_ok(backend_tokenize_with_opts(Mod, S, Text, Opts)), Data);
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
     reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
-handle_common(_State, {call, From}, {detokenize, Tokens, Opts}, Data) ->
-    reply(From, wrap_ok(backend_detokenize_with_opts(Data, Tokens, Opts)), Data);
+handle_common(
+    _State, {call, From}, {detokenize, Tokens, Opts}, #data{backend = Mod, backend_state = S} = Data
+) ->
+    reply(From, wrap_ok(backend_detokenize_with_opts(Mod, S, Tokens, Opts)), Data);
 handle_common(_State, {call, From}, vocab_info, Data) ->
     reply(From, optional_backend_call(Data, vocab_info, []), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
@@ -2459,7 +2521,7 @@ do_chat_apply(
             ModelRef = Mod:get_model_ref(S),
             case
                 erllama_chat_cache:get_or_init(
-                    ModelId, ModelRef, Tmpl
+                    ModelId, self(), ModelRef, Tmpl
                 )
             of
                 {ok, Templates} ->
@@ -4403,7 +4465,7 @@ backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
 %% Tokenize via the backend's optional 3-arity callback (forwards
 %% caller-supplied options like `parse_special'). Falls back to the
 %% 2-arity callback when the backend hasn't been updated.
-backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) ->
+backend_tokenize_with_opts(Mod, S, Text, Opts) ->
     case erlang:function_exported(Mod, tokenize, 3) of
         true -> Mod:tokenize(S, Text, Opts);
         false -> Mod:tokenize(S, Text)
@@ -4412,7 +4474,7 @@ backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) 
 %% Detokenize via the backend's optional 3-arity callback (special
 %% token rendering options). Backends without it fall back to the
 %% plain arity-2 form, ignoring the options.
-backend_detokenize_with_opts(#data{backend = Mod, backend_state = S}, Tokens, Opts) ->
+backend_detokenize_with_opts(Mod, S, Tokens, Opts) ->
     case erlang:function_exported(Mod, detokenize, 3) of
         true -> Mod:detokenize(S, Tokens, Opts);
         false -> Mod:detokenize(S, Tokens)
