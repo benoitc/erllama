@@ -44,30 +44,9 @@ ERL_NIF_TERM nif_kv_format(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
  * the destination sequence id for unpack.
  * ========================================================================= */
 
-ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    erllama_context_t *c;
-    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
-        return enif_make_badarg(env);
-    }
-    /* A split model's KV, embeddings and speculative or media decodes
-     * are not kept in step across its ranks yet. */
-    if (ERLLAMA_IS_TP(c)) {
-        return erllama_error(env, atom_not_supported);
-    }
-    /* Tokens (argv[1]) is informational; NTokens (argv[2]) ignored.
-     * The model layer must have prefilled exactly the desired prefix
-     * before calling kv_pack. argv[3], when present (arity 4),
-     * specifies which sequence to extract from. Default 0 keeps
-     * existing 3-arity callers working. */
-    llama_seq_id seq_id = 0;
-    if (argc == 4) {
-        int sid;
-        if (!enif_get_int(env, argv[3], &sid) || sid < 0) {
-            return enif_make_badarg(env);
-        }
-        seq_id = (llama_seq_id) sid;
-    }
-
+/* Pack `seq_id''s KV state of `c' (the caller checked the context's
+ * kind). */
+static ERL_NIF_TERM kv_pack_seq(ErlNifEnv *env, erllama_context_t *c, llama_seq_id seq_id) {
     if (!erllama_lock_ctx(c)) {
         return erllama_error(env, atom_released);
     }
@@ -109,30 +88,15 @@ ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     return enif_make_binary(env, &out);
 }
 
-ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void) argc;
-    erllama_context_t *c;
-    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
-        return enif_make_badarg(env);
-    }
-    /* A split model's KV, embeddings and speculative or media decodes
-     * are not kept in step across its ranks yet. */
-    if (ERLLAMA_IS_TP(c)) {
-        return erllama_error(env, atom_not_supported);
-    }
-    ErlNifBinary in;
-    if (!enif_inspect_binary(env, argv[1], &in)) {
-        return enif_make_badarg(env);
-    }
-    int seq_id;
-    if (!enif_get_int(env, argv[2], &seq_id) || seq_id < 0) {
-        return enif_make_badarg(env);
-    }
+/* Restore `in' into `seq_id' of `c' (the caller checked the context's
+ * kind). */
+static ERL_NIF_TERM kv_unpack_seq(ErlNifEnv *env, erllama_context_t *c, const ErlNifBinary *in,
+                                  int seq_id) {
     if (!erllama_lock_ctx(c)) {
         return erllama_error(env, atom_released);
     }
     size_t consumed = erllama_safe_state_seq_set_data(
-        c->ctx, in.data, in.size, seq_id);
+        c->ctx, in->data, in->size, seq_id);
     /* kv_unpack only restores KV cells, not the per-context logits
      * buffer; the model layer must drop the last cell and re-prefill
      * it before the next sample. Mark the context as not ready until
@@ -151,10 +115,59 @@ ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
         c->per_seq[seq_id].last_logits_idx = -1;
     }
     pthread_mutex_unlock(&c->mu);
-    if (consumed == 0 || consumed != in.size) {
+    if (consumed == 0 || consumed != in->size) {
         return erllama_error(env, atom_unpack_failed);
     }
     return atom_ok;
+}
+
+ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    /* A split model's KV is packed on every rank at once, through its
+     * serving rank (nif_tp_kv_pack). */
+    if (ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
+    }
+    /* Tokens (argv[1]) is informational; NTokens (argv[2]) ignored.
+     * The model layer must have prefilled exactly the desired prefix
+     * before calling kv_pack. argv[3], when present (arity 4),
+     * specifies which sequence to extract from. Default 0 keeps
+     * existing 3-arity callers working. */
+    llama_seq_id seq_id = 0;
+    if (argc == 4) {
+        int sid;
+        if (!enif_get_int(env, argv[3], &sid) || sid < 0) {
+            return enif_make_badarg(env);
+        }
+        seq_id = (llama_seq_id) sid;
+    }
+
+    return kv_pack_seq(env, c, seq_id);
+}
+
+ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    /* A split model's KV is restored on every rank at once
+     * (nif_tp_kv_unpack). */
+    if (ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
+    }
+    ErlNifBinary in;
+    if (!enif_inspect_binary(env, argv[1], &in)) {
+        return enif_make_badarg(env);
+    }
+    int seq_id;
+    if (!enif_get_int(env, argv[2], &seq_id) || seq_id < 0) {
+        return enif_make_badarg(env);
+    }
+    return kv_unpack_seq(env, c, &in, seq_id);
 }
 
 /* Remove the cells in [p0, p1) from the given sequence. p0 < 0 means
@@ -268,4 +281,68 @@ ERL_NIF_TERM nif_kv_seq_cp(ErlNifEnv *env, int argc,
     c->per_seq[dst].last_logits_idx = -1;
     pthread_mutex_unlock(&c->mu);
     return atom_ok;
+}
+
+/* =========================================================================
+ * Checkpoints of a model split over a tensor-parallel group
+ *
+ * Each rank holds its share of the KV. A checkpoint is every rank's
+ * share at the same committed token: the serving rank puts a command in
+ * its sink's stream (nif_tp_send), after every batch it decoded, and
+ * each rank packs or restores its own share (nif_tp_kv_pack,
+ * nif_tp_kv_unpack) when it reaches that command. The shares are
+ * gathered and checked in Erlang (erllama_tp_rank).
+ * ========================================================================= */
+
+/* nif_tp_send(Ctx, Cmd) -> ok | {error, not_supported}: send `Cmd' to
+ * the serving rank's sink with the next sequence number. */
+ERL_NIF_TERM nif_tp_send(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    if (!ERLLAMA_IS_TP(c) || !c->tp_sink_set) {
+        return erllama_error(env, atom_not_supported);
+    }
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
+    }
+    ErlNifEnv *menv = enif_alloc_env();
+    erllama_tp_send(env, c, menv, enif_make_copy(menv, argv[1]));
+    pthread_mutex_unlock(&c->mu);
+    return atom_ok;
+}
+
+/* nif_tp_kv_pack(Ctx, SeqId) -> Bin | {error, Reason}: this rank's
+ * share of `SeqId''s KV. */
+ERL_NIF_TERM nif_tp_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    int sid;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c) ||
+        !enif_get_int(env, argv[1], &sid) || sid < 0) {
+        return enif_make_badarg(env);
+    }
+    if (!ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
+    }
+    return kv_pack_seq(env, c, (llama_seq_id) sid);
+}
+
+/* nif_tp_kv_unpack(Ctx, Bin, SeqId) -> ok | {error, Reason}: restore
+ * this rank's share of `SeqId''s KV. */
+ERL_NIF_TERM nif_tp_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    ErlNifBinary in;
+    int sid;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c) ||
+        !enif_inspect_binary(env, argv[1], &in) || !enif_get_int(env, argv[2], &sid) || sid < 0) {
+        return enif_make_badarg(env);
+    }
+    if (!ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
+    }
+    return kv_unpack_seq(env, c, &in, sid);
 }

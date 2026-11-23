@@ -19,7 +19,16 @@
     home/2,
     model/0,
     nccl_lines/1,
-    parallel/1
+    parallel/1,
+    with_serving/2,
+    serve/4,
+    serve/5,
+    form/3,
+    load/4,
+    complete/3,
+    complete_stats/3,
+    stop_group/1,
+    long_prompt/1
 ]).
 
 -define(T, "$HOME/erllama-tp").
@@ -156,3 +165,114 @@ parallel(Funs) ->
         end
      || Ref <- Refs
     ].
+
+%% -----------------------------------------------------------------------------
+%% A split model served from its own node
+
+%% A serving node on the first host (erllama, the coordinator and the
+%% stream helper; no GPU work) for `Fun(S)'.
+with_serving([Host0 | _], Fun) ->
+    Cookie = cookie(),
+    {S, _} = start_peer(name("erllama_tps"), Host0, Cookie),
+    put(cookie, Cookie),
+    [ok = ?MODULE:load_module(S, M) || M <- [erllama_tp_coordinator, erllama_tp_stream]],
+    try
+        Fun(S)
+    after
+        peer:stop(S)
+    end.
+
+%% A group of generation `Gen' on fresh rank nodes, serving the model
+%% from node `S' through erllama_model_tp.
+serve(Hosts, S, Gen, Policy) ->
+    serve(Hosts, S, Gen, Policy, #{}).
+
+%% `Extra' adds to the load config (e.g. tp_kv_timeout).
+serve(Hosts, S, Gen, Policy, Extra) ->
+    load(form(Hosts, S, Gen), Policy, Extra, 600000).
+
+%% A group of generation `Gen' on fresh rank nodes, one per host,
+%% watched by a coordinator on node `S'.
+form(Hosts, S, Gen) ->
+    Peers = [
+        element(
+            1, start_peer(name("erllama_tp" ++ integer_to_list(R)), H, get(cookie), R)
+        )
+     || {R, H} <- lists:enumerate(0, Hosts)
+    ],
+    {ok, Coord} = peer:call(S, erllama_tp_coordinator, start, [length(Hosts), 60000]),
+    Ranks = form_group(Peers, Coord, Gen, 60000),
+    RankPids = [R || {_, R} <- Ranks],
+    ok = peer:call(S, erllama_tp_coordinator, watch, [Coord, RankPids]),
+    #{gen => Gen, coord => Coord, rank_peers => Peers, rank_pids => RankPids, serving => S}.
+
+%% The model (model/0) loaded on the group and served from its node.
+load(
+    #{gen := Gen, rank_peers := Peers, rank_pids := RankPids, serving := S} = G,
+    Policy,
+    Extra,
+    Timeout
+) ->
+    [{P0, R0} | Followers] = lists:zip(Peers, RankPids),
+    Model = model(),
+    MOpts = #{n_gpu_layers => 99},
+    COpts = #{n_ctx => 2048, n_batch => 512, flash_attn => enabled},
+    Loaded = parallel([
+        fun() ->
+            peer:call(P, erllama_tp_rank, load, [R, home(P, Model), {MOpts, COpts}], Timeout)
+        end
+     || {P, R} <- Followers
+    ]),
+    [ok = L || L <- Loaded],
+    Descs = [
+        {R,
+            peer:call(P, erllama_tp_rank, describe, [
+                home(P, Model), {MOpts, COpts}, length(Peers)
+            ])}
+     || {P, R} <- Followers
+    ],
+    Id = iolist_to_binary(["tp_gen", integer_to_list(Gen)]),
+    {ok, Id} = peer:call(
+        S,
+        erllama,
+        load_model,
+        [
+            Id,
+            Extra#{
+                backend => erllama_model_tp,
+                model_path => home(P0, Model),
+                model_opts => MOpts,
+                context_opts => COpts,
+                policy => Policy,
+                tp_worker => R0,
+                tp_followers => Descs
+            }
+        ],
+        Timeout
+    ),
+    G#{id => Id}.
+
+%% 32 greedy tokens after `Prompt', and the request's stats.
+complete(S, G, Prompt) ->
+    element(1, complete_stats(S, G, Prompt)).
+
+complete_stats(S, #{id := Id}, Prompt) ->
+    {ok, #{generated := G} = Stats} = peer:call(
+        S, erllama, complete, [Id, Prompt, #{response_tokens => 32, temperature => 0.0}], 120000
+    ),
+    {G, Stats}.
+
+stop_group(#{id := Id, coord := C, rank_peers := Peers, serving := S}) ->
+    _ = catch peer:call(S, erllama, unload, [Id], 60000),
+    _ = catch peer:call(S, erllama_tp_coordinator, stop, [C], 10000),
+    [catch peer:stop(P) || P <- Peers],
+    ok.
+
+long_prompt(N) ->
+    iolist_to_binary(lists:duplicate(N, <<"The quick brown fox jumps over the lazy dog. ">>)).
+
+cookie() ->
+    "erllama_tp_" ++ integer_to_list(erlang:unique_integer([positive])).
+
+name(Base) ->
+    list_to_atom(Base ++ "_" ++ integer_to_list(erlang:unique_integer([positive]))).
