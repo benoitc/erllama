@@ -43,7 +43,11 @@
     fail_media_prefill,
     %% multimodal projector (libmtmd)
     mmproj_path,
-    mmproj_opts
+    mmproj_opts,
+    %% erllama_model_tp (experimental tensor parallelism)
+    tp_worker,
+    tp_followers,
+    tp_call_timeout
 ]).
 
 -define(MODEL_OPT_KEYS, [
@@ -286,7 +290,10 @@ base_load_checks() ->
         {context_opts, fun is_map/1},
         {policy, fun is_map/1},
         {mmproj_path, fun is_path/1},
-        {mmproj_opts, fun mmproj_opts_check/1}
+        {mmproj_opts, fun mmproj_opts_check/1},
+        {tp_worker, fun is_pid/1},
+        {tp_followers, fun is_list/1},
+        {tp_call_timeout, fun(V) -> V =:= infinity orelse pos_int(V) end}
     ].
 
 %% Stub-backend test knobs.

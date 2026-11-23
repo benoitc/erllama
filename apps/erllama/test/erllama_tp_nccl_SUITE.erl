@@ -48,8 +48,6 @@
     data_path_bytes/1
 ]).
 
--define(T, "$HOME/erllama-tp").
-
 all() ->
     [
         matvec_fixture,
@@ -65,26 +63,37 @@ all() ->
     ].
 
 init_per_suite(Config) ->
-    case os:getenv("ERLLAMA_TP_HOSTS") of
+    case erllama_tp_hosts:hosts() of
         false ->
             {skip, "set ERLLAMA_TP_HOSTS to the CUDA hosts (see scripts/tp_hosts.sh)"};
-        Hosts0 ->
-            Hosts = string:lexemes(Hosts0, ","),
+        Hosts ->
             Cookie = "erllama_tp_" ++ integer_to_list(erlang:unique_integer([positive])),
-            Peers = [start_peer(R, H, Cookie) || {R, H} <- lists:enumerate(0, Hosts)],
+            Peers = [
+                begin
+                    Name = list_to_atom("erllama_tp" ++ integer_to_list(R)),
+                    {P, N} = erllama_tp_hosts:start_peer(Name, H, Cookie, R),
+                    {R, P, N}
+                end
+             || {R, H} <- lists:enumerate(0, Hosts)
+            ],
             [{_, P0, _} | _] = Peers,
-            {M, Bin, File} = code:get_object_code(erllama_tp_coordinator),
-            {module, M} = peer:call(P0, code, load_binary, [M, File, Bin]),
+            ok = erllama_tp_hosts:load_module(P0, erllama_tp_coordinator),
+            %% The node serving the split model: erllama, no GPU work.
+            {S, _} = erllama_tp_hosts:start_peer(erllama_tps, hd(Hosts), Cookie),
+            ok = erllama_tp_hosts:load_module(S, erllama_tp_stream),
             {ok, Caps} = peer:call(P0, erllama_tp, caps, []),
             ct:pal("rank 0 caps: ~p", [Caps]),
             case Caps of
-                #{init_rank := true} -> [{peers, Peers}, {world, length(Hosts)} | Config];
-                _ -> {skip, "the hosts' build has no per-process communicator (CUDA with NCCL)"}
+                #{init_rank := true} ->
+                    [{peers, Peers}, {serving, S}, {world, length(Hosts)} | Config];
+                _ ->
+                    {skip, "the hosts' build has no per-process communicator (CUDA with NCCL)"}
             end
     end.
 
 end_per_suite(Config) ->
     [peer:stop(P) || {_, P, _} <- proplists:get_value(peers, Config, [])],
+    _ = [peer:stop(S) || S <- [proplists:get_value(serving, Config)], S =/= undefined],
     ok.
 
 init_per_testcase(transport_in_use, Config) ->
@@ -107,7 +116,7 @@ end_per_testcase(_TC, Config) ->
 matvec_fixture(Config) ->
     2 = ?config(world, Config),
     [{P0, R0}, {P1, R1}] = rank_pids(Config),
-    [{ok, Part0, Sum0}, {ok, Part1, Sum1}] = parallel([
+    [{ok, Part0, Sum0}, {ok, Part1, Sum1}] = erllama_tp_hosts:parallel([
         fun() -> peer:call(P0, erllama_tp_rank, matvec, [R0, [[1, 2], [4, 3]], [1, 2]], 60000) end,
         fun() -> peer:call(P1, erllama_tp_rank, matvec, [R1, [[3, 4], [2, 1]], [3, 4]], 60000) end
     ]),
@@ -153,7 +162,7 @@ open_and_close_repeat(Config) ->
     lists:foreach(
         fun(I) ->
             Ranks = form_group(Config, 60000),
-            Results = parallel([
+            Results = erllama_tp_hosts:parallel([
                 fun() -> peer:call(P, erllama_tp_rank, reduce, [R, [float(I + Rank)]], 60000) end
              || {Rank, {P, R}} <- lists:enumerate(0, Ranks)
             ]),
@@ -182,21 +191,29 @@ uneven_split_matches_one_gpu(Config) ->
     split_model(Config, #{tensor_split => [3.0, 1.0]}).
 
 split_model(Config, Split) ->
-    Model = os:getenv("ERLLAMA_TP_MODEL", "erllama-tp/tinyllama-1.1b-chat.gguf"),
+    Model = erllama_tp_hosts:model(),
     Ranks = rank_pids(Config),
     [{P0, R0} | _] = Ranks,
     MOpts = #{n_gpu_layers => 99},
     CtxOpts = #{n_ctx => 512, n_batch => 512, flash_attn => enabled},
     Opts = {maps:merge(MOpts, Split), CtxOpts},
     Before = [peer:call(P, erllama_tp_rank, info, [R]) || {P, R} <- Ranks],
-    Loaded = parallel([
-        fun() -> peer:call(P, erllama_tp_rank, load, [R, home(P, Model), Opts], 600000) end
+    Loaded = erllama_tp_hosts:parallel([
+        fun() ->
+            peer:call(P, erllama_tp_rank, load, [R, erllama_tp_hosts:home(P, Model), Opts], 600000)
+        end
      || {P, R} <- Ranks
     ]),
     ct:pal("split load: ~p", [Loaded]),
     [ok = L || L <- Loaded],
     After = [peer:call(P, erllama_tp_rank, info, [R]) || {P, R} <- Ranks],
-    ok = peer:call(P0, erllama_tp_rank, ref_load, [R0, home(P0, Model), {MOpts, CtxOpts}], 600000),
+    ok = peer:call(
+        P0,
+        erllama_tp_rank,
+        ref_load,
+        [R0, erllama_tp_hosts:home(P0, Model), {MOpts, CtxOpts}],
+        600000
+    ),
     %% "The quick brown fox jumps over the lazy dog" in the Llama vocabulary.
     Prompt = [1, 450, 4996, 17354, 1701, 29916, 432, 17204, 975, 278, 17366, 11203],
     Step1 = compare_step(Ranks, P0, R0, Prompt, "prompt"),
@@ -224,7 +241,7 @@ split_model(Config, Split) ->
     ?assert(length(Sizes0) > 0).
 
 compare_step(Ranks, P0, R0, Tokens, What) ->
-    Got = parallel([
+    Got = erllama_tp_hosts:parallel([
         fun() -> peer:call(P, erllama_tp_rank, decode, [R, Tokens], 120000) end
      || {P, R} <- Ranks
     ]),
@@ -265,39 +282,54 @@ top(L, N) ->
 free_mib(#{devices := [#{free_b := F} | _]}) -> F div 1048576;
 free_mib(_) -> undefined.
 
-%% `Path' relative to the home directory of the peer's host.
-home(P, Path) ->
-    case Path of
-        "/" ++ _ -> Path;
-        _ -> filename:join(peer:call(P, os, getenv, ["HOME"]), Path)
-    end.
-
-%% The split model served through erllama on rank 0, as any loaded
-%% model: a greedy completion against the same model on one GPU, a
-%% timed stream, a cancel and the next request; the other ranks follow
-%% rank 0's batches.
+%% The split model served through erllama, as any loaded model, from a
+%% node that is no rank (erllama_model_tp; rank 0 samples): a greedy
+%% completion against the same model on one GPU, a timed stream, a
+%% cancel and the next request; the other ranks follow rank 0's
+%% batches.
 serve_through_erllama(Config) ->
-    Model = os:getenv("ERLLAMA_TP_MODEL", "erllama-tp/tinyllama-1.1b-chat.gguf"),
+    Model = erllama_tp_hosts:model(),
+    S = ?config(serving, Config),
     [{P0, R0} | Followers] = rank_pids(Config),
+    MOpts = #{n_gpu_layers => 99},
     COpts = #{n_ctx => 1024, n_batch => 512, flash_attn => enabled},
-    Opts = {#{n_gpu_layers => 99}, COpts},
-    Loaded = parallel([
-        fun() -> peer:call(P, erllama_tp_rank, load, [R, home(P, Model), Opts], 600000) end
+    Opts = {MOpts, COpts},
+    Loaded = erllama_tp_hosts:parallel([
+        fun() ->
+            peer:call(P, erllama_tp_rank, load, [R, erllama_tp_hosts:home(P, Model), Opts], 600000)
+        end
      || {P, R} <- Followers
     ]),
     [ok = L || L <- Loaded],
     Descs = [
-        {R, peer:call(P, erllama_tp_rank, describe, [home(P, Model), Opts, ?config(world, Config)])}
+        {R,
+            peer:call(P, erllama_tp_rank, describe, [
+                erllama_tp_hosts:home(P, Model), Opts, ?config(world, Config)
+            ])}
      || {P, R} <- Followers
     ],
-    {M, Bin, File} = code:get_object_code(erllama_tp_stream),
-    {module, M} = peer:call(P0, code, load_binary, [M, File, Bin]),
-    {ok, Id} = peer:call(
-        P0, erllama_tp_rank, serve, [R0, <<"tp_served">>, home(P0, Model), Opts, Descs], 600000
-    ),
+    ok = erllama_tp_hosts:load_module(P0, erllama_tp_stream),
     NoCache = #{
         min_tokens => infinity, cold_min_tokens => infinity, continued_interval => infinity
     },
+    {ok, Id} = peer:call(
+        S,
+        erllama,
+        load_model,
+        [
+            <<"tp_served">>,
+            #{
+                backend => erllama_model_tp,
+                model_path => erllama_tp_hosts:home(P0, Model),
+                model_opts => MOpts,
+                context_opts => COpts,
+                policy => NoCache,
+                tp_worker => R0,
+                tp_followers => Descs
+            }
+        ],
+        600000
+    ),
     {ok, Ref} = peer:call(
         P0,
         erllama,
@@ -306,7 +338,7 @@ serve_through_erllama(Config) ->
             <<"tp_one_gpu">>,
             #{
                 backend => erllama_model_llama,
-                model_path => home(P0, Model),
+                model_path => erllama_tp_hosts:home(P0, Model),
                 model_opts => #{n_gpu_layers => 99},
                 context_opts => COpts,
                 policy => NoCache
@@ -316,9 +348,14 @@ serve_through_erllama(Config) ->
     ),
     try
         %% Greedy, fixed prompt: the same tokens as on one GPU.
+        %% The split model is on the serving node, the one-GPU copy on rank 0's.
+        On = fun
+            (Mod) when Mod =:= Id -> S;
+            (_) -> P0
+        end,
         Complete = fun(Mod) ->
             {ok, #{generated := G}} = peer:call(
-                P0,
+                On(Mod),
                 erllama,
                 complete,
                 [Mod, <<"The quick brown fox">>, #{response_tokens => 32, temperature => 0.0}],
@@ -337,9 +374,9 @@ serve_through_erllama(Config) ->
         Long = iolist_to_binary(
             lists:duplicate(20, <<"The quick brown fox jumps over the lazy dog. ">>)
         ),
-        {ok, PromptToks} = peer:call(P0, erllama, tokenize, [Id, Long]),
+        {ok, PromptToks} = peer:call(S, erllama, tokenize, [Id, Long]),
         Timed = fun(Mod) ->
-            peer:call(P0, erllama_tp_stream, run, [Mod, Long, 128, infinity], 300000)
+            peer:call(On(Mod), erllama_tp_stream, run, [Mod, Long, 128, infinity], 300000)
         end,
         _ = Timed(Ref),
         [SplitRun, OneRun] = [Timed(Mod) || Mod <- [Id, Ref]],
@@ -361,7 +398,7 @@ serve_through_erllama(Config) ->
         ],
         ?assertEqual(128, maps:get(tokens, SplitRun)),
         %% Cancel after 10 tokens; the next request is served.
-        Cancelled = peer:call(P0, erllama_tp_stream, run, [Id, Long, 128, 10], 300000),
+        Cancelled = peer:call(S, erllama_tp_stream, run, [Id, Long, 128, 10], 300000),
         ?assertMatch(#{ended := cancelled, tokens := 10}, Cancelled),
         ?assertEqual(Split, Complete(Id)),
         %% The followers made every reduction rank 0 made, in order.
@@ -374,13 +411,14 @@ serve_through_erllama(Config) ->
         [?assertEqual(Sizes0, Sz) || Sz <- Others],
         %% A decode-sized reduction (2048 values, FP32), timed in each
         %% rank's process, including the copy to and from the GPU.
-        Latency = parallel([
+        Latency = erllama_tp_hosts:parallel([
             fun() -> peer:call(P, erllama_tp_rank, time_reduce, [R, 2048, 200], 120000) end
          || {P, R} <- rank_pids(Config)
         ]),
         ct:pal("2048-value reduction, mean over 200 in the rank process: ~w us", [Latency])
     after
-        peer:call(P0, erllama, unload, [Ref])
+        peer:call(P0, erllama, unload, [Ref]),
+        peer:call(S, erllama, unload, [Id])
     end.
 
 decode_rate(#{gaps_ms := []}) -> 0.0;
@@ -391,7 +429,7 @@ median(L) -> lists:nth((length(L) + 1) div 2, lists:sort(L)).
 
 %% What NCCL chose for the data path, from each rank's INIT/NET log.
 transport_in_use(Config) ->
-    PerRank = [nccl_lines(P) || {_, P, _} <- ?config(peers, Config)],
+    PerRank = [erllama_tp_hosts:nccl_lines(P) || {_, P, _} <- ?config(peers, Config)],
     Lines = lists:append(PerRank),
     ct:pal("NCCL transport and network lines:~n~ts", [lists:join("\n", Lines)]),
     ?assertNotEqual([], Lines),
@@ -435,7 +473,7 @@ data_path_bytes(Config) ->
     Before = [if_bytes(P) || P <- Peers],
     %% The values are made on each rank's node: only the reductions
     %% cross the network.
-    Us = parallel([
+    Us = erllama_tp_hosts:parallel([
         fun() -> peer:call(P, erllama_tp_rank, time_reduce, [R, 512 * 4096, 16], 300000) end
      || {P, R} <- Ranks
     ]),
@@ -499,7 +537,7 @@ reduce_case(Config, N, Tol, Path) ->
     ct:pal("~b values per rank, ~p path; tolerance |got - exact| =< ~g x sum of |inputs| + 1e-6", [
         N, Path, Tol
     ]),
-    Results = parallel([
+    Results = erllama_tp_hosts:parallel([
         fun() -> peer:call(P, erllama_tp_rank, reduce, [R, In], 120000) end
      || {{P, R}, In} <- lists:zip(Ranks, Inputs)
     ]),
@@ -530,55 +568,11 @@ worst(Got, Exact, Scale, Tol) ->
     Gs = [V || <<V:32/float-native>> <= Got],
     lists:max([abs(G - E) / (Tol * S + 1.0e-6) || {G, E, S} <- lists:zip3(Gs, Exact, Scale)]).
 
-start_peer(Rank, Host, Cookie) ->
-    Extra =
-        string:lexemes(os:getenv("ERLLAMA_TP_NCCL_ENV", ""), " ") ++
-            string:lexemes(os:getenv("ERLLAMA_TP_NCCL_ENV_" ++ integer_to_list(Rank), ""), " "),
-    Env = [
-        "LD_LIBRARY_PATH=" ?T "/nccl/lib:" ?T "/openssl/lib",
-        "NCCL_DEBUG=INFO",
-        "NCCL_DEBUG_SUBSYS=INIT,NET",
-        "NCCL_DEBUG_FILE=/tmp/erllama_tp.%h.%p.nccl"
-        | Extra
-    ],
-    {ok, Peer, Node} = peer:start(#{
-        name => list_to_atom("erllama_tp" ++ integer_to_list(Rank)),
-        host => Host,
-        longnames => true,
-        connection => standard_io,
-        exec => {os:find_executable("ssh"), [Host, "env" | Env] ++ [?T "/otp-28.3.1/bin/erl"]},
-        args => [
-            "-setcookie", Cookie, "-pa", ?T "/erllama/_build/test/lib/erllama/ebin", "-noshell"
-        ],
-        wait_boot => 120000
-    }),
-    {ok, _} = peer:call(Peer, application, ensure_all_started, [erllama], 120000),
-    ct:pal("rank ~b on ~s: ~p", [Rank, Host, Node]),
-    {Rank, Peer, Node}.
-
 %% A coordinator on rank 0's node, then every rank joined at once.
 form_group(Config, Timeout) ->
-    Peers = ?config(peers, Config),
-    [{_, P0, _} | _] = Peers,
-    World = ?config(world, Config),
-    {ok, Coord} = peer:call(P0, erllama_tp_coordinator, start, [World, Timeout]),
-    Starts = parallel([
-        fun() ->
-            peer:call(
-                P,
-                erllama_tp_rank,
-                start,
-                [#{rank => R, world => World, join => {call, Coord}, timeout => Timeout}],
-                Timeout + 30000
-            )
-        end
-     || {R, P, _} <- Peers
-    ]),
-    case [S || S <- Starts, element(1, S) =/= ok] of
-        [] -> ok;
-        Bad -> ct:fail({group_failed, Bad})
-    end,
-    [{P, Pid} || {{_, P, _}, {ok, Pid}} <- lists:zip(Peers, Starts)].
+    [{_, P0, _} | _] = Peers = ?config(peers, Config),
+    {ok, Coord} = peer:call(P0, erllama_tp_coordinator, start, [?config(world, Config), Timeout]),
+    erllama_tp_hosts:form_group([P || {_, P, _} <- Peers], Coord, 0, Timeout).
 
 rank_pids(Config) ->
     ?config(ranks, Config).
@@ -586,39 +580,3 @@ rank_pids(Config) ->
 stop_ranks(_Config, Ranks) ->
     [catch peer:call(P, erllama_tp_rank, stop, [R], 30000) || {P, R} <- Ranks],
     ok.
-
-nccl_lines(Peer) ->
-    OsPid = peer:call(Peer, os, getpid, []),
-    Files = peer:call(Peer, filelib, wildcard, ["/tmp/erllama_tp.*." ++ OsPid ++ ".nccl"]),
-    lists:append([
-        [
-            unicode:characters_to_list(L)
-         || L <- binary:split(Bin, <<"\n">>, [global]),
-            interesting(L)
-        ]
-     || F <- Files, {ok, Bin} <- [peer:call(Peer, file, read_file, [F])]
-    ]).
-
-interesting(L) ->
-    lists:any(
-        fun(P) -> binary:match(L, P) =/= nomatch end,
-        [<<"NET/">>, <<"Using network">>, <<"via ">>, <<"NCCL version">>, <<"comm ">>]
-    ).
-
-parallel(Funs) ->
-    Self = self(),
-    Refs = [
-        begin
-            Ref = make_ref(),
-            spawn(fun() -> Self ! {Ref, catch F()} end),
-            Ref
-        end
-     || F <- Funs
-    ],
-    [
-        receive
-            {Ref, R} -> R
-        after 300000 -> ct:fail(parallel_timeout)
-        end
-     || Ref <- Refs
-    ].

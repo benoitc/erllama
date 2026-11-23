@@ -387,3 +387,23 @@ Same two GB10 hosts, same build, TinyLlama 1.1B Chat Q4, `n_ctx 1024`, a 242-tok
 - The NIC speeds are the hosts' reported link speeds (`/sys/class/net/*/speed`). The two hosts' GPUs are shared with another workload; the runs vary.
 
 Not run over TCP: the rank-loss, stale-command and checkpoint cases, which come with milestone 4.
+
+## Tensor parallelism, milestone 4a: failures while serving (2026-11-23)
+
+Experimental. The split model is now served from a node that is no rank (`erllama_model_tp`): tokenizing and chat templates run there on the GGUF's vocabulary, and decoding, sampling and KV changes run on rank 0. Commands to the other ranks carry the group's generation; a stale or duplicate one is dropped before any GPU work, a gap stops the follower. A split model's decode is not interrupted: a cancel waits for the step in flight. When a rank goes, the coordinator kills the others and the model fails its requests once and stops. See [internals/tensor-parallel.md](../internals/tensor-parallel.md).
+
+Run on the two GB10 hosts over RoCE, TinyLlama 1.1B Chat Q4, `n_ctx 2048`, `n_batch 512`, flash attention on, greedy; the serving node on the first host. Each case starts its own nodes (`erllama_tp_failure_SUITE`).
+
+| Case | Result |
+|---|---|
+| rank 1's OS process killed after 10 streamed tokens | one terminal error, `{tp_rank_lost, {nodedown, rank 0}}`, 6.3 ms after the kill (the coordinator killed rank 0, held in the collective); the serving node lists its models in 8 ms; the model has stopped |
+| a new group (new nodes, generation 2) | the same 32 greedy tokens as the first group |
+| a command of the previous generation, then one already applied | both dropped (stale 1, duplicate 1); no reduction made; the next request gives the same tokens |
+| a command past a gap | the follower stops (`{out_of_order, 70, 75}`); the next request fails once in 540 ms and the model stops |
+| cancel right after a 962-token prompt is admitted | one terminal result, `cancelled`, after the first 128-token step; 2948 reductions on each rank, same order; the next request gives the same tokens |
+
+Serving from the separate node, `erllama_tp_nccl_SUITE` (same model, `n_ctx 1024`, 242-token prompt, 128 tokens): greedy identical to one GPU for all 32 tokens; first token 64.3 ms, decode 150.6 tokens/s, median gap 6.57 ms (one GB10: 34.2 ms, 287.9 tokens/s, 3.42 ms); 9196 reductions on each rank. Each step now crosses the serving node and rank 0 once more than in milestone 3 (rank 0 serving: 173 to 234 tokens/s); one run each, so the share of that hop is not measured apart from the variation between runs.
+
+Over TCP (`NCCL_NET=Socket` on the two 200 Gb/s links) the three cases pass too: the terminal error came 6.3 ms after the kill, the request after a gap failed once in 119 ms, and the cancel during prefill ended once, 68 ms after the cancel.
+
+Not done: coordinated checkpoints and cache hits, a model larger than one GPU, more than two hosts, Metal.
