@@ -346,3 +346,24 @@ ERL_NIF_TERM nif_tp_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
     }
     return kv_unpack_seq(env, c, &in, sid);
 }
+
+/* nif_kv_seq_pos_max(Ctx, SeqId) -> Pos | {error, Reason}: the highest
+ * position the sequence holds, -1 when it is empty. */
+ERL_NIF_TERM nif_kv_seq_pos_max(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    int seq;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c) || !enif_get_int(env, argv[1], &seq) ||
+        seq < 0 || seq >= ERLLAMA_N_SEQ_MAX_CAP) {
+        return enif_make_badarg(env);
+    }
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
+    }
+    long p = erllama_safe_memory_seq_pos_max(c->ctx, seq);
+    pthread_mutex_unlock(&c->mu);
+    if (p == -2) {
+        return erllama_error(env, atom_exception);
+    }
+    return enif_make_long(env, p);
+}

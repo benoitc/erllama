@@ -560,6 +560,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_tp_bootstrap_selftest", 5, nif_tp_bootstrap_selftest, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_tp_stats",           1, nif_tp_stats,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_tp_decode",          2, nif_tp_decode,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_decode_seq",      4, nif_tp_decode_seq,      ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_kv_seq_pos_max",     2, nif_kv_seq_pos_max,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_tp_follow",          2, nif_tp_follow,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_tp_send",            2, nif_tp_send,            ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_tp_kv_pack",         2, nif_tp_kv_pack,         ERL_NIF_DIRTY_JOB_CPU_BOUND},

@@ -87,6 +87,8 @@
     tp_bootstrap_selftest/5,
     tp_stats/1,
     tp_decode/2,
+    tp_decode_seq/4,
+    kv_seq_pos_max/2,
     tp_follow/2,
     tp_send/2,
     tp_kv_pack/2,
@@ -794,6 +796,20 @@ tp_decode(Ctx, Tokens) -> nif_tp_decode(Ctx, Tokens).
 
 nif_tp_stats(_Rank) -> erlang:nif_error(nif_not_loaded).
 nif_tp_decode(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
+
+%% tp_decode/2 on sequence `Seq', with the logits of every row (`true')
+%% or of the last one, summed over the group.
+-spec tp_decode_seq(context_ref(), non_neg_integer(), [token_id()], boolean()) ->
+    {ok, binary()} | {error, atom()}.
+tp_decode_seq(Ctx, Seq, Tokens, All) -> nif_tp_decode_seq(Ctx, Seq, Tokens, All).
+
+nif_tp_decode_seq(_Ctx, _Seq, _Tokens, _All) -> erlang:nif_error(nif_not_loaded).
+
+%% The highest position sequence `Seq' holds, -1 when empty.
+-spec kv_seq_pos_max(context_ref(), non_neg_integer()) -> integer() | {error, atom()}.
+kv_seq_pos_max(Ctx, Seq) -> nif_kv_seq_pos_max(Ctx, Seq).
+
+nif_kv_seq_pos_max(_Ctx, _Seq) -> erlang:nif_error(nif_not_loaded).
 
 -spec tp_follow(context_ref(), tuple()) -> ok | {error, atom()}.
 tp_follow(Ctx, Cmd) -> nif_tp_follow(Ctx, Cmd).
