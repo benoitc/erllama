@@ -86,7 +86,8 @@
     tp_close/1,
     tp_bootstrap_selftest/5,
     tp_stats/1,
-    tp_decode/2
+    tp_decode/2,
+    tp_follow/2
 ]).
 
 -export_type([tp_rank_ref/0, tp_bridge_ref/0]).
@@ -790,3 +791,8 @@ tp_decode(Ctx, Tokens) -> nif_tp_decode(Ctx, Tokens).
 
 nif_tp_stats(_Rank) -> erlang:nif_error(nif_not_loaded).
 nif_tp_decode(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
+
+-spec tp_follow(context_ref(), tuple()) -> ok | {error, atom()}.
+tp_follow(Ctx, Cmd) -> nif_tp_follow(Ctx, Cmd).
+
+nif_tp_follow(_Ctx, _Cmd) -> erlang:nif_error(nif_not_loaded).

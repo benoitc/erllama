@@ -34,6 +34,7 @@
     open_and_close_repeat/1,
     model_matches_one_gpu/1,
     uneven_split_matches_one_gpu/1,
+    serve_through_erllama/1,
     transport_in_use/1
 ]).
 
@@ -48,6 +49,7 @@ all() ->
         open_and_close_repeat,
         model_matches_one_gpu,
         uneven_split_matches_one_gpu,
+        serve_through_erllama,
         transport_in_use
     ].
 
@@ -258,6 +260,123 @@ home(P, Path) ->
         "/" ++ _ -> Path;
         _ -> filename:join(peer:call(P, os, getenv, ["HOME"]), Path)
     end.
+
+%% The split model served through erllama on rank 0, as any loaded
+%% model: a greedy completion against the same model on one GPU, a
+%% timed stream, a cancel and the next request; the other ranks follow
+%% rank 0's batches.
+serve_through_erllama(Config) ->
+    Model = os:getenv("ERLLAMA_TP_MODEL", "erllama-tp/tinyllama-1.1b-chat.gguf"),
+    [{P0, R0} | Followers] = rank_pids(Config),
+    COpts = #{n_ctx => 1024, n_batch => 512, flash_attn => enabled},
+    Opts = {#{n_gpu_layers => 99}, COpts},
+    Loaded = parallel([
+        fun() -> peer:call(P, erllama_tp_rank, load, [R, home(P, Model), Opts], 600000) end
+     || {P, R} <- Followers
+    ]),
+    [ok = L || L <- Loaded],
+    Descs = [
+        {R, peer:call(P, erllama_tp_rank, describe, [home(P, Model), Opts, ?config(world, Config)])}
+     || {P, R} <- Followers
+    ],
+    {M, Bin, File} = code:get_object_code(erllama_tp_stream),
+    {module, M} = peer:call(P0, code, load_binary, [M, File, Bin]),
+    {ok, Id} = peer:call(
+        P0, erllama_tp_rank, serve, [R0, <<"tp_served">>, home(P0, Model), Opts, Descs], 600000
+    ),
+    NoCache = #{
+        min_tokens => infinity, cold_min_tokens => infinity, continued_interval => infinity
+    },
+    {ok, Ref} = peer:call(
+        P0,
+        erllama,
+        load_model,
+        [
+            <<"tp_one_gpu">>,
+            #{
+                backend => erllama_model_llama,
+                model_path => home(P0, Model),
+                model_opts => #{n_gpu_layers => 99},
+                context_opts => COpts,
+                policy => NoCache
+            }
+        ],
+        600000
+    ),
+    try
+        %% Greedy, fixed prompt: the same tokens as on one GPU.
+        Complete = fun(Mod) ->
+            {ok, #{generated := G}} = peer:call(
+                P0,
+                erllama,
+                complete,
+                [Mod, <<"The quick brown fox">>, #{response_tokens => 32, temperature => 0.0}],
+                120000
+            ),
+            G
+        end,
+        Split = Complete(Id),
+        One = Complete(Ref),
+        Same = length(lists:takewhile(fun({A, B}) -> A =:= B end, lists:zip(Split, One))),
+        ct:pal("greedy, 32 tokens: split ~w~none GPU ~w~nidentical for the first ~b", [
+            Split, One, Same
+        ]),
+        ?assert(Same >= 8),
+        %% A stream with a longer prompt, timed, on both.
+        Long = iolist_to_binary(
+            lists:duplicate(20, <<"The quick brown fox jumps over the lazy dog. ">>)
+        ),
+        {ok, PromptToks} = peer:call(P0, erllama, tokenize, [Id, Long]),
+        Timed = fun(Mod) ->
+            peer:call(P0, erllama_tp_stream, run, [Mod, Long, 128, infinity], 300000)
+        end,
+        _ = Timed(Ref),
+        [SplitRun, OneRun] = [Timed(Mod) || Mod <- [Id, Ref]],
+        [
+            ct:pal(
+                "~s: ~b prompt tokens, first token ~.1f ms (~.1f prompt tokens/s), ~b tokens, decode ~.1f tokens/s, median gap ~.2f ms, ended ~p",
+                [
+                    Name,
+                    length(PromptToks),
+                    maps:get(ttft_ms, Run),
+                    length(PromptToks) / maps:get(ttft_ms, Run) * 1000,
+                    maps:get(tokens, Run),
+                    decode_rate(Run),
+                    median(maps:get(gaps_ms, Run)),
+                    maps:get(ended, Run)
+                ]
+            )
+         || {Name, Run} <- [{"split over the ranks", SplitRun}, {"one GPU", OneRun}]
+        ],
+        ?assertEqual(128, maps:get(tokens, SplitRun)),
+        %% Cancel after 10 tokens; the next request is served.
+        Cancelled = peer:call(P0, erllama_tp_stream, run, [Id, Long, 128, 10], 300000),
+        ?assertMatch(#{ended := cancelled, tokens := 10}, Cancelled),
+        ?assertEqual(Split, Complete(Id)),
+        %% The followers made every reduction rank 0 made, in order.
+        Stats = [
+            element(2, peer:call(P, erllama_tp_rank, stats, [R]))
+         || {P, R} <- rank_pids(Config)
+        ],
+        [Sizes0 | Others] = [maps:get(sizes, St) || St <- Stats],
+        ct:pal("reductions per rank: ~w", [[maps:get(reductions, St) || St <- Stats]]),
+        [?assertEqual(Sizes0, Sz) || Sz <- Others],
+        %% A decode-sized reduction (2048 values, FP32), timed in each
+        %% rank's process, including the copy to and from the GPU.
+        Latency = parallel([
+            fun() -> peer:call(P, erllama_tp_rank, time_reduce, [R, 2048, 200], 120000) end
+         || {P, R} <- rank_pids(Config)
+        ]),
+        ct:pal("2048-value reduction, mean over 200 in the rank process: ~w us", [Latency])
+    after
+        peer:call(P0, erllama, unload, [Ref])
+    end.
+
+decode_rate(#{gaps_ms := []}) -> 0.0;
+decode_rate(#{gaps_ms := Gaps}) -> length(Gaps) / lists:sum(Gaps) * 1000.
+
+median([]) -> 0.0;
+median(L) -> lists:nth((length(L) + 1) div 2, lists:sort(L)).
 
 %% What NCCL chose for the data path, from each rank's INIT/NET log.
 transport_in_use(Config) ->

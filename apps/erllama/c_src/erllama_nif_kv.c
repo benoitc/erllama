@@ -49,6 +49,11 @@ ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
         return enif_make_badarg(env);
     }
+    /* A split model's KV, embeddings and speculative or media decodes
+     * are not kept in step across its ranks yet. */
+    if (ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
+    }
     /* Tokens (argv[1]) is informational; NTokens (argv[2]) ignored.
      * The model layer must have prefilled exactly the desired prefix
      * before calling kv_pack. argv[3], when present (arity 4),
@@ -110,6 +115,11 @@ ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
     if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
         return enif_make_badarg(env);
     }
+    /* A split model's KV, embeddings and speculative or media decodes
+     * are not kept in step across its ranks yet. */
+    if (ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
+    }
     ErlNifBinary in;
     if (!enif_inspect_binary(env, argv[1], &in)) {
         return enif_make_badarg(env);
@@ -169,6 +179,12 @@ ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
     if (!erllama_lock_ctx(c)) {
         return erllama_error(env, atom_released);
     }
+    if (c->tp_sink_set) {
+        ErlNifEnv *menv = enif_alloc_env();
+        erllama_tp_send(env, c, menv,
+                        enif_make_tuple4(menv, enif_make_atom(menv, "seq_rm"), enif_make_int(menv, seq_id),
+                                         enif_make_int(menv, p0), enif_make_int(menv, p1)));
+    }
     int rc = erllama_safe_memory_seq_rm(c->ctx, seq_id, p0, p1);
     /* Removing cells invalidates last-decode logits; force a fresh
      * prefill before the next sample. */
@@ -225,10 +241,22 @@ ERL_NIF_TERM nif_kv_seq_cp(ErlNifEnv *env, int argc,
         pthread_mutex_unlock(&c->mu);
         return erllama_error(env, enif_make_atom(env, "seq_cp_failed"));
     }
+    if (c->tp_sink_set) {
+        ErlNifEnv *menv = enif_alloc_env();
+        erllama_tp_send(env, c, menv,
+                        enif_make_tuple3(menv, enif_make_atom(menv, "seq_cp"), enif_make_int(menv, src),
+                                         enif_make_int(menv, dst)));
+    }
     int rc = erllama_safe_memory_seq_cp(c->ctx, src, dst);
     long dst_max =
         rc == 0 ? erllama_safe_memory_seq_pos_max(c->ctx, dst) : -2;
     if (rc != 0 || dst_max != src_max) {
+        if (c->tp_sink_set) {
+            ErlNifEnv *menv = enif_alloc_env();
+            erllama_tp_send(env, c, menv,
+                            enif_make_tuple4(menv, enif_make_atom(menv, "seq_rm"), enif_make_int(menv, dst),
+                                             enif_make_int(menv, 0), enif_make_int(menv, -1)));
+        }
         (void) erllama_safe_memory_seq_rm(c->ctx, dst, 0, -1);
         c->per_seq[dst].next_pos = 0;
         c->per_seq[dst].last_logits_idx = -1;

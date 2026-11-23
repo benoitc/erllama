@@ -104,6 +104,19 @@ ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     if (!erllama_parse_cparams(env, argv[1], &params)) {
         return enif_make_badarg(env);
     }
+    /* `tp_sink => Pid': only for a model split over a tensor-parallel
+     * rank (see erllama_ctx_decode). */
+    ErlNifPid tp_sink;
+    int tp_sink_set = 0;
+    {
+        ERL_NIF_TERM v;
+        if (enif_get_map_value(env, argv[1], enif_make_atom(env, "tp_sink"), &v)) {
+            if (!enif_get_local_pid(env, v, &tp_sink) || !m->tp_rank) {
+                return enif_make_badarg(env);
+            }
+            tp_sink_set = 1;
+        }
+    }
 
     /* The release_pending refusal: if free_model/1 has been called
      * and is waiting for the last context to drop, do not let a new
@@ -143,6 +156,10 @@ ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     res->ctx = ctx;
     res->model_res = m;
     res->decode_budget_ns = decode_budget_ns;
+    if (tp_sink_set) {
+        res->tp_sink = tp_sink;
+        res->tp_sink_set = 1;
+    }
     /* Install the per-step interrupt. data = res stays valid for the
      * context's lifetime (the context is freed before the resource in
      * ctx_dtor / free_context) and the callback only runs during a
