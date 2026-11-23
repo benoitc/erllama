@@ -238,7 +238,14 @@ rows_case(G, Name, Extent) ->
     ct:pal(
         "~p: fused KV rows as resolved on each rank: ~p~ndecode median ~.1f ms, p95 ~.1f ms; graph counters per rank over the 40 timed decodes: ~p",
         [
-            Name, kv_rows_lines(G), pct(Dec, 50), pct(Dec, 95), perf_delta(Perf0, Perf1)
+            Name,
+            [
+                lists:flatten(lists:join(" | ", [binary_to_list(L) || L <- Ls]))
+             || Ls <- kv_rows_lines(G)
+            ],
+            pct(Dec, 50),
+            pct(Dec, 95),
+            perf_delta(Perf0, Perf1)
         ]
     ),
     case Extent of
