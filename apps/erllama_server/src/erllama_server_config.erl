@@ -44,7 +44,11 @@ defaults() ->
         %% the recent messages kept verbatim; the summary's length.
         compact_threshold => 0.75,
         compact_keep_messages => 6,
-        compact_summary_tokens => 512
+        compact_summary_tokens => 512,
+        %% Sequences a model serves at once (its `parallel' load option
+        %% overrides it), sharing one KV pool of `n_ctx' when `kv_unified'.
+        default_parallel => 4,
+        kv_unified => true
     }.
 
 -spec validate() -> ok | {error, term()}.
@@ -91,14 +95,14 @@ valid(http, V) ->
     valid_http(V);
 valid(api_keys, V) ->
     is_list(V) andalso lists:all(fun is_name/1, V);
-valid(allow_unauthenticated, V) ->
+valid(K, V) when K =:= allow_unauthenticated; K =:= mcp_endpoint; K =:= kv_unified ->
     is_boolean(V);
 valid(mcp_servers, V) ->
     is_list(V) andalso lists:all(fun valid_mcp/1, V) andalso unique_names(V);
-valid(mcp_endpoint, V) ->
-    is_boolean(V);
 valid(compact_threshold, V) ->
     valid_fraction(V);
+valid(default_parallel, V) ->
+    is_integer(V) andalso V >= 1 andalso V =< 64;
 valid(_, V) ->
     is_integer(V) andalso V > 0.
 

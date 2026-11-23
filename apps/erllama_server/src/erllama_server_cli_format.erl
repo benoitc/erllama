@@ -64,15 +64,22 @@ format_ps([]) ->
     "no model loaded\n";
 format_ps(Ms) ->
     [
-        io_lib:format("~ts  ~p  ctx ~p  ~ts  ~ts~n", [
+        io_lib:format("~ts  ~p  ctx ~p  ~ts  ~ts  ~ts~n", [
             maps:get(id, M),
             maps:get(status, M, unknown),
             maps:get(context_size, M, 0),
             maps:get(quant_tag, M, <<"-">>),
+            seqs_text(M),
             keep_alive_text(M)
         ])
      || M <- Ms
     ].
+
+%% Requests a model serves at once, and how many run now.
+seqs_text(#{n_seq_max := N, available_seqs := A}) when is_integer(N), is_integer(A) ->
+    io_lib:format("~b of ~b sequences busy", [N - A, N]);
+seqs_text(_) ->
+    "".
 
 keep_alive_text(#{managed := true, holders := H}) when H > 0 ->
     io_lib:format("in use by ~b", [H]);

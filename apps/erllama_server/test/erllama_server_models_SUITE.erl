@@ -23,7 +23,8 @@
     unload_then_run_reloads/1,
     two_models_at_once/1,
     load_failure_reaches_every_waiter/1,
-    acquire_waits_for_eviction/1
+    acquire_waits_for_eviction/1,
+    second_request_is_not_queued/1
 ]).
 
 all() ->
@@ -37,7 +38,8 @@ all() ->
         unload_then_run_reloads,
         two_models_at_once,
         load_failure_reaches_every_waiter,
-        acquire_waits_for_eviction
+        acquire_waits_for_eviction,
+        second_request_is_not_queued
     ].
 
 init_per_testcase(TC, Config) ->
@@ -250,3 +252,42 @@ acquire_waits_for_eviction(Config) ->
     end,
     ?assert(loaded(Id)),
     Holder ! stop.
+
+%% Two users of one model: a short request that arrives while a long
+%% generation streams is served alongside it, not after it.
+second_request_is_not_queued(Config) ->
+    M = add_model(Config, <<"shared">>, #{step_delay_ms => 20}),
+    %% About 40 s of generation.
+    Long = run(M, #{opts => #{response_tokens => 2000}}),
+    ok = wait(fun() -> lists:member(token, events(Long)) end),
+    T0 = erlang:monotonic_time(millisecond),
+    Short = run(M, #{conversation_id => none, opts => #{response_tokens => 3}}),
+    Done = wait_short(Short, 5000),
+    Waited = erlang:monotonic_time(millisecond) - T0,
+    ct:log("the short request took ~b ms (~p)", [Waited, Done]),
+    ?assertMatch(#{status := done}, Done),
+    ?assertMatch({ok, #{status := running}}, erllama_server_api:run(Long)),
+    ok = erllama_server_api:cancel(Long).
+
+%% The run's result within `Ms', or what it was then.
+wait_short(Run, Ms) ->
+    Deadline = erlang:monotonic_time(millisecond) + Ms,
+    wait_short_until(Run, Deadline).
+
+wait_short_until(Run, Deadline) ->
+    case [R || #{run_id := Id, status := done} = R <- erllama_server_runs:list(), Id =:= Run] of
+        [_] ->
+            {ok, R} = erllama_server_api:result(Run),
+            R;
+        [] ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true ->
+                    %% Its process is parked in erllama waiting for a free
+                    %% sequence: read its state from the job table.
+                    [Info] = [R || #{run_id := Id} = R <- erllama_server_runs:list(), Id =:= Run],
+                    ct:fail({queued_behind_the_long_run, maps:with([status, model], Info)});
+                false ->
+                    timer:sleep(20),
+                    wait_short_until(Run, Deadline)
+            end
+    end.

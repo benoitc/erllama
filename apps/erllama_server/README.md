@@ -95,8 +95,10 @@ the release). A bad value stops the release from starting.
 | `data_dir` | `ERLLAMA_DATA_DIR`, else the platform user data directory | the model registry and downloaded files |
 | `keep_alive_ms` | `300000` | idle time before a model unloads (`infinity` keeps it) |
 | `default_n_ctx` | `4096` | context size when a model sets none (capped at its training context) |
+| `default_parallel` | `4` | requests a model serves at once (its `parallel` load option overrides it) |
+| `kv_unified` | `true` | those requests share one KV pool of `n_ctx` (`false`: each gets `n_ctx / parallel`) |
 | `default_model` | none | the model a request without one uses |
-| `models` | `[]` | local files registered at boot: `#{name, path}` plus `n_ctx`, `n_gpu_layers`, `mmproj`, `keep_alive` |
+| `models` | `[]` | local files registered at boot: `#{name, path}` plus `n_ctx`, `n_gpu_layers`, `parallel`, `kv_unified`, `mmproj`, `keep_alive` |
 | `hf_token` | `HF_TOKEN` | Hugging Face token for gated repositories |
 | `hf_base_url`, `ollama_base_url` | the public registries | where pulls go (a mirror) |
 | `max_active_pulls` | `4` | downloads at once |

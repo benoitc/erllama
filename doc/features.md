@@ -211,3 +211,34 @@ Terminal tests: `erllama_server_cli_input_tests` (continuation, blocks, commands
   - `erllama_vision_SUITE` on SmolVLM 256M: 6 of 7, the audio case skipped (no audio model locally);
   - `erllama_family_SUITE` on Mamba 130M (recurrent) and Gemma 3 270M (sliding window): 5 of 5.
 - **Not run:** the audio case (no audio GGUF and projector at hand); MCP against servers other than barrel_mcp's own (covered by `erllama_server_mcp_SUITE` against barrel_mcp over stdio and Streamable HTTP).
+
+## Shared serving: several requests on one model (2026-11-23)
+
+| Feature | State | Notes |
+|---|---|---|
+| finding | fixed | the server loaded every model with llama.cpp's default of one sequence (`n_seq_max = 1`), so a request on a busy model waited for the running generation to end: a short HTTP question during a long CLI reply got its first token only when the reply was done |
+| parallel sequences | done | a model serves `parallel` requests at once (default `default_parallel`, 4), batched into one decode per step; `erllama load ... --parallel N`; `ps` shows how many are busy |
+| KV pool | done | with `kv_unified` (default) the requests share one pool of `n_ctx` cells, each up to `n_ctx`, as llama-server with automatic slots; `kv_unified => false` gives each `n_ctx / parallel`; `parallel => 1` is the old behaviour |
+
+Tests that fail before the fix and pass after it:
+- `erllama_server_models_SUITE:second_request_is_not_queued`: a short request during a 40 s generation on the same model. Before, it was queued behind the long one; after, it is done in under 200 ms.
+- `erllama_server_http_SUITE:http_request_during_a_long_run`: a streamed `/v1/chat/completions` during a long CLI-style run. Before, there was no token within 2 s; after, the first token comes in about 100 ms.
+- Gated on Qwen2.5 1.5B, `real_model_concurrent_streams`: the short answer ("Paris.") in 238 ms while a 400-token reply goes on, and both end with text.
+
+### Benchmark: what a second user waits for
+
+`scripts/bench_shared_model.py`, measured on an Apple M-series machine with Metal: Qwen2.5 1.5B Q4_K_M, `n_ctx 4096`, greedy.
+- A 1500-token streamed reply; at token 750, a short streamed question (16 tokens) on the same model.
+- Medians of 3 runs. erllama_server is this branch (vendored llama.cpp v1.0.0); llama-server is MacPorts build b12110 with `-c 4096 -np 4 -kvu`.
+
+| Setup | Short: first token | Short: total | Long tok/s before / during / after | Long: longest gap |
+|---|---|---|---|---|
+| erllama, `parallel 1` (as before the fix) | 5429 ms | 5436 ms | 150 / 140 / n/a | 15 ms |
+| erllama, `parallel 4` | 67 ms | 76 ms | 149 / 67 / 139 | 39 ms |
+| llama-server, 4 slots, unified, `cache_prompt: false` | 47 ms | 58 ms | 151 / 40 / 139 | 40 ms |
+| llama-server, 4 slots, unified, prompt cache on | 19 ms (first run 84) | 28 ms | 146 / 96 / 134 | 19 ms |
+
+- With the fix, the second user waits about 67 ms instead of the rest of the first user's reply.
+- With both prefilling the short question from scratch, that is about 20 ms more than llama-server. The first user's longest pause (about 40 ms, the second request's prefill) is the same.
+- llama-server's slot cache also reuses a short prompt it has seen. erllama's cache keeps only prompts of at least 512 tokens (`min_tokens`), so a repeated short question is always prefilled.
+- Not measured here: a cache checkpoint of a long conversation pauses the model's other streams while it is saved (the save reads a paused context, an invariant of the cache). Its length depends on the conversation's size.

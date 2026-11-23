@@ -176,7 +176,8 @@ ps() ->
 
 -doc """
 Register a GGUF file on the release machine. `Opts`: `name`, `mmproj`,
-`n_ctx`, `n_gpu_layers`, `chat_template`, `keep_alive`.
+`n_ctx`, `n_gpu_layers`, `parallel` (requests served at once, default
+`default_parallel`), `kv_unified`, `chat_template`, `keep_alive`.
 """.
 -spec register_model(binary() | string(), map()) -> {ok, map()} | {error, term()}.
 register_model(Path, Opts) when is_map(Opts) ->
@@ -247,7 +248,7 @@ Download a model and register it; returns the job id to follow with
 `attach/3`. `Source`: `hf://ORG/REPO[:QUANT]`, `hf://ORG/REPO/FILE.gguf`,
 `https://...gguf`, `ollama://NAME[:TAG]` or `NAME[:TAG]`. `Opts`:
 `name`, `sha256` (https), `revision` (hf), `n_ctx`, `n_gpu_layers`,
-`keep_alive`.
+`parallel`, `kv_unified`, `keep_alive`.
 """.
 -spec pull(binary() | string(), map()) -> {ok, #{job_id := binary()}} | {error, term()}.
 pull(Source, Opts) when is_map(Opts) ->

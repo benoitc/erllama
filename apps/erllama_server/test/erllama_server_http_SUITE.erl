@@ -31,9 +31,11 @@
     load_on_demand_and_keep_alive/1,
     unload_during_stream/1,
     concurrent_requests_on_two_models/1,
+    http_request_during_a_long_run/1,
     ops_endpoints/1,
     real_model_tool_call/1,
     real_model_logprobs/1,
+    real_model_concurrent_streams/1,
     image_needs_a_projector/1,
     real_model_image_chat/1,
     anthropic_message/1,
@@ -67,9 +69,11 @@ all() ->
         load_on_demand_and_keep_alive,
         unload_during_stream,
         concurrent_requests_on_two_models,
+        http_request_during_a_long_run,
         ops_endpoints,
         real_model_tool_call,
         real_model_logprobs,
+        real_model_concurrent_streams,
         image_needs_a_projector,
         real_model_image_chat,
         anthropic_message,
@@ -413,6 +417,57 @@ disconnect_cancels_the_run(_Config) ->
     ok = wait(fun() -> erllama:status(<<"slow">>) =:= {ok, idle} end),
     ok = wait(fun() -> [R || #{status := cancelled} = R <- erllama_server_runs:list()] =/= [] end).
 
+%% A second user on the HTTP API, while a long generation (as the CLI
+%% starts one) streams on the same model: the first token comes at once,
+%% not when the long generation ends.
+http_request_during_a_long_run(Config) ->
+    Path = filename:join(?config(dir, Config), "shared.gguf"),
+    ok = file:write_file(Path, erllama_server_fake_registry:gguf(4096)),
+    {ok, #{name := Id}} = erllama_server_api:register_model(Path, #{
+        name => <<"shared">>, backend => erllama_model_stub, step_delay_ms => 20
+    }),
+    {ok, #{run_id := Long}} = erllama_server_api:start_run(#{
+        model => Id,
+        messages => [#{role => user, content => <<"a long story">>}],
+        opts => #{response_tokens => 2000}
+    }),
+    ok = wait(fun() -> erllama:status(Id) =:= {ok, generating} end),
+    Body = iolist_to_binary(
+        json:encode(
+            chat(<<"a short question">>, #{
+                <<"model">> => <<"shared">>, <<"max_tokens">> => 8, <<"stream">> => true
+            })
+        )
+    ),
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, erllama_server_http:port(), [binary, {active, false}]),
+    T0 = erlang:monotonic_time(millisecond),
+    ok = gen_tcp:send(S, [
+        <<"POST /v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: ">>,
+        integer_to_binary(byte_size(Body)),
+        <<"\r\n\r\n">>,
+        Body
+    ]),
+    First = first_content(S, <<>>, T0 + 2000),
+    Waited = erlang:monotonic_time(millisecond) - T0,
+    ct:log("first token after ~b ms: ~p", [Waited, First]),
+    ok = gen_tcp:close(S),
+    ?assertMatch({ok, #{status := running}}, erllama_server_api:run(Long)),
+    ok = erllama_server_api:cancel(Long).
+
+%% Read the response until a content delta arrives, or fail at `Deadline'.
+first_content(S, Acc, Deadline) ->
+    %% A delta with text (not the opening one, whose content is empty).
+    case re:run(Acc, <<"\"content\":\"[^\"]">>) of
+        nomatch ->
+            Left = Deadline - erlang:monotonic_time(millisecond),
+            case Left > 0 andalso gen_tcp:recv(S, 0, Left) of
+                {ok, More} -> first_content(S, <<Acc/binary, More/binary>>, Deadline);
+                _ -> ct:fail({no_first_token_in_time, Acc})
+            end;
+        {match, _} ->
+            Acc
+    end.
+
 load_on_demand_and_keep_alive(Config) ->
     Path = filename:join(?config(dir, Config), "lazy.gguf"),
     ok = file:write_file(Path, erllama_server_fake_registry:gguf(4096)),
@@ -551,6 +606,49 @@ real_model_tool_call(Config) ->
                 {skip, "the model's template synthesizes no tool grammar"}
         end
     end).
+
+%% Gated: a short question asked halfway through a long reply on the
+%% same real model is answered while the long one goes on, and both end
+%% with text. (No byte comparison: llama.cpp does not promise the same
+%% tokens whatever the batch.)
+real_model_concurrent_streams(Config) ->
+    with_real_model(<<"real_shared">>, fun(Id) ->
+        {ok, #{run_id := Long}} = erllama_server_api:start_run(#{
+            model => Id,
+            messages => [
+                #{role => user, content => <<"Count from 1 to 200, one number per line.">>}
+            ],
+            opts => #{response_tokens => 400, temperature => 0.0}
+        }),
+        ok = wait(fun() -> tokens_so_far(Long) >= 60 end),
+        T0 = erlang:monotonic_time(millisecond),
+        {200, Body} = post(
+            Config,
+            <<"/v1/chat/completions">>,
+            chat(<<"What is the capital of France? One word.">>, #{
+                <<"model">> => Id, <<"max_tokens">> => 8, <<"temperature">> => 0.0
+            })
+        ),
+        Took = erlang:monotonic_time(millisecond) - T0,
+        #{<<"choices">> := [#{<<"message">> := #{<<"content">> := Answer}}]} = decode(Body),
+        Running = erllama_server_api:run(Long),
+        ct:log("short answer in ~b ms: ~ts; long run then: ~p", [Took, Answer, Running]),
+        ?assert(byte_size(Answer) > 0),
+        ?assertMatch({ok, #{status := running}}, Running),
+        ok = wait(fun() ->
+            case erllama_server_api:result(Long) of
+                {ok, #{status := S}} -> S =/= running;
+                _ -> false
+            end
+        end),
+        {ok, #{status := done, content := LongText}} = erllama_server_api:result(Long),
+        ?assert(byte_size(LongText) > 100)
+    end).
+
+tokens_so_far(Run) ->
+    {ok, #{replay := Replay}} = erllama_server_api:attach(Run, self(), 0),
+    ok = erllama_server_api:detach(Run, self()),
+    length([T || #{type := token} = T <- Replay]).
 
 real_model_logprobs(Config) ->
     with_real_model(<<"real_logprobs">>, fun(Id) ->
