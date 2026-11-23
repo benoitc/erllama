@@ -178,8 +178,17 @@ shell(Ws, #{<<"command">> := Cmd} = Args, Ctx) when is_binary(Cmd), Cmd =/= <<>>
             Result = erllama_server_tool_shell:run(Ws, Cmd, Timeout),
             Text = erllama_server_tool_shell:format(Result),
             case maps:get(exit, Result) of
-                0 -> {ok, Text};
-                _ -> {error, Text}
+                0 ->
+                    {ok, Text};
+                timeout ->
+                    ok = erllama_server_failures:record(
+                        tool_timed_out,
+                        maps:get(owner_id, Ctx, <<>>),
+                        #{tool => <<"shell">>, command => Cmd, timeout_ms => Timeout}
+                    ),
+                    {error, Text};
+                _ ->
+                    {error, Text}
             end
     end;
 shell(_Ws, _, _Ctx) ->

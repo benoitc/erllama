@@ -533,7 +533,21 @@ ops_endpoints(Config) ->
     {200, _} = post(Config, <<"/v1/chat/completions">>, chat(<<"x">>)),
     {200, M} = get(Config, <<"/metrics">>),
     ?assertNotEqual(nomatch, binary:match(M, <<"erllama_server_models_loaded 2">>)),
-    ?assertNotEqual(nomatch, binary:match(M, <<"http_server_request_duration">>)).
+    ?assertNotEqual(nomatch, binary:match(M, <<"http_server_request_duration">>)),
+    ?assertNotEqual(nomatch, binary:match(M, <<"erllama_server_waiting_runs 0">>)),
+    %% What runs, waits and failed, as JSON.
+    {200, St} = get(Config, <<"/status">>),
+    ?assertMatch(
+        #{
+            <<"models">> := [_, _],
+            <<"runs">> := #{},
+            <<"agents">> := [],
+            <<"mcp">> := _,
+            <<"cache">> := #{<<"misses">> := _},
+            <<"failures">> := _
+        },
+        decode(St)
+    ).
 
 %% -----------------------------------------------------------------------------
 %% Gated: a real model

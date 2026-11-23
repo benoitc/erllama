@@ -202,4 +202,5 @@ object, followed by `[DONE]`.
 |---|---|
 | `GET /health` | `200` while the release runs |
 | `GET /ready` | `200` when the engine, the registry and the model manager are up, `503` and the failed checks otherwise |
-| `GET /metrics` | Prometheus text: HTTP request metrics, erllama's cache counters, loaded models, active runs and downloads |
+| `GET /metrics` | Prometheus text: HTTP request metrics, erllama's cache counters, loaded models, active and waiting runs, downloads, failures by kind |
+| `GET /status` | what runs, waits and failed, as JSON (the same as `erllama status`; see [Operating the release](operations.md)) |

@@ -135,6 +135,7 @@ load(Id) ->
                 {ok, Conv0} ->
                     {Conv, Repairs} = erllama_server_conv_log:recover(Conv0),
                     ok = erllama_server_conv_log:append(Id, Repairs),
+                    ok = recovered(Id, Repairs, <<"a run cut by the stop">>),
                     true = ets:insert(?TAB, {Id, Conv#{tools => #{}}});
                 {error, Why} ->
                     logger:warning(#{msg => "unreadable conversation log", id => Id, why => Why})
@@ -176,8 +177,38 @@ do_release(ConvId, RunId) ->
             C#{open_run => RunId, tools := Tools}
         ),
         ok = log(ConvId, Records),
+        ok = recovered(ConvId, Records, <<"a run that ended without finishing its turn">>),
         Repaired#{active_run := undefined, tools => #{}}
     end).
+
+%% What a repair did, for operators. Only repairs that changed the
+%% transcript (calls given a result) or freed a restart's cut run.
+recovered(ConvId, Records, What) ->
+    case [R || #{t := recovered} = R <- Records] of
+        [#{run := Run, unresolved := U}] ->
+            erllama_server_failures:record(
+                recovered,
+                ConvId,
+                #{run => Run, unresolved => U},
+                <<What/binary,
+                    ": calls left without a result got one; unresolved ones are never run again">>
+            );
+        [] when Records =/= [], What =:= <<"a run cut by the stop">> ->
+            erllama_server_failures:record(
+                recovered,
+                ConvId,
+                #{run => open_run(Records)},
+                <<What/binary, ": its conversation was freed">>
+            );
+        [] ->
+            ok
+    end.
+
+open_run(Records) ->
+    case [R || #{t := run, run := R} <- Records] of
+        [R | _] -> R;
+        [] -> undefined
+    end.
 
 do_tool(ConvId, Owner, What) ->
     owned(ConvId, Owner, fun(#{tools := Tools} = C) ->

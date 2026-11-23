@@ -16,6 +16,12 @@
 %% A conversation turn whose transcript nears the model's context is
 %% compacted first (erllama_server_compact), in a helper, once the
 %% model is held: `compacting', then `compacted' events.
+%%
+%% Admission waits for a free sequence when the model serves as many
+%% requests as it has; the stream is started from a helper, so the run
+%% keeps answering (info, attach, cancel) while it waits. Its phase
+%% (`loading', `compacting', `waiting', `generating') is kept in the
+%% job table for listings.
 
 -behaviour(gen_server).
 
@@ -51,7 +57,14 @@
     acquired = false :: boolean(),
     cancel_requested = false :: boolean(),
     %% The helper compacting the conversation before the turn.
-    compactor :: pid() | undefined
+    compactor :: pid() | undefined,
+    %% The helper starting the stream (admission may wait for a free
+    %% sequence).
+    admitting :: pid() | undefined,
+    %% Stream events that arrived before the helper said which stream
+    %% is ours (newest first).
+    early = [] :: [{reference(), term()}],
+    phase = loading :: erllama_server_runs:phase()
 }).
 -type state() :: #state{}.
 
@@ -91,7 +104,7 @@ handle_call(go, _From, #state{status = pending, model = Model, keep_alive = KA} 
         end,
     Self = self(),
     _ = spawn_link(fun() -> Self ! {acquired, erllama_server_models:acquire(Model, Self, KA)} end),
-    {reply, ok, St2};
+    {reply, ok, set_phase(loading, St2)};
 handle_call(go, _From, St) ->
     {reply, {error, already_started}, St};
 handle_call({attach, Sub, Cursor}, _From, #state{events = Ev, status = Status} = St) ->
@@ -110,6 +123,12 @@ handle_call(cancel, _From, #state{status = running, compactor = C} = St) when is
     Result = erllama_server_generate:finish(undefined, <<>>, <<>>, #{finish_reason => cancelled}),
     release_conv(St),
     {reply, ok, terminal(cancelled, Result, St#state{compactor = undefined})};
+handle_call(cancel, _From, #state{status = running, admitting = H} = St) when is_pid(H) ->
+    %% Still waiting for a sequence: end now. A stream admitted later
+    %% is cancelled when it arrives (`stream_started').
+    Result = erllama_server_generate:finish(undefined, <<>>, <<>>, #{finish_reason => cancelled}),
+    release_conv(St),
+    {reply, ok, terminal(cancelled, Result, St)};
 handle_call(cancel, _From, #state{status = running, ref = undefined} = St) ->
     {reply, ok, St#state{cancel_requested = true}};
 handle_call(cancel, _From, #state{status = running, ref = Ref} = St) ->
@@ -140,7 +159,7 @@ handle_info({acquired, {ok, _Id}}, #state{status = running, conv = Conv} = St) w
 handle_info({acquired, {ok, _Id}}, #state{status = running} = St) ->
     {noreply, stream_or_fail(St#state{acquired = true})};
 handle_info({compacting, C}, #state{compactor = C, status = running} = St) ->
-    {noreply, emit(compacting, #{}, St)};
+    {noreply, set_phase(compacting, emit(compacting, #{}, St))};
 handle_info({compaction, C, Outcome}, #state{compactor = C, status = running} = St) ->
     {noreply, stream_or_fail(compacted(Outcome, St#state{compactor = undefined}))};
 handle_info({acquired, {error, Reason}}, #state{status = running} = St) ->
@@ -148,13 +167,39 @@ handle_info({acquired, {error, Reason}}, #state{status = running} = St) ->
 handle_info({acquired, {ok, Id}}, St) ->
     erllama_server_models:release(Id, self()),
     {noreply, St};
+handle_info({stream_started, H, {ok, Ref, Parser}}, #state{admitting = H, status = running} = St) ->
+    St1 = St#state{
+        admitting = undefined,
+        early = [],
+        ref = Ref,
+        parser = Parser,
+        sp = erllama_server_generate:stream_parser(Parser)
+    },
+    Early = [E || {R, E} <- lists:reverse(St#state.early), R =:= Ref],
+    {noreply, replay_early(Early, set_phase(generating, St1))};
+handle_info({stream_started, H, {error, Reason}}, #state{admitting = H, status = running} = St) ->
+    {noreply, fail(Reason, St#state{admitting = undefined})};
+handle_info({stream_started, _H, {ok, Ref, _Parser}}, St) ->
+    %% Admitted after the run ended (cancelled while waiting, or its
+    %% model went down): nobody wants this stream.
+    _ = erllama:cancel(Ref),
+    {noreply, St#state{admitting = undefined, early = []}};
+handle_info({stream_started, _H, _}, St) ->
+    {noreply, St#state{admitting = undefined, early = []}};
 handle_info({'EXIT', _, normal}, St) ->
     {noreply, St};
 handle_info({erllama, Ref, Event}, #state{ref = Ref, status = running} = St) ->
     {noreply, stream_event(Event, St)};
+handle_info({erllama, Ref, Event}, #state{admitting = H, early = Early} = St) when is_pid(H) ->
+    %% The stream sends to this process as soon as it is admitted,
+    %% which can be before the helper's `stream_started'.
+    {noreply, St#state{early = [{Ref, Event} | Early]}};
 handle_info({ack, Sub, Seq}, #state{events = Ev} = St) when is_integer(Seq) ->
     {noreply, St#state{events = erllama_server_events:ack(Sub, Seq, Ev)}};
 handle_info({'DOWN', Mon, process, _, Reason}, #state{model_mon = Mon, status = running} = St) ->
+    ok = erllama_server_failures:record(model_down, St#state.model, #{
+        run => St#state.id, reason => Reason
+    }),
     {noreply, fail({model_down, Reason}, St#state{model_mon = undefined})};
 handle_info({'DOWN', Mon, process, Pid, _}, #state{events = Ev} = St) ->
     case erllama_server_events:down(Mon, Pid, Ev) of
@@ -209,22 +254,35 @@ start_stream(#state{model = Model, input = Input, opts = Opts, parent_key = PK} 
                     undefined -> Opts;
                     _ -> Opts#{parent_key => PK}
                 end,
-            case erllama_server_generate:start(Model, Input, Opts1, self()) of
-                {ok, Ref, Parser} ->
-                    St1 = St#state{
-                        ref = Ref,
-                        parser = Parser,
-                        sp = erllama_server_generate:stream_parser(Parser),
-                        model_mon = erlang:monitor(process, MPid),
-                        status = running
-                    },
-                    {ok, St1};
-                {error, _} = E ->
-                    E
-            end;
+            Self = self(),
+            Helper = spawn_link(fun() ->
+                Self ! {stream_started, self(), start_generation(Model, Input, Opts1, Self)}
+            end),
+            St1 = St#state{admitting = Helper, model_mon = erlang:monitor(process, MPid)},
+            {ok, set_phase(waiting, St1)};
         {error, not_loaded} ->
             {error, {model_not_loaded, Model}}
     end.
+
+replay_early([], St) ->
+    St;
+replay_early([E | Rest], #state{status = running} = St) ->
+    replay_early(Rest, stream_event(E, St));
+replay_early(_, St) ->
+    St.
+
+%% In the helper: a crash in it is this run's error, not the run's
+%% own crash.
+start_generation(Model, Input, Opts, To) ->
+    try
+        erllama_server_generate:start(Model, Input, Opts, To)
+    catch
+        Class:Reason -> {error, {Class, Reason}}
+    end.
+
+set_phase(Phase, #state{id = Id} = St) ->
+    ok = erllama_server_runs:set_phase(Id, Phase),
+    St#state{phase = Phase}.
 
 started_data(#state{id = Id, conv = Conv, model = Model}) ->
     #{run_id => Id, conversation_id => Conv, model => Model}.
@@ -262,7 +320,8 @@ complete(Stats, #state{parser = Parser, text = T, thinking = Th} = St) ->
             terminal(done, Result, St)
     end.
 
-fail(Reason, St) ->
+fail(Reason, #state{id = Id} = St) ->
+    ok = erllama_server_failures:record(run_failed, Id, Reason),
     release_conv(St),
     terminal(error, #{error => Reason}, St).
 
@@ -295,12 +354,16 @@ release_conv(#state{conv = Conv, id = Id}) -> erllama_server_convs:release(Conv,
 emit(Type, Data, #state{events = Ev} = St) ->
     St#state{events = erllama_server_events:emit(Type, Data, Ev)}.
 
-summary(#state{id = Id, conv = Conv, model = Model, status = Status, events = Ev}) ->
-    #{
+summary(#state{id = Id, conv = Conv, model = Model, status = Status, phase = Phase, events = Ev}) ->
+    Base = #{
         run_id => Id,
         kind => run,
         conversation_id => Conv,
         model => Model,
         status => Status,
         next_seq => erllama_server_events:next_seq(Ev)
-    }.
+    },
+    case Status of
+        running -> Base#{phase => Phase};
+        _ -> Base
+    end.

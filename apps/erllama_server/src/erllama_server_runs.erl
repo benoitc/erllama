@@ -11,18 +11,31 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, start/1, lookup/1, list/0, set_status/2, active_count/0, active_count/1]).
+-export([
+    start_link/0,
+    start/1,
+    lookup/1,
+    list/0,
+    set_status/2,
+    set_phase/2,
+    active_count/0,
+    active_count/1
+]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(TAB, ?MODULE).
 
 -type status() :: running | done | cancelled | error.
 -type kind() :: run | pull | agent.
+%% Where a running job is: a run loads its model, may compact the
+%% conversation, waits for a free sequence, then generates. Other jobs
+%% stay `running'.
+-type phase() :: running | loading | compacting | waiting | generating.
 
 %% Monitor ref of each run process, to its run id.
 -record(state, {mons = #{} :: #{reference() => binary()}}).
 -type state() :: #state{}.
--export_type([status/0, kind/0]).
+-export_type([status/0, kind/0, phase/0]).
 
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
@@ -53,15 +66,19 @@ list() ->
 set_status(RunId, Status) ->
     gen_server:cast(?MODULE, {set_status, RunId, Status}).
 
+-spec set_phase(binary(), phase()) -> ok.
+set_phase(RunId, Phase) ->
+    gen_server:cast(?MODULE, {set_phase, RunId, Phase}).
+
 -spec active_count() -> non_neg_integer().
 active_count() ->
     active_count(run).
 
 -spec active_count(kind()) -> non_neg_integer().
 active_count(Kind) ->
-    ets:select_count(?TAB, [{{'_', '_', '_', '_', '_', running, Kind}, [], [true]}]).
+    ets:select_count(?TAB, [{{'_', '_', '_', '_', '_', running, Kind, '_'}, [], [true]}]).
 
-to_map({RunId, Pid, ConvId, Model, StartedAt, Status, Kind}) ->
+to_map({RunId, Pid, ConvId, Model, StartedAt, Status, Kind, Phase}) ->
     #{
         run_id => RunId,
         kind => Kind,
@@ -69,7 +86,8 @@ to_map({RunId, Pid, ConvId, Model, StartedAt, Status, Kind}) ->
         conversation_id => ConvId,
         model => Model,
         started_at => StartedAt,
-        status => Status
+        status => Status,
+        phase => Phase
     }.
 
 -spec init([]) -> {ok, state()}.
@@ -93,7 +111,8 @@ handle_call({start, #{run_id := RunId} = Spec}, _From, #state{mons = Mons} = S) 
                         maps:get(model, Spec),
                         erlang:system_time(millisecond),
                         running,
-                        Kind
+                        Kind,
+                        running
                     },
                     true = ets:insert(?TAB, Row),
                     Mon = erlang:monitor(process, Pid),
@@ -108,14 +127,18 @@ handle_call(_Req, _From, S) ->
 handle_cast({set_status, RunId, Status}, S) ->
     _ = ets:update_element(?TAB, RunId, {6, Status}),
     {noreply, S};
+handle_cast({set_phase, RunId, Phase}, S) ->
+    _ = ets:update_element(?TAB, RunId, {8, Phase}),
+    {noreply, S};
 handle_cast(_Msg, S) ->
     {noreply, S}.
 
-handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{mons = Mons} = S) ->
+handle_info({'DOWN', Mon, process, _Pid, Reason}, #state{mons = Mons} = S) ->
     case maps:take(Mon, Mons) of
         {RunId, Mons1} ->
+            ok = job_down(RunId, Reason),
             case ets:lookup(?TAB, RunId) of
-                [{_, _, ConvId, _, _, _, _}] when ConvId =/= undefined ->
+                [{_, _, ConvId, _, _, _, _, _}] when ConvId =/= undefined ->
                     release_conv(ConvId, RunId);
                 _ ->
                     ok
@@ -130,6 +153,19 @@ handle_info(_Msg, S) ->
 
 %% The conversation store may be restarting; the lock it held is gone
 %% with it then.
+%% A job process that crashed (not one that ended).
+job_down(_RunId, Reason) when Reason =:= normal; Reason =:= shutdown ->
+    ok;
+job_down(_RunId, {shutdown, _}) ->
+    ok;
+job_down(RunId, Reason) ->
+    Kind =
+        case ets:lookup(?TAB, RunId) of
+            [{_, _, _, _, _, _, agent, _}] -> agent_down;
+            _ -> run_failed
+        end,
+    erllama_server_failures:record(Kind, RunId, Reason).
+
 release_conv(ConvId, RunId) ->
     try
         erllama_server_convs:release(ConvId, RunId)

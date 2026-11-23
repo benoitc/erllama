@@ -838,7 +838,7 @@ through the model process.
     {ok, [non_neg_integer()]} | {error, term()}.
 tokenize(Model, Text) when is_binary(Text) ->
     case shared(Model) of
-        {_Pid, {Mod, S}} -> shared_result(wrap_ok(Mod:tokenize(S, Text)));
+        {_Pid, {Mod, S}} -> shared_result(guarded(fun() -> wrap_ok(Mod:tokenize(S, Text)) end));
         undefined -> call(Model, {tokenize, Text}, infinity)
     end.
 
@@ -847,7 +847,9 @@ tokenize(Model, Text) when is_binary(Text) ->
 tokenize(Model, Text, Opts) when is_binary(Text), is_map(Opts) ->
     case shared(Model) of
         {_Pid, {Mod, S}} ->
-            shared_result(wrap_ok(backend_tokenize_with_opts(Mod, S, Text, Opts)));
+            shared_result(
+                guarded(fun() -> wrap_ok(backend_tokenize_with_opts(Mod, S, Text, Opts)) end)
+            );
         undefined ->
             call(Model, {tokenize, Text, Opts}, infinity)
     end.
@@ -860,7 +862,7 @@ concurrently with `complete/2,3`.
     {ok, binary()} | {error, term()}.
 detokenize(Model, Tokens) when is_list(Tokens) ->
     case shared(Model) of
-        {_Pid, {Mod, S}} -> shared_result(wrap_ok(Mod:detokenize(S, Tokens)));
+        {_Pid, {Mod, S}} -> shared_result(guarded(fun() -> wrap_ok(Mod:detokenize(S, Tokens)) end));
         undefined -> call(Model, {detokenize, Tokens}, infinity)
     end.
 
@@ -875,7 +877,9 @@ arity-2 form drops them).
 detokenize(Model, Tokens, Opts) when is_list(Tokens), is_map(Opts) ->
     case shared(Model) of
         {_Pid, {Mod, S}} ->
-            shared_result(wrap_ok(backend_detokenize_with_opts(Mod, S, Tokens, Opts)));
+            shared_result(
+                guarded(fun() -> wrap_ok(backend_detokenize_with_opts(Mod, S, Tokens, Opts)) end)
+            );
         undefined ->
             call(Model, {detokenize, Tokens, Opts}, infinity)
     end.
@@ -918,7 +922,7 @@ chat_apply(Model, Inputs) when is_map(Inputs) ->
             undefined -> not_found
         end,
     case Cached of
-        {ok, Templates} -> erllama_chat:apply(Templates, Inputs);
+        {ok, Templates} -> guarded(fun() -> erllama_chat:apply(Templates, Inputs) end);
         not_found -> call(Model, {chat_apply, Inputs}, infinity)
     end.
 
@@ -2281,30 +2285,40 @@ handle_common(_State, {call, From}, {reset_session, SessionId}, Data) ->
     {NewData, Outcome} = reset_session_seq(SessionId, Data),
     reply(From, {ok, Outcome}, NewData);
 handle_common(_State, {call, From}, {tokenize, Text}, Data) ->
-    reply(From, wrap_ok(backend_call(Data, tokenize, [Text])), Data);
+    reply(From, guarded(fun() -> wrap_ok(backend_call(Data, tokenize, [Text])) end), Data);
 handle_common(
     _State, {call, From}, {tokenize, Text, Opts}, #data{backend = Mod, backend_state = S} = Data
 ) ->
-    reply(From, wrap_ok(backend_tokenize_with_opts(Mod, S, Text, Opts)), Data);
+    reply(
+        From, guarded(fun() -> wrap_ok(backend_tokenize_with_opts(Mod, S, Text, Opts)) end), Data
+    );
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
-    reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
+    reply(From, guarded(fun() -> wrap_ok(backend_call(Data, detokenize, [Tokens])) end), Data);
 handle_common(
     _State, {call, From}, {detokenize, Tokens, Opts}, #data{backend = Mod, backend_state = S} = Data
 ) ->
-    reply(From, wrap_ok(backend_detokenize_with_opts(Mod, S, Tokens, Opts)), Data);
+    reply(
+        From,
+        guarded(fun() -> wrap_ok(backend_detokenize_with_opts(Mod, S, Tokens, Opts)) end),
+        Data
+    );
 handle_common(_State, {call, From}, vocab_info, Data) ->
     reply(From, optional_backend_call(Data, vocab_info, []), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
-    reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
+    reply(
+        From,
+        guarded(fun() -> optional_backend_call(Data, apply_chat_template, [Request]) end),
+        Data
+    );
 handle_common(_State, {call, From}, {chat_apply, Inputs}, Data) ->
-    reply(From, do_chat_apply(Data, Inputs), Data);
+    reply(From, guarded(fun() -> do_chat_apply(Data, Inputs) end), Data);
 handle_common(_State, {call, From}, chat_purge, Data) ->
     erllama_chat_cache:purge(Data#data.model_id),
     reply(From, ok, Data);
 handle_common(_State, {call, From}, {embed, Tokens}, Data) ->
-    reply(From, optional_backend_call(Data, embed, [Tokens]), Data);
+    reply(From, guarded(fun() -> optional_backend_call(Data, embed, [Tokens]) end), Data);
 handle_common(_State, {call, From}, {embed_batch, TokenLists}, Data) ->
-    reply(From, embed_each(Data, TokenLists, []), Data);
+    reply(From, guarded(fun() -> embed_each(Data, TokenLists, []) end), Data);
 handle_common(State, {call, From}, {load_adapter, Path}, Data) ->
     handle_load_adapter(State, From, Path, Data);
 handle_common(State, {call, From}, {unload_adapter, Handle}, Data) ->
@@ -2480,6 +2494,16 @@ reply(From, Reply, Data) ->
 
 %% Wrap a backend tokenize/detokenize raw result in `{ok, _}` so the
 %% public API surface stays uniform across backends.
+%% A request the native code rejects (a malformed message list, a token
+%% id out of range) is that caller's error, not the model's: the model
+%% process serves everyone else and must not crash on it.
+guarded(Fun) ->
+    try
+        Fun()
+    catch
+        error:badarg -> {error, badarg}
+    end.
+
 wrap_ok({error, _} = E) -> E;
 wrap_ok(Result) -> {ok, Result}.
 

@@ -18,7 +18,8 @@
     "\n",
     "commands:\n",
     "  ping                          check that the release is running\n",
-    "  status                        versions, loaded models, active jobs\n",
+    "  status                        what runs, waits and failed: models, runs,\n",
+    "                                agents, MCP servers, cache, recent failures\n",
     "  models                        the registry's models and what is loaded\n",
     "  pull SOURCE [--name NAME] [--sha256 HEX] [--detach]\n",
     "                                download a model: hf://ORG/REPO[:QUANT],\n",
@@ -37,6 +38,8 @@
     "  chat MODEL [--conversation ID] [--max-tokens N]\n",
     "                                chat line by line; /help lists the commands\n",
     "  agent MODEL --workspace PATH | --conversation ID [--yes | --read-only] [--max-rounds N]\n",
+    "  agent --attach AGENT          go back to a running session: its pending\n",
+    "                                approvals and tools, then its latest turn\n",
     "                                work with tools in PATH on the release machine;\n",
     "                                /help lists the commands of a session\n",
     "  agents                        list the agent sessions\n",
@@ -49,6 +52,8 @@
     "                                read, export, copy, shorten or delete a\n",
     "                                conversation, or follow what runs in it\n",
     "  runs                          list the runs and downloads the release holds\n",
+    "  inspect JOB                   a run or agent session in detail: phase,\n",
+    "                                approvals, tools, background jobs, budgets\n",
     "  attach JOB [--from SEQ]       follow a run or download from an event sequence\n",
     "  cancel JOB                    cancel a run or download\n",
     "  result JOB                    print a finished run's or download's result\n",
@@ -60,12 +65,23 @@
 
 -spec main([string()]) -> no_return().
 main(Args) ->
+    ok = log_to_stderr(),
     %% A terminal: Ctrl-C is handled here (see erllama_server_cli_term).
     _ = erllama_server_cli_term:start(),
     {Code, Output} = run(Args),
     ok = erllama_server_cli_term:finish(),
-    io:put_chars(Output),
+    ok = erllama_server_cli_term:safe_put(standard_io, Output),
     halt(Code).
+
+%% Diagnostics go to standard error: standard output is the command's
+%% result, and may be a pipe its reader closes.
+log_to_stderr() ->
+    _ = logger:remove_handler(default),
+    %% The CLI reports its own errors; of OTP's reports, only the
+    %% critical ones (a closed output pipe is logged as an error).
+    logger:add_handler(default, logger_std_h, #{
+        level => critical, config => #{type => standard_error}
+    }).
 
 %% Run one command and return its exit code and remaining output, so
 %% commands can be tested without halting the VM. Streaming commands
@@ -132,6 +148,7 @@ command("agent") ->
         [
             {"--workspace", workspace, string},
             {"--conversation", conversation_id, string},
+            {"--attach", attach, string},
             {"--yes", yes, flag},
             {"--read-only", read_only, flag},
             {"--max-rounds", max_rounds, int}
@@ -150,6 +167,8 @@ command("conversation") ->
     {[{"--format", format, string}], fun erllama_server_cli_conv:conversation/4};
 command("runs") ->
     {[], fun runs/4};
+command("inspect") ->
+    {[], fun inspect/4};
 command("attach") ->
     {[{"--from", from, int}], fun attach/4};
 command("cancel") ->
@@ -180,7 +199,7 @@ ping(_, _, _, _) ->
 
 status(Node, _Info, _Opts, []) ->
     reply(
-        erllama_server_client:call(Node, status, []), fun erllama_server_cli_format:format_status/1
+        erllama_server_client:call(Node, status, []), fun erllama_server_cli_status:format_status/1
     );
 status(_, _, _, _) ->
     usage("status").
@@ -292,6 +311,14 @@ runs(Node, _Info, _Opts, []) ->
     reply(erllama_server_client:call(Node, runs, []), fun erllama_server_cli_format:format_runs/1);
 runs(_, _, _, _) ->
     usage("runs").
+
+inspect(Node, _Info, _Opts, [Id]) ->
+    reply(
+        erllama_server_client:call(Node, inspect, [list_to_binary(Id)]),
+        fun erllama_server_cli_status:format_inspect/1
+    );
+inspect(_, _, _, _) ->
+    usage("inspect").
 
 attach(Node, _Info, Opts, [RunId]) ->
     %% Ctrl-C detaches: the run goes on.

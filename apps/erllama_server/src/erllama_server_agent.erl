@@ -90,6 +90,9 @@
     compact_from :: gen_statem:from() | undefined,
     calls = [] :: [#call{}],
     jobs = #{} :: #{binary() => pid()},
+    %% The event sequence of the latest turn's `turn_started', so a
+    %% client that comes back can replay that turn.
+    turn_seq :: non_neg_integer() | undefined,
     finish_key :: term(),
     retention :: non_neg_integer(),
     closed = false :: boolean()
@@ -176,6 +179,7 @@ handle_event(info, {'DOWN', Mon, process, Pid, Reason}, State, D) ->
 handle_event(info, {'EXIT', Gen, Reason}, generating, #d{gen = Gen} = D) when is_pid(Gen) ->
     %% The round died without reporting (a crash, or killed from
     %% outside): the turn fails, and its model hold is released.
+    ok = erllama_server_failures:record(turn_failed, D#d.id, {generator_exited, Reason}),
     end_turn({error, {generator_exited, Reason}}, D#d{gen = undefined}, []);
 handle_event(info, {'EXIT', C, Reason}, compacting, #d{compactor = C} = D) when is_pid(C) ->
     compaction_done({error, {compactor_exited, Reason}}, D#d{compactor = undefined});
@@ -232,6 +236,7 @@ handle_event(info, {agent_gen, Gen, {delta, Type, Data}}, generating, #d{gen = G
 handle_event(info, {agent_gen, Gen, {done, Result}}, generating, #d{gen = Gen} = D) ->
     after_generation(Result, D#d{gen = undefined});
 handle_event(info, {agent_gen, Gen, {error, Reason}}, generating, #d{gen = Gen} = D) ->
+    ok = erllama_server_failures:record(turn_failed, D#d.id, Reason),
     end_turn({error, Reason}, D#d{gen = undefined}, []);
 %% --- tools ----------------------------------------------------------------------
 handle_event(info, {tool_done, Worker, Index, Result}, tools, D) ->
@@ -258,7 +263,8 @@ start_turn(Text, #d{budgets = #{max_elapsed_ms := Ms}} = D) ->
     Ref = make_ref(),
     _ = erlang:send_after(Ms, self(), {turn_deadline, Ref}),
     Turn = #{rounds => 0, tokens => 0, deadline => now_ms() + Ms, deadline_ref => Ref},
-    start_compaction(#{}, emit(turn_started, #{input => Text}, D1#d{turn = Turn})).
+    Seq = erllama_server_events:next_seq(D1#d.events),
+    start_compaction(#{}, emit(turn_started, #{input => Text}, D1#d{turn = Turn, turn_seq = Seq})).
 
 %% Measure the transcript, and compact it when needed (or always, with
 %% `force'), in a helper that holds the model for the session.
@@ -381,22 +387,11 @@ plan_call(I, #{id := Id, function := #{name := Name, arguments := ArgsJson}}, D)
 
 approve_call(CallId, Decision, From, #d{calls = Calls, policy = Policy} = D) ->
     case [C || #call{id = Id, status = pending} = C <- Calls, Id =:= CallId] of
-        [#call{} = C] ->
+        [#call{name = Name, mcp = Mcp} = C] ->
             {Updated, Policy1} =
-                case Decision of
-                    deny ->
-                        {
-                            C#call{
-                                status = done, result = {error, <<"the user declined this call">>}
-                            },
-                            Policy
-                        };
-                    allow ->
-                        {C#call{status = queued}, Policy};
-                    always ->
-                        {C#call{status = queued}, Policy#{
-                            erllama_server_agent_policy:grant_key(C#call.name, C#call.mcp) => auto
-                        }}
+                case erllama_server_agent_policy:decide(Decision, Name, Mcp, Policy) of
+                    {queued, Pol} -> {C#call{status = queued}, Pol};
+                    {{done, Result}, Pol} -> {C#call{status = done, result = Result}, Pol}
                 end,
             D1 = D#d{calls = replace(Updated, Calls), policy = Policy1},
             case [P || #call{status = pending} = P <- D1#d.calls] of
@@ -449,7 +444,7 @@ start_call(
     %% known to have maybe run, and is never run again.
     ok = erllama_server_convs:tool_intent(Conv, Owner, Id, Name, Args),
     Self = self(),
-    Ctx0 = #{workspace => Ws, owner => Self, jobs => Jobs},
+    Ctx0 = #{workspace => Ws, owner => Self, owner_id => Owner, jobs => Jobs},
     Ctx =
         case C#call.mcp of
             undefined -> Ctx0;
@@ -603,7 +598,10 @@ shutdown(#d{jobs = Jobs, conv = Conv, id = Id} = D) ->
 
 down(Mon, Pid, Reason, tools, #d{calls = Calls} = D) ->
     case [C || #call{worker = {W, M}} = C <- Calls, W =:= Pid, M =:= Mon] of
-        [#call{index = I}] ->
+        [#call{index = I, name = Name}] ->
+            ok = erllama_server_failures:record(tool_crashed, D#d.id, #{
+                tool => Name, reason => Reason
+            }),
             Text = iolist_to_binary(io_lib:format("the tool crashed: ~0p", [Reason])),
             tool_finished(Pid, I, {error, Text}, D);
         [] ->
@@ -631,17 +629,21 @@ emit(Type, Data, #d{events = Ev} = D) ->
 preview(Text) when byte_size(Text) > 400 -> <<(binary:part(Text, 0, 400))/binary, "...">>;
 preview(Text) -> Text.
 
-summary(State, #d{id = Id, conv = Conv, model = M, workspace = Ws, queue = Q, events = Ev}) ->
-    #{
+summary(State, #d{id = Id, conv = Conv, model = M, workspace = Ws, queue = Q, events = Ev} = D) ->
+    erllama_server_status:agent_summary(State, #{
         run_id => Id,
         kind => agent,
         conversation_id => Conv,
         model => M,
         workspace => Ws,
-        state => State,
         queued => length(Q),
         status => status(State),
-        next_seq => erllama_server_events:next_seq(Ev)
-    }.
+        next_seq => erllama_server_events:next_seq(Ev),
+        turn_seq => D#d.turn_seq,
+        calls => [{St, CId, N, A} || #call{status = St, id = CId, name = N, args = A} <- D#d.calls],
+        jobs => D#d.jobs,
+        budgets => D#d.budgets,
+        turn => D#d.turn
+    }).
 
 now_ms() -> erlang:monotonic_time(millisecond).

@@ -23,6 +23,7 @@ start_link() ->
 init([]) ->
     SupFlags = #{strategy => rest_for_one, intensity => 5, period => 30},
     Children = [
+        worker(erllama_server_failures),
         worker(erllama_server_registry),
         worker(erllama_server_models),
         worker(erllama_server_runs),

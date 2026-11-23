@@ -9,6 +9,12 @@
 %% running on the release. Ctrl-C interrupts the turn; a second one
 %% leaves the CLI. Commands: /new, /sessions, /switch ID, /fork,
 %% /compact, /prompt, /help, /quit (the session goes on), /stop.
+%%
+%% Going back to a running session (`agent --attach ID', /switch ID)
+%% shows what it is doing, then replays its latest turn from the
+%% session's event buffer and follows it live: output produced while
+%% no client was attached is shown, and a part of the turn the bounded
+%% buffer no longer holds is reported as a gap.
 
 -export([prompt_args/1]).
 -export([agent/4, agents/4, stop/4]).
@@ -25,6 +31,13 @@
     "a line ending in \\ goes on; \"\"\" opens a block up to \"\"\"\n"
 ]).
 
+agent(Node, _Info, #{attach := Id} = Opts, []) ->
+    ok = erllama_server_cli_term:interactive(),
+    S0 = #{node => Node, id => undefined, conv => undefined, cursor => 0, opts => Opts},
+    case to_session(bin(Id), S0) of
+        #{id := undefined} -> {1, ""};
+        S -> loop(S)
+    end;
 agent(Node, _Info, Opts, [Model]) when
     is_map_key(workspace, Opts); is_map_key(conversation_id, Opts)
 ->
@@ -33,11 +46,31 @@ agent(Node, _Info, Opts, [Model]) when
         {ok, S} ->
             say("[/quit leaves the session running, /stop ends it, /help lists commands]\n"),
             loop(S#{model => Model, opts => Opts});
+        {error, conversation_busy} ->
+            {1, busy_text(Node, maps:get(conversation_id, Opts))};
         {error, Reason} ->
             erllama_server_cli:fail(Reason)
     end;
 agent(_, _, _, _) ->
     erllama_server_cli:usage("agent").
+
+%% The conversation is held by a running job: name it, and how to go
+%% back to it when it is a session.
+busy_text(Node, Conv) ->
+    case erllama_server_client:call(Node, conversation, [erllama_server_cli:to_bin(Conv)]) of
+        {ok, #{active_run := <<"agent_", _/binary>> = Id}} ->
+            [
+                "erllama: session ",
+                Id,
+                " is working in this conversation; erllama agent --attach ",
+                Id,
+                "\n"
+            ];
+        {ok, #{active_run := Id}} when is_binary(Id) ->
+            ["erllama: run ", Id, " is working in this conversation; erllama attach ", Id, "\n"];
+        _ ->
+            "erllama: the conversation already has a run in progress\n"
+    end.
 
 %% A new session: its id, conversation, and where its events start.
 start_session(Node, Spec) ->
@@ -122,18 +155,61 @@ mcp_prompt(Args, S) ->
             S
     end.
 
-%% Go to a running session, from the next event it will send.
+%% Go to a running session: what it is doing, then its latest turn
+%% (replayed, then followed live while it runs).
 to_session(Id, #{node := Node} = S) ->
-    case erllama_server_client:call(Node, run, [Id]) of
-        {ok, #{kind := agent, conversation_id := Conv, next_seq := Next}} ->
+    case erllama_server_client:call(Node, inspect, [Id]) of
+        {ok, #{kind := agent, conversation_id := Conv, next_seq := Next, model := M} = Info} ->
             announce(Id, Conv),
-            S#{id := Id, conv := Conv, cursor := Next};
+            say(arrival_text(Info)),
+            S1 = S#{id := Id, conv := Conv, cursor := Next, model => binary_to_list(M)},
+            Pending = [C || #{call_id := C} <- maps:get(approvals, Info, [])],
+            catch_up(maps:get(turn_seq, Info, undefined), Next, Pending, S1);
         {ok, _} ->
             say(["[", Id, " is not an agent session]\n"]),
             S;
         {error, Reason} ->
             say_error(Reason),
             S
+    end.
+
+arrival_text(#{state := State} = I) ->
+    Parts =
+        [
+            T
+         || {K, What} <- [{approvals, "approval(s) pending"}, {tools, "tool call(s) running"}],
+            N <- [length(maps:get(K, I, []))],
+            N > 0,
+            T <- [io_lib:format("~b ~s", [N, What])]
+        ] ++
+            [
+                io_lib:format("~b background job(s)", [N])
+             || N <- [length([J || #{running := true} = J <- maps:get(jobs, I, [])])],
+                N > 0
+            ],
+    ["[", atom_to_list(State), [[", ", P] || P <- Parts], "]\n"].
+
+%% Replay the latest turn from `TurnSeq' up to its end (following it
+%% live if it still runs). A replayed approval request is asked only
+%% if that call is still pending (`Pending', as of event `Next').
+catch_up(undefined, _Next, _Pending, S) ->
+    S;
+catch_up(TurnSeq, Next, Pending, #{node := Node, id := Id} = S) ->
+    say(io_lib:format("[the latest turn, from event ~b]~n", [TurnSeq])),
+    Sink = fun
+        (#{type := approval_request, seq := Seq, data := #{call_id := C, name := N}} = E) when
+            Seq < Next
+        ->
+            case lists:member(C, Pending) of
+                true -> event(Node, Id, E);
+                false -> say(["[", N, " ", C, " was already answered]\n"])
+            end;
+        (E) ->
+            event(Node, Id, E)
+    end,
+    case follow_turn(Node, Id, TurnSeq, Sink) of
+        {ok, #{type := turn_done, seq := Seq}} -> S#{cursor := Seq + 1};
+        _ -> S
     end.
 
 %% A new session on a copy of this session's conversation.
@@ -183,17 +259,23 @@ is_pair(_) -> false.
 
 bin(S) -> unicode:characters_to_binary(S).
 
+%% Follow a session from `Cursor' to the end of a turn; Ctrl-C
+%% interrupts the turn.
+follow_turn(Node, Id, Cursor, Sink) ->
+    erllama_server_cli_term:interrupt(
+        fun() -> erllama_server_client:call(Node, agent_interrupt, [Id]) end,
+        fun() ->
+            erllama_server_client:follow(Node, Id, Cursor, Sink, fun(#{type := T}) ->
+                T =:= turn_done
+            end)
+        end
+    ).
+
 %% Send input (or a prompt) and follow the turn. Ctrl-C interrupts it.
 turn(Fun, Args, #{node := Node, id := Id, cursor := Cursor} = S) ->
     case erllama_server_client:call(Node, Fun, [Id | Args]) of
         Sent when Sent =:= ok; element(1, Sent) =:= queued ->
-            Sink = fun(E) -> event(Node, Id, E) end,
-            Stop = fun(#{type := T}) -> T =:= turn_done end,
-            Result = erllama_server_cli_term:interrupt(
-                fun() -> erllama_server_client:call(Node, agent_interrupt, [Id]) end,
-                fun() -> erllama_server_client:follow(Node, Id, Cursor, Sink, Stop) end
-            ),
-            case Result of
+            case follow_turn(Node, Id, Cursor, fun(E) -> event(Node, Id, E) end) of
                 {ok, #{type := turn_done, seq := Seq}} -> loop(S#{cursor := Seq + 1});
                 {ok, #{type := done}} -> {0, "[session ended]\n"};
                 {ok, _} -> {1, "[session ended unexpectedly]\n"};

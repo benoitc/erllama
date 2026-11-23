@@ -94,7 +94,8 @@ routes() ->
         {<<"POST">>, <<"/api/push">>, {erllama_server_ollama_models, not_supported}},
         {<<"GET">>, <<"/health">>, {erllama_server_http_ops, health}},
         {<<"GET">>, <<"/ready">>, {erllama_server_http_ops, ready}},
-        {<<"GET">>, <<"/metrics">>, {erllama_server_http_ops, metrics}}
+        {<<"GET">>, <<"/metrics">>, {erllama_server_http_ops, metrics}},
+        {<<"GET">>, <<"/status">>, {erllama_server_http_ops, status}}
     ].
 
 -spec middleware() -> list().
