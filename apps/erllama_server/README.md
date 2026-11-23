@@ -1,13 +1,40 @@
 # erllama_server
 
-The erllama_server release owns loaded models, KV state, conversations,
-agent runs and MCP connections, and serves them to a terminal client
-and to HTTP clients. You need this page if you want to run the server
-rather than embed the [erllama library](../erllama/README.md) in your
-own application.
+erllama_server is a local inference and agent service that keeps
+running: one release loads your models and owns the conversations, runs
+and agent sessions, and the `erllama` CLI, HTTP clients and other
+Erlang nodes are clients of it. You need this page to run it. To call a
+model from your own OTP application without a service, use the
+[erllama library](../erllama/README.md) instead.
 
-This app is being built in phases; the current state is tracked in
-[doc/features.md](../../doc/features.md).
+## What you get
+
+- **Several clients share one loaded model.** A model serves `parallel`
+  requests at once, batched into each decode step (default 4). Past the
+  release's limits, work is refused (HTTP 429) instead of queued
+  without end. See [Managing models](../../guides/server/models.md).
+- **Clients come and go; the work stays.** A run or an agent session
+  keeps going when its terminal closes. Another terminal can attach,
+  replay what it missed and answer the approvals waiting for it.
+  Conversations are kept on disk and survive a restart.
+- **Failures stay with their owner.** Each run, agent session, tool
+  call and MCP connection is its own process: a slow or crashed tool, a
+  dead MCP server or a killed model affects only the work that used
+  it, and `erllama status` shows what runs, what waits and what failed.
+  See [Operating the release](../../guides/server/operations.md).
+- **Computed prefixes are reused.** The KV cache is exact: a
+  conversation's earlier turns and a long shared system prompt are
+  restored instead of prefilled again.
+- **The engine stays a library.** The same erllama runs inside your OTP
+  application; the release is the service around it.
+
+What it does not do: a crash in native code (llama.cpp, the NIF) ends
+the whole VM; a restart keeps the conversations, not the computation
+that was in flight; and requests on one model share its hardware, so
+more at once means each is slower. The measurements behind these
+points are in [doc/features.md](../../doc/features.md), and
+[A walkthrough](../../guides/server/demo.md) shows them on a real
+model.
 
 ## Build and run the release
 
@@ -49,7 +76,9 @@ $R/bin/erllama help
 ```
 
 Runs belong to the release: they keep going when the CLI exits, and
-you can attach to them again by id. See
+you can attach to them again by id. `erllama status` shows what runs,
+waits and failed, and `erllama inspect JOB` one run or session in
+detail. See
 [Driving the release from the CLI](../../guides/server/rpc.md) for
 conversations, reattachment, the node and cookie setup, TLS for remote
 administration, and what each error means, and
@@ -61,7 +90,8 @@ registry, keep-alive and memory pressure.
 The release listens on `127.0.0.1:8080` and answers OpenAI
 (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
 `/v1/models`, `/v1/responses`), Anthropic (`/v1/messages`) and Ollama
-(`/api/...`) requests, plus `/health`, `/ready` and `/metrics`. See
+(`/api/...`) requests, plus `/health`, `/ready`, `/metrics` and
+`/status`. See
 [The HTTP APIs](../../guides/server/http.md) for every supported field,
 API keys and limits.
 
@@ -72,8 +102,9 @@ $R/bin/erllama agent qwen --workspace /srv/projects/app
 ```
 
 The model reads, searches and edits files in the workspace and runs
-commands there, asking before it changes anything. See
-[Agent sessions](../../guides/server/agent.md).
+commands there, asking before it changes anything. `/quit` leaves the
+session running; `erllama agent --attach AGENT` goes back to it from
+any terminal. See [Agent sessions](../../guides/server/agent.md).
 
 Conversations, sessions' included, are kept on disk and survive a
 restart. See [Conversations](../../guides/server/conversations.md).

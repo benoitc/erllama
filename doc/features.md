@@ -247,8 +247,6 @@ Tests that fail before the fix and pass after it:
 
 ## Work that outlives its client, and what an operator sees (2026-11-23)
 
-The audit behind this section is in [differentiation.md](differentiation.md).
-
 | Feature | State | Notes |
 |---|---|---|
 | runtime view | done | `erllama status`, `erllama inspect JOB`, `GET /status` (JSON) and `/metrics`: loaded models with busy sequences and requests waiting for one, runs by phase, agent sessions with pending approvals, running tools and background jobs, MCP servers, cache activity, memory, recent failures |

@@ -30,7 +30,7 @@ you> /quit
 |---|---|
 | `/new` | a new session on the same model and workspace (the current one keeps running) |
 | `/sessions` | lists the agent sessions |
-| `/switch ID` | goes to session `ID`, or starts one on conversation `ID` |
+| `/switch ID` | goes to session `ID` (as `--attach`, below), or starts one on conversation `ID` |
 | `/fork` | a new session on a copy of this session's conversation |
 | `/compact` | shortens this session's conversation now |
 | `/prompt SERVER NAME [KEY=VALUE ...]` | sends an MCP server's prompt as your input (see [MCP servers](mcp.md)) |
@@ -47,6 +47,43 @@ you> /quit
   the workspace that conversation was last worked in.
 - `--max-rounds N` limits how many times the model may call tools in
   one turn.
+
+## Come back to a session
+
+A session goes on while no terminal is attached: it finishes its turn,
+and it waits at an approval until someone answers. From any terminal:
+
+```bash
+$R/bin/erllama agents
+$R/bin/erllama agent --attach agent_8df9f3ad195f07b7
+[agent agent_8df9f3ad195f07b7, conversation conv_e4379d97781c24c2]
+[approving, 1 approval(s) pending]
+[the latest turn, from event 1]
+looking first
+allow write_file {"path":"away.txt","content":"done"}? [y]es / [n]o / [a]lways: y
+written while you were away
+you>
+```
+
+- You see what the session is doing (its state, approvals waiting,
+  tool calls and background jobs running), then its latest turn
+  replayed from the start, then the rest of it live.
+- An approval request in the replay is asked only if that call is
+  still waiting; one already answered is shown as answered.
+- The release keeps the last `run_buffer_events` events of a session
+  (default 1024). If the turn started before that, you are told which
+  events are gone and the replay starts at the oldest one kept.
+- `erllama agent MODEL --conversation ID` on a conversation a session
+  is working in names that session and the `--attach` command.
+- `erllama inspect AGENT` shows the same without attaching: state,
+  approvals with their arguments, tools, jobs, the turn's use of its
+  budgets, and where its latest turn starts (`erllama attach AGENT
+  --from N` prints its raw events).
+
+Coming back works while the session's process runs. After a release
+restart the session is gone; its conversation is kept, and
+`erllama agent MODEL --conversation ID` starts a new session on it.
+A tool call the restart cut is marked unresolved and never run again.
 
 ## The tools
 
