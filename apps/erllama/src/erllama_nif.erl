@@ -84,7 +84,9 @@
     tp_matvec/5,
     tp_reduce/2,
     tp_close/1,
-    tp_bootstrap_selftest/5
+    tp_bootstrap_selftest/5,
+    tp_stats/1,
+    tp_decode/2
 ]).
 
 -export_type([tp_rank_ref/0, tp_bridge_ref/0]).
@@ -779,3 +781,12 @@ nif_tp_reduce(_Rank, _F32) -> erlang:nif_error(nif_not_loaded).
 nif_tp_close(_Rank) -> erlang:nif_error(nif_not_loaded).
 nif_tp_bootstrap_selftest(_World, _Payload, _Rounds, _Agent, _TimeoutMs) ->
     erlang:nif_error(nif_not_loaded).
+
+-spec tp_stats(tp_rank_ref()) -> {ok, map()}.
+tp_stats(Rank) -> nif_tp_stats(Rank).
+
+-spec tp_decode(context_ref(), [token_id()]) -> {ok, binary()} | {error, atom()}.
+tp_decode(Ctx, Tokens) -> nif_tp_decode(Ctx, Tokens).
+
+nif_tp_stats(_Rank) -> erlang:nif_error(nif_not_loaded).
+nif_tp_decode(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).

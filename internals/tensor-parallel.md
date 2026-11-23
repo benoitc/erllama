@@ -5,8 +5,8 @@ several machines, one GPU each, computing parts of the same layers for
 the same request. Read it before changing `erllama_tp`, the rank NIFs
 in `c_src/erllama_tp_nif.cpp` or the tests that drive them. The work
 is experimental and comes in milestones; this page describes what
-exists now (milestone 1: a reduction between ranks) and how failures
-behave.
+exists now (a reduction between ranks, and a model split over them)
+and how failures behave.
 
 ## The model
 
@@ -73,6 +73,49 @@ and expanded back. A buffer handed to the all-reduce must carry
 `GGML_TENSOR_FLAG_COMPUTE`, or the backend treats it as no contribution
 and zeroes it; `nif_tp_reduce` sets it.
 
+## Splitting a model over the ranks
+
+A model is loaded with llama.cpp's own tensor split
+(`LLAMA_SPLIT_MODE_TENSOR`) over one device per rank, in rank order:
+load it with `tp_rank => Rank` (an open erllama_tp handle) and every
+rank loads the same file with the same options. erllama supplies the
+devices (`c_src/erllama_tp_nif.cpp`, built on ggml's backend
+interfaces):
+
+- the device at this rank's slot wraps the local GPU and forwards
+  everything to it, except that its backends report the wrapper, so the
+  split backend asks the wrapper's registry for its collectives;
+- the devices at the other slots stand for the other ranks: their
+  buffers reserve address space (`PROT_NONE`) and no memory, their
+  graphs compute nothing and their tensors read as zeros.
+
+So each rank holds and computes only its slices, from the same split
+rules (`llama_meta_device_get_split_state`), in the split backend's
+order, and each all-reduce the split backend asks for is this rank's
+tensor through the rank's communicator, at the same point on every
+rank. No vendored file is changed.
+
+Two things the split backend does not do across processes:
+
+- **Stream order.** The communicator runs on the CUDA stream of the
+  backend it was created with, not the one the model computes on. CUDA
+  events order the two around every reduction.
+- **The output head.** `output.weight` is split along the vocabulary,
+  so each rank computes part of the logits (the other parts read as
+  zeros). `erllama_nif:tp_decode/2` sums them over the ranks in chunks
+  below the FP32 threshold, so the sum is exact and every rank holds
+  the full logits; rank 0 samples.
+
+The devices are never registered with ggml: llama.cpp's default device
+selection would otherwise pick them up for ordinary loads. A rank stays
+open while a model is loaded on it (`erllama_tp:close/1` answers
+`{error, in_use}`).
+
+`erllama_tp_rank` drives this for tests: `load/3`, `decode/2` (every
+rank at once), `stats/1` (the reductions made, with their sizes in
+order, and what the placeholders reserve) and a single-GPU reference
+copy (`ref_load/3`, `ref_decode/2`).
+
 ## What a failure does
 
 | Failure | Result |
@@ -98,7 +141,8 @@ formed again, under a new coordinator (a new generation).
 - `test/erllama_tp_nccl_SUITE.erl` is opt-in, on CUDA hosts prepared
   with `scripts/tp_hosts.sh`. The plan's matrix fixture, a
   decode-sized FP32 reduction and a prefill-sized BF16 one with stated
-  tolerances, a missing rank, repeated open and close, and the
+  tolerances, a missing rank, repeated open and close, a GGUF split
+  evenly and unevenly against the same model on one GPU, and the
   transport NCCL chose.
 
 ```bash
@@ -114,10 +158,19 @@ must reach each other by the names given (rank 0's node runs the
 coordinator), and the build must be `rebar3 as test compile` so the
 rank nodes load the test build.
 
+## When you bump llama.cpp
+
+The devices implement ggml's internal backend interfaces
+(`ggml/src/ggml-backend-impl.h`), which change between pins (new entries
+in the buffer type interface between b10593 and v1.0.0), and rely on
+how the split backend behaves (`ggml/src/ggml-backend-meta.cpp`, the
+fastest-moving file). A changed interface fails the build; a changed
+behaviour fails `erllama_tp_nccl_SUITE`, so run it on the CUDA hosts at
+every bump.
+
 ## Not done yet
 
-Running a model across ranks (milestones 2 to 4): rank-local execution
-of a transformer block from the pinned split rules, the full model with
-one sampling rank, failure handling during generation and coordinated
-cache checkpoints. Groups of more than two hosts and Metal are not
-qualified.
+Serving through the normal erllama path (load, stream, cancel) with one
+sampling rank driving the others, failure handling during generation,
+coordinated cache checkpoints, a model too large for one GPU, groups of
+more than two hosts, and Metal.

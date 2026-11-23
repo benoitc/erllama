@@ -31,9 +31,17 @@
 #include <string>
 #include <vector>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-backend-impl.h"
 #include "erllama_safe.h"
 
 namespace {
@@ -182,6 +190,8 @@ bool bootstrap_cb(void *user_data, const void *send_buf, void *recv_buf, size_t 
 /* Rank                                                              */
 /* ---------------------------------------------------------------- */
 
+struct tp_group;
+
 struct tp_rank {
     pthread_mutex_t mu;
     ggml_backend_t backend = nullptr;
@@ -190,9 +200,19 @@ struct tp_rank {
     ggml_backend_comm_allreduce_tensor_t allreduce = nullptr;
     int rank = 0;
     int world = 0;
+    /* The devices a model is loaded on (created on first use). */
+    tp_group *group = nullptr;
+    /* Models loaded on the group: the rank stays open while any lives. */
+    std::atomic<int> models{0};
 };
 
+void group_free(tp_group *g);
+
 void rank_release(tp_rank *r) {
+    if (r->group) {
+        group_free(r->group);
+        r->group = nullptr;
+    }
     if (r->comm && r->comm_free) {
         try {
             r->comm_free(r->comm);
@@ -235,6 +255,306 @@ ggml_backend_dev_t gpu_device(int idx) {
 void *reg_proc(ggml_backend_dev_t dev, const char *name) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+/* ---------------------------------------------------------------- */
+/* The group's devices                                               */
+/* ---------------------------------------------------------------- */
+/*
+ * A model is loaded with llama.cpp's own tensor split
+ * (LLAMA_SPLIT_MODE_TENSOR) over `world' devices, one per rank, in
+ * rank order. On this rank:
+ *
+ *   - the device at this rank's slot wraps the local GPU: everything is
+ *     forwarded to it, except that its backends report this device, so
+ *     the split backend asks this device's reg for its collectives;
+ *   - the devices at the other slots are placeholders for the other
+ *     ranks: their buffers reserve address space and no memory, their
+ *     graphs compute nothing, and their tensors read as zeros.
+ *
+ * So this rank holds and computes only its own slices, in the split
+ * backend's order, and every all-reduce the split backend asks for is
+ * this rank's tensor through the rank's communicator (the other ranks
+ * do the same at the same point).
+ *
+ * The communicator queues its work on the CUDA stream of the backend it
+ * was created with, not the one the model computes on: events order the
+ * two streams around each reduction.
+ */
+
+struct tp_dev_ctx {
+    tp_group *g = nullptr;
+    int slot = 0;
+    std::string name;
+    std::string desc;
+};
+
+struct tp_group {
+    tp_rank *rank = nullptr;
+    int world = 0;
+    int slot = 0;
+    ggml_backend_dev_t local = nullptr;
+    ggml_backend_reg reg;
+    std::vector<ggml_backend_device> devs;
+    std::vector<tp_dev_ctx> dctx;
+    ggml_backend_buffer_type ph_buft;
+    /* Bytes the placeholders reserve (what the other ranks hold), and
+     * the reductions made, with their sizes in order (bounded). */
+    std::atomic<uint64_t> remote_bytes{0};
+    std::atomic<uint64_t> reductions{0};
+    std::mutex log_mu;
+    std::vector<int64_t> sizes;
+};
+
+/* What the split backend's comm_init returns: the backend this rank
+ * computes on and the events ordering it with the communicator. */
+struct tp_comm {
+    tp_group *g = nullptr;
+    ggml_backend_t compute = nullptr;
+    ggml_backend_event_t before = nullptr;
+    ggml_backend_event_t after = nullptr;
+};
+
+constexpr size_t TP_LOG_MAX = 65536;
+
+tp_dev_ctx *dc(ggml_backend_dev_t d) {
+    return static_cast<tp_dev_ctx *>(d->context);
+}
+
+ggml_backend_dev_t local_of(ggml_backend_dev_t d) {
+    return dc(d)->g->local;
+}
+
+/* --- the wrapper around the local GPU --- */
+
+const char *w_name(ggml_backend_dev_t d) { return dc(d)->name.c_str(); }
+const char *w_desc(ggml_backend_dev_t d) { return ggml_backend_dev_description(local_of(d)); }
+void w_memory(ggml_backend_dev_t d, size_t *f, size_t *t) { ggml_backend_dev_memory(local_of(d), f, t); }
+enum ggml_backend_dev_type w_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; }
+void w_props(ggml_backend_dev_t d, struct ggml_backend_dev_props *p) {
+    ggml_backend_dev_get_props(local_of(d), p);
+    p->name = dc(d)->name.c_str();
+}
+ggml_backend_t w_init(ggml_backend_dev_t d, const char *params) {
+    ggml_backend_t b = ggml_backend_dev_init(local_of(d), params);
+    if (b) {
+        b->device = d;
+    }
+    return b;
+}
+ggml_backend_buffer_type_t w_buft(ggml_backend_dev_t d) { return ggml_backend_dev_buffer_type(local_of(d)); }
+ggml_backend_buffer_type_t w_host_buft(ggml_backend_dev_t d) { return ggml_backend_dev_host_buffer_type(local_of(d)); }
+ggml_backend_buffer_t w_from_ptr(ggml_backend_dev_t d, void *ptr, size_t size, size_t max) {
+    return ggml_backend_dev_buffer_from_host_ptr(local_of(d), ptr, size, max);
+}
+bool w_supports_op(ggml_backend_dev_t d, const struct ggml_tensor *op) { return ggml_backend_dev_supports_op(local_of(d), op); }
+bool w_supports_buft(ggml_backend_dev_t d, ggml_backend_buffer_type_t b) { return ggml_backend_dev_supports_buft(local_of(d), b); }
+bool w_offload_op(ggml_backend_dev_t d, const struct ggml_tensor *op) { return ggml_backend_dev_offload_op(local_of(d), op); }
+ggml_backend_event_t w_event_new(ggml_backend_dev_t d) { return ggml_backend_event_new(local_of(d)); }
+void w_event_free(ggml_backend_dev_t, ggml_backend_event_t e) { ggml_backend_event_free(e); }
+void w_event_sync(ggml_backend_dev_t, ggml_backend_event_t e) { ggml_backend_event_synchronize(e); }
+
+const struct ggml_backend_device_i WRAPPER_I = {
+    w_name, w_desc, w_memory, w_type, w_props, w_init, w_buft, w_host_buft, w_from_ptr,
+    w_supports_op, w_supports_buft, w_offload_op, w_event_new, w_event_free, w_event_sync,
+};
+
+/* --- placeholders for the other ranks --- */
+
+struct ph_buffer {
+    void *base = nullptr;
+    size_t map = 0;
+    tp_group *g = nullptr;
+};
+
+void ph_free_buffer(ggml_backend_buffer_t b) {
+    auto *pb = static_cast<ph_buffer *>(b->context);
+    if (pb->base && pb->map) {
+        munmap(pb->base, pb->map);
+    }
+    pb->g->remote_bytes -= b->size;
+    delete pb;
+}
+void *ph_base(ggml_backend_buffer_t b) { return static_cast<ph_buffer *>(b->context)->base; }
+void ph_memset(ggml_backend_buffer_t, struct ggml_tensor *, uint8_t, size_t, size_t) {}
+void ph_set(ggml_backend_buffer_t, struct ggml_tensor *, const void *, size_t, size_t) {}
+void ph_get(ggml_backend_buffer_t, const struct ggml_tensor *, void *data, size_t, size_t size) { memset(data, 0, size); }
+bool ph_cpy(ggml_backend_buffer_t, const struct ggml_tensor *, struct ggml_tensor *) { return false; }
+void ph_clear(ggml_backend_buffer_t, uint8_t) {}
+
+const struct ggml_backend_buffer_i PH_BUFFER_I = {
+    ph_free_buffer, ph_base, nullptr, ph_memset, ph_set, ph_get, nullptr, nullptr, ph_cpy, ph_clear,
+    nullptr, nullptr, nullptr, nullptr,
+};
+
+tp_group *buft_group(ggml_backend_buffer_type_t buft) { return static_cast<tp_group *>(buft->context); }
+ggml_backend_buffer_type_t local_buft(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_dev_buffer_type(buft_group(buft)->local);
+}
+
+const char *ph_buft_name(ggml_backend_buffer_type_t) { return "ERLLAMA_TP_REMOTE"; }
+/* Address space only (PROT_NONE): nothing may read or write it, so a
+ * stray access faults instead of reading garbage. */
+ggml_backend_buffer_t ph_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    size_t map = ((size > 0 ? size : 1) + page - 1) / page * page;
+    void *base = mmap(nullptr, map, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) {
+        return nullptr;
+    }
+    auto *pb = new ph_buffer();
+    pb->base = base;
+    pb->map = map;
+    pb->g = buft_group(buft);
+    pb->g->remote_bytes += size;
+    return ggml_backend_buffer_init(buft, PH_BUFFER_I, pb, size);
+}
+/* Same alignment, maximum and padding as the local GPU, so a
+ * placeholder holds what the rank it stands for does. */
+size_t ph_align(ggml_backend_buffer_type_t b) { return ggml_backend_buft_get_alignment(local_buft(b)); }
+size_t ph_max(ggml_backend_buffer_type_t b) { return ggml_backend_buft_get_max_size(local_buft(b)); }
+size_t ph_alloc_size(ggml_backend_buffer_type_t b, const struct ggml_tensor *t) {
+    return ggml_backend_buft_get_alloc_size(local_buft(b), t);
+}
+bool ph_is_host(ggml_backend_buffer_type_t) { return false; }
+
+const struct ggml_backend_buffer_type_i PH_BUFT_I = {
+    ph_buft_name, ph_alloc, nullptr, ph_align, ph_max, ph_alloc_size, nullptr, ph_is_host,
+};
+
+const char *phb_name(ggml_backend_t b) { return dc(b->device)->name.c_str(); }
+void phb_free(ggml_backend_t b) { delete b; }
+void phb_set_async(ggml_backend_t, struct ggml_tensor *, const void *, size_t, size_t) {}
+void phb_get_async(ggml_backend_t, const struct ggml_tensor *, void *data, size_t, size_t size) { memset(data, 0, size); }
+void phb_sync(ggml_backend_t) {}
+enum ggml_status phb_compute(ggml_backend_t, struct ggml_cgraph *) { return GGML_STATUS_SUCCESS; }
+
+const struct ggml_backend_i PH_BACKEND_I = {
+    phb_name, phb_free, phb_set_async, phb_get_async, nullptr, nullptr, nullptr, phb_sync,
+    nullptr, nullptr, nullptr, nullptr, phb_compute, nullptr, nullptr, nullptr,
+};
+
+ggml_guid ph_guid = {0x65, 0x72, 0x6c, 0x6c, 0x61, 0x6d, 0x61, 0x5f, 0x74, 0x70, 0x5f, 0x72, 0x65, 0x6d, 0x6f, 0x74};
+
+const char *p_desc(ggml_backend_dev_t d) { return dc(d)->desc.c_str(); }
+void p_props(ggml_backend_dev_t d, struct ggml_backend_dev_props *p) {
+    memset(p, 0, sizeof(*p));
+    p->name = dc(d)->name.c_str();
+    p->description = dc(d)->desc.c_str();
+    p->type = GGML_BACKEND_DEVICE_TYPE_GPU;
+    ggml_backend_dev_memory(local_of(d), &p->memory_free, &p->memory_total);
+}
+ggml_backend_t p_init(ggml_backend_dev_t d, const char *) {
+    return new ggml_backend{&ph_guid, PH_BACKEND_I, d, dc(d)};
+}
+ggml_backend_buffer_type_t p_buft(ggml_backend_dev_t d) { return &dc(d)->g->ph_buft; }
+bool p_supports_op(ggml_backend_dev_t, const struct ggml_tensor *) { return true; }
+bool p_supports_buft(ggml_backend_dev_t d, ggml_backend_buffer_type_t b) { return b == &dc(d)->g->ph_buft; }
+
+const struct ggml_backend_device_i PLACEHOLDER_I = {
+    w_name, p_desc, w_memory, w_type, p_props, p_init, p_buft, nullptr, nullptr,
+    p_supports_op, p_supports_buft, nullptr, nullptr, nullptr, nullptr,
+};
+
+/* --- the reg: the split backend's collectives --- */
+
+void *comm_init(ggml_backend_t *backends, size_t n) {
+    if (n == 0 || !backends[0] || !backends[0]->device) {
+        return nullptr;
+    }
+    tp_group *g = dc(backends[0]->device)->g;
+    if ((int) n != g->world || !backends[g->slot]) {
+        return nullptr;
+    }
+    auto *c = new tp_comm();
+    c->g = g;
+    c->compute = backends[g->slot];
+    c->before = ggml_backend_event_new(g->local);
+    c->after = ggml_backend_event_new(g->local);
+    if (!c->before || !c->after) {
+        if (c->before) ggml_backend_event_free(c->before);
+        if (c->after) ggml_backend_event_free(c->after);
+        delete c;
+        return nullptr;
+    }
+    return c;
+}
+
+void comm_free(void *ctx) {
+    auto *c = static_cast<tp_comm *>(ctx);
+    if (!c) {
+        return;
+    }
+    ggml_backend_event_free(c->before);
+    ggml_backend_event_free(c->after);
+    delete c;
+}
+
+bool comm_allreduce(void *ctx, struct ggml_tensor **tensors) {
+    auto *c = static_cast<tp_comm *>(ctx);
+    tp_group *g = c->g;
+    tp_rank *r = g->rank;
+    ggml_tensor *t = tensors[g->slot];
+    ggml_backend_event_record(c->before, c->compute);
+    ggml_backend_event_wait(r->backend, c->before);
+    ggml_tensor *mine[1] = {t};
+    bool ok = r->allreduce(r->comm, mine);
+    ggml_backend_event_record(c->after, r->backend);
+    ggml_backend_event_wait(c->compute, c->after);
+    g->reductions++;
+    {
+        std::lock_guard<std::mutex> l(g->log_mu);
+        if (g->sizes.size() < TP_LOG_MAX) {
+            g->sizes.push_back(ggml_nelements(t));
+        }
+    }
+    return ok;
+}
+
+const char *reg_name(ggml_backend_reg_t) { return "ERLLAMA_TP"; }
+size_t reg_count(ggml_backend_reg_t r) { return static_cast<tp_group *>(r->context)->devs.size(); }
+ggml_backend_dev_t reg_dev(ggml_backend_reg_t r, size_t i) { return &static_cast<tp_group *>(r->context)->devs[i]; }
+void *tp_reg_proc(ggml_backend_reg_t, const char *name) {
+    if (strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *) comm_init;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *) comm_allreduce;
+    }
+    if (strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *) comm_free;
+    }
+    return nullptr;
+}
+
+const struct ggml_backend_reg_i REG_I = {reg_name, reg_count, reg_dev, tp_reg_proc};
+
+tp_group *group_new(tp_rank *r, ggml_backend_dev_t local) {
+    auto *g = new tp_group();
+    g->rank = r;
+    g->world = r->world;
+    g->slot = r->rank;
+    g->local = local;
+    g->reg = ggml_backend_reg{GGML_BACKEND_API_VERSION, REG_I, g};
+    g->ph_buft = ggml_backend_buffer_type{PH_BUFT_I, nullptr, g};
+    g->dctx.resize((size_t) g->world);
+    g->devs.resize((size_t) g->world);
+    for (int i = 0; i < g->world; i++) {
+        tp_dev_ctx &d = g->dctx[(size_t) i];
+        d.g = g;
+        d.slot = i;
+        d.name = "TP" + std::to_string(i);
+        d.desc = i == g->slot ? std::string(ggml_backend_dev_description(local))
+                              : "erllama tensor-parallel rank " + std::to_string(i);
+        g->devs[(size_t) i] = ggml_backend_device{i == g->slot ? WRAPPER_I : PLACEHOLDER_I, &g->reg, &d};
+    }
+    /* Any placeholder: the one after this rank's slot. */
+    g->ph_buft.device = &g->devs[(size_t) ((g->slot + 1) % g->world)];
+    return g;
+}
+
+void group_free(tp_group *g) {
+    delete g;
 }
 
 bool get_rank(ErlNifEnv *env, ERL_NIF_TERM t, tp_rank **out) {
@@ -530,6 +850,10 @@ extern "C" ERL_NIF_TERM nif_tp_close(ErlNifEnv *env, int, const ERL_NIF_TERM arg
         return enif_make_badarg(env);
     }
     pthread_mutex_lock(&r->mu);
+    if (r->models > 0) {
+        pthread_mutex_unlock(&r->mu);
+        return mk_error(env, "in_use");
+    }
     rank_release(r);
     pthread_mutex_unlock(&r->mu);
     return mk_atom(env, "ok");
@@ -583,4 +907,115 @@ extern "C" ERL_NIF_TERM nif_tp_bootstrap_selftest(ErlNifEnv *env, int, const ERL
         list = enif_make_list_cell(env, all[i - 1], list);
     }
     return mk_ok(env, list);
+}
+
+/* ---------------------------------------------------------------- */
+/* For the model loader and the decode NIF (C callers)               */
+/* ---------------------------------------------------------------- */
+
+/* The devices to load a model on this rank's group: `world' entries,
+ * in rank order, then NULL (`cap' must leave room). Keeps the rank (and
+ * so its communicator and devices) alive until
+ * erllama_tp_model_released(*keep). Returns the device count, or -1. */
+extern "C" int erllama_tp_model_devices(ErlNifEnv *env, ERL_NIF_TERM term, ggml_backend_dev_t *out,
+                                        size_t cap, void **keep) {
+    tp_rank *r;
+    if (!get_rank(env, term, &r)) {
+        return -1;
+    }
+    pthread_mutex_lock(&r->mu);
+    if (!r->comm || (size_t) r->world + 1 > cap) {
+        pthread_mutex_unlock(&r->mu);
+        return -1;
+    }
+    try {
+        if (!r->group) {
+            r->group = group_new(r, ggml_backend_get_device(r->backend));
+        }
+    } catch (...) {
+        pthread_mutex_unlock(&r->mu);
+        return -1;
+    }
+    for (int i = 0; i < r->world; i++) {
+        out[i] = &r->group->devs[(size_t) i];
+    }
+    out[r->world] = nullptr;
+    r->models++;
+    enif_keep_resource(r);
+    *keep = r;
+    pthread_mutex_unlock(&r->mu);
+    return r->world;
+}
+
+extern "C" void erllama_tp_model_released(void *keep) {
+    auto *r = static_cast<tp_rank *>(keep);
+    r->models--;
+    enif_release_resource(r);
+}
+
+/* Sum `n' floats on the host over every rank, exactly: in chunks below
+ * the backend's FP32 threshold (larger buffers are reduced in BF16).
+ * Every rank must call it with the same `n'. 0 on success. */
+extern "C" int erllama_tp_reduce_host(void *keep, float *data, size_t n) {
+    constexpr size_t CHUNK = 32000;
+    auto *r = static_cast<tp_rank *>(keep);
+    pthread_mutex_lock(&r->mu);
+    int rc = 0;
+    try {
+        tensor_scope s;
+        /* The chunk tensor, and one view per chunk. */
+        s.ctx = small_ctx(2 + n / CHUNK);
+        ggml_tensor *t = ggml_new_tensor_1d(s.ctx, GGML_TYPE_F32, (int64_t) CHUNK);
+        s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, r->backend);
+        if (!s.buf || !r->comm) {
+            rc = -1;
+        }
+        for (size_t off = 0; rc == 0 && off < n; off += CHUNK) {
+            size_t len = std::min(CHUNK, n - off);
+            ggml_tensor *v = ggml_view_1d(s.ctx, t, (int64_t) len, 0);
+            v->buffer = t->buffer;
+            v->data = t->data;
+            ggml_backend_tensor_set(v, data + off, 0, len * sizeof(float));
+            std::vector<float> out;
+            if (!reduce_into(r, v, out)) {
+                rc = -1;
+                break;
+            }
+            memcpy(data + off, out.data(), len * sizeof(float));
+        }
+    } catch (...) {
+        rc = -1;
+    }
+    pthread_mutex_unlock(&r->mu);
+    return rc;
+}
+
+/* nif_tp_stats(Rank) -> {ok, #{remote_bytes, reductions, sizes}}: what
+ * the placeholders reserve (the other ranks' share of every buffer),
+ * and the model's reductions so far with their element counts, in
+ * order (the first 65536). */
+extern "C" ERL_NIF_TERM nif_tp_stats(ErlNifEnv *env, int, const ERL_NIF_TERM argv[]) {
+    tp_rank *r;
+    if (!get_rank(env, argv[0], &r)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&r->mu);
+    ERL_NIF_TERM m = enif_make_new_map(env);
+    uint64_t remote = 0, reductions = 0;
+    std::vector<int64_t> sizes;
+    if (r->group) {
+        remote = r->group->remote_bytes;
+        reductions = r->group->reductions;
+        std::lock_guard<std::mutex> l(r->group->log_mu);
+        sizes = r->group->sizes;
+    }
+    pthread_mutex_unlock(&r->mu);
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (size_t i = sizes.size(); i > 0; i--) {
+        list = enif_make_list_cell(env, enif_make_int64(env, sizes[i - 1]), list);
+    }
+    enif_make_map_put(env, m, mk_atom(env, "remote_bytes"), enif_make_uint64(env, remote), &m);
+    enif_make_map_put(env, m, mk_atom(env, "reductions"), enif_make_uint64(env, reductions), &m);
+    enif_make_map_put(env, m, mk_atom(env, "sizes"), list, &m);
+    return mk_ok(env, m);
 }
