@@ -336,3 +336,27 @@ Run on the two GB10 hosts (pin v1.0.0, NCCL 2.32.6 over RoCE), TinyLlama 1.1B Ch
 - The differences come from the split itself (matrix shapes change the CUDA kernels used); they are not shown to be rounding only. Throughput and latency were not measured.
 
 Not done: serving through the normal erllama path with one sampling rank driving the others, failure handling during generation, coordinated checkpoints, a model larger than one GPU, more than two hosts, Metal.
+
+## Tensor parallelism, milestone 3: serving a split model (2026-11-23)
+
+Experimental. Rank 0 loads the split model through `erllama:load_model/2` (`tp_rank` and `tp_sink` options) and serves it with the normal API; it samples once per step. Every batch and KV change is sent, numbered, to the other ranks, which apply them in order. Ranks with a different file, options or engine build are refused. A split model saves no KV yet. See [internals/tensor-parallel.md](../internals/tensor-parallel.md).
+
+Run on the two GB10 hosts over RoCE, TinyLlama 1.1B Chat Q4, `n_ctx 1024`, flash attention on, one sequence, greedy; reference: the same file loaded through erllama on one GB10.
+
+| Check | Result |
+|---|---|
+| greedy completion of "The quick brown fox", 32 tokens | identical to one GPU, all 32 |
+| stream of 128 tokens after a 242-token prompt | ends `length`, 128 tokens |
+| cancel after 10 tokens | ends cancelled; the next request returns the same 32 greedy tokens |
+| followers in step | 9196 reductions on each rank, same sizes in the same order |
+
+| 242-token prompt, 128 tokens | First token | Prompt tokens/s | Decode tokens/s | Median gap |
+|---|---|---|---|---|
+| split over the two hosts (two runs) | 39.0 and 53.1 ms | 6202 and 4559 | 233.7 and 172.8 | 4.17 and 5.75 ms |
+| one GB10 (two runs) | 22.7 and 22.1 ms | 10673 and 10935 | 288.9 and 290.8 | 3.41 ms |
+
+- A 2048-value reduction (FP32), timed in each rank's process with the copy to and from the GPU: about 230 µs. Each token makes 44 reductions inside the model graph (two per layer), without the copies.
+- For a model this small, splitting is slower than one GPU: the time saved computing half of each layer is smaller than the time spent reducing. The point of splitting is a model that does not fit one GPU; that run is still to be made (the test hosts' GPUs are shared with another workload).
+- The split runs vary between runs (39 to 53 ms first token); the one-GPU runs do not. Only these configurations were measured.
+
+Not done: failure handling during generation (a rank lost mid-stream, a stale or duplicate step, cancel during a collective), coordinated checkpoints and cache hits, a model larger than one GPU, more than two hosts, Metal.

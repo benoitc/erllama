@@ -58,7 +58,9 @@
     devices,
     cpu_moe,
     tensor_buft_overrides,
-    fit
+    fit,
+    %% experimental: split over an erllama_tp rank's group
+    tp_rank
 ]).
 
 -define(CONTEXT_OPT_KEYS, [
@@ -77,7 +79,9 @@
     type_v,
     moe_cache_size,
     moe_cache_cpu_share,
-    decode_budget_ms
+    decode_budget_ms,
+    %% experimental: on the serving rank of a split model
+    tp_sink
 ]).
 
 -define(POLICY_KEYS, [
@@ -331,7 +335,8 @@ model_opt_checks() ->
         {devices, fun devices_opt/1},
         {cpu_moe, fun cpu_moe_opt/1},
         {tensor_buft_overrides, fun tbo_opt/1},
-        {fit, fun fit_opt/1}
+        {fit, fun fit_opt/1},
+        {tp_rank, fun is_reference/1}
     ].
 
 %% `cpu_moe => true | N`: all expert tensors to CPU, or the first N
@@ -408,7 +413,8 @@ context_opt_checks() ->
         {type_v, fun(V) -> lists:member(V, ?KV_TYPES) end},
         {moe_cache_size, fun non_neg_int/1},
         {moe_cache_cpu_share, fun(V) -> is_number(V) andalso V >= 0 andalso V =< 1 end},
-        {decode_budget_ms, fun pos_int/1}
+        {decode_budget_ms, fun pos_int/1},
+        {tp_sink, fun is_pid/1}
     ].
 
 policy_checks() ->

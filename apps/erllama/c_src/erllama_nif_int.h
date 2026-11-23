@@ -110,6 +110,13 @@ typedef struct erllama_context_s {
     int mu_inited;
     struct llama_context *ctx;     /* NULL after successful release */
     erllama_model_t *model_res;    /* keep_resource'd by new_context */
+    /* Tensor parallelism, on the rank that serves (`tp_sink' option):
+     * every decode batch and KV change is first sent to this process
+     * as `{erllama_tp, Seq, Cmd}' (Seq from 1, in order) for the other
+     * ranks to apply. Unset on the other ranks. */
+    int tp_sink_set;
+    ErlNifPid tp_sink;
+    uint64_t tp_seq;
     int decode_ready;              /* set after llama_decode; cleared after kv ops */
     /* Decode interrupt/budget. The abort callback (installed on the
      * llama_context at new_context time) reads these from ggml worker
@@ -260,6 +267,18 @@ int get_map_int32(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
 
 /* Deferred-free protocol (definition in erllama_nif.c). */
 void model_release_tp(erllama_model_t *m);
+/* Decode on a context, through its tensor-parallel group when its model
+ * is split (see erllama_nif_decode.c); erllama_safe_decode's results,
+ * or ERLLAMA_TP_REDUCE_FAILED. */
+#define ERLLAMA_TP_REDUCE_FAILED (-1000)
+int erllama_ctx_decode(ErlNifEnv *env, erllama_context_t *c, struct llama_batch batch);
+/* Send a command (built in `menv', which is freed) to the context's
+ * tensor-parallel sink with the next sequence number. */
+void erllama_tp_send(ErlNifEnv *env, erllama_context_t *c, ErlNifEnv *menv, ERL_NIF_TERM cmd);
+/* A split model is served only through the decode paths that keep the
+ * ranks in step. */
+#define ERLLAMA_IS_TP(c) ((c)->model_res && (c)->model_res->tp_rank)
+ERL_NIF_TERM nif_tp_follow(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_tp_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 void context_drops_model(erllama_model_t *m);
 

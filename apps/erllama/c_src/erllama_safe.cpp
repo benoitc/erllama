@@ -1132,6 +1132,14 @@ long erllama_safe_memory_seq_pos_max(struct llama_context *c,
 //
 // Returns 0 ok; -1 on llama_decode failure; -2 on batch_init OOM
 // or invalid n_tokens; -3 on C++ exception.
+float *erllama_safe_get_logits(struct llama_context *c) noexcept {
+    try {
+        return llama_get_logits(c);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 // Decode `tokens' at positions start_pos.. on seq 0 and copy the last
 // token's logits (n_vocab floats) into `out'. 0 on success, -1 decode
 // failed, -2 bad arguments or allocation, -3 exception.

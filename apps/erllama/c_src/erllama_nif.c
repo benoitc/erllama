@@ -559,7 +559,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_tp_close",           1, nif_tp_close,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_tp_bootstrap_selftest", 5, nif_tp_bootstrap_selftest, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_tp_stats",           1, nif_tp_stats,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_tp_decode",          2, nif_tp_decode,          ERL_NIF_DIRTY_JOB_IO_BOUND}
+    {"nif_tp_decode",          2, nif_tp_decode,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_follow",          2, nif_tp_follow,          ERL_NIF_DIRTY_JOB_IO_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)

@@ -116,6 +116,34 @@ rank at once), `stats/1` (the reductions made, with their sizes in
 order, and what the placeholders reserve) and a single-GPU reference
 copy (`ref_load/3`, `ref_decode/2`).
 
+## Serving a split model
+
+The serving rank (rank 0) loads the model through erllama like any
+other (`erllama_tp_rank:serve/5`): `model_opts.tp_rank` is its handle
+and `context_opts.tp_sink` a forwarder process. Callers use the normal
+API (`complete`, `stream`, `cancel`); this rank samples, once per step.
+
+- Before every `llama_decode` (`erllama_ctx_decode` in
+  `c_src/erllama_nif_decode.c`), the context sends the exact batch to
+  the sink, and every KV change (`kv_seq_rm`, `kv_seq_cp`) too, as
+  `{erllama_tp, Seq, Cmd}` numbered from 1. The forwarder sends them,
+  in order, to the other ranks' `erllama_tp_rank` processes, which
+  have loaded the same file with `load/3` and apply each command with
+  `erllama_nif:tp_follow/2`: the same batch, the same KV change. The
+  ranks meet in the decode's first collective.
+- After each decode, every rank sums the output logits over the group,
+  so the serving rank samples from the full logits.
+- Before serving, every rank describes its model (file size, hash of
+  its first MiB, options, world size, engine build); a rank that
+  differs is refused (`{error, {incompatible_ranks, _}}`).
+- A follower that sees a gap or a repeat in the sequence stops: it no
+  longer holds the serving rank's KV state.
+- Until checkpoints are coordinated across ranks, a split model saves
+  and restores no KV (`kv_pack`/`kv_unpack` answer `not_supported`;
+  the serving rank's cache policy never saves). Embeddings,
+  speculative decoding, the argmax forward and media prefill also
+  answer `not_supported` on a split model.
+
 ## What a failure does
 
 | Failure | Result |
@@ -170,7 +198,8 @@ every bump.
 
 ## Not done yet
 
-Serving through the normal erllama path (load, stream, cancel) with one
-sampling rank driving the others, failure handling during generation,
-coordinated cache checkpoints, a model too large for one GPU, groups of
-more than two hosts, and Metal.
+Failure handling during generation (a rank lost mid-stream, a duplicate
+or stale step reaching a follower, cancel during a collective),
+coordinated cache checkpoints, a model too large for one GPU (the test
+hosts' GPUs are shared with another workload), groups of more than two
+hosts, and Metal.

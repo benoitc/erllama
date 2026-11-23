@@ -12,9 +12,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
   and sum buffers with them on the GPUs' own network path
   (`erllama_tp`), and a model can be split over such a group with
   llama.cpp's own tensor split, each machine holding and computing its
-  share (`tp_rank` load option). These are the first steps towards
-  serving one model across several machines; they need a CUDA build
-  with NCCL.
+  share (`tp_rank` load option), and served through the usual
+  `complete`, `stream` and `cancel` calls from one machine while the
+  others follow it step by step. A split model does not use the KV
+  cache yet. This needs a CUDA build with NCCL.
 
 - `media_add_special`, a request option for streams with media: set it
   to `false` when the prompt comes from a chat template, so the BOS
