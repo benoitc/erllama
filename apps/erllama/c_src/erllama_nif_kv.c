@@ -97,6 +97,8 @@ static ERL_NIF_TERM kv_unpack_seq(ErlNifEnv *env, erllama_context_t *c, const Er
     }
     size_t consumed = erllama_safe_state_seq_set_data(
         c->ctx, in->data, in->size, seq_id);
+    /* The drafter's context holds nothing of the restored cells. */
+    erllama_ctx_mtp_seq_reset(c, seq_id);
     /* kv_unpack only restores KV cells, not the per-context logits
      * buffer; the model layer must drop the last cell and re-prefill
      * it before the next sample. Mark the context as not ready until
@@ -176,6 +178,16 @@ ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
  * restored. So after kv_unpack the model layer drops the last cell of
  * the saved sequence and re-prefills the corresponding token to
  * regenerate logits for the next sample. */
+int erllama_ctx_seq_rm(ErlNifEnv *env, erllama_context_t *c, int seq, int p0, int p1) {
+    if (c->tp_sink_set) {
+        ErlNifEnv *menv = enif_alloc_env();
+        erllama_tp_send(env, c, menv,
+                        enif_make_tuple4(menv, enif_make_atom(menv, "seq_rm"), enif_make_int(menv, seq),
+                                         enif_make_int(menv, p0), enif_make_int(menv, p1)));
+    }
+    return erllama_safe_memory_seq_rm(c->ctx, seq, p0, p1);
+}
+
 ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
                                   const ERL_NIF_TERM argv[]) {
     (void) argc;
@@ -192,13 +204,7 @@ ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
     if (!erllama_lock_ctx(c)) {
         return erllama_error(env, atom_released);
     }
-    if (c->tp_sink_set) {
-        ErlNifEnv *menv = enif_alloc_env();
-        erllama_tp_send(env, c, menv,
-                        enif_make_tuple4(menv, enif_make_atom(menv, "seq_rm"), enif_make_int(menv, seq_id),
-                                         enif_make_int(menv, p0), enif_make_int(menv, p1)));
-    }
-    int rc = erllama_safe_memory_seq_rm(c->ctx, seq_id, p0, p1);
+    int rc = erllama_ctx_seq_rm(env, c, seq_id, p0, p1);
     /* Removing cells invalidates last-decode logits; force a fresh
      * prefill before the next sample. */
     c->decode_ready = 0;
@@ -277,6 +283,7 @@ ERL_NIF_TERM nif_kv_seq_cp(ErlNifEnv *env, int argc,
         return erllama_error(env, enif_make_atom(env, "seq_cp_failed"));
     }
     c->decode_ready = 0;
+    erllama_ctx_mtp_seq_reset(c, dst);
     c->per_seq[dst].next_pos = (int32_t) (dst_max + 1);
     c->per_seq[dst].last_logits_idx = -1;
     pthread_mutex_unlock(&c->mu);

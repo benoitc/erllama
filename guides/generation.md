@@ -182,6 +182,38 @@ length, and drafts shorter than `n_min` are discarded (defaults are
 llama.cpp's). See [configuration](configuration.md#speculation) for
 when the option is silently ignored.
 
+### Drafting with an MTP head (experimental)
+
+Some models ship a multi-token-prediction (MTP) head, often as a
+separate GGUF (GLM-5.3-Flash's `mtp-*.gguf`). You load it next to the
+model as `draft_model`; with `speculative => #{type => mtp}` the head
+guesses the next tokens and the model checks them, with the token it
+just chose, in one batch.
+
+```erlang
+{ok, M} = erllama:load_model(<<"glm">>, #{
+    model_path => "GLM-5.3-Flash-Q4_K-00001-of-00002.gguf",
+    draft_model => "mtp-GLM-5.3-Flash-Q8_0.gguf",
+    context_opts => #{n_ctx => 4096, n_rs_seq => 2}
+}),
+{ok, R} = erllama:complete(M, Prompt, #{
+    response_tokens => 256,
+    temperature => 0.0,
+    speculative => #{type => mtp, n_max => 2}
+}).
+```
+
+- Greedy requests only: the guesses are checked against the most
+  likely token. Other requests decode without drafts.
+- A recurrent or hybrid model needs `n_rs_seq` of at least `n_max`, so
+  rejected guesses can be taken back.
+- The output follows the model's greedy choices, but the check runs
+  several tokens in one batch, whose arithmetic differs slightly from a
+  one-token step: where the two best tokens are almost tied, the text
+  can differ from decoding without drafts.
+- It also works on a model split over several machines (see the
+  tensor-parallel page): the head runs on the first rank's GPU.
+
 For a two-model setup, the manual building blocks remain:
 
 ```erlang

@@ -200,6 +200,28 @@ indexer whole on every rank. Two things differ from a dense model:
   from the model's family (`erllama_model_llama:family_context_opts/2`);
   the other ranks apply the same function.
 
+## Drafting with the MTP head
+
+`speculative => #{type => mtp}` on a split model drafts on rank 0 with
+the model's MTP head (`draft_model`, loaded whole on rank 0's GPU) and
+checks the drafts on the split model:
+
+1. rank 0 samples the next token K from the last logits;
+2. the head guesses the two tokens after K;
+3. every rank decodes K and the guesses in one batch with every row
+   out (`erllama_nif:mtp_step/5`, `c_src/erllama_nif_mtp.c`);
+4. rank 0 keeps the guesses the model agrees with (argmax) and the
+   rejected rows are taken back on every rank, with the
+   recurrent-state snapshots, and from the head's own context.
+
+The token after the kept ones is not decoded: the next round samples
+it from the last kept row. The head reads the model's hidden state
+after every decode, which changes the graph llama.cpp builds, so rank 0
+sends `{nextn, On}` in the command stream and every rank builds the
+same graphs. Use `n_rs_seq => 2` on every rank. With one stream on two
+GB10s (GLM-5.3-Flash Q4_K) a round takes about 85 ms (head 10 ms,
+verify batch 73 ms, rollback 1 ms) and produces 2.1 to 2.4 tokens.
+
 On a GB10, whose GPU shares the host's memory, load large models with
 `load_mode => direct_io`: the page cache a buffered load leaves behind
 is not given back to CUDA, whose allocations can then fail although
@@ -310,6 +332,12 @@ formed again, under a new coordinator (a new generation).
   decoding without drafts (even split at sequence 0, 3:1 at sequence
   1), and rounds of one known token and two drafted ones, timed against
   ordinary decoding.
+- `test/erllama_tp_mtp_SUITE.erl` is opt-in on the same hosts, with
+  their GPUs free: MTP drafting on a split GLM-5.3-Flash
+  (`ERLLAMA_TP_GLM`, `ERLLAMA_TP_GLM_MTP`), TensorFold's four prompts
+  with and without drafts; where the outputs first differ, the top two
+  candidates; and rounds replayed from their exact prefix in a fresh
+  group, compared row by row with the live run.
 - `test/erllama_tp_glm_SUITE.erl` is opt-in on the same hosts, with
   their GPUs free: GLM-5.3-Flash split against the same file whole on
   one GB10 (`ERLLAMA_TP_GLM_REF`, a quant small enough for one host),

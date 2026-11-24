@@ -70,6 +70,11 @@
     spec_accept/3,
     spec_free/1,
     spec_step/4,
+    mtp_new/3,
+    mtp_step/5,
+    mtp_stats/1,
+    mtp_free/1,
+    mtp_trace/2,
     mtmd_init/3,
     mtmd_free/1,
     mtmd_caps/1,
@@ -104,8 +109,9 @@
 -type chat_templates_ref() :: reference().
 -type chat_params_ref() :: reference().
 
--export_type([spec_ref/0]).
+-export_type([spec_ref/0, mtp_ref/0]).
 -type spec_ref() :: reference().
+-type mtp_ref() :: reference().
 
 -export_type([mtmd_ref/0]).
 -type mtmd_ref() :: reference().
@@ -610,6 +616,36 @@ spec_free(Spec) ->
 spec_step(Ctx, Sampler, SeqId, Draft) when is_list(Draft), Draft =/= [] ->
     nif_spec_step(Ctx, Sampler, SeqId, Draft).
 
+%% Experimental. An MTP drafter on `Ctx' from `DraftModel' (loaded
+%% with `load_mtp => true'), proposing up to `n_max' (default 2) tokens
+%% a round; see nif_mtp_step in c_src/erllama_nif_mtp.c. One per
+%% context; it turns on the context's nextn embeddings.
+-spec mtp_new(context_ref(), model_ref(), map()) -> {ok, mtp_ref()} | {error, term()}.
+mtp_new(Ctx, DraftModel, Opts) when is_map(Opts) -> nif_mtp_new(Ctx, DraftModel, Opts).
+
+%% One MTP round on `SeqId': sample the next token, draft up to
+%% `MaxDraft' after it, verify them in one decode and drop the rejected
+%% ones. Returns the tokens now in the KV (the sampled one and the
+%% accepted drafts) and how many drafts were accepted. Needs a greedy
+%% sampler (`{error, not_greedy}' otherwise).
+-spec mtp_step(context_ref(), sampler_ref(), mtp_ref(), non_neg_integer(), non_neg_integer()) ->
+    {ok, {spec, [token_id()], 0 | 1, non_neg_integer()}} | {error, term()}.
+mtp_step(Ctx, Sampler, Mtp, SeqId, MaxDraft) -> nif_mtp_step(Ctx, Sampler, Mtp, SeqId, MaxDraft).
+
+%% Rounds, drafted and accepted tokens, and the microseconds spent
+%% drafting, verifying and rolling back.
+-spec mtp_stats(mtp_ref()) -> #{atom() => non_neg_integer()} | {error, released}.
+mtp_stats(Mtp) -> nif_mtp_stats(Mtp).
+
+-spec mtp_free(mtp_ref()) -> ok | {error, released}.
+mtp_free(Mtp) -> nif_mtp_free(Mtp).
+
+%% Tests: record every round from `on' (the batch, the drafts kept and
+%% the top 8 logits of each row), stop with `off', or `read' the rounds
+%% recorded as `#{pos, tokens, n_acc, rows => [[{Id, Logit}]]}'.
+-spec mtp_trace(mtp_ref(), on | off | read) -> ok | [map()] | {error, term()}.
+mtp_trace(Mtp, Op) -> nif_mtp_trace(Mtp, Op).
+
 %% Multimodal projector (libmtmd): load an mmproj GGUF against a
 %% loaded text model. Opts: use_gpu (default true), n_threads,
 %% image_min_tokens, image_max_tokens.
@@ -741,6 +777,11 @@ nif_spec_draft(_Spec, _SeqId, _IdLast, _Delta) -> erlang:nif_error(nif_not_loade
 nif_spec_accept(_Spec, _SeqId, _N) -> erlang:nif_error(nif_not_loaded).
 nif_spec_free(_Spec) -> erlang:nif_error(nif_not_loaded).
 nif_spec_step(_Ctx, _Sampler, _SeqId, _Draft) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_new(_Ctx, _Model, _Opts) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_step(_Ctx, _Sampler, _Mtp, _SeqId, _MaxDraft) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_stats(_Mtp) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_free(_Mtp) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_trace(_Mtp, _Op) -> erlang:nif_error(nif_not_loaded).
 nif_mtmd_init(_Model, _Path, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_mtmd_free(_Mtmd) -> erlang:nif_error(nif_not_loaded).
 nif_mtmd_caps(_Mtmd) -> erlang:nif_error(nif_not_loaded).

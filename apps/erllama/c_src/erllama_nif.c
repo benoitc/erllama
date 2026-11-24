@@ -207,8 +207,9 @@ static void model_dtor(ErlNifEnv *env, void *obj) {
 }
 
 static void ctx_dtor(ErlNifEnv *env, void *obj) {
-    (void) env;
     erllama_context_t *c = (erllama_context_t *) obj;
+    /* A drafter keeps its context, so none is attached by now. */
+    erllama_ctx_mtp_release(env, c);
     grammar_cache_clear(c);
     if (c->smpl) {
         (void) erllama_safe_sampler_free(c->smpl);
@@ -369,6 +370,9 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     /* Register the ngram-speculator resource (defined in
      * erllama_spec_nif.cpp). */
     if (spec_nif_load(env) != 0) {
+        return -1;
+    }
+    if (erllama_mtp_nif_load(env) != 0) {
         return -1;
     }
 
@@ -548,6 +552,11 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_spec_accept", 3, nif_spec_accept, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_spec_free",   1, nif_spec_free,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_spec_step",   4, nif_spec_step,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_new",     3, nif_mtp_new,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_step",    5, nif_mtp_step,    ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_mtp_stats",   1, nif_mtp_stats,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_free",    1, nif_mtp_free,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_trace",   2, nif_mtp_trace,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_mtmd_init",      3, nif_mtmd_init,      ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_mtmd_free",      1, nif_mtmd_free,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_mtmd_caps",      1, nif_mtmd_caps,      ERL_NIF_DIRTY_JOB_CPU_BOUND},

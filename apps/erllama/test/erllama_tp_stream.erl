@@ -5,15 +5,20 @@
 %% node: stream one request through erllama and time it.
 -module(erllama_tp_stream).
 
--export([run/4, run_with/5, run_many/4, chat_tokens/2, kill/2]).
+-export([run/4, run/5, run_with/5, run_many/4, chat_tokens/2, kill/2]).
 
 %% Stream `Prompt' on `Model' (greedy, at most `Max' tokens); cancel
 %% after `CancelAfter' tokens (`infinity' to let it finish). Returns the
 %% tokens, the time to the first one, the gaps between the others, and
 %% how the request ended.
 run(Model, Prompt, Max, CancelAfter) ->
+    run(Model, Prompt, Max, CancelAfter, #{}).
+
+%% run/4 with more request options (e.g. `speculative'); the result
+%% also holds the request's stats when it finished.
+run(Model, Prompt, Max, CancelAfter, Opts) ->
     T0 = erlang:monotonic_time(microsecond),
-    {ok, Ref} = erllama:stream(Model, Prompt, #{response_tokens => Max, temperature => 0.0}),
+    {ok, Ref} = erllama:stream(Model, Prompt, Opts#{response_tokens => Max, temperature => 0.0}),
     collect(Ref, T0, CancelAfter, [], []).
 
 collect(Ref, T0, CancelAfter, Times, Text) when length(Times) =:= CancelAfter ->
@@ -24,7 +29,9 @@ collect(Ref, T0, CancelAfter, Times, Text) ->
         {erllama, Ref, {token, Bin}} ->
             collect(Ref, T0, CancelAfter, [erlang:monotonic_time(microsecond) | Times], [Bin | Text]);
         {erllama, Ref, {done, Stats}} ->
-            result(T0, Times, Text, {done, maps:get(finish_reason, Stats, done)});
+            (result(T0, Times, Text, {done, maps:get(finish_reason, Stats, done)}))#{
+                stats => Stats
+            };
         {erllama, Ref, {error, Why}} ->
             result(T0, Times, Text, {error, Why})
     after 120000 ->

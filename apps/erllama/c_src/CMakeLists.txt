@@ -139,6 +139,8 @@ add_library(erllama_nif SHARED
     erllama_spec_nif.cpp
     erllama_mtmd_nif.cpp
     erllama_tp_nif.cpp
+    erllama_nif_mtp.c
+    erllama_mtp.cpp
     crc32c.c
 )
 

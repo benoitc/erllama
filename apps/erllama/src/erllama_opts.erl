@@ -44,6 +44,9 @@
     %% multimodal projector (libmtmd)
     mmproj_path,
     mmproj_opts,
+    %% MTP draft model (speculative => #{type => mtp}), experimental
+    draft_model,
+    draft_model_opts,
     %% erllama_model_tp (experimental tensor parallelism)
     tp_worker,
     tp_followers,
@@ -64,6 +67,7 @@
     cpu_moe,
     tensor_buft_overrides,
     fit,
+    load_mtp,
     %% experimental: split over an erllama_tp rank's group
     tp_rank
 ]).
@@ -292,6 +296,8 @@ base_load_checks() ->
         {policy, fun is_map/1},
         {mmproj_path, fun is_path/1},
         {mmproj_opts, fun mmproj_opts_check/1},
+        {draft_model, fun is_path/1},
+        {draft_model_opts, fun is_map/1},
         {tp_worker, fun is_pid/1},
         {tp_followers, fun is_list/1},
         {tp_call_timeout, fun(V) -> V =:= infinity orelse pos_int(V) end},
@@ -345,6 +351,7 @@ model_opt_checks() ->
         {cpu_moe, fun cpu_moe_opt/1},
         {tensor_buft_overrides, fun tbo_opt/1},
         {fit, fun fit_opt/1},
+        {load_mtp, fun is_boolean/1},
         {tp_rank, fun is_reference/1}
     ].
 
@@ -568,9 +575,21 @@ media_opt(_) ->
     false.
 
 %% `speculative => true | false | #{type => ngram_mod, n_match | n_max
-%% | n_min => pos_int()}`. `true` = ngram_mod with upstream defaults.
+%% | n_min => pos_int()} | #{type => mtp, n_max => pos_int()}`. `true` =
+%% ngram_mod with upstream defaults; `mtp` drafts with the model's
+%% `draft_model` (experimental).
 speculative_opt(V) when is_boolean(V) ->
     true;
+speculative_opt(#{type := mtp} = V) ->
+    maps:fold(
+        fun
+            (type, _, Acc) -> Acc;
+            (n_max, N, Acc) -> Acc andalso pos_int(N) andalso N =< 16;
+            (_, _, _) -> false
+        end,
+        true,
+        V
+    );
 speculative_opt(V) when is_map(V) ->
     Known = [type, n_match, n_max, n_min],
     maps:fold(

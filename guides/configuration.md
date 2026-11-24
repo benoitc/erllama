@@ -280,7 +280,11 @@ stages are skipped entirely, as upstream does.
 The per-request `speculative` option enables draft-model-free ngram
 speculation (see [generating text](generation.md#speculative-decoding)
 for usage). It is a decode strategy, not a sampler stage: output is
-unchanged, only latency improves.
+unchanged, only latency improves. `speculative => #{type => mtp,
+n_max => 2}` drafts with an MTP head instead (experimental): load the
+head with the model as `draft_model` (a GGUF path) and, optionally,
+`draft_model_opts` (its load options; `load_mtp => true` is always
+set).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -298,7 +302,11 @@ normally, when:
 - other requests are active on the same model (it resumes when the
   request is alone again);
 - the model family is recurrent or hybrid (their memories refuse
-  the partial KV rollback a draft miss needs);
+  the partial KV rollback a draft miss needs), unless the request
+  drafts with MTP and the context keeps `n_rs_seq >= n_max`
+  recurrent-state snapshots;
+- the request drafts with MTP and does not sample greedily
+  (`temperature` above 0, or a `grammar`);
 - the request sets `thinking => enabled` or `logprobs`;
 - the backend does not support it (the stub does; a llama model
   with thinking markers configured does not).
