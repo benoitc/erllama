@@ -180,7 +180,10 @@ divergence_margin(Config) ->
 %% 2.0 (the largest difference seen between batch shapes was 1.62).
 rollback_state_matches(Config) ->
     Live = serve(Config, fun(S, G, R0) ->
-        [live_rounds(S, G, R0, P) || P <- [chat(S, G, T) || T <- dec_prompts()]]
+        Prompts = [chat(S, G, T) || T <- dec_prompts()],
+        %% The drafter exists from the first MTP request.
+        _ = run(S, G, hd(Prompts), 16, ?MTP),
+        [live_rounds(S, G, R0, P) || P <- Prompts]
     end),
     Checks = with_group(Config, fun(G) ->
         lists:append([[replay(G, P, B, T) || T <- Targets] || {P, B, Targets} <- Live])
