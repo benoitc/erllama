@@ -39,6 +39,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- A hybrid model such as GLM-5.3-Flash split over several machines can
+  now keep recurrent-state snapshots (`n_rs_seq`), so its last tokens
+  can be taken back. Every machine used to stop at the first decode
+  when they were on. This is a local fix to the vendored llama.cpp
+  until upstream carries it; split loads still keep no snapshot unless
+  asked.
+
 - Hybrid models such as GLM-5.3-Flash rebuilt their decode graph for
   every token when the KV cache was unified (one cache shared by all
   sequences), which cost about 10 ms a token on GB10 hosts. They now

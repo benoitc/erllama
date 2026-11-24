@@ -30,13 +30,21 @@ and then removes whole directories we never build:
 the upstream `LLAMA_BUILD_MTMD` standalone hook with `MTMD_VIDEO`
 forced off, and it links `vendor/{stb,miniaudio,hash,sheredom}`.
 
-The vendor script applies [the hybrid K-only graph-reuse patch](scripts/patches/hybrid-k-graph-reuse.patch)
-to the extracted tarball before copying it. The patch checks the dense
-attention mask built for this input, so GLM can reuse its decode graph
-with unified KV and fused K/V rows enabled. When updating the pin, check
-whether upstream has fixed the builder and reuse check. Once the fix is
-upstream, remove the patch and its invocation. A patch failure leaves the
-current vendored tree intact.
+The vendor script applies every patch in `scripts/patches/`, in name
+order, to the extracted tarball before copying it:
+
+- [hybrid-k-graph-reuse.patch](scripts/patches/hybrid-k-graph-reuse.patch)
+  checks the dense attention mask built for the hybrid K-only input, so
+  GLM can reuse its decode graph with unified KV and fused K/V rows
+  enabled.
+- [meta-recurrent-snapshot-view.patch](scripts/patches/meta-recurrent-snapshot-view.patch)
+  lets the split backend (`ggml-backend-meta.cpp`) split a view that
+  walks the split axis one window at a time, which GLM's recurrent-state
+  snapshots take; without it a split GLM with snapshots aborts.
+
+When updating the pin, check whether upstream has fixed each one; once
+it has, remove that patch. A patch failure leaves the current vendored
+tree intact.
 
 `common/` is needed for the chat template pipeline
 (`common_chat_*`, the PEG autoparser, the jinja runtime). It links

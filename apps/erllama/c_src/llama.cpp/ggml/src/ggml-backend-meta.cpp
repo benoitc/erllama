@@ -749,6 +749,34 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
         }
+        // a view with one dim walking the split axis in steps of whole elements (e.g. one channel of a
+        // [d_conv-1, channel] window), spanning one repetition of the axis and starting on one, while every
+        // other dim stays inside that step or moves across rows: split that dim in the same ratio
+        // (the recurrent-state snapshots of a conv cache holding the q, k and v windows one after the other)
+        if (axis >= 0 && axis < GGML_MAX_DIMS-1 && !ggml_is_permuted(tensor->src[0]) && src_ss[0].n_segments == 1 &&
+                src_ss[0].nr[0] > 0 && tensor->src[0]->ne[axis] % src_ss[0].nr[0] == 0) {
+            const ggml_tensor * src = tensor->src[0];
+            const size_t nb_axis = src->nb[axis];
+            const size_t nb_row  = src->nb[axis+1];
+            const size_t rep     = (size_t) (src->ne[axis] / src_ss[0].nr[0]) * nb_axis;
+            const size_t offs    = (tensor->view_offs - src->view_offs) % nb_row;
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                if (tensor->ne[dim] <= 1 || tensor->nb[dim] % nb_axis != 0 || tensor->nb[dim] >= nb_row ||
+                        (size_t) tensor->ne[dim]*tensor->nb[dim] != rep || offs % rep != 0) {
+                    continue;
+                }
+                bool others_ok = true;
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                    if (i == dim || tensor->ne[i] <= 1) {
+                        continue;
+                    }
+                    others_ok = others_ok && ((size_t) tensor->ne[i]*tensor->nb[i] <= tensor->nb[dim] || tensor->nb[i] % nb_row == 0);
+                }
+                if (others_ok) {
+                    return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
+                }
+            }
+        }
         // a view that only regroups dims inside one slab of the split axis keeps the split,
         // the per-device strides are only rescaled above nb[axis] (e.g. the KV streams of a permuted q)
         if (axis >= 0 && axis < GGML_MAX_DIMS && tensor->view_offs == tensor->src[0]->view_offs) {
