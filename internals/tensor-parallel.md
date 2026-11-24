@@ -229,8 +229,16 @@ part of one.
   applies it; a rank that fails its own share fails it after. The model
   then clears the sequence on every rank and serves the request cold.
 - **Part of the KV identity.** The world size and `tensor_split` are
-  appended to the KV format (`/tp=2:even`), so a checkpoint restores
-  only into a group split the same way.
+  appended to the KV format (`/tp2=2:even`), so a checkpoint restores
+  only into a group split the same way. `tp2` (and version 2 of the
+  frame) leaves out checkpoints saved before mirrored tensors were read
+  from the rank's own device: theirs held zeros on every rank but the
+  first.
+- **Mirrored tensors.** A tensor the split backend mirrors (GLM's MLA
+  latent cache and indexer, for instance) is read from the rank's own
+  device, which the rank's devices tell it (`ggml_backend_dev_holds_data`,
+  `scripts/patches/meta-split-mirrored-read.patch`); a restore writes it
+  back there.
 - **Size.** Each rank's share is the size of the whole sequence's KV:
   the split backend reads the other ranks' slices from the placeholders,
   as zeros. A checkpoint is the world size times the single-GPU size.

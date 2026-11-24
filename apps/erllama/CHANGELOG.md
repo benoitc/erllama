@@ -39,6 +39,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- A KV cache entry of a model split over several machines now restores
+  correctly on every machine. For models that keep part of their
+  attention state on every machine, such as GLM-5.3-Flash, every
+  machine but the first came back with that state empty, so a request
+  resumed from the cache gave subtly different, worse output. Entries
+  saved before this fix are no longer found and those requests start
+  cold.
 - Turning thinking off (`enable_thinking => false`, or `reasoning_effort:
   "none"` on the server) now works for models whose chat template
   always opens a thinking block, such as GLM-5.3-Flash. Such a model

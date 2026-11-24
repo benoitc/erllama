@@ -527,7 +527,19 @@ bool comm_allreduce(void *ctx, struct ggml_tensor **tensors) {
 const char *reg_name(ggml_backend_reg_t) { return "ERLLAMA_TP"; }
 size_t reg_count(ggml_backend_reg_t r) { return static_cast<tp_group *>(r->context)->devs.size(); }
 ggml_backend_dev_t reg_dev(ggml_backend_reg_t r, size_t i) { return &static_cast<tp_group *>(r->context)->devs[i]; }
+/* Whether a device of the group holds its tensors' data: only this
+ * rank's own slot does. The split backend reads a mirrored tensor from
+ * the first device that does, not from slot 0 (on every rank but the
+ * first, a placeholder that reads as zeros). */
+bool dev_holds_data(ggml_backend_dev_t d) {
+    auto *c = static_cast<tp_dev_ctx *>(d->context);
+    return c->slot == c->g->slot;
+}
+
 void *tp_reg_proc(ggml_backend_reg_t, const char *name) {
+    if (strcmp(name, "ggml_backend_dev_holds_data") == 0) {
+        return (void *) dev_holds_data;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *) comm_init;
     }
