@@ -39,6 +39,12 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Turning thinking off (`enable_thinking => false`, or `reasoning_effort:
+  "none"` on the server) now works for models whose chat template
+  always opens a thinking block, such as GLM-5.3-Flash. Such a model
+  used to think anyway, and its whole reply came back as reasoning
+  with empty content.
+
 - A hybrid model such as GLM-5.3-Flash split over several machines can
   now keep recurrent-state snapshots (`n_rs_seq`), so its last tokens
   can be taken back. Every machine used to stop at the first decode

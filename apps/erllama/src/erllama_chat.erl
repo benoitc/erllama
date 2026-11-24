@@ -12,7 +12,7 @@
 %% per-model templates ref is cached by `erllama_chat_cache`, and
 %% `erllama_model:chat_apply/2` is the entry point used by the façade.
 
--export([init/2, apply/2, parse/3]).
+-export([init/2, apply/2, parse/3, close_thinking/3]).
 -export([
     chat/3,
     inputs/2,
@@ -24,7 +24,10 @@
 -export_type([templates_ref/0, params_ref/0, parsed_msg/0, message/0, tool/0]).
 
 -type templates_ref() :: erllama_nif:chat_templates_ref().
--type params_ref() :: erllama_nif:chat_params_ref().
+%% A parser, or one whose output follows a thinking block this module
+%% closed in the prompt (see close_thinking/3).
+-type params_ref() ::
+    erllama_nif:chat_params_ref() | {thinking_closed, erllama_nif:chat_params_ref(), binary()}.
 
 -type parsed_msg() :: erllama:parsed_message().
 
@@ -303,10 +306,49 @@ init(Model, TemplateOverride) ->
 -spec apply(templates_ref(), map()) ->
     {ok, params_ref(), map()} | {error, term()}.
 apply(Templates, Inputs) when is_map(Inputs) ->
-    erllama_nif:chat_templates_apply(Templates, Inputs).
+    case erllama_nif:chat_templates_apply(Templates, Inputs) of
+        {ok, Params, Render} ->
+            close_thinking(maps:get(enable_thinking, Inputs, true), Params, Render);
+        Err ->
+            Err
+    end.
+
+%% Thinking off for a template that always opens its thinking block (GLM-5.3:
+%% its template has no `enable_thinking' and ends every generation prompt
+%% with `<think>'): close the block in the prompt, as the template renders a
+%% past turn without reasoning, so the model answers at once; the parser,
+%% built for a reply that starts inside the block, then reads the output
+%% after that end tag. A template that honours `enable_thinking' never ends
+%% on an open block and is left as it is.
+-spec close_thinking(boolean(), erllama_nif:chat_params_ref(), map()) -> {ok, params_ref(), map()}.
+close_thinking(
+    false,
+    Params,
+    #{
+        prompt := Prompt,
+        supports_thinking := true,
+        thinking_start_tag := Start,
+        thinking_end_tags := [End | _]
+    } =
+        Render
+) when Start =/= <<>>, End =/= <<>> ->
+    case binary:longest_common_suffix([Prompt, Start]) =:= byte_size(Start) of
+        true ->
+            Gen = maps:get(generation_prompt, Render, <<>>),
+            {ok, {thinking_closed, Params, End}, Render#{
+                prompt => <<Prompt/binary, End/binary>>,
+                generation_prompt => <<Gen/binary, End/binary>>
+            }};
+        false ->
+            {ok, Params, Render}
+    end;
+close_thinking(_EnableThinking, Params, Render) ->
+    {ok, Params, Render}.
 
 -spec parse(params_ref(), binary(), boolean()) ->
     {ok, parsed_msg()} | {error, term()}.
+parse({thinking_closed, Params, End}, Input, IsPartial) when is_binary(Input) ->
+    parse(Params, <<End/binary, Input/binary>>, IsPartial);
 parse(Params, Input, IsPartial) when
     is_binary(Input), is_boolean(IsPartial)
 ->
