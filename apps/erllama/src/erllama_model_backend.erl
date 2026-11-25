@@ -6,14 +6,21 @@
 Behaviour describing the operations the `erllama_model` gen_statem
 needs from a backing inference engine.
 
-Two backends ship in v0.2:
+Three backends ship with erllama:
 
-  `erllama_model_stub` — deterministic phash2-based stubs; used
-      by tests that don't have a GGUF on disk.
-  `erllama_model_llama` — real llama.cpp via the NIF.
+- `erllama_model_llama`: llama.cpp through the NIF.
+- `erllama_model_tp`: a model split over a group of ranks on other
+  hosts (see the tensor-parallel guide).
+- `erllama_model_stub`: deterministic stubs, for tests that have no
+  GGUF on disk.
 
-Future backends (mock for fault injection, remote for distributed
-inference, etc.) can plug in via this same surface.
+Only `init/1`, `terminate/1`, `tokenize/2`, `detokenize/2`,
+`kv_pack/2` and `kv_unpack/2` are needed for the model to load; every
+other callback is optional, and each says what the model does without
+it. A backend that generates text also needs `step/2`,
+`sampler_new/2` and `sampler_free/1`. `prefill/2` and `decode_one/2`
+are part of the original single-sequence surface and are not called by
+the model any more.
 """.
 
 -type state() :: term().
@@ -58,7 +65,7 @@ inference, etc.) can plug in via this same surface.
 
 -callback kv_unpack(state(), Bin :: binary()) -> ok | {error, term()}.
 
-%% Optional seq-aware variants. Used by the multi-sequence scheduler
+%% Optional seq-aware variants. Used by the request scheduler
 %% to thread per-request seq_ids through the same pack/unpack/cell-
 %% removal flow the single-seq paths already use. Backends that have
 %% not been ported keep the single-seq callbacks above and `seq_id =
@@ -69,7 +76,7 @@ inference, etc.) can plug in via this same surface.
 -callback kv_unpack(state(), Bin :: binary(), seq_id()) -> ok | {error, term()}.
 
 %% Optional. Free all KV cells of a given seq_id and drop any
-%% per-seq tracking inside the backend. Called by the scheduler on
+%% per-seq tracking inside the backend. Called by the request scheduler on
 %% request finish (success, error, or cancel) before the seq_id is
 %% returned to the idle pool.
 -callback seq_rm(state(), seq_id()) -> ok | {error, term()}.
@@ -110,7 +117,7 @@ inference, etc.) can plug in via this same surface.
 
 %% Optional. Build a per-request sampler chain from the same config
 %% map `configure_sampler/2` accepts. Returns an opaque handle the
-%% scheduler hands to `step/2` as the decode-row sampler. The chain
+%% request scheduler hands to `step/2` as the decode-row sampler. The chain
 %% lives until `sampler_free/1` (or the backend's terminate/1).
 -callback sampler_new(state(), sampler_opts()) ->
     {ok, sampler_ref()} | {error, term()}.
@@ -210,7 +217,7 @@ inference, etc.) can plug in via this same surface.
     | {error, term()}.
 
 %% Draft-model-free ngram speculation (llama.cpp common_speculative,
-%% NGRAM_MOD). The scheduler creates one speculator per model
+%% NGRAM_MOD). The request scheduler creates one speculator per model
 %% (spec_new), announces each speculative request's prompt
 %% (spec_begin), asks for a draft each solo decode tick (spec_draft:
 %% Delta = committed tokens since the previous call excluding IdLast,
@@ -247,13 +254,52 @@ inference, etc.) can plug in via this same surface.
     {ok, {spec, Committed :: [erllama:token_id()], Eog :: 0 | 1, NAcc :: non_neg_integer()}}
     | {error, term()}.
 
+%% Optional. How many drafted tokens a speculative round can take back
+%% on this context: `infinity` for attention-only models, the number of
+%% recurrent-state snapshots (`n_rs_seq`) for recurrent and hybrid
+%% ones. Without it, a recurrent or hybrid model does not draft.
+-callback spec_rollback(state()) -> non_neg_integer() | infinity.
+
+%% Optional. One MTP round for several sequences in one verify decode
+%% (see `erllama_nif:mtp_step_batch/4`). Each item is `{Sampler, Seq,
+%% Drafts}` with Drafts `auto`, `{auto, Cap}`, `[]` or a forced list.
+%% The round must hold every sequence waiting for a token. A refusal
+%% before any decode names its sequence: `{not_greedy, Seq}` (a drafting
+%% sampler that is not greedy) or `{not_supported, Seq}` (logprobs).
+%% Without it, several MTP requests decode on the ordinary co-batched
+%% step and draft only while alone.
+-callback mtp_step_batch(
+    state(),
+    SpecRef :: term(),
+    [{sampler_ref(), seq_id(), auto | {auto, non_neg_integer()} | [erllama:token_id()]}],
+    MaxDraft :: non_neg_integer()
+) ->
+    {ok,
+        [
+            {
+                seq_id(),
+                Committed :: [erllama:token_id()],
+                Eog :: 0 | 1,
+                NAcc :: non_neg_integer(),
+                NDrafted :: non_neg_integer()
+            }
+        ],
+        Times :: map()}
+    | {error, {not_greedy | not_supported, seq_id()} | term()}.
+
+%% Optional. The model handle the chat-template engine is built from
+%% (`erllama_chat_cache:get_or_init/4`), used by `erllama:chat/3` and
+%% `erllama:chat_apply/3`. Without it, those calls answer
+%% `{error, chat_not_supported}`.
+-callback get_model_ref(state()) -> term().
+
 %% Multimodal (libmtmd) support. media_caps/1 reports the loaded
 %% projector's modalities (`undefined` when the model has none);
 %% media_prefill/4 evaluates a whole rendered prompt (text plus one
 %% media marker per item) into the sequence in one call, leaving the
 %% sequence decode-ready with logits on the final position. NPos is
 %% KV positions consumed (differs from NTokens on M-RoPE models).
-%% The scheduler only calls it when the request is the sole active
+%% The request scheduler only calls it when the request is the sole active
 %% one; media requests bypass the KV cache entirely.
 -callback media_caps(state()) -> #{vision := boolean(), audio := boolean()} | undefined.
 
@@ -310,6 +356,9 @@ inference, etc.) can plug in via this same surface.
     spec_accept/4,
     spec_free/2,
     spec_step/4,
+    spec_rollback/1,
+    mtp_step_batch/4,
+    get_model_ref/1,
     media_caps/1,
     media_prefill/4,
     thinking_signature/3,
@@ -366,13 +415,13 @@ inference, etc.) can plug in via this same surface.
     %% full-vocab logprob plus the top-N `{TokenId, Logprob}` pairs,
     %% descending.
     | {token, erllama:token_id(), 0 | 1, {float(), [{erllama:token_id(), float()}]}}
-    %% Thinking-phase token: scheduler detokenises and emits
+    %% Thinking-phase token: the request scheduler detokenises and emits
     %% {erllama, Ref, {thinking, Bin}} instead of a plain
     %% text fragment. Backends without extended-thinking support
     %% never emit this variant.
     | {thinking_token, erllama:token_id()}
     %% Marker that the thinking phase has closed for this decode row.
-    %% The scheduler resolves a signature via thinking_signature/1
+    %% The request scheduler resolves a signature via thinking_signature/1
     %% (or `<<>>` when the callback is not exported) and sends
     %% {erllama, Ref, {thinking_end, Sig}} before any subsequent token.
     | thinking_end.
@@ -381,13 +430,13 @@ inference, etc.) can plug in via this same surface.
 
 %% Optional. Returns the integrity signature for the most recently
 %% closed thinking block on the given sequence. Called by the
-%% scheduler once it sees `thinking_end` in a step result, before
+%% request scheduler once it sees `thinking_end` in a step result, before
 %% emitting the corresponding `erllama_thinking_end` message.
 %% `Bytes` is the detokenised concatenation of the thinking-phase
-%% tokens the scheduler observed for this block; backends that sign
+%% tokens the request scheduler observed for this block; backends that sign
 %% the produced text (e.g. an HMAC for tamper detection across
 %% turns) can use it directly. The binary returned is opaque to the
-%% scheduler and forwarded verbatim to the caller; `<<>>` means "no
+%% request scheduler and forwarded verbatim to the caller; `<<>>` means "no
 %% signature available" and tells the downstream to omit
 %% `signature_delta` from its wire output.
 -callback thinking_signature(state(), seq_id(), Bytes :: binary()) -> binary().

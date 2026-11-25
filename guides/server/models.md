@@ -145,14 +145,14 @@ The release turns on erllama's scheduler: when memory runs short it
 evicts KV cache rows first, then asks the server to unload the least
 recently used model that no request holds. Configure it under
 `erllama` in `config/sys.config` (see the
-[configuration guide](../configuration.md)); `model_evictor` must stay
+[configuration guide](https://hexdocs.pm/erllama/configuration.html)); `model_evictor` must stay
 `erllama_server_models`.
 
 ## Where things are stored
 
 | Setting | Default | Holds |
 |---|---|---|
-| `data_dir` | `ERLLAMA_DATA_DIR`, else `~/.local/share/erllama` (Linux) or `~/Library/Application Support/erllama` (macOS) | `registry.json` and `blobs/` |
+| `data_dir` | `ERLLAMA_DATA_DIR`, else `~/.local/share/erllama` (Linux) or `~/Library/Application Support/erllama` (macOS) | `registry.json` and `blobs/` (models), `conversations/` (one log per conversation) and `responses/` (stored responses) |
 
 - `registry.json` is rewritten atomically on each change.
 - A registry file that cannot be read is renamed

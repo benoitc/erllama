@@ -20,10 +20,10 @@
 %%
 %% Two states only:
 %%
-%% - `idle/3` — `req_table` is empty AND `pending` is empty. Accepts
+%% - `idle/3`: `req_table` is empty AND `pending` is empty. Accepts
 %%   admit events (complete, prefill_only, infer) and transitions to
 %%   `running`. Verifies and other read-only ops are allowed.
-%% - `running/3` — one or more `#req{}` are in flight. Accepts further
+%% - `running/3`: one or more `#req{}` are in flight. Accepts further
 %%   admit events (allocate seq_id from `idle_seq_ids` or enqueue in
 %%   `pending`), cancel casts, and the internal `tick` cast. Verify
 %%   is refused with `{error, busy}` because it mutates the context.
@@ -88,7 +88,7 @@
 %%
 %% - **cold**: fired right after a fresh prompt's prefill completes,
 %%   before any decoding. Saves the trimmed prefix the policy
-%%   produces from `cold_save_split/2`. Per-#req — each new admit
+%%   produces from `cold_save_split/2`. Per-#req: each new admit
 %%   fires its own cold save at most once.
 %% - **continued**: fired every `continued_interval` tokens during
 %%   decode. Per-#req, gated on the request's `last_save_at`.
@@ -107,22 +107,34 @@
 %% The gen_statem is the sole writer of the context's KV cells: every
 %% `backend:step/2` and `kv_pack` / `kv_unpack` / `seq_rm` call runs
 %% inside a state callback, so the AGENTS.md paused-context invariant
-%% holds — `kv_pack` only runs between ticks when no `llama_decode`
+%% holds: `kv_pack` only runs between ticks when no `llama_decode`
 %% is in flight. Default `n_seq_max => 1` collapses this to the v0.2
 %% single-tenant flow bit-identically; opting in via
 %% `context_opts.n_seq_max > 1` lets up to N requests run
 %% concurrently through one decode call per tick.
 %%
-%% ## Backwards compatibility
+%% ## Where things are
 %%
-%% - Public API (`complete/2,3`, `prefill_only/2`, `infer/4`,
-%%   `cancel/1`, `status/1`, `model_info/1`, `verify/4`, etc.) is
-%%   unchanged.
-%% - Default `n_seq_max => 1` keeps single-tenant behaviour
-%%   bit-identical to v0.2; multi-tenancy is opt-in.
-%% - `phase` on the obs row and in `model_info/1` is still
-%%   `idle | prefilling | generating`, computed from the dominant
-%%   phase across in-flight reqs (`dominant_phase/1`).
+%% Sections, in file order (search for the banner title):
+%%
+%% - Public API: the calls erllama.erl makes, and test getters.
+%% - gen_statem callbacks, then the idle and running states.
+%% - Admission, sequences and sessions: `admit/2', `start_request/4',
+%%   the `setup_*' functions. Invariant: a seq_id is either in
+%%   `idle_seq_ids', owned by exactly one #req, or pinned to a session.
+%% - Common event handler: calls valid in every state (chat, adapters,
+%%   model_info, embeddings).
+%% - Tick driver: `step_tick/1'. Order within a tick: cancellations,
+%%   then a sole-active media prefill, then a sole-active speculative
+%%   round, then a batched MTP round, else the co-batched step.
+%% - Multimodal requests, ngram speculation, MTP rounds for several
+%%   requests, then speculation: committing drafted tokens.
+%% - Tick: building the batch and applying its results.
+%% - Streaming and thinking output; terminal checks and saves;
+%%   finishing and failing requests (recovery lives here too:
+%%   `fail_all_requests/2', and `recover_in_place/2' above).
+%% - Request helpers; cache integration (lookup chain and save meta);
+%%   backend dispatch.
 -behaviour(gen_statem).
 
 -include("erllama_cache.hrl").
@@ -680,11 +692,11 @@ sticky path in `infer/4` would fall through to a cold admission.
 
 Errors:
 
-- `{error, no_session}` — `session_id` is unknown (no prior turn
+- `{error, no_session}`: `session_id` is unknown (no prior turn
   pinned this session, or it was released).
-- `{error, sticky_busy}` — the session's seq is currently in flight
+- `{error, sticky_busy}`: the session's seq is currently in flight
   with an earlier request.
-- `{error, {transcript_mismatch, Detail}}` — `Opts` carried
+- `{error, {transcript_mismatch, Detail}}`: `Opts` carried
   `expect_committed` and it did not equal the session's stored
   committed tokens (see below). The seq stays pinned; nothing is
   prefilled.
@@ -801,11 +813,10 @@ status(Model) ->
     call(Model, status).
 
 -doc """
-Request that the model evict its current state. Fires an `evict`
-save synchronously if there is anything in the context. Called by
-`erllama_scheduler` (future) when GPU memory pressure requires this
-model to release its context handle. No-op when the model is idle
-with no live context.
+Fire an `evict` save of the live context of every in-flight request
+and return; the requests keep running and nothing is released, so a
+later admission can resume from the saved row. Reached through
+`erllama:evict/1`. No-op when the model is idle with no live context.
 """.
 -spec evict(model()) -> ok | {error, not_loaded | timeout}.
 evict(Model) ->
@@ -1337,6 +1348,14 @@ run_verify(PrefixTokens, Candidates, K, Data) ->
 public_verify_reply({ok, Accepted, NextToken, _NewBState}) ->
     {ok, Accepted, NextToken}.
 
+%% =============================================================================
+%% Admission, sequences and sessions
+%%
+%% Admitting a request: resolving its sequence (sticky session, continuation,
+%% a free sequence or the pending queue), forking sessions, the cache lookup
+%% and the warm, cold or ladder setup it leads to, then the #req it runs as.
+%% =============================================================================
+
 %% Admit one pending_request(). Resolves which seq_id to use given
 %% the request's optional `session_id`: if a prior request on the
 %% same session left its KV cells live, we reuse that seq_id and
@@ -1479,7 +1498,7 @@ start_admission(Item, SeqId, Mode, Data) ->
         {error, Reason, From} ->
             %% Sampler build or pre-validation failed. Return the
             %% seq_id to the free list and reply to the caller.
-            %% Sticky seqs don't need to return to the idle pool —
+            %% Sticky seqs don't need to return to the idle pool :
             %% they're still owned by their session.
             Data1 =
                 case Mode of
@@ -1641,7 +1660,7 @@ pending_from_of(_) -> undefined.
 
 %% Public end_session handler: drop the session's sticky mapping,
 %% free the seq's KV cells, and return the seq to the idle pool.
-%% Idempotent — unknown sessions and busy seqs are both no-ops
+%% Idempotent: unknown sessions and busy seqs are both no-ops
 %% (a busy seq finishes through the normal release path; the
 %% caller can re-call end_session after that).
 drop_session(SessionId, Data) ->
@@ -1821,7 +1840,7 @@ prompt_tokens_of({infer, _From, Tokens, _Params, _CallerPid}, _Data) ->
 %% when the seq_id is being reused for a continuing session. In the
 %% sticky case the kv_unpack and cache-lookup steps are skipped:
 %% the seq's KV cells already hold `StoredTokens` and the new
-%% prompt is `StoredTokens ++ Suffix` — we just prefill the suffix
+%% prompt is `StoredTokens ++ Suffix`: we just prefill the suffix
 %% in place.
 start_request({complete, From, Prompt, #{media := _} = Opts}, SeqId, _Mode, Data) when
     is_binary(Prompt)
@@ -2635,7 +2654,7 @@ pinned_idle_seq_count(#data{session_seq = SS, req_table = RT}) ->
 %% Row shape: {ModelId, Phase, PendingLen, LastCacheHitKind, LastCacheHitPrefixLen}.
 %% The initial row carries `undefined` for the last-hit kind so external
 %% routers can distinguish "model has never admitted a request" from
-%% "model's last admission was cold" — both are valid signals.
+%% "model's last admission was cold": both are valid signals.
 obs_install_initial(Data) ->
     Row = {Data#data.model_id, idle, 0, undefined, 0},
     _ = erllama_inflight:obs_put(Data#data.model_id, Row),
@@ -3239,6 +3258,14 @@ refuse_mtp_batch(Refused, Seq, Data) ->
             Data
     end.
 
+%% =============================================================================
+%% Speculation: committing drafted tokens
+%%
+%% Shared by the ngram, lone MTP and batched MTP rounds: feed committed
+%% tokens through the decode commit clause, trim a KV overshoot, report
+%% acceptance back to the drafter, and which decode errors recover in place.
+%% =============================================================================
+
 %% Feed committed tokens one at a time through the decode commit
 %% clause, stopping as soon as the request flips to finishing (a
 %% stop string matched mid-batch). Returns how many committed tokens
@@ -3307,6 +3334,14 @@ is_recoverable_decode_error({decode_timeout, _}) -> true;
 is_recoverable_decode_error({decode_failed, _}) -> true;
 is_recoverable_decode_error(_) -> false.
 
+%% =============================================================================
+%% Tick: building the batch and applying its results
+%%
+%% The co-batched step: cancellations, the op list (prefill slices and decode
+%% rows within the batch budget), then each row's result applied to its
+%% request.
+%% =============================================================================
+
 %% Pair each op with its result by matching on seq_id. The backend
 %% returns results in op-list order but we tolerate reordering by
 %% looking up each op's result via its seq_id; the (seq_id, op)
@@ -3355,7 +3390,7 @@ honour_cancellations(Data) ->
 %% Build the op list for this tick. Returns {OpList, FinishersFirst}.
 %% FinishersFirst is requests that have already hit a terminal
 %% condition (response_target met, eog flag, cancel) and don't
-%% participate in this tick — they're finalised in the post-step
+%% participate in this tick; they're finalised in the post-step
 %% finisher walk.
 build_op_list(Data) ->
     Reqs = maps:values(Data#data.req_table),
@@ -3370,7 +3405,7 @@ build_op_list(Data) ->
                 undefined ->
                     case R#req.sampler_ref of
                         undefined ->
-                            %% prefill_only completed prefill — it's a
+                            %% prefill_only completed prefill: it's a
                             %% finisher this tick.
                             {Decodes, Prefills};
                         Ref ->
@@ -3552,6 +3587,10 @@ req_append_token(Req, Token) ->
         generated = Req#req.generated ++ [Token]
     }.
 
+%% =============================================================================
+%% Streaming and thinking output
+%% =============================================================================
+
 %% Stream a token to the caller (no-op for non-streaming modes
 %% unless stop_sequences are active, in which case we still need to
 %% accumulate detokenized bytes so an early match can stop the
@@ -3731,6 +3770,13 @@ fail_thinking_disabled(#req{
 fail_thinking_disabled(_Req) ->
     ok.
 
+%% =============================================================================
+%% Terminal checks and saves
+%%
+%% Whether a request is done, and the cold, continued and agent-prefix saves
+%% fired on the way.
+%% =============================================================================
+
 %% Mark any req whose generated count >= response_target as
 %% finishing. Called after apply_step_results so we don't mutate
 %% the table mid-iteration.
@@ -3797,7 +3843,7 @@ maybe_fire_cold_save(
 %% first N tokens) and pin it. Bypasses the cold_min/cold_max band
 %% (only the min_tokens floor). Calls `fire_save_if/5` (NOT the writer
 %% directly) so the writer's `{error, already_present}` is normalised
-%% to `fired` — the row exists either way, which is exactly when we
+%% to `fired`: the row exists either way, which is exactly when we
 %% pin. Computes the key itself (deterministic from the tokens) so no
 %% other save path's return contract changes.
 fire_agent_prefix_save(Ctx, Req, Data) ->
@@ -3831,6 +3877,13 @@ maybe_fire_continued_for_req(Req, Data) ->
         false ->
             Req
     end.
+
+%% =============================================================================
+%% Finishing and failing requests
+%%
+%% The finish save, done or error messages to callers, freeing samplers,
+%% releasing or pinning sequences, and admitting what was queued.
+%% =============================================================================
 
 %% Walk all #req with finishing=true; for each, fire its finish
 %% save, build the reply / stream-done, free its sampler, free its
@@ -4050,6 +4103,13 @@ dispatch_pending_admits(Data, Actions) ->
 enqueue(Item, Data) ->
     Data#data{pending = Data#data.pending ++ [Item]}.
 
+%% =============================================================================
+%% Request helpers
+%%
+%% Small lookups over a request: its phase, sampler config, stop sequences,
+%% thinking options and the stats a finished request reports.
+%% =============================================================================
+
 finish_key_or_undefined({ok, Key}) -> Key;
 finish_key_or_undefined(skipped) -> undefined.
 
@@ -4118,7 +4178,7 @@ sampler_cfg_from(Opts) ->
 %% sent to the backend; the caller stashes both on the #req. Falls
 %% back to {ok, undefined, Cfg, Data} if the backend doesn't
 %% implement sampler_new (legacy backends; they also won't implement
-%% step/2 so the request will fail on first tick — only kept for
+%% step/2 so the request will fail on first tick: only kept for
 %% the error story).
 sampler_for(Opts, Data = #data{backend = Mod, backend_state = S}) ->
     Cfg = sampler_cfg_from(Opts),
@@ -4691,7 +4751,7 @@ via(ModelId) when is_binary(ModelId) ->
         undefined -> exit({noproc, {?MODULE, not_found, ModelId}})
     end.
 
-%% prime_logits/3 is gone — the warm-restore primer is now part of
+%% prime_logits/3 is gone: the warm-restore primer is now part of
 %% the per-#req flow. On an exact hit setup_warm/5 drops the last KV
 %% cell via warm_restore_primer/3 and the #req.prefill_cursor carries
 %% `[Last]` so the next step_tick re-prefills the primer token; a

@@ -21,12 +21,19 @@
 
 -spec names() -> [binary()].
 names() ->
-    [N || #{name := N} <- definitions()].
+    [N || #{name := N} <- specs()].
 
+%% The tool schemas offered to the model.
 -spec definitions() -> [map()].
 definitions() ->
+    [maps:with([name, description, parameters], S) || S <- specs()].
+
+%% Each native tool once: its schema and its class. A tool that changes
+%% the workspace or runs a command is `write'.
+specs() ->
     [
         tool(
+            read,
             <<"read_file">>,
             <<"Read a text file of the workspace as numbered lines, a page at a time.">>,
             #{
@@ -37,6 +44,7 @@ definitions() ->
             [<<"path">>]
         ),
         tool(
+            read,
             <<"list_dir">>,
             <<"List a directory of the workspace; directories end with /.">>,
             #{
@@ -46,6 +54,7 @@ definitions() ->
             []
         ),
         tool(
+            read,
             <<"search">>,
             <<"Search the workspace's text files for a regular expression.">>,
             #{
@@ -56,6 +65,7 @@ definitions() ->
             [<<"pattern">>]
         ),
         tool(
+            write,
             <<"write_file">>,
             <<"Create a new file. Fails if it exists: use edit_file to change a file.">>,
             #{
@@ -65,6 +75,7 @@ definitions() ->
             [<<"path">>, <<"content">>]
         ),
         tool(
+            write,
             <<"edit_file">>,
             <<"Replace an exact text in a file. The old text must match exactly once unless replace_all is set.">>,
             #{
@@ -76,6 +87,7 @@ definitions() ->
             [<<"path">>, <<"old">>, <<"new">>]
         ),
         tool(
+            write,
             <<"shell">>,
             <<"Run a shell command in the workspace and return its exit status and output.">>,
             #{
@@ -89,12 +101,14 @@ definitions() ->
             [<<"command">>]
         ),
         tool(
+            read,
             <<"shell_status">>,
             <<"Output so far and status of a background shell job.">>,
             #{<<"job">> => str(<<"Job id">>)},
             [<<"job">>]
         ),
         tool(
+            write,
             <<"shell_kill">>,
             <<"Stop a background shell job and everything it started.">>,
             #{<<"job">> => str(<<"Job id">>)},
@@ -102,8 +116,9 @@ definitions() ->
         )
     ].
 
-tool(Name, Desc, Props, Required) ->
+tool(Class, Name, Desc, Props, Required) ->
     #{
+        class => Class,
         name => Name,
         description => Desc,
         parameters => #{
@@ -115,12 +130,12 @@ str(D) -> #{<<"type">> => <<"string">>, <<"description">> => D}.
 int(D) -> #{<<"type">> => <<"integer">>, <<"description">> => D}.
 
 -spec class(binary()) -> class().
-class(N) when
-    N =:= <<"write_file">>; N =:= <<"edit_file">>; N =:= <<"shell">>; N =:= <<"shell_kill">>
-->
-    write;
-class(_) ->
-    read.
+class(N) ->
+    case [C || #{name := Name, class := C} <- specs(), Name =:= N] of
+        [C] -> C;
+        %% A name this module does not define is never treated as a read.
+        [] -> write
+    end.
 
 %% Reading is allowed; changing the workspace or running commands asks.
 -spec default_policy(binary()) -> policy().

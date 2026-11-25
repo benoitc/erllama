@@ -43,6 +43,7 @@ init_per_testcase(TC, Config) ->
     [{ws, list_to_binary(Ws)} | Config].
 
 end_per_testcase(_TC, _Config) ->
+    _ = application:unset_env(erllama_server, agent_generator),
     _ = application:stop(erllama_server),
     [erllama:unload(Id) || #{id := Id} <- erllama:list_models()],
     application:unset_env(erllama_server, data_dir),
@@ -168,6 +169,7 @@ store_crash_recovers(Config) ->
     check_repaired(Conv, Ws).
 
 slow_call(Config) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     Script = [
         #{
             calls => [
@@ -179,7 +181,6 @@ slow_call(Config) ->
     {ok, #{agent_id := Id, conversation_id := Conv}} = erllama_server_api:agent_start(#{
         model => <<"stub">>,
         workspace => ?config(ws, Config),
-        generator => erllama_server_agent_script,
         policy => yes
     }),
     ok = erllama_server_agent_script:set(Id, Script),
@@ -213,10 +214,10 @@ check_repaired(Conv, Ws) ->
     ?assertNot(filelib:is_file(filename:join(Ws, "out.txt"))).
 
 resume_does_not_repeat(Conv, Ws) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     {ok, #{agent_id := Id2}} = erllama_server_api:agent_start(#{
         model => <<"stub">>,
         conversation_id => Conv,
-        generator => erllama_server_agent_script,
         policy => yes
     }),
     {ok, #{workspace := Ws}} = erllama_server_api:conversation(Conv),

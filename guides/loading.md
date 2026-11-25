@@ -244,8 +244,7 @@ CtxHash = crypto:hash(sha256, term_to_binary({Nctx, Nbatch})).
 With the llama.cpp backend you don't need to cover the KV layout
 yourself: the llama.cpp build and the `type_k`, `type_v`,
 `flash_attn`, `n_seq_max` and `kv_unified` context options are mixed
-into your hash. `erllama_model:cache_key_meta/1` returns the value
-actually used in cache keys.
+into your hash.
 
 ### `context_size`
 
@@ -289,7 +288,8 @@ map (or omit the key entirely) to use the defaults.
 and close an extended-thinking block for models that emit one (for
 example `<think>` / `</think>`). With markers set and `thinking =>
 enabled` on the request, the text between them arrives as
-`{thinking, Bin}` stream events instead of `{token, Bin}`.
+`{thinking, Bin}` stream events instead of `{token, Bin}`. A llama
+model with markers set does not run speculative decoding.
 
 ### `chat_template`
 
@@ -312,6 +312,31 @@ audio content parts and `stream/complete` accept the `media` option.
 `mmproj_opts` tunes it: `use_gpu` (default true), `n_threads`,
 `image_min_tokens`, `image_max_tokens`. `model_info/1` reports the
 modalities under `mmproj`. See [multimodal](multimodal.md).
+
+### `draft_model` and `draft_model_opts`
+
+A GGUF path to a multi-token-prediction (MTP) head, for
+`speculative => #{type => mtp}` requests (experimental). The llama
+backend loads it with every layer on the GPU (`n_gpu_layers => -1`
+unless `draft_model_opts` says otherwise; `load_mtp => true` is always
+set). If the head fails to load, the whole load fails.
+See [speculative decoding](generation.md#drafting-with-an-mtp-head-experimental).
+
+```erlang
+{ok, M} = erllama:load_model(<<"glm">>, #{
+    model_path => "GLM-5.3-Flash-Q4_K-00001-of-00002.gguf",
+    draft_model => "mtp-GLM-5.3-Flash-Q8_0.gguf",
+    context_opts => #{n_ctx => 4096, n_rs_seq => 2}
+}).
+```
+
+### Split models (`tp_*`)
+
+To split one model over several machines, you load it with
+`backend => erllama_model_tp` and the `tp_worker`, `tp_followers`,
+`tp_call_timeout` and `tp_kv_timeout` keys (experimental). See
+[tensor parallelism](tensor-parallel.md) for building, forming the
+ranks and loading.
 
 ### `model_id`
 
@@ -369,30 +394,9 @@ The stub backend sends no progress messages.
 
 ## Forking a session
 
-`erllama:fork_session(Model, SrcSessionId, NewSessionId)` duplicates a
-sticky session's live KV cells into a fresh sequence, so two
-continuations can explore different branches without re-prefilling
-the shared prefix:
-
-```erlang
-{ok, _} = erllama:complete(M, Prompt, #{session_id => a}),
-ok = erllama:fork_session(M, a, b),
-{ok, _} = erllama:complete(M, <<Transcript/binary, " option one">>, #{session_id => a}),
-{ok, _} = erllama:complete(M, <<Transcript/binary, " option two">>, #{session_id => b}).
-```
-
-Notes:
-
-- The context needs free sequences (`context_opts.n_seq_max > 1`);
-  with `kv_unified => true` the copy is metadata-only (the branches
-  share cells until they diverge).
-- The copy carries no logits, so the forked session's first request
-  must extend the stored transcript (any normal continuation does).
-- Works on every model family; on recurrent models it copies the
-  compressed state tail.
-- Never queues: with no free sequence (after reclaiming the
-  least-recently-used idle pin, never the source) the reply is
-  `{error, seq_capacity}`.
+`erllama:fork_session/3` copies a sticky session's live KV into a new
+session, so two branches share the prefill. See
+[sessions](sessions.md) for the steps and the limits.
 
 ## Loading multiple models
 
@@ -408,7 +412,7 @@ concurrently:
 {ok, #{reply := R2}} = erllama:complete(<<"big">>,  <<"hello">>).
 ```
 
-Both share one `erllama_cache` instance - cache rows are scoped by
+Both share one `erllama_cache` instance; cache rows are scoped by
 fingerprint, so they never collide.
 
 ## Unloading

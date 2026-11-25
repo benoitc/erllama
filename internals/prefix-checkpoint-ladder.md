@@ -1,125 +1,109 @@
-# Design proposal: prefix-checkpoint ladder for warm agent turns
+# Prefix-checkpoint ladder
 
-Status: proposal, for review before implementing. Companion to
-[cache-design.md](cache-design.md).
+Status: shipped (option B1 of the original proposal), off by default.
+This page records why the ladder exists, what was built, where it lives
+and how to check it. Read it before you change cold-prefill saves,
+`erllama_cache_policy` or the `agent_prefix` checkpoint. Companion to
+[cache-design.md](cache-design.md); the user-facing knobs are in the
+[caching guide](../guides/caching.md).
 
 ## Problem
 
-Agent clients (Claude Code over `/v1/messages`, similar OpenAI loops) get
-`cache_hit_kind = cold` on every turn. Measured live on a qwen3-coder:30b
-load serving Claude Code:
+Agent clients (Claude Code over `/v1/messages`, similar OpenAI loops)
+got `cache_hit_kind = cold` on every turn. Measured live on a
+qwen3-coder:30b load serving Claude Code:
 
 ```
 longest_prefix_probes => 19296   hits_longest_prefix => 0
 saves_finish => 11   saves_continued => 11   saves_cold => 0
 ```
 
-Lookups run constantly and never hit. Two causes:
+Lookups ran constantly and never hit, for two reasons:
 
-1. **No checkpoint at the shared boundary.** The cold path writes at most
-   one save row, at the trimmed-prefix boundary (`cold` reason, see the
-   save-reasons table in cache-design.md), and that boundary is near the
-   full prompt length (`boundary_align_tokens` is small, `boundary_trim`
-   is 0). The `finish` row is the full prompt+reply. So every stored row
-   for a session is near-full-length. The longest-prefix walk probes the
-   new prompt at stride alignments and can only hit a row whose tokens
-   equal the new prompt's prefix at that length. When the conversation
-   diverges anywhere before the end (a tool result inserted mid-history,
-   client-side compaction, a re-render), the only common region is the
-   head, and there is no row at a head-length boundary to hit.
+1. **No checkpoint at the shared boundary.** A cold prefill wrote at
+   most one save, at the trimmed-prefix boundary, which is close to
+   the full prompt length, and the finish save is the full
+   prompt plus reply. So every stored row for a session was close to
+   full length. When a conversation diverges before its end (a tool
+   result inserted mid-history, client-side compaction, a re-render),
+   the only common region is the head, and no row ended there.
+2. **Turns are not token-exact extensions.** Claude Code re-renders
+   and compacts, so the session continuation path and the sticky
+   prefix check, which both need an exact extension, never armed.
 
-2. **Turns are not token-exact extensions.** Claude Code re-renders and
-   compacts: logged prompt sizes are non-monotonic. The session
-   continuation path (`maybe_arm_continuation`, strict `lists:prefix`)
-   and the engine sticky prefix-equality both require an exact extension,
-   so neither arms.
+(`cold_max_tokens` was also capping cold saves at 8192 while these
+prompts were 25k to 32k tokens, which zeroed `saves_cold`; that was
+fixed separately.)
 
-(`cold_max_tokens` was also capping cold-save at 8192 while these prompts
-are 25-32k, which zeroed `saves_cold` outright. That cap is raised
-separately; this proposal is the structural fix that helps even when
-turns are not clean extensions.)
+The lookup side already did the right thing: the longest-byte-prefix
+lookup takes the longest stored row whose bytes prefix the new prompt.
+The gap was on the save side.
 
-The lookup side already does the right thing (walk at stride alignments,
-longest hit wins). The gap is on the save side: we never produce rows at
-the boundaries the walk probes below the full length.
+## What shipped
 
-## Proposal
+A cold prefill can write extra `cold` rows at a ladder of boundaries
+below the trimmed boundary, so a later prompt that shares only the head
+hits the largest boundary it still matches and prefills only the
+divergent tail. The rows are ordinary `cold` rows: no new save reason,
+no format change, the same reservation and publication rules.
 
-During a cold prefill, emit `cold` save rows at a **ladder** of stride
-boundaries, not just the final trimmed boundary. A later prompt that
-shares the head up to boundary K then hits at K and resumes there,
-re-prefilling only the divergent tail.
+- **Boundaries** (`erllama_cache_policy:cold_save_segments/2`): up to
+  `max_ladder_rows` points spaced `ladder_interval` apart (rounded down
+  to a multiple of `boundary_align_tokens`), at or above
+  `cold_min_tokens` and strictly below the trimmed boundary, plus the
+  trimmed boundary itself. A prompt outside
+  `[cold_min_tokens, cold_max_tokens]` gets no cold save at all.
+- **Defaults:** `max_ladder_rows => 0` (the ladder is off: one cold
+  save at the trimmed boundary, as before) and
+  `ladder_interval => 16384`. Both are keys of a model's `policy` map
+  (accepted by `erllama_opts`).
+- **Firing** (`erllama_model`): `setup_cold/2` splits the prompt into
+  segments; the first goes into the prefill cursor, and each time the
+  cursor drains at an internal boundary `maybe_fire_cold_save/2` packs
+  the sequence (its KV then holds exactly that prefix), fires an async
+  save and rotates the next segment in. The last segment is the
+  remainder, covered by the finish save.
+- **Static prefix** (`build_cold_ladder/3`): a request with
+  `prefix_checkpoint_len => N` adds a boundary at N, tagged
+  `agent_prefix` instead of `cold`. That row ignores the cold band
+  (only `min_tokens` applies) and is pinned, so `gc/0` keeps it and
+  byte-targeted eviction takes it only as a last resort.
 
-Concretely:
+## Decisions on the open questions
 
-- `erllama_cache_policy`: add a function that yields the ladder of
-  save boundaries for a prompt given `(ladder_interval, cold_min_tokens,
-  cold_max_tokens, boundary_align_tokens)`, e.g. every `ladder_interval`
-  tokens from `cold_min_tokens` up to the trimmed boundary. Keep
-  `cold_save_split/2` for the final boundary; the ladder is the set of
-  earlier ones.
-- `erllama_model` cold prefill (`setup_cold/2`, the cursor-drain
-  in `apply_step_results`, `maybe_fire_cold_save/2`): fire a `cold` save
-  each time the prefill cursor crosses a ladder boundary, reusing the
-  existing async save plumbing (`fire_save_for_tokens(cold, ...)`).
-- Consumer (`lookup_longest_text_prefix`, `try_longest_prefix`) is
-  unchanged by the ladder. Note: the cache is now byte-keyed (see
-  cache-design.md), so each ladder row is keyed over its rendered-byte
-  prefix and the longest-prefix lookup scans byte lengths, not token
-  strides.
+- **B1 or B2.** B1 (a coarse, bounded ladder on the existing slab
+  format) shipped. B2 (paged, block-level KV shared between prefixes)
+  was not built: it is a slab and meta-format rework.
+- **Placement.** Fixed interval from the head, plus the optional
+  `prefix_checkpoint_len` boundary for a known static prefix.
+- **Budget.** No separate quota or TTL: ladder rows compete with the
+  other rows under frecency eviction (see cache-design.md). Rows that
+  must stay are the pinned `agent_prefix` ones.
+- **Pack pauses.** Bounded only by `max_ladder_rows`: each boundary
+  costs one pack pause during the prefill.
 
-No new save reason; the rows are ordinary `cold` rows at more boundaries.
-Byte-exactness, sole-writer arbitration, and the slab format are all
-untouched.
+## Cost
 
-## The cost tradeoff (the part that needs a decision)
-
-Cumulative prefixes are redundant: a row at length L contains every
-shorter row's bytes. A full ladder at the lookup stride (2048) for a 29k
-prompt is ~14 rows totalling ~7x the full-prompt KV, with a pack pause at
-each boundary during prefill. That is too expensive to take blindly.
-
-Realistic shapes to choose between:
-
-- **(B1) Coarse, bounded ladder.** Pick a `ladder_interval` much larger
-  than the lookup stride (e.g. 8192) and cap the row count (e.g. 3-4).
-  Bounds both storage and pack pauses; reuse granularity is coarse (a
-  divergence at 12k reuses the 8k checkpoint). Smallest change, ships on
-  the existing slab format and LRU. Disk tier absorbs the extra rows;
-  per-tier quota + LRU already evict the cold ones.
-- **(B2) Paged / block KV (radix-style).** Store KV in fixed-size blocks
-  and reconstruct any prefix from shared blocks, so checkpoints cost
-  one block each and there is no cumulative redundancy. This is the
-  vLLM/SGLang answer and the right long-term shape, but it is a slab and
-  meta-format rework (cache-design.md explicitly calls the slab format
-  "opinionated, fixed-size per-layer regions"). Large; out of scope for a
-  first cut.
-
-Recommendation: ship **B1** behind policy knobs (`ladder_interval`,
-`max_ladder_rows`, default off or conservative), measure the warm-hit
-rate against a real Claude Code session, and only pursue B2 if B1's
-coarse granularity proves insufficient.
-
-## Open questions for review
-
-1. B1 vs jumping straight to B2.
-2. Ladder placement: fixed interval from the head, or biased toward the
-   tail (agent turns most often diverge near the end, where one near-tail
-   checkpoint already helps once `cold_max_tokens` is raised)?
-3. Budget: extra cold rows compete with finish/continued rows in the LRU.
-   Do we want a separate quota or a TTL for ladder rows so they cannot
-   evict the more valuable finish rows?
-4. Pack-pause budget during prefill: cap total ladder pack time per
-   request so a long cold prefill does not stall the response.
-5. Eviction interaction with `n_seq_max` concurrency (multiple cold
-   prefills laddering at once).
+Cumulative prefixes are redundant: a row at length L holds every
+shorter row's KV. With `max_ladder_rows` R, one cold prefill writes up
+to R + 1 rows and pauses R + 1 times to pack. Keep `ladder_interval`
+large and R small.
 
 ## Tests
 
-- Policy: ladder boundaries for representative lengths and knobs;
-  count is bounded; empty below `cold_min_tokens`.
-- Engine: a cold prefill emits `cold` saves at each ladder boundary
-  (assert via counters / save announcements), and a follow-up prompt
-  sharing only a head prefix resumes at the largest ladder boundary
-  that still matches (`partial` hit), not cold.
-- Budget: ladder rows are evictable and do not starve finish rows.
+- `erllama_cache_policy_tests`:
+  `cold_save_segments_no_ladder_matches_legacy_test` (no ladder keys
+  gives the single legacy boundary),
+  `cold_save_segments_ladder_below_trim_test`,
+  `cold_save_segments_bounded_by_max_ladder_rows_test`.
+- `erllama_model_tests:ladder_fires_multiple_cold_saves_test`: a cold
+  prefill with the ladder on fires several cold saves, and the head
+  boundary's row is in the cache.
+- `erllama_model_tests:build_cold_ladder_*_test`: the segments are a
+  partition of the prompt, and only the boundary at N is tagged
+  `agent_prefix`.
+- `erllama_model_tests:agent_prefix_checkpoint_fires_pinned_and_survives_evict_test`
+  and `no_agent_prefix_without_boundary_test`: the static-prefix row is
+  pinned, survives `gc/0`, and a later prompt resumes from it.
+- Not covered: a follow-up prompt that shares only a ladder boundary
+  (no `agent_prefix`) resuming from that row as a `partial` hit.

@@ -27,6 +27,8 @@
     body_limit/1,
     concurrency_limit/1,
     run_limit_is_429/1,
+    embeddings_share_the_run_limit/1,
+    a_slot_is_freed_with_its_holder/1,
     disconnect_cancels_the_run/1,
     load_on_demand_and_keep_alive/1,
     unload_during_stream/1,
@@ -71,6 +73,8 @@ all() ->
         body_limit,
         concurrency_limit,
         run_limit_is_429,
+        embeddings_share_the_run_limit,
+        a_slot_is_freed_with_its_holder,
         disconnect_cancels_the_run,
         load_on_demand_and_keep_alive,
         unload_during_stream,
@@ -135,6 +139,8 @@ env(api_keys) -> [{api_keys, [<<"k1">>, <<"k2">>]}];
 env(body_limit) -> [{max_body_bytes, 256}];
 env(concurrency_limit) -> [{max_http_requests, 1}];
 env(run_limit_is_429) -> [{max_active_runs, 1}];
+env(embeddings_share_the_run_limit) -> [{max_active_runs, 1}];
+env(a_slot_is_freed_with_its_holder) -> [{max_active_runs, 1}];
 env(_) -> [].
 
 %% -----------------------------------------------------------------------------
@@ -412,6 +418,62 @@ run_limit_is_429(Config) ->
         {first, {200, _}} -> ok
     after 30000 -> ct:fail(first_request_did_not_finish)
     end.
+
+%% An embedding takes a run slot: with the only one held by a run it
+%% answers 429, while model lookups and token counts, which take none,
+%% still answer. Once the run ends, embeddings are served again.
+embeddings_share_the_run_limit(Config) ->
+    Self = self(),
+    _ = spawn(fun() ->
+        Self !
+            {first,
+                post(
+                    Config,
+                    <<"/v1/chat/completions">>,
+                    chat(<<"x">>, #{<<"model">> => <<"slow">>, <<"max_tokens">> => 40})
+                )}
+    end),
+    ok = wait(fun() -> erllama:status(<<"slow">>) =:= {ok, generating} end),
+    Embed = #{<<"model">> => <<"stub">>, <<"input">> => <<"a b">>},
+    {429, _} = post(Config, <<"/v1/embeddings">>, Embed),
+    {429, _} = post(Config, <<"/api/embed">>, #{<<"model">> => <<"stub">>, <<"input">> => <<"a b">>}),
+    {200, _} = get(Config, <<"/v1/models">>),
+    {200, _} = get(Config, <<"/v1/models/stub">>),
+    {200, _} = get(Config, <<"/api/tags">>),
+    {200, Count} = post(
+        Config, <<"/v1/messages/count_tokens">>, maps:remove(<<"max_tokens">>, anthropic(#{}))
+    ),
+    ?assertMatch(#{<<"input_tokens">> := _}, decode(Count)),
+    receive
+        {first, {200, _}} -> ok
+    after 30000 -> ct:fail(first_request_did_not_finish)
+    end,
+    {200, _} = post(Config, <<"/v1/embeddings">>, Embed),
+    %% The embedding gave its slot back.
+    {200, _} = post(Config, <<"/v1/chat/completions">>, chat(<<"x">>)).
+
+%% A slot whose holder exits is freed: no leak if a request handler
+%% crashes while it embeds.
+a_slot_is_freed_with_its_holder(_Config) ->
+    Self = self(),
+    Holder = spawn(fun() ->
+        Self ! {held, erllama_server_runs:hold_slot(self())},
+        receive
+            stop -> ok
+        end
+    end),
+    receive
+        {held, {ok, _}} -> ok
+    after 5000 -> ct:fail(no_slot)
+    end,
+    ?assertEqual({error, too_many_runs}, erllama_server_runs:hold_slot(self())),
+    exit(Holder, kill),
+    ok = wait(fun() ->
+        case erllama_server_runs:hold_slot(self()) of
+            {ok, Slot} -> ok =:= erllama_server_runs:release_slot(Slot);
+            {error, too_many_runs} -> false
+        end
+    end).
 
 %% A client that goes away mid-stream: its run is cancelled and the
 %% model is free again at once (500 tokens at 20 ms would take 10 s).

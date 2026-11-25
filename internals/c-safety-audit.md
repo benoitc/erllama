@@ -1,13 +1,14 @@
 # C / NIF safety audit
 
-Note: this audit predates the split of `erllama_nif.c` into
-per-concern files (`erllama_nif_*.c`); the `file:line` references
-below point into the pre-split monolith and remain valid against the
-audit branch.
-
-Audit branch: `audit/c-safety-review`. Scope: `c_src/erllama_nif.c`,
-`c_src/erllama_safe.cpp`, `c_src/crc32c.{c,h}`. The upstream
-`c_src/llama.cpp/` submodule was not examined.
+This is a dated engineering record, not a description of the current
+code. Audited at commit `018a14d` (2026-05-11, branch
+`audit/c-safety-review`). Its scope was `c_src/erllama_nif.c`,
+`c_src/erllama_safe.cpp` and `c_src/crc32c.{c,h}`; the vendored
+llama.cpp was not examined. It predates the split of `erllama_nif.c`
+into several files (`erllama_nif_*.c` and the C++ shims), so every file
+name and line number below refers to that revision, and findings may
+have been fixed since. For the rules the code follows today, read
+[nif-safety.md](nif-safety.md).
 
 The audit looked for segfaults, deadlocks, infinite loops, leaks, and
 non-thread-safe operations. Findings are grouped by severity. Line
@@ -15,7 +16,7 @@ numbers are against the tree at the time of audit.
 
 ## High severity
 
-### H1. Adapter outlives its underlying `llama_model` — use-after-free on adapter free
+### H1. Adapter outlives its underlying `llama_model`: use-after-free on adapter free
 
 - Sites: `nif_free_model` (`c_src/erllama_nif.c:602-633`),
   `nif_adapter_load` (`c_src/erllama_nif.c:2051-2095`),
@@ -28,7 +29,7 @@ numbers are against the tree at the time of audit.
   derived from it. The wrapping `erllama_adapter_t` keeps the *resource*
   alive (via `enif_keep_resource`) but `a->adapter` is now a dangling
   pointer. A subsequent `nif_adapter_free` or `adapter_dtor` calls
-  `llama_adapter_lora_free` on freed memory — UAF / double-free.
+  `llama_adapter_lora_free` on freed memory: UAF / double-free.
 - Fix sketch: track `active_adapters` on `erllama_model_t` next to
   `active_contexts`. `nif_free_model` should set `release_pending`
   whenever either counter is non-zero. Decrement `active_adapters`
@@ -43,10 +44,10 @@ numbers are against the tree at the time of audit.
   array is then passed to `erllama_safe_set_adapters_lora` outside any
   adapter lock. A concurrent `nif_adapter_free` on any of the listed
   adapters will null the underlying llama object between the unlock
-  and the llama call — the call sees a dangling pointer.
+  and the llama call; the call sees a dangling pointer.
 - Fix sketch: either (a) hold every `a->mu` for the duration of
-  `set_adapters_lora` (lock them in deterministic order — e.g. by
-  resource pointer — to avoid AB-BA), or (b) add an `in_use` counter
+  `set_adapters_lora` (lock them in deterministic order, e.g. by
+  resource pointer, to avoid AB-BA), or (b) add an `in_use` counter
   to `erllama_adapter_t` that `nif_adapter_free` waits on, or (c)
   serialise adapter mutation through a coarser lock (one per model
   is enough since adapters are always model-scoped).
@@ -105,7 +106,7 @@ The combination of `m->active_contexts` and `m->release_pending`
 under `m->mu` is the only state involved. The single decrement
 that observes `release_pending && active_contexts == 0 && m->model`
 performs the free atomically, all under the lock. Race-free for
-contexts. (Adapters are *not* covered — see H1.)
+contexts. (Adapters are *not* covered: see H1.)
 
 ### `enif_keep_resource` / `enif_release_resource` pairing
 

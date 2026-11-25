@@ -1,12 +1,15 @@
 # Tensor parallelism across hosts
 
-This page is for contributors working on cross-host tensor parallelism:
+This page is the design record for cross-host tensor parallelism:
 several machines, one GPU each, computing parts of the same layers for
-the same request. Read it before changing `erllama_tp`, the rank NIFs
-in `c_src/erllama_tp_nif.cpp` or the tests that drive them. The work
-is experimental and comes in milestones; this page describes what
-exists now (a reduction between ranks, and a model split over them)
-and how failures behave.
+the same request. Read it before changing `erllama_tp`,
+`erllama_tp_rank`, `erllama_model_tp`, the rank NIFs in
+`apps/erllama/c_src/erllama_tp_nif.cpp` or the tests that drive them.
+It explains why the collectives are ordered the way they are, how the
+devices and the command stream work, the checkpoint format and how
+failures behave. To set up a group and serve a split model, follow the
+[tensor-parallel guide](../guides/tensor-parallel.md). The work is
+experimental: two hosts are verified, larger groups are not.
 
 ## The model
 
@@ -19,7 +22,7 @@ and how failures behave.
   node's GPU backend, joins the backend's communicator and runs
   collectives. Forming a group (which ranks, when, which generation)
   is the coordinator's job: `erllama_cluster` later, a test coordinator
-  (`test/erllama_tp_coordinator.erl`) here.
+  (`apps/erllama/test/erllama_tp_coordinator.erl`) here.
 - **Tensor data stays native.** Only the communicator's bootstrap
   records cross Erlang. Reductions go GPU to GPU through the backend's
   communicator (NCCL for CUDA).
@@ -28,7 +31,7 @@ and how failures behave.
 
 The pinned llama.cpp gives each backend an optional
 `ggml_backend_comm_init_rank(backend, rank, world_size, callback,
-data)` (`ggml/include/ggml-backend.h`). The CUDA backend has it when
+data)` (`apps/erllama/c_src/llama.cpp/ggml/include/ggml-backend.h`). The CUDA backend has it when
 built with NCCL. It calls `callback(data, send, recv, size)` one or
 more times; each call must fill `recv` with every rank's `size` bytes
 in rank order. CUDA uses one round, carrying each rank's local checks
@@ -79,7 +82,7 @@ A model is loaded with llama.cpp's own tensor split
 (`LLAMA_SPLIT_MODE_TENSOR`) over one device per rank, in rank order:
 load it with `tp_rank => Rank` (an open erllama_tp handle) and every
 rank loads the same file with the same options. erllama supplies the
-devices (`c_src/erllama_tp_nif.cpp`, built on ggml's backend
+devices (`apps/erllama/c_src/erllama_tp_nif.cpp`, built on ggml's backend
 interfaces):
 
 - the device at this rank's slot wraps the local GPU and forwards
@@ -115,41 +118,33 @@ selection would otherwise pick them up for ordinary loads. A rank stays
 open while a model is loaded on it (`erllama_tp:close/1` answers
 `{error, in_use}`).
 
-`erllama_tp_rank` drives this for tests: `load/3`, `decode/2` (every
-rank at once), `stats/1` (the reductions made, with their sizes in
-order, and what the placeholders reserve) and a single-GPU reference
-copy (`ref_load/3`, `ref_decode/2`).
+`erllama_tp_rank:load/3` loads the split model on a rank. For tests it
+also has `decode/2` (every rank at once), `stats/1` (the reductions
+made, with their sizes in order, and what the placeholders reserve)
+and a single-GPU reference copy (`ref_load/3`, `ref_decode/2`); these
+are hidden from the docs.
 
 ## Serving a split model
 
 The model is served from a node that is no rank: the serving VM loads
-it with `backend => erllama_model_tp` (`src/erllama_model_tp.erl`), so
-callers use the normal API (`complete`, `stream`, `cancel`), and every
-rank, the sampling one included, is a separate OS process. A
-collective that fails or hangs then takes down a rank, never the
-serving VM.
-
-```erlang
-%% On the serving node, once the group is formed and every rank but 0
-%% has run erllama_tp_rank:load/3 with the same file and options:
-{ok, Id} = erllama:load_model(<<"split">>, #{
-    backend => erllama_model_tp,
-    model_path => Path,
-    model_opts => MOpts,
-    context_opts => COpts,
-    tp_worker => Rank0Pid,                     %% rank 0's erllama_tp_rank
-    tp_followers => [{Pid, erllama_tp_rank:describe(Path, {MOpts, COpts}, World)}]
-}).
-```
+it with `backend => erllama_model_tp`
+(`apps/erllama/src/erllama_model_tp.erl`), so callers use the normal
+API (`complete`, `stream`, `cancel`), and every rank, the sampling one
+included, is a separate OS process. A collective that fails or hangs
+then takes down a rank, never the serving VM. The load options and the
+steps are in the [guide](../guides/tensor-parallel.md).
 
 - **What runs where.** Tokenizing, detokenizing and chat templates run
   on the serving node, on a copy of the GGUF's vocabulary (no weights;
   the file must be readable there). Decoding, sampling and KV changes
-  run on rank 0, which hosts `erllama_model_llama` for the serving node
-  (`erllama_tp_rank:host/3`); samplers stay on rank 0 and travel as
-  handles.
+  run on rank 0, which hosts `erllama_model_llama` for the serving node:
+  `erllama_model_tp:init/1` sends rank 0 a
+  `{hosting, {host, Config, Followers}}` call, and every backend
+  callback after that is a `{hosting, {backend, Fn, Args}}` call.
+  Samplers stay on rank 0 and travel as handles
+  (`{erllama_tp_ref, Pid, Id}`).
 - **Rank 0 keeps the others in step.** Before every `llama_decode`
-  (`erllama_ctx_decode` in `c_src/erllama_nif_decode.c`) its context
+  (`erllama_ctx_decode` in `apps/erllama/c_src/erllama_nif_decode.c`) its context
   sends the exact batch to a forwarder, and every KV change
   (`kv_seq_rm`, `kv_seq_cp`) too, numbered from 1. The forwarder tags
   each with the group's generation (`{erllama_tp, Gen, Seq, Cmd}`) and
@@ -174,8 +169,11 @@ serving VM.
   callback on its context): a step stopped on one rank and not on the
   others would leave them waiting in a collective. A cancel takes
   effect between steps, once every rank finished the step in flight.
-- **Embeddings, speculative decoding, the argmax forward and media
-  prefill** answer `not_supported` on a split model.
+- **What a split model does not do.** Embeddings, ngram speculation,
+  `erllama:verify/4`, LoRA adapters and media prefill are not
+  available: `erllama_model_tp` exports none of those callbacks, and
+  its `spec_new/2` answers `not_supported` for any drafter but MTP.
+  Speculative decoding with the MTP head works: see the next sections.
 
 ## Hybrid models (GLM-5.3-Flash)
 
@@ -207,9 +205,10 @@ the model's MTP head (`draft_model`, loaded whole on rank 0's GPU) and
 checks the drafts on the split model:
 
 1. rank 0 samples the next token K from the last logits;
-2. the head guesses the two tokens after K;
-3. every rank decodes K and the guesses in one batch with every row
-   out (`erllama_nif:mtp_step/5`, `c_src/erllama_nif_mtp.c`);
+2. the head drafts up to `n_max` tokens after K (default 2, at most
+   16);
+3. every rank decodes K and the drafts in one batch with every row
+   out (`erllama_nif:mtp_step/5`, `apps/erllama/c_src/erllama_nif_mtp.c`);
 4. rank 0 keeps the guesses the model agrees with (argmax) and the
    rejected rows are taken back on every rank, with the
    recurrent-state snapshots, and from the head's own context.
@@ -218,9 +217,21 @@ The token after the kept ones is not decoded: the next round samples
 it from the last kept row. The head reads the model's hidden state
 after every decode, which changes the graph llama.cpp builds, so rank 0
 sends `{nextn, On}` in the command stream and every rank builds the
-same graphs. Use `n_rs_seq => 2` on every rank. With one stream on two
-GB10s (GLM-5.3-Flash Q4_K) a round takes about 85 ms (head 10 ms,
-verify batch 73 ms, rollback 1 ms) and produces 2.1 to 2.4 tokens.
+same graphs. Use `n_rs_seq` of at least `n_max` on every rank. With
+one stream on two GB10s (GLM-5.3-Flash Q4_K, `n_max` 2) a round takes
+about 85 ms (head 10 ms, verify batch 73 ms, rollback 1 ms) and
+produces 2.1 to 2.4 tokens.
+
+**Several requests at once.** When two or more requests (at most 16)
+are active, every one of them ready to decode and none asking for
+`logprobs`, `erllama_model` runs one batched round
+(`maybe_mtp_batch_tick/1`): `erllama_model_tp:mtp_step_batch/4`
+forwards it to rank 0, which runs `erllama_nif:mtp_step_batch/4` on the
+split context, so every request's next token and drafts are one batch
+on every rank. A round's draft length is also capped by the batch
+budget shared between the requests. A request that cannot draft joins
+the round with no drafts; when any request is not ready, the tick runs
+the ordinary co-batched step for all of them.
 
 On a GB10, whose GPU shares the host's memory, load large models with
 `load_mode => direct_io`: the page cache a buffered load leaves behind
@@ -241,7 +252,7 @@ part of one.
   0. A restore goes the same way with `kv_unpack`.
 - **One entry, all or nothing.** Rank 0 frames the shares into one
   binary, each with its size and CRC32C
-  (`src/erllama_tp_checkpoint.erl`), and `erllama_model_tp:kv_pack/3`
+  (`apps/erllama/src/erllama_tp_checkpoint.erl`), and `erllama_model_tp:kv_pack/3`
   hands that to the model like any payload, so the cache's own
   reservation and publication rules apply unchanged. A share that does
   not come within `tp_kv_timeout` (default 30 s) fails the pack, and the
@@ -256,10 +267,13 @@ part of one.
   frame) leaves out checkpoints saved before mirrored tensors were read
   from the rank's own device: theirs held zeros on every rank but the
   first.
+- **The frame.** `<<"ETPK", 2:8, World:16, (Size:64, Crc:32) x World,
+  Share x World>>`, shares in rank order. A version 1 frame is
+  refused.
 - **Mirrored tensors.** A tensor the split backend mirrors (GLM's MLA
   latent cache and indexer, for instance) is read from the rank's own
   device, which the rank's devices tell it (`ggml_backend_dev_holds_data`,
-  `scripts/patches/meta-split-mirrored-read.patch`); a restore writes it
+  `apps/erllama/scripts/patches/meta-split-mirrored-read.patch`); a restore writes it
   back there.
 - **Size.** Each rank's share is the size of the whole sequence's KV:
   the split backend reads the other ranks' slices from the placeholders,
@@ -321,43 +335,44 @@ formed again, under a new coordinator (a new generation).
 
 ## Tests
 
-- `test/erllama_tp_bootstrap_SUITE.erl` runs everywhere: the bridge,
+- `apps/erllama/test/erllama_tp_bootstrap_SUITE.erl` runs everywhere: the bridge,
   the agent and the coordinator through
   `erllama_tp:bootstrap_selftest/5`, which makes the same callback
   rounds as a communicator's init without a GPU. Ranks in rank order,
   a missing rank, a silent coordinator, a rank lost between rounds, a
   duplicate rank, and `not_supported` without a communicator.
-- `test/erllama_tp_failure_SUITE.erl` is opt-in on the same hosts, with
+- `apps/erllama/test/erllama_tp_failure_SUITE.erl` is opt-in on the same hosts, with
   fresh nodes for each case: a rank killed mid-stream, stale, duplicate
   and out-of-order commands, and a cancel during prefill, each followed
   by a request served.
-- `test/erllama_tp_checkpoint_SUITE.erl` is opt-in on the same hosts:
+- `apps/erllama/test/erllama_tp_checkpoint_SUITE.erl` is opt-in on the same hosts:
   a checkpoint restored by a new group, and a save missing a rank's
-  share that publishes nothing. `test/erllama_tp_checkpoint_tests.erl`
+  share that publishes nothing. `apps/erllama/test/erllama_tp_checkpoint_tests.erl`
   checks the frame everywhere.
-- `test/erllama_tp_rollback_SUITE.erl` is opt-in on the same hosts:
+- `apps/erllama/test/erllama_tp_rollback_SUITE.erl` is opt-in on the same hosts:
   snapshots on a split GLM-5.3-Flash rolled back by 1 and 2 against
   decoding without drafts (even split at sequence 0, 3:1 at sequence
   1), and rounds of one known token and two drafted ones, timed against
   ordinary decoding.
-- `test/erllama_tp_mtp_SUITE.erl` is opt-in on the same hosts, with
+- `apps/erllama/test/erllama_tp_mtp_SUITE.erl` is opt-in on the same hosts, with
   their GPUs free: MTP drafting on a split GLM-5.3-Flash
   (`ERLLAMA_TP_GLM`, `ERLLAMA_TP_GLM_MTP`), TensorFold's four prompts
   with and without drafts; where the outputs first differ, the top two
-  candidates; and rounds replayed from their exact prefix in a fresh
-  group, compared row by row with the live run.
-- `test/erllama_tp_glm_SUITE.erl` is opt-in on the same hosts, with
+  candidates; rounds replayed from their exact prefix in a fresh
+  group, compared row by row with the live run; and batched rounds for
+  several requests, through `erllama_model` and the server.
+- `apps/erllama/test/erllama_tp_glm_SUITE.erl` is opt-in on the same hosts, with
   their GPUs free: GLM-5.3-Flash split against the same file whole on
   one GB10 (`ERLLAMA_TP_GLM_REF`, a quant small enough for one host),
   four streams on one GB10 and split, the decode sweep of TensorFold's
   recipe, and a checkpoint restored by a new group
   (`ERLLAMA_TP_GLM`).
-- `test/erllama_tp_capacity_SUITE.erl` is opt-in on the same hosts,
+- `apps/erllama/test/erllama_tp_capacity_SUITE.erl` is opt-in on the same hosts,
   with their GPUs free and `ERLLAMA_TP_BIG_MODEL` naming a GGUF larger
   than one GPU: the model split over the group and served, each rank's
   peak memory and llama.cpp's placement. Its one-host case
   (`ERLLAMA_TP_CAPACITY_ONE_HOST=1`) can run a host out of memory.
-- `test/erllama_tp_nccl_SUITE.erl` is opt-in, on CUDA hosts prepared
+- `apps/erllama/test/erllama_tp_nccl_SUITE.erl` is opt-in, on CUDA hosts prepared
   with `scripts/tp_hosts.sh`. The plan's matrix fixture, a
   decode-sized FP32 reduction and a prefill-sized BF16 one with stated
   tolerances, a missing rank, repeated open and close, a GGUF split
@@ -388,7 +403,9 @@ ERLLAMA_TP_HOSTS=gx10-fa8e.local,gx10-e25e.local \
 whose interfaces are named differently. `ERLLAMA_TP_EXPECT_NET=IB`
 checks RDMA; RDMA traffic does not show in the interface counters.
 
-The suite runs on any machine with ssh access to the hosts. The hosts
+Every opt-in suite, with its environment variables, is listed in
+[hardware-suites.md](hardware-suites.md). The suite runs on any machine
+with ssh access to the hosts. The hosts
 must reach each other by the names given (rank 0's node runs the
 coordinator), and the build must be `rebar3 as test compile` so the
 rank nodes load the test build.
@@ -396,13 +413,20 @@ rank nodes load the test build.
 ## When you bump llama.cpp
 
 The devices implement ggml's internal backend interfaces
-(`ggml/src/ggml-backend-impl.h`), which change between pins (new entries
-in the buffer type interface between b10593 and v1.0.0), and rely on
-how the split backend behaves (`ggml/src/ggml-backend-meta.cpp`, the
+(`apps/erllama/c_src/llama.cpp/ggml/src/ggml-backend-impl.h`), which
+change between pins (new entries in the buffer type interface between
+b10593 and v1.0.0), and rely on how the split backend behaves
+(`apps/erllama/c_src/llama.cpp/ggml/src/ggml-backend-meta.cpp`, the
 fastest-moving file). A changed interface fails the build; a changed
 behaviour fails `erllama_tp_nccl_SUITE`, so run it on the CUDA hosts at
 every bump.
 
 ## Not done yet
 
-Groups of more than two hosts, and Metal.
+- Groups of more than two hosts are experimental: nothing in the code
+  limits the world size (`erllama_tp:open/5` checks only
+  `Rank < World`), but only two hosts are verified, and four-host
+  testing is open.
+- Metal.
+- A production coordinator (`erllama_cluster`); the suites use the
+  test coordinator.

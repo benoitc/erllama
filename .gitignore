@@ -17,7 +17,9 @@ log/
 erl_crash.dump
 **/priv/erllama_nif.so
 rebar3.crashdump
-apps/*/doc/
+apps/*/doc/*
+!apps/erllama/doc/features.md
+!apps/erllama_server/doc/features.md
 /doc/*
 !/doc/features.md
 bench/results/

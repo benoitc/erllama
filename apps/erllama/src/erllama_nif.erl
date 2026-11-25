@@ -158,15 +158,15 @@ Load a GGUF model.
 Recognised keys in `Opts` (all optional; defaults come from
 `llama_model_default_params()`):
 
-- `n_gpu_layers :: integer()` — number of layers offloaded to GPU.
-- `main_gpu :: non_neg_integer()` — GPU index when `split_mode = none`.
-- `split_mode :: none | layer | row | tensor` — how to split a model
+- `n_gpu_layers :: integer()`: number of layers offloaded to GPU.
+- `main_gpu :: non_neg_integer()`: GPU index when `split_mode = none`.
+- `split_mode :: none | layer | row | tensor`: how to split a model
   across multiple GPUs. Atom mapping: `none -> LLAMA_SPLIT_MODE_NONE`,
   `layer -> LLAMA_SPLIT_MODE_LAYER`, `row -> LLAMA_SPLIT_MODE_ROW`
   (deprecated upstream), `tensor -> LLAMA_SPLIT_MODE_TENSOR`
   (experimental upstream; needs flash attention and f16/bf16/f32 KV
   types, llama.cpp rejects the context otherwise).
-- `tensor_split :: [float()]` — per-device proportions when splitting.
+- `tensor_split :: [float()]`: per-device proportions when splitting.
   Up to `llama_max_devices()` entries (16 in the vendored llama.cpp);
   shorter lists zero-fill the tail.
 - `use_mmap, use_mlock, vocab_only :: boolean()`,
@@ -196,20 +196,20 @@ Recognised keys in `Opts` (all optional; defaults come from
 `llama_context_default_params()`):
 
 - `n_ctx, n_batch, n_ubatch, n_seq_max :: pos_integer()`.
-- `n_rs_seq :: non_neg_integer()` — recurrent-state rollback
+- `n_rs_seq :: non_neg_integer()`: recurrent-state rollback
   snapshots per sequence (recurrent / hybrid archs only; default 0
   = no rollback; experimental upstream). With `1`, archs that
   support recurrent-state rollback accept the single-token partial
   `kv_seq_rm/4` the warm-restore primer issues.
 - `n_threads, n_threads_batch :: pos_integer()`.
 - `embeddings, offload_kqv :: boolean()`.
-- `flash_attn :: boolean() | auto` — `true` enables, `false`
+- `flash_attn :: boolean() | auto`: `true` enables, `false`
   disables, `auto` lets llama.cpp decide based on the build and
   model. Maps to `enum llama_flash_attn_type`.
-- `type_k, type_v :: f16 | f32 | bf16 | q4_0 | q5_0 | q5_1 | q8_0`
-  — KV cache element type for keys and values. Maps to
+- `type_k, type_v :: f16 | f32 | bf16 | q4_0 | q5_0 | q5_1 | q8_0`:
+  KV cache element type for keys and values. Maps to
   `GGML_TYPE_*`.
-- `decode_budget_ms :: non_neg_integer()` — per-step wall-clock
+- `decode_budget_ms :: non_neg_integer()`: per-step wall-clock
   budget (default 30000; 0 disables). A `decode`/`step`/`embed` call
   that exceeds it is aborted via the context's ggml abort callback
   and returns `{error, decode_timeout}` instead of blocking
@@ -276,30 +276,30 @@ Each `SamplerRef` must have been built via `sampler_new/2` against
 this same `CtxRef`.
 
 Errors:
-- `{error, no_logits}` — a decode row's seq has `last_logits_idx =
+- `{error, no_logits}`: a decode row's seq has `last_logits_idx =
   -1`, i.e. no prefill has run for that seq since the context was
   built or since the last `kv_unpack` / `kv_seq_rm`. The caller
   must issue a prefill row for that seq first.
-- `{error, batch_overflow}` — the total slice length exceeds the
-  context's `n_batch`. A budget-aware scheduler should shrink the
+- `{error, batch_overflow}`: the total slice length exceeds the
+  context's `n_batch`. A budget-aware request scheduler should shrink the
   prefill slices and retry.
-- `{error, released}` — the context or one of the samplers has
+- `{error, released}`: the context or one of the samplers has
   been explicitly freed.
-- `{error, exception}` — `llama_decode` or `llama_sampler_sample`
+- `{error, exception}`: `llama_decode` or `llama_sampler_sample`
   threw across the C ABI; the context's `decode_ready` flag is
   cleared and the gen_statem owning it is expected to stop.
-- `{error, decode_timeout}` — the decode exceeded the context's
+- `{error, decode_timeout}`: the decode exceeded the context's
   `decode_budget_ms` and was aborted. The engine recovers the
   context in place rather than stopping.
-- `{error, decode_aborted}` — an external `request_abort/1` fired
+- `{error, decode_aborted}`: an external `request_abort/1` fired
   during the decode (e.g. a `cancel/1` mid-decode). Same in-place
   recovery as `decode_timeout`.
-- `{error, {decode_failed, Rc}}` — `llama_decode` returned a
+- `{error, {decode_failed, Rc}}`: `llama_decode` returned a
   non-zero code `Rc` for a non-timeout, non-abort reason.
 
 Logprobs: a sampler built with `logprobs => N` (N > 0) turns its
 decode results into 4-tuples `{token, Token, Eog, {SampledLogprob,
-[{TokenId, Logprob}, ...]}}` — the sampled token's full-vocab
+[{TokenId, Logprob}, ...]}}`: the sampled token's full-vocab
 log-softmax logprob plus the top-N ids/logprobs, descending.
 """.
 -spec step(

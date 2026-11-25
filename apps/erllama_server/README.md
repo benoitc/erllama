@@ -32,7 +32,7 @@ What it does not do: a crash in native code (llama.cpp, the NIF) ends
 the whole VM; a restart keeps the conversations, not the computation
 that was in flight; and requests on one model share its hardware, so
 more at once means each is slower. The measurements behind these
-points are in [doc/features.md](../../doc/features.md), and
+points are in [the feature record](https://github.com/benoitc/erllama/blob/main/apps/erllama_server/doc/features.md), and
 [A walkthrough](../../guides/server/demo.md) shows them on a real
 model.
 
@@ -148,57 +148,136 @@ the release). A bad value stops the release from starting.
 | `compact_summary_tokens` | `512` | the longest compaction summary |
 
 The library's own settings (cache tiers, scheduler) go under `erllama`;
-see the [configuration guide](../../guides/configuration.md).
+see the [configuration guide](https://hexdocs.pm/erllama/configuration.html).
 
 ## Where the code is
+
+Every front end goes through `erllama_server_api`: the CLI and other
+Erlang nodes over distribution, the HTTP adapters in process (model
+access, runs, embeddings, token counts). Why the release is shaped this
+way is in [the server design record](../../internals/server-design.md).
+
+Service API and jobs:
 
 | Module | Role |
 |---|---|
 | `erllama_server_api` | the versioned service API every front end calls |
-| `erllama_server_run` | one run: owns the erllama stream, numbers and buffers its events, serves subscribers |
-| `erllama_server_runs` | the table of jobs (runs and downloads); starts them and enforces the limits |
+| `erllama_server_runs` | the table of live jobs (runs, downloads, agent sessions); starts them, enforces the limits, holds the embedding slots |
+| `erllama_server_job` | the calls every job process answers: attach, detach, cancel, result, info |
 | `erllama_server_events` | a job's numbered, buffered, flow-controlled event stream |
+| `erllama_server_ring` | the bounded event buffer behind reattachment and gaps |
+| `erllama_server_run_sup` | supervises the runs (temporary) |
+| `erllama_server_run` | one run: owns the erllama stream, numbers and buffers its events, serves subscribers |
+| `erllama_server_generate` | renders chat or prompt requests into an erllama stream and parses the result |
+| `erllama_server_inference` | inference that is not a run: embeddings (they hold a run slot) and token counts |
+| `erllama_server_ids` | the ids of runs, conversations, agent sessions, downloads, jobs and tool calls |
+
+Release and operations:
+
+| Module | Role |
+|---|---|
+| `erllama_server_app` | the application; a bad environment fails the start |
+| `erllama_server_sup` | the top supervisor, `rest_for_one` in dependency order |
+| `erllama_server_config` | the application environment: defaults, validation, reads |
+| `erllama_server_status` | the runtime view behind `erllama status`, `inspect` and `GET /status` |
+| `erllama_server_failures` | the bounded log of recent failures and what the release did next |
+
+Models:
+
+| Module | Role |
+|---|---|
 | `erllama_server_registry` | the persistent model registry (`registry.json`) |
 | `erllama_server_models` | loads registry models on demand, keep-alive, the scheduler's model evictor |
+| `erllama_server_pull_sup` | supervises the downloads (temporary) |
 | `erllama_server_pull` | one download: plan, resumable transfer, integrity check, registration |
 | `erllama_server_source` | what `hf://`, `ollama://` and `https://` sources mean and what to fetch |
 | `erllama_server_gguf` | reads GGUF metadata without loading the model |
+
+HTTP:
+
+| Module | Role |
+|---|---|
 | `erllama_server_http` | the Livery listener: routes and the middleware stack |
-| `erllama_server_http_kit` | shared HTTP plumbing: JSON bodies, protocol error shapes, driving a run from a handler |
 | `erllama_server_http_auth` | API keys |
-| `erllama_server_openai`, `erllama_server_openai_req` | the OpenAI chat, completion, embedding and model endpoints, and their request translation |
-| `erllama_server_openai_responses`, `..._stream` | the OpenAI Responses API and its event stream |
-| `erllama_server_responses` | stored responses and their conversations |
+| `erllama_server_http_kit` | shared HTTP plumbing: JSON bodies, protocol error shapes, driving a run from a handler |
+| `erllama_server_http_ops` | `/health`, `/ready`, `/metrics`, `/status` |
+| `erllama_server_openai`, `erllama_server_openai_req` | the OpenAI chat, completion, embedding and model endpoints, and the request translation the other dialects share |
+| `erllama_server_openai_responses`, `erllama_server_openai_responses_stream` | the OpenAI Responses API and its typed event stream |
+| `erllama_server_responses` | the store of stored responses and their conversations |
 | `erllama_server_anthropic` | the Anthropic Messages API |
 | `erllama_server_ollama`, `erllama_server_ollama_models` | the Ollama generation and model-management endpoints |
+
+Conversations:
+
+| Module | Role |
+|---|---|
+| `erllama_server_convs` | conversations: history, last cache key, one active run each, persisted and recovered |
+| `erllama_server_conv_log`, `erllama_server_conv_codec` | a conversation's log on disk: records, replay, repair after a stop; messages to JSON and back |
+| `erllama_server_conv_export` | a conversation as one JSON or Markdown document |
+| `erllama_server_compact` | context compaction: what to keep, the summary, when it is needed |
+
+Agent sessions and tools:
+
+| Module | Role |
+|---|---|
+| `erllama_server_agent_sup` | supervises the agent sessions (temporary) |
 | `erllama_server_agent` | an agent session: the generate, approve, run tools, continue loop |
 | `erllama_server_agent_gen` | one generation round of a session |
-| `erllama_server_tools`, `_tool_fs`, `_tool_shell` | the native tools, their policies, file tools and shell jobs |
+| `erllama_server_agent_policy` | which tools a session offers and the policy (`auto`, `ask`, `deny`) of each call |
+| `erllama_server_tools`, `erllama_server_tool_fs`, `erllama_server_tool_shell` | the native tools (one definition each, with its class), file tools and shell jobs |
 | `erllama_server_workspace` | keeps tool paths inside the workspace |
+
+MCP:
+
+| Module | Role |
+|---|---|
 | `erllama_server_mcp` | the MCP clients: connections, tool catalog, calls and their results |
 | `erllama_server_mcp_endpoint` | the opt-in `/mcp` endpoint and its tools |
-| `erllama_server_cli_conv` | the CLI's conversation commands |
+
+CLI (none of these loads an erllama module):
+
+| Module | Role |
+|---|---|
+| `erllama_server_client` | the client side of the service API: connection, bounded calls, following a job |
+| `erllama_server_cli` | the `erllama` command: argument parsing and output |
 | `erllama_server_cli_chat` | `erllama chat`: the line-by-line conversation and its commands |
+| `erllama_server_cli_agent`, `erllama_server_cli_mcp`, `erllama_server_cli_conv` | the agent, MCP and conversation commands |
+| `erllama_server_cli_status` | how `erllama status` and `inspect` show the release |
+| `erllama_server_cli_format` | output formatting |
 | `erllama_server_cli_term` | the terminal: Ctrl-C as a key, cooked and raw modes, serialised output, the status line |
 | `erllama_server_cli_input` | what is typed at a prompt: continued lines, blocks, commands |
-| `erllama_server_cli_agent`, `erllama_server_cli_mcp`, `erllama_server_cli_format` | the CLI's agent and MCP commands and its output formatting |
-| `erllama_server_http_ops` | health, readiness, metrics |
-| `erllama_server_convs` | conversations: history, last cache key, one active run each, persisted and recovered |
-| `erllama_server_compact` | context compaction: what to keep, the summary, when it is needed |
-| `erllama_server_conv_log`, `erllama_server_conv_codec` | a conversation's log on disk: records, replay, repair after a stop; messages to JSON and back |
-| `erllama_server_generate` | renders chat or prompt requests into an erllama stream and parses the result |
-| `erllama_server_client` | the client side, used by the CLI (no erllama module) |
-| `erllama_server_cli` | the `erllama` command: argument parsing and output |
 
-Tests: `test/erllama_server_rpc_SUITE.erl` drives the API from a
-separate hidden node as the CLI does; `test/erllama_server_tls_SUITE.erl`
-does the same over TLS distribution; `test/erllama_server_pull_SUITE.erl`
-downloads from a local stand-in for Hugging Face and Ollama
-(`test/erllama_server_fake_registry.erl`); and
-`test/erllama_server_models_SUITE.erl` covers loading, keep-alive and
-eviction; `test/erllama_server_http_SUITE.erl` drives the HTTP APIs over
-a socket; `test/erllama_server_agent_SUITE.erl` drives agent sessions
-with a scripted model (`test/erllama_server_agent_script.erl`);
-`test/erllama_server_mcp_SUITE.erl` connects sessions to real MCP
-servers over HTTP and stdio; `test/erllama_server_convs_SUITE.erl`
-restarts the release and crashes sessions and the store mid-call.
+## Tests
+
+Common Test suites, from the repository root with
+`rebar3 ct --dir apps/erllama_server/test` (most run on erllama's stub
+backend; the real-model cases skip unless `LLAMA_TEST_MODEL` is set):
+
+| Suite | Covers |
+|---|---|
+| `erllama_server_SUITE` | the application starts on top of erllama and stops without taking it down |
+| `erllama_server_rpc_SUITE` | the service API from a separate hidden node, as the CLI uses it; the CLI under a terminal; `leaked/1` checks the client loaded no erllama module |
+| `erllama_server_tls_SUITE` | the same over TLS distribution |
+| `erllama_server_models_SUITE` | loading on demand, keep-alive, eviction, requests sharing a model |
+| `erllama_server_pull_SUITE` | downloads from a local stand-in for Hugging Face and Ollama (`erllama_server_fake_registry`) |
+| `erllama_server_http_SUITE` | the HTTP APIs over a socket: shapes, streaming, strict fields, errors, keys, limits |
+| `erllama_server_agent_SUITE` | agent sessions with a scripted model (`erllama_server_agent_script`) |
+| `erllama_server_mcp_SUITE` | sessions against real MCP servers over Streamable HTTP and stdio |
+| `erllama_server_convs_SUITE` | restarts, forks, exports, and sessions or the store crashing mid-call |
+| `erllama_server_compact_SUITE` | compaction of runs and sessions, automatic and on request |
+| `erllama_server_ops_SUITE` | what an operator sees, and failures staying with their owner |
+| `erllama_server_demo_SUITE` | the walkthrough of [guides/server/demo.md](../../guides/server/demo.md) |
+
+EUnit and PropEr modules (`rebar3 eunit`, `rebar3 proper`):
+`erllama_server_api_tests` (configuration, specs, the version check),
+`erllama_server_cli_tests` and `erllama_server_cli_input_tests` (the
+CLI and its input), `erllama_server_generate_tests` (option
+conflicts), `erllama_server_openai_tests` and
+`erllama_server_protocols_tests` (the HTTP dialects),
+`erllama_server_registry_tests` (the registry and the GGUF reader),
+`erllama_server_conv_tests` (the conversation log),
+`erllama_server_compact_tests` (the compaction plan),
+`erllama_server_tools_tests` (the native tools),
+`erllama_server_mcp_tests` (MCP names, rendering, configuration),
+`erllama_server_ring_tests` and `prop_erllama_server_ring` (the event
+buffer).

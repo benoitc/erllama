@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- An embedding request (OpenAI `/v1/embeddings`, Ollama `/api/embed`)
+  now counts against `max_active_runs`, like a generation: when every
+  slot is in use it answers 429 instead of running on top of them.
+  Model listings and token counts take no slot and still answer.
+- A remote caller can no longer choose the module an agent session
+  generates with (the undocumented `generator` key of `agent_start`);
+  it was a test hook.
 - A streamed Responses request that stops at `max_output_tokens` now
   ends with `response.incomplete` instead of `response.completed`, as
   OpenAI does; the response it carries already had status `incomplete`.

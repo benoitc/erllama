@@ -107,13 +107,15 @@ lists every reason.
 | Tokens | `tokenize/2,3`, `detokenize/2,3`, `vocab_info/1` |
 | Embeddings | `embed/2`, `embed_batch/2` |
 | Adapters | `load_adapter/2`, `unload_adapter/2`, `set_adapter_scale/3`, `list_adapters/1` |
-| Observability | `status/1`, `phase/1`, `pending_len/1`, `queue_depth/0,1`, `last_cache_hit/1`, `cached_prefix_len/2`, `counters/0`, `vram_info/0`, `list_devices/0`, `pressure/0`, `requests/0`, `request_info/1` |
-| Speculative | `speculative` request option (ngram, no draft model), `draft_tokens/3`, `verify/4` |
-| Memory control | `evict/1`, `shutdown/1` |
+| Observability | `status/1`, `phase/1`, `pending_len/1`, `queue_depth/0,1`, `last_cache_hit/1`, `cached_prefix_len/2`, `counters/0`, `vram_info/0`, `list_devices/0`, `pressure/0`, `pressure_sources/0`, `requests/0`, `request_info/1` |
+| Speculative | `speculative` request option (ngram, or an MTP head with `#{type => mtp}`), `draft_tokens/3`, `verify/4` |
+| Checkpoint live work | `evict/1`: save every in-flight request's live context; the requests keep running |
+| Shutdown save | `shutdown/1`: the same save with reason `shutdown`, as `unload/1` does before it stops the model |
 
 The cache has its own module, `erllama_cache` (`add_tier/1`, `info/0`,
-`gc/0`, `evict_bytes/1,2`, `get_counters/0`), and every call can be
-wrapped by a hackney-style middleware chain (`erllama_middleware`).
+`gc/0`, `evict_bytes/1,2`, `get_counters/0`), and the main calls can
+be wrapped by a hackney-style middleware chain (`erllama_middleware`;
+the [middleware guide](../../guides/middleware.md) lists which).
 
 ### Stream tokens
 
@@ -261,14 +263,19 @@ erllama_sup
 │   ├── erllama_cache_meta_srv
 │   ├── erllama_cache_ram            the always-on RAM tier
 │   ├── erllama_cache_writer
-│   └── erllama_cache_tier_sup       disk / ram_file tiers (add_tier/1, `tiers` env)
+│   ├── erllama_cache_tier_sup       disk / ram_file tiers (add_tier/1)
+│   └── erllama_cache_tiers_boot     transient child: starts the `tiers` env, then exits
 ├── erllama_registry
 ├── erllama_inflight
 ├── erllama_chat_cache
+├── erllama_log                      native llama.cpp logs into logger
 ├── erllama_model_sup
-│   └── erllama_model                one supervised gen_statem per loaded model
-└── erllama_scheduler                memory-pressure poller, off by default
+│   └── erllama_model                one gen_statem per loaded model (temporary: not restarted)
+└── erllama_scheduler                cache eviction scheduler (memory pressure), off by default
 ```
+
+`erllama_cache_tiers_boot` is a child id, not a module: it runs
+`erllama_cache:start_configured_tiers/0`.
 
 Models point at a tier with `tier` + `tier_srv` in their load config.
 
@@ -277,6 +284,15 @@ SHA-256 over the model fingerprint, quantization, context shape, and the
 **rendered prompt bytes** (`detokenize(tokens)`), so a prompt that
 retokenises across turns still hits. erllama may find a shorter saved
 byte-prefix for a longer prompt, but it never returns an approximate match.
+
+### Tensor parallelism and the server
+
+A model too large for one machine can be split over several GPUs on
+several machines (experimental, CUDA with NCCL): see the
+[tensor parallelism guide](../../guides/tensor-parallel.md). For an
+HTTP server (OpenAI, Anthropic and Ollama shapes), a CLI and agent
+sessions on top of this library, see the server app in
+[`apps/erllama_server`](../erllama_server/README.md).
 
 ## Requirements
 
@@ -300,7 +316,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Contributing
 
-The contributor guide is [AGENTS.md](../../AGENTS.md). The short version:
+The contributor guide is [CONTRIBUTING.md](../../CONTRIBUTING.md). The short version:
 
 ```bash
 rebar3 fmt
@@ -325,9 +341,10 @@ Bumping the vendored `llama.cpp` is covered in
 
 ## Related projects
 
-`erllama_cluster` is planned as a separate OTP application for routing,
-cache-aware placement, speculative decoding, and distributed inference
-across erllama nodes.
+- [`erllama_server`](../erllama_server/README.md), in this repository:
+  the server release and the `erllama` CLI built on this library.
+- Splitting one model over several machines is part of erllama itself;
+  see [tensor parallelism](../../guides/tensor-parallel.md).
 
 Repository: <https://github.com/benoitc/erllama>
 

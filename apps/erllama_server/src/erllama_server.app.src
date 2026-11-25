@@ -6,6 +6,7 @@
     {vsn, "0.1.0"},
     {registered, [
         erllama_server_sup,
+        erllama_server_failures,
         erllama_server_registry,
         erllama_server_models,
         erllama_server_runs,

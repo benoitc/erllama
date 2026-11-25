@@ -66,7 +66,7 @@ across deployments:
 - **`ram`** (ETS slabs): lowest latency, smallest budget, and the
   default tier. ETS reads are sub-µs and hot-path-friendly; stores go
   through `erllama_cache_ram`, which enforces `ram_tier_budget` by
-  evicting the least used RAM rows before inserting.
+  evicting the lowest-frecency RAM rows before inserting.
 - **`ram_file`** (`/dev/shm`): fast and effectively unlimited by
   process address space. Survives a model-supervisor restart but
   not a node restart.
@@ -91,9 +91,11 @@ enough to keep restore cost in the millisecond range.
 ## Sole-writer arbitration
 
 The meta server (`erllama_cache_meta_srv`) is the only process that
-mutates the meta ETS, the LRU, and the reservation table. Every
-write (claim, release, evict, save announce) goes through a
-gen_server call. Reads stay on ETS directly via `ets:lookup/2`.
+mutates the meta ETS, the recency index (an ordered ETS table keyed
+on last use) and the reservations. Every write (claim, release,
+evict, save announce) goes through a gen_server call; only
+`set_live_key/1` is a cast. Reads stay on ETS directly via
+`ets:lookup/2`.
 
 The split is deliberate: hot-path reads must not contend on a
 gen_server message queue, but writes must serialise so we never
@@ -102,13 +104,40 @@ considered for in-place atomic updates but rejected: the
 reservation state machine is rich enough that single-row CAS would
 not be enough, and we'd need a lock anyway.
 
+## Eviction order: frecency
+
+Eviction is not plain LRU. Each row's score is its last use, moved
+forward by its accumulated hits: every hit counts one second
+(`HIT_BONUS_NS`), decayed by a 6 h half-life on the row's age
+(`HIT_HALF_LIFE_NS` in `erllama_cache_meta_srv`). A row hit often
+recently outranks an old one, and old hits fade. Byte-targeted
+eviction (`evict_bytes/2`, used by the RAM tier and the cache eviction
+scheduler under memory pressure) drops the lowest scores first.
+
+Protected rows (pinned `agent_prefix` checkpoints and the live key)
+sort in a separate, higher rank: byte-targeted eviction takes them
+only as a last resort, and `gc/0` never takes them. `gc/0` drops every
+other available, unreferenced row, node-wide, and returns
+`{evicted, N}`.
+
+## The live key
+
+`live_key` is one value for the whole node, held by the meta server:
+the finish key of the most recent request that saved one
+(`erllama_model` calls `erllama_cache_meta_srv:set_live_key/1` after a
+finish save). It protects that row, the most likely resume target of
+the next turn, from eviction until another request's finish replaces
+it. It is not per model or per session: with several models or
+sessions, only the last recorded key is protected. Pin a row
+(`agent_prefix`) when it must stay.
+
 ## Save reasons taxonomy
 
-Five reasons, each with distinct semantics:
+Six reasons, each with distinct semantics:
 
 | Reason | Trigger | Why it's a separate reason |
 |---|---|---|
-| `cold` | After a cold prefill, at the trimmed-prefix boundary | First save for this prefix; we want it stored as soon as possible. |
+| `cold` | During a cold prefill, at each ladder boundary and the trimmed-prefix boundary | First save for this prefix; we want it stored as soon as possible. |
 | `continued` | Every `continued_interval` tokens during generation | Keeps the cache useful even if generation is interrupted. |
 | `finish` | End of generation, captures prompt+reply | Multi-turn flows resume from this row. |
 | `agent_prefix` | At `prefix_checkpoint_len` | A static prefix shared by many requests; pinned against eviction. |

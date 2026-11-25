@@ -844,7 +844,7 @@ run_eviction({_LastUsed, Key} = LruKey, LiveKey, N) ->
         _ -> run_eviction(Next, LiveKey, N)
     end.
 
-%% Byte-targeted eviction (evict_bytes, scheduler pressure): drop the
+%% Byte-targeted eviction (evict_bytes, from the cache eviction scheduler under memory pressure): drop the
 %% LOWEST-frecency rows first until Target bytes are freed. Protected
 %% rows (pinned / live key) score in a separate higher rank, so they are
 %% evicted only as a last resort when nothing else frees enough - they

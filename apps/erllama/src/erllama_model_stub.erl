@@ -262,7 +262,7 @@ kv_unpack(#stub{fail_kv_unpack = true}, _Bin, _SeqId) ->
 kv_unpack(_S, _Bin, _SeqId) ->
     ok.
 
-%% Drops the per-seq phase counter when the scheduler releases a
+%% Drops the per-seq phase counter when the request scheduler releases a
 %% seq's KV. Without this, a subsequent admission to the same
 %% seq_id would inherit the prior request's state.
 seq_rm(_S, SeqId) ->
@@ -629,7 +629,7 @@ reset_sampler_new_cfgs() ->
 %% tool_call_capable is set).
 sampler_new(_S, Cfg) ->
     %% Record the cfg so tests can assert which sampler chains the
-    %% scheduler built (e.g. the grammar-less greedy `#{temperature
+    %% request scheduler built (e.g. the grammar-less greedy `#{temperature
     %% => 0.0}` chain vs a request chain carrying a grammar).
     Prev = persistent_term:get({?MODULE, sampler_new_cfgs}, []),
     persistent_term:put({?MODULE, sampler_new_cfgs}, Prev ++ [Cfg]),

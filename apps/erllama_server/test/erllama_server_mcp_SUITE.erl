@@ -106,6 +106,7 @@ boot(Config) ->
     Config.
 
 end_per_testcase(_TC, Config) ->
+    _ = application:unset_env(erllama_server, agent_generator),
     _ = application:stop(erllama_server),
     [erllama:unload(Id) || #{id := Id} <- erllama:list_models()],
     case ?config(mcp_server, Config) of
@@ -244,11 +245,11 @@ start(Config, Script) ->
     start(Config, Script, #{}).
 
 start(Config, Script, Extra) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     Spec = maps:merge(
         #{
             model => <<"stub">>,
-            workspace => ?config(ws, Config),
-            generator => erllama_server_agent_script
+            workspace => ?config(ws, Config)
         },
         Extra
     ),

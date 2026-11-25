@@ -86,10 +86,10 @@ CPU-only builds). For the per-device breakdown use
 name, type, free/total bytes, and capability flags (the same names
 the `devices` load option accepts; see
 [loading](loading.md#devices-moe-offload-and-auto-fit)).
-`pressure/0` samples the source the background
-evictor uses; `erllama:pressure_sources/0` lists what is available
-on this host. The scheduler evicts cache tiers under pressure
-automatically; see [configuration](configuration.md).
+`pressure/0` samples the source the cache eviction scheduler uses;
+`erllama:pressure_sources/0` lists what is available on this host.
+When enabled, the cache eviction scheduler evicts cache tiers under
+pressure; see [caching](caching.md#memory-pressure-driven-eviction).
 
 ## Load progress
 
@@ -133,12 +133,13 @@ logger:add_handler(llama_native, logger_std_h, #{
 
 ## Per-call tracing
 
-Every API call runs through a hackney-style middleware chain: wrap
-calls to time them, tag them, or short-circuit them. See
-[middleware](middleware.md).
+The main API calls run through a hackney-style middleware chain: wrap
+them to time them, tag them, or short-circuit them. See
+[middleware](middleware.md) for which calls are intercepted.
 
 ## See also
 
-- [Caching](caching.md) - counter semantics, tiers, eviction
-- [Configuration](configuration.md) - scheduler and pressure knobs
-- [Middleware](middleware.md) - per-call instrumentation
+- [Caching](caching.md): counter semantics, tiers, eviction
+- [Configuration](configuration.md): cache eviction scheduler and
+  pressure knobs
+- [Middleware](middleware.md): per-call instrumentation

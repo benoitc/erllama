@@ -1,9 +1,10 @@
 # Examples
 
-Drop-in patterns for common erllama workflows. Each block is a
-self-contained snippet that runs from `rebar3 shell` after
+Copy-paste recipes that combine several erllama features. Each block
+runs from `rebar3 shell` after
 `{ok, _} = application:ensure_all_started(erllama)` (the boot is
-omitted from the snippets; assume it's there).
+omitted from the snippets). Topics a guide already covers are listed
+at the end with a link to that guide.
 
 ## 10-second smoke test (no model required)
 
@@ -27,8 +28,9 @@ The stub backend runs the whole API without a GGUF or a NIF. From
 
 The second completion is a byte-exact cache hit on the first one's
 cold save, restored from the RAM tier. The small `policy` lets a
-four-word prompt be saved; the defaults only save from 512 tokens. Nothing touches llama.cpp: `llama_backend_init` never
-runs, so there is no Metal/CUDA discovery cost.
+four-word prompt be saved; the defaults only save from 512 tokens.
+Nothing touches llama.cpp: `llama_backend_init` never runs, so there
+is no Metal/CUDA discovery cost.
 
 ## 1. Load a model and run a one-shot completion
 
@@ -66,7 +68,7 @@ rows. Repeating the same call hits the cache via the exact-key path.
 ```erlang
 %% Inside your request handler. The cache walks the new prompt's
 %% tokens backward by `boundary_align_tokens` and resumes from the
-%% longest published prefix automatically - no parent_key needed.
+%% longest published prefix automatically: no parent_key needed.
 handle_chat(ModelId, Prompt) ->
     {ok, #{reply := Reply}} =
         erllama:complete(ModelId, Prompt, #{response_tokens => 256}),
@@ -75,56 +77,7 @@ handle_chat(ModelId, Prompt) ->
 
 Hits show up as `hits_longest_prefix` in `erllama_cache:get_counters/0`.
 
-## 3. Multi-turn Erlang-native session (tracks parent_key)
-
-The session layer threads `parent_key` between turns. `complete/2,3`
-returns the `finish_key` for the full context - pass it as
-`parent_key` on the next turn.
-
-```erlang
-chat(Model, Prompt, undefined) ->
-    {ok, #{reply := Reply, finish_key := K}} =
-        erllama:complete(Model, Prompt, #{}),
-    {Reply, K};
-chat(Model, Prompt, ParentKey) ->
-    {ok, #{reply := Reply, finish_key := K}} =
-        erllama:complete(Model, Prompt, #{parent_key => ParentKey}),
-    {Reply, K}.
-
-%% Driver.
-{R1, K1} = chat(M, <<"User: hello\nAssistant:">>, undefined),
-{R2, _K2} = chat(M,
-    <<"User: hello\nAssistant: ", R1/binary,
-      "\nUser: tell me a joke\nAssistant:">>,
-    K1),
-ok.
-```
-
-Passing `parent_key` skips the longest-prefix walk and resumes
-directly from the previous turn's finish save. `finish_key` is
-`undefined` if the finish save was suppressed (token count below
-`min_tokens`); guard with a pattern match if your sessions can be
-that short.
-
-## 4. Multiple loaded models
-
-Model ids are `binary()` (the registered name).
-
-```erlang
-{ok, _} = erllama:load_model(<<"tiny">>, TinyConfig),
-{ok, _} = erllama:load_model(<<"big">>,  BigConfig),
-
-{ok, #{reply := R1}} = erllama:complete(<<"tiny">>, <<"summarise: ...">>),
-{ok, #{reply := R2}} = erllama:complete(<<"big">>,  <<"deep analysis of: ...">>),
-
-ok = erllama:unload(<<"tiny">>),
-ok = erllama:unload(<<"big">>).
-```
-
-Both share one `erllama_cache` instance. Cache rows are scoped by
-fingerprint, so the two models never collide.
-
-## 5. Concurrent agents on a shared system prompt
+## 3. Concurrent agents on a shared system prompt
 
 ```erlang
 ModelId = <<"assistant">>,
@@ -149,7 +102,7 @@ Replies = [receive {N, R} -> {N, R} end || N <- lists:seq(1, 8)],
 Replies.
 ```
 
-## 6. Streaming tokens (`stream/3`) with cancellation
+## 4. Streaming tokens (`stream/3`) with cancellation
 
 ```erlang
 {ok, Tokens} = erllama:tokenize(ModelId, <<"Once upon a time">>),
@@ -177,25 +130,7 @@ loop(Ref) ->
 always emits a final `{erllama, Ref, {done, Stats}}` with
 `#{cancelled => true}`.
 
-## 7. Chat and embeddings
-
-```erlang
-%% One chat turn: render through the model's template, generate,
-%% parse. Messages are maps; see guides/tool-calls.md for tools.
-{ok, #{message := #{content := Answer}, stats := Stats}} =
-    erllama:chat(ModelId, [
-        #{role => system, content => <<"You are concise.">>},
-        #{role => user,   content => <<"What's 2+2?">>}
-    ], #{response_tokens => 16, temperature => 0.0}).
-```
-
-```erlang
-%% Embeddings need a model loaded with context_opts => #{embeddings => true}.
-{ok, Vec}  = erllama:embed(ModelId, <<"The quick brown fox.">>),
-{ok, Vecs} = erllama:embed_batch(ModelId, [<<"alpha">>, <<"beta">>, <<"gamma">>]).
-```
-
-## 8. Grammar-constrained sampling (GBNF)
+## 5. Grammar-constrained sampling (GBNF)
 
 ```erlang
 %% Force the model to emit a JSON-shaped string with a digit value.
@@ -209,107 +144,15 @@ Grammar = <<
                            #{response_tokens => 32, grammar => Grammar}).
 ```
 
-The grammar is per-request: the sampler chain is reset to grammar →
-greedy for the duration of the request and cleared on completion or
-cancellation.
+The grammar is per request: it constrains every sampled token of this
+request and no other.
 
-## 9. Stop sequences
+## 6. Collect a thinking block and its answer
 
-Halt generation as soon as one of the caller-supplied strings
-appears in the detokenised output. The match is trimmed from the
-streamed text and from the synchronous `reply`; the matched binary
-is reported as `stop_sequence` in the result map and in the
-streaming `Stats`.
-
-```erlang
-{ok, #{reply := Reply, finish_reason := FinishReason} = Result} =
-    erllama:complete(ModelId, <<"Write a short list, then say END.">>,
-                     #{response_tokens => 64,
-                       stop_sequences => [<<"END">>, <<"\n\nUser:">>]}),
-case maps:find(stop_sequence, Result) of
-    {ok, S} ->
-        %% Generation halted on a caller-supplied stop string.
-        %% FinishReason is `stop`; `reply` has been trimmed at the
-        %% first occurrence of S.
-        io:format("stopped at ~p, reply=~p~n", [S, Reply]);
-    error ->
-        %% No stop string fired: FinishReason is `length`, `stop`
-        %% (natural EOG), or `cancelled`.
-        io:format("finished ~p, reply=~p~n", [FinishReason, Reply])
-end.
-```
-
-Streaming works the same way: the matched string never appears in
-any `{erllama, _, {token, _}}` chunk, and the final
-`{erllama, _, {done, Stats}}` carries the matched value:
-
-```erlang
-{ok, Tokens} = erllama:tokenize(ModelId, Prompt),
-{ok, Ref} = erllama:stream(ModelId, Tokens,
-                          #{response_tokens => 200,
-                            stop_sequences => [<<"\n\nUser:">>]}),
-
-receive
-    {erllama, Ref, {done, #{stop_sequence := <<"\n\nUser:">>}}} ->
-        stopped_at_user_turn;
-    {erllama, Ref, {done, _Stats}} ->
-        finished_without_match
-end.
-```
-
-The first occurrence by **text position** wins; the scanner holds
-back the last `(max_stop_len - 1)` bytes of each chunk so a match
-crossing a chunk boundary is still detected, then flushes the tail
-on terminal end when no match fired.
-
-## 10. Extended thinking (`thinking` / `thinking_end`)
-
-Some LLMs emit a "thinking" phase before their actual answer -
-typically text wrapped in template-defined markers like
-`<think>...</think>`. erllama surfaces those thoughts as a
-separate stream so Anthropic-Messages SDKs can render and verify
-them.
-
-### Enabling thinking on a real model
-
-Tell the backend which token strings open and close a thinking
-block for *this* GGUF. Each model has its own - qwen3 uses
-`<think>`/`</think>`, deepseek-r1 uses different markers. The
-strings are tokenised through the model's own vocabulary at load
-time.
-
-```erlang
-erllama:load_model(<<"qwen3-thinking">>, #{
-    backend => erllama_model_llama,
-    model_path => "/models/qwen3-7b.gguf",
-    context_size => 8192,
-    thinking_markers => #{
-        start => <<"<think>">>,
-        'end' => <<"</think>">>
-    }
-}).
-```
-
-Omitting `thinking_markers` (or passing `#{}`) keeps the backend
-on the non-thinking path - requests with `thinking => enabled`
-behave identically to a normal text request, no thinking messages
-arrive.
-
-For tamper-proof signatures on each thinking block, set a
-node-wide HMAC key once at boot:
-
-```erlang
-{erllama, [
-    {thinking_signing_key, <<"a-32-byte-secret-or-longer">>}
-]}.
-```
-
-`erllama_model_llama:thinking_signature` (arity 3) HMACs the observed
-thinking text with this key. Leaving it unset returns `<<>>`, the
-documented "no signature" path - the downstream forwards no
-`signature_delta` event.
-
-### Per-request usage
+The model needs `thinking_markers` at load (see
+[loading](loading.md#thinking_markers)); set `thinking_signing_key` in
+the application environment to sign each block (see
+[configuration](configuration.md#thinking_signing_key)).
 
 ```erlang
 {ok, Tokens} = erllama:tokenize(<<"qwen3-thinking">>, <<"Solve: 23 * 17.">>),
@@ -331,46 +174,12 @@ loop(Ref, Thinking, Answer, Sig) ->
     end.
 ```
 
-### Capping the thinking phase (`thinking_budget_tokens`)
+Add `thinking_budget_tokens => N` to cap the thinking phase: past `N`
+thinking payloads erllama closes the block with
+`{thinking_end, Sig}` and the rest of the output arrives as answer
+tokens. See [generating text](generation.md#extended-thinking).
 
-Anthropic's API takes a `thinking.budget_tokens` hint that caps
-the thinking phase. erllama honours it as the maximum number of
-`{thinking, _}` payloads to deliver. Once the budget is
-reached, the scheduler synthesises the `{thinking_end, Sig}`
-close immediately and routes any further model-emitted thinking
-tokens through the normal post-thinking pipeline so generation
-still progresses.
-
-```erlang
-{ok, Ref} = erllama:stream(<<"qwen3-thinking">>, Tokens,
-                          #{response_tokens => 256,
-                            thinking => enabled,
-                            thinking_budget_tokens => 64}).
-```
-
-Non-positive values and a missing key both mean "no cap".
-
-## 11. Tool calls
-
-```erlang
-Tools = [#{name => <<"get_weather">>,
-           description => <<"Current weather for a city">>,
-           parameters => #{type => object,
-                           properties => #{city => #{type => string}},
-                           required => [city]}}],
-{ok, #{message := #{tool_calls := Calls}}} =
-    erllama:chat(ModelId,
-                 [#{role => user, content => <<"Weather in Paris?">>}],
-                 #{tools => Tools, temperature => 0.0}).
-%% Calls = [#{name => <<"get_weather">>,
-%%            arguments => #{<<"city">> => <<"Paris">>}, id => undefined}]
-```
-
-The full loop (run the tool, append a `tool` message, call again) and
-the streaming form (`chat_apply/3` + `stream/3` + `chat_parse/3`) are
-in the [tool-calls guide](tool-calls.md).
-
-## 12. Warm a session without sampling (`prefill_only/2,3`)
+## 7. Warm a prompt without sampling (`prefill_only/2,3`)
 
 Useful for priming the cache before a burst of short follow-ups,
 or for holding a warm session across long pauses without consuming
@@ -415,52 +224,7 @@ than relying on the implicit longest-prefix walk:
                          #{parent_key => K1}).
 ```
 
-## 13. Sticky sessions (`session_id` + `end_session/2`)
-
-A `session_id` (any term) pins the request's seq_id across turns
-so the next turn whose prompt continues the stored tokens
-truncates-and-prefills in place on the already-live KV cells -
-no `kv_unpack` from disk. The HTTP server's conversation id is
-the natural value; nothing here is HTTP-specific.
-
-```erlang
-SessionId = ConvId,  %% your auth layer's conversation identifier
-
-%% Turn 1: cold or partial via longest-prefix; on finish the
-%% seq_id stays pinned to SessionId.
-{ok, #{generated := Gen1}} =
-    erllama:complete(ModelId, Turn1Prompt,
-                     #{session_id => SessionId,
-                       response_tokens => 32}),
-
-%% Turn 2: the prompt extends the stored prefix (prior prompt +
-%% generated). cache_hit_kind comes back as `sticky`: no disk
-%% read, just suffix prefill on the live cells.
-{ok, #{cache_hit_kind := sticky}} =
-    erllama:complete(ModelId, Turn2Prompt,
-                     #{session_id => SessionId,
-                       response_tokens => 32}),
-
-%% End the conversation explicitly when the user logs out / TTL
-%% expires. Idempotent; unknown ids are a no-op.
-ok = erllama:end_session(ModelId, SessionId).
-```
-
-Constraints:
-
-- Concurrent admits on the same `session_id` return `{error,
-  sticky_busy}`; serialise per session (typical HTTP per-user
-  request pipelines do this naturally).
-- A new prompt that *diverges* from the stored tokens evicts the
-  sticky seq (KV cleared, seq returned to idle) and falls back to
-  the normal cold/warm path - useful when a user starts a fresh
-  conversation while a prior one was still active.
-- The sticky map is bounded by `n_seq_max`. Sessions that overrun
-  the pool will see `{error, sticky_busy}` until older sessions
-  end (or you can pre-`end_session` LRU ones from your own
-  scheduler).
-
-## 14. Chat-template continuation (`continue/3`)
+## 8. Chat-template continuation (`continue/3`)
 
 `stream/3` with `session_id` reuses the live KV cells across turns,
 but only when the new prompt's tokens are a strict prefix extension
@@ -468,8 +232,8 @@ of what was stored on the prior turn. Production chat templates
 typically render different role markers when the same first user
 message is wrapped in a 1-message vs an N-message history, so the
 retokenised prefix on turn N does not equal the stored tokens from
-turn N-1 - the sticky path evicts the seq and admits cold every
-single turn.
+turn N-1: the sticky path keeps only the common prefix and
+re-prefills the rest on every turn.
 
 `continue/3` lets the caller assert "here is the new tokenised
 tail" and the engine appends it directly on top of the resident KV,
@@ -497,7 +261,7 @@ PriorTokenCount = maps:get(prompt_tokens, Stats1)
 %% Turn 2: re-render the full conversation, then slice off the
 %% tokens the engine already has and pass only the new tail to
 %% continue/3. No need for the slice to match what the model
-%% actually decoded - continue/3 trusts the caller.
+%% actually decoded: continue/3 trusts the caller.
 {ok, Turn2Tokens} = erllama:render_chat_template(ModelId, #{
     messages => [
         #{role => <<"user">>, content => Q1},
@@ -519,7 +283,7 @@ ok = erllama:end_session(ModelId, SessionId).
 ```
 
 During caller development it is worth running the slicing path in
-debug mode and asserting `StoredTokens ++ Suffix == Turn2Tokens` -
+debug mode and asserting `StoredTokens ++ Suffix == Turn2Tokens`:
 when the chat template renders identically across turns the slice
 will be a true tail, and the assertion validates the caller's
 math. In production, drop the assertion: the whole point of
@@ -527,13 +291,13 @@ math. In production, drop the assertion: the whole point of
 
 Errors:
 
-- `{error, no_session}` - the session id is not known to the model.
+- `{error, no_session}`: the session id is not known to the model.
   Falls back to the cold/warm path: rebuild the conversation and
   call `stream/3` instead.
-- `{error, sticky_busy}` - an earlier request on the same session
+- `{error, sticky_busy}`: an earlier request on the same session
   is still in flight. Serialise calls per session id (typical HTTP
   per-user pipelines do this naturally).
-- `{error, {transcript_mismatch, Detail}}` - only when the optional
+- `{error, {transcript_mismatch, Detail}}`: only when the optional
   `expect_committed` guard is set and diverges (see below).
 
 `parent_key` is ignored on the `continue/3` path because no cache
@@ -550,7 +314,7 @@ pass them as `expect_committed`. The engine checks they equal the
 session's stored context before prefilling:
 
 ```erlang
-PriorCommitted = Turn1Prompt ++ maps:get(generated, Stats1),
+PriorCommitted = Turn1Tokens ++ maps:get(generated, Stats1),
 {ok, Ref2} = erllama:continue(ModelId, Suffix,
                               #{session_id => SessionId,
                                 to => self(),
@@ -564,11 +328,12 @@ and prefills nothing; the seq stays pinned, so the caller can re-sync
 its transcript and retry (or fall back to `stream/3`). Omit
 `expect_committed` to keep the historical trust-the-tail behaviour.
 
-## 15. Multi-tenant concurrent decoding (`n_seq_max`)
+## 9. Concurrent requests on one model (`n_seq_max`)
 
-Default is single-tenant. Opt in with `context_opts.n_seq_max > 1`
-and up to N requests prefill and decode concurrently through one
-`llama_decode` per tick.
+By default a model runs one request at a time. With
+`context_opts.n_seq_max > 1` the request scheduler co-batches up to N
+requests, prefilling and decoding them through one `llama_decode` per
+tick.
 
 ```erlang
 {ok, _} = erllama:load_model(<<"chat">>, Config#{
@@ -590,40 +355,14 @@ Per-request samplers are isolated: each worker can pass its own
 `temperature`, `seed`, or `grammar` in the `Opts` map without
 spilling sampler state across the other in-flight requests.
 Admissions past `n_seq_max` queue FIFO in the model's `pending`
-list - observable via `erllama:pending_len/1`.
+list, observable via `erllama:pending_len/1`.
 
 Long prompts are sliced by `prefill_chunk_size` (default
 `max(64, n_batch div 4)`) so a single heavy prompt cannot
 monopolise the batch. See [caching](caching.md) for warm-prefix
 behaviour across concurrent workers.
 
-## 16. Lock-free observability for routers
-
-A cluster router that bin-packs requests onto the least-loaded node
-should not serialise behind the work it is probing. These accessors
-read a public ETS row, never cross the model gen_statem:
-
-```erlang
-1> erllama:phase(<<"chat">>).
-{ok, generating}
-2> erllama:pending_len(<<"chat">>).
-{ok, 3}
-3> erllama:queue_depth(<<"chat">>).
-{ok, 1}
-4> erllama:last_cache_hit(<<"chat">>).
-{ok, #{kind => partial, prefix_len => 1024}}
-5> erllama:queue_depth().
-%% global: total admitted streaming stream/3 rows across all loaded models.
-4
-```
-
-`phase/1` returns `idle | prefilling | generating` and falls back to
-`idle` for unknown ids. `last_cache_hit/1` returns `undefined` if
-the model has not admitted any request yet. All four are O(1) ETS
-reads and safe to call from a hot path or via `erpc` from another
-node.
-
-## 17. Per-request cache delta (`cache_creation_input_tokens` / `cache_read_input_tokens`)
+## 10. Per-request cache delta (`cache_creation_input_tokens` / `cache_read_input_tokens`)
 
 Every result and `Stats` map carries `cache_delta => #{read := N,
 created := N}`. `read` counts tokens served from the warm prefix
@@ -652,91 +391,7 @@ Streaming consumers read the same map from the final
 `{erllama, Ref, {done, Stats}}` message; `prefill_only/2` exposes it
 on its result map too.
 
-## 18. Inspecting cache state
-
-```erlang
-%% Hit/miss/save counters and per-path latency totals.
-Counters = erllama_cache:get_counters(),
-io:format("~p~n", [Counters]).
-
-%% Tiers, row count and bytes per tier backend.
-#{tiers := Tiers, entries := N, bytes := Bytes} = erllama_cache:info(),
-
-%% Free at least 256 MiB, oldest LRU first, RAM tiers only.
-erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
-
-%% Synchronous full eviction pass.
-erllama_cache:gc().
-```
-
-## 19. Memory-pressure-driven eviction (in `sys.config`)
-
-```erlang
-{erllama, [
-  {scheduler, #{
-    enabled         => true,
-    pressure_source => system,        %% memsup-backed, portable
-    interval_ms     => 5000,
-    high_watermark  => 0.85,
-    low_watermark   => 0.75,
-    evict_tiers     => [ram, ram_file] %% disk fills to its own quota
-  }}
-]}.
-```
-
-Sources shipped: `noop`, `system`, `nvidia_smi`, `{module, M}`. Roll
-your own with `-behaviour(erllama_pressure)` and pass
-`{module, M}` as the source.
-
-## 20. Tests without a model
-
-`erllama_model_stub` lets your own test suite exercise loading,
-completion, streaming, sessions and cache tiers with no GGUF:
-
-```erlang
-%% test/my_app_llm_tests.erl
--module(my_app_llm_tests).
--include_lib("eunit/include/eunit.hrl").
-
-with_model(Body) ->
-    {ok, Started} = application:ensure_all_started(erllama),
-    {ok, M} = erllama:load_model(#{backend => erllama_model_stub}),
-    try Body(M) after
-        erllama:unload(M),
-        [application:stop(A) || A <- lists:reverse(Started)]
-    end.
-
-completion_round_trip_test() ->
-    with_model(fun(M) ->
-        {ok, #{reply := Reply, finish_key := Key}} =
-            erllama:complete(M, <<"hello there">>, #{response_tokens => 4}),
-        ?assert(is_binary(Reply)),
-        ?assert(is_binary(Key))
-    end).
-
-stream_delivers_done_test() ->
-    with_model(fun(M) ->
-        {ok, Ref} = erllama:stream(M, <<"hello there">>, #{response_tokens => 3}),
-        {ok, #{finish_reason := stop, generated := [_, _, _]}} = erllama:collect(Ref, 5000)
-    end).
-```
-
-Replies are deterministic for a given prompt, so assertions on cache
-behaviour (`cache_hit_kind`, `cache_delta`) hold across runs.
-
-## 21. End-to-end against a real GGUF
-
-```bash
-LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
-    rebar3 ct --dir apps/erllama/test --suite erllama_real_model_SUITE
-```
-
-The 6-case suite covers cold prefill, warm restore, multi-turn
-parent-key resume, longest-prefix walk, eviction, and a multi-model
-concurrent run. Without the env var it skips so default
-`rebar3 ct` stays green.
-
-## 22. Microbench: cold vs. warm
+## 11. Microbench: cold vs. warm
 
 ```bash
 bench/run.sh tiny    # TinyLlama 1.1B Q4_K_M
@@ -746,101 +401,26 @@ bench/run.sh large   # LLaMA-3 8B Q4_K_M (needs the file)
 `bench/run.sh` drives a `cold_vs_warm` matrix plus a 4-agent
 shared-prefix scenario; see `bench/README.md`.
 
-## 23. Fork a session and explore two branches
+## Covered in the guides
 
-```erlang
-{ok, M} = erllama:load_model(#{
-    model_path => Path,
-    context_opts => #{n_seq_max => 4, kv_unified => true}
-}),
-{ok, R1} = erllama:complete(M, Prompt, #{session_id => src, response_tokens => 32}),
-Transcript = <<Prompt/binary, (maps:get(reply, R1))/binary>>,
-ok = erllama:fork_session(M, src, alt),
-{ok, _} = erllama:complete(M, <<Transcript/binary, " Option A:">>, #{session_id => src}),
-{ok, _} = erllama:complete(M, <<Transcript/binary, " Option B:">>, #{session_id => alt}).
-```
-
-Both branches reuse the shared prefix from live KV; see
-[sessions](sessions.md) for capacity rules and errors.
-
-## 24. Per-token logprobs
-
-```erlang
-{ok, #{logprobs := Lps}} = erllama:complete(M, Prompt, #{
-    response_tokens => 8, temperature => 0.0, logprobs => 5
-}),
-[#{token_id := Id, logprob := Lp, top := Top} | _] = Lps.
-%% streaming: {erllama, Ref, {logprobs, Entry}} events before each token
-```
-
-## 25. Fill-in-the-middle (code infill)
-
-```erlang
-{ok, #{fim_pre := Pre, fim_suf := Suf, fim_mid := Mid}} = erllama:vocab_info(M),
-{ok, P} = erllama:tokenize(M, <<"def add(a, b):\n    ">>, #{add_special => false}),
-{ok, S} = erllama:tokenize(M, <<"\n\nprint(add(1, 2))">>, #{add_special => false}),
-{ok, Ref} = erllama:stream(M, [Pre | P] ++ [Suf | S] ++ [Mid], #{
-    response_tokens => 64, infill => true, stop_sequences => [<<"\n\n">>]
-}),
-{ok, #{reply := Middle}} = erllama:collect(Ref, 30000).
-```
-
-Skip when `fim_pre` is `undefined`; see [tokens](tokens.md).
-
-## 26. JSON-schema constrained replies
-
-```erlang
-Schema = #{type => object,
-           properties => #{answer => #{type => string}},
-           required => [answer]},
-{ok, #{message := #{content := Json}}} =
-    erllama:chat(M, Messages, #{json_schema => Schema}),
-#{<<"answer">> := Answer} = json:decode(Json).
-```
-
-The reply is grammar-constrained to the schema; decoding always
-succeeds. Not combinable with `tools`.
-
-## 27. Load progress
-
-```erlang
-Self = self(),
-spawn_link(fun() ->
-    {ok, _} = erllama:load_model(#{model_path => Path, progress_to => Self,
-                                   model_id => <<"big">>})
-end),
-(fun Loop() ->
-    receive
-        {erllama_load_progress, <<"big">>, 1.0} -> done;
-        {erllama_load_progress, <<"big">>, P} ->
-            io:format("\rloading ~.0f%", [P * 100]), Loop()
-    end
-end)().
-```
-
-## 28. Native llama.cpp logs in `logger`
-
-```erlang
-%% sys.config:
-{erllama, [{native_log_level, info}]}
-%% lines arrive under the logger domain [erllama, native]
-```
-
-See [observability](observability.md) for a domain filter recipe.
+- Multi-turn with `parent_key` / `finish_key`, sticky sessions, forking:
+  [sessions](sessions.md).
+- Several models on one node: [loading](loading.md#loading-multiple-models).
+- Load progress messages: [loading](loading.md#load-progress).
+- Chat turns and tool calls: [tool calls](tool-calls.md); JSON-schema
+  replies: [tool calls](tool-calls.md#forcing-a-schema-instead-of-tools).
+- Embeddings: [embeddings](embeddings.md).
+- Stop sequences, logprobs, extended thinking, speculative decoding:
+  [generating text](generation.md).
+- Fill-in-the-middle: [tokens](tokens.md#fill-in-the-middle-infill).
+- Router accessors (`phase/1`, `pending_len/1`, `last_cache_hit/1`),
+  cache counters, native logs: [observability](observability.md).
+- Cache inspection, `gc/0`, `evict_bytes/1,2` and the cache eviction
+  scheduler: [caching](caching.md).
+- Tests with the stub backend or a real GGUF: [testing](testing.md).
+- Something does not work: [troubleshooting](troubleshooting.md).
 
 ## See also
 
-- [Generating text](generation.md) - the request model, streaming,
-  logprobs, stop sequences.
-- [Sessions](sessions.md) - sticky sessions, continue, fork.
-- [Tool calls](tool-calls.md) - the tool round trip, enforcement,
-  JSON schemas.
-- [Tokens and vocabulary](tokens.md) - tokenize, detokenize, FIM.
-- [Loading a model](loading.md) - every option to
-  `erllama:load_model/1,2`, with examples and pitfalls.
-- [Caching](caching.md) - tiers, save reasons, lookup paths,
-  watermarks.
-- [Observability](observability.md) - counters, requests, logs.
-- [Testing](testing.md) - the stub backend.
-- [Configuration](configuration.md) - full `sys.config` reference.
-- [Building](building.md) - platform-specific build notes.
+- [Configuration](configuration.md): full `sys.config` reference.
+- [Building](building.md): platform-specific build notes.

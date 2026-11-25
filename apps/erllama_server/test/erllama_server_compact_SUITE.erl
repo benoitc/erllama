@@ -61,6 +61,7 @@ init_per_testcase(TC, Config) ->
     [{ws, list_to_binary(Ws)} | Config].
 
 end_per_testcase(_TC, _Config) ->
+    _ = application:unset_env(erllama_server, agent_generator),
     _ = application:stop(erllama_server),
     [erllama:unload(Id) || #{id := Id} <- erllama:list_models()],
     [
@@ -159,17 +160,16 @@ conversation_compacts_on_request(_Config) ->
     {ok, #{agent_id := Agent}} = erllama_server_api:agent_start(#{
         model => <<"stub">>,
         workspace => ?config(ws, [{ws, <<"/tmp">>}]),
-        conversation_id => Conv,
-        generator => erllama_server_agent_script
+        conversation_id => Conv
     }),
     ?assertEqual({error, conversation_busy}, erllama_server_api:conversation_compact(Conv)),
     ok = erllama_server_api:agent_stop(Agent).
 
 session(Config, Script) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     {ok, #{agent_id := Id, conversation_id := Conv}} = erllama_server_api:agent_start(#{
         model => <<"stub">>,
-        workspace => ?config(ws, Config),
-        generator => erllama_server_agent_script
+        workspace => ?config(ws, Config)
     }),
     ok = erllama_server_agent_script:set(Id, Script),
     {Id, Conv}.
@@ -209,6 +209,7 @@ session_compacts_on_request(Config) ->
 %% A session resuming a compacted conversation sees its summary, in one
 %% leading system message with the session's own prompt once.
 resumed_session_keeps_the_summary(Config) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     {Id, Conv} = session(Config, [#{text => <<"one">>}, #{text => <<"two">>}]),
     ok = agent_turn(Id, <<"first task">>),
     ok = agent_turn(Id, <<"second">>),
@@ -217,8 +218,7 @@ resumed_session_keeps_the_summary(Config) ->
     ok = erllama_server_api:agent_stop(Id),
     {ok, #{agent_id := Id2}} = erllama_server_api:agent_start(#{
         model => <<"stub">>,
-        conversation_id => Conv,
-        generator => erllama_server_agent_script
+        conversation_id => Conv
     }),
     ok = erllama_server_agent_script:set(Id2, [#{text => <<"resumed">>}]),
     ok = agent_turn(Id2, <<"go on">>),
@@ -232,12 +232,12 @@ resumed_session_keeps_the_summary(Config) ->
 %% A slow model (each token takes a while) so the compaction can be
 %% caught in progress.
 interrupt_stops_compaction(Config) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     {ok, _} = erllama:load_model(<<"slow">>, #{backend => erllama_model_stub, step_delay_ms => 200}),
     ok = application:set_env(erllama_server, compact_summary_tokens, 200),
     {ok, #{agent_id := Id, conversation_id := Conv}} = erllama_server_api:agent_start(#{
         model => <<"slow">>,
-        workspace => ?config(ws, Config),
-        generator => erllama_server_agent_script
+        workspace => ?config(ws, Config)
     }),
     ok = erllama_server_agent_script:set(Id, [
         #{text => <<"a">>}, #{text => <<"b">>}, #{text => <<"c">>}

@@ -27,6 +27,7 @@ init_per_testcase(TC, Config) ->
     [{ws, list_to_binary(Ws)}, {dir, Base} | Config].
 
 end_per_testcase(_TC, _Config) ->
+    _ = application:unset_env(erllama_server, agent_generator),
     _ = application:stop(erllama_server),
     [erllama:unload(Id) || #{id := Id} <- erllama:list_models()],
     application:unset_env(erllama_server, data_dir),
@@ -144,10 +145,10 @@ run(Model, Conv, Text, Tokens) ->
     {Run, C}.
 
 agent(Config, Model, Script) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     {ok, #{agent_id := Id}} = erllama_server_api:agent_start(#{
         model => Model,
         workspace => ?config(ws, Config),
-        generator => erllama_server_agent_script,
         policy => yes
     }),
     ok = erllama_server_agent_script:set(Id, Script),
