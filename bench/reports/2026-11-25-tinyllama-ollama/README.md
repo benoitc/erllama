@@ -67,3 +67,22 @@ and the HTTP adapter delivered the first text in 0.2 ms. The decode
 call samples the prompt logits and submits the next decode, so it can
 include a wait for earlier Metal work. These measurements time call
 boundaries. [Per-request trace after unrelated text](mac-first-text.csv)
+
+## M4 Pro retry with verified cache hits
+
+Using erllama `fcadd14` and Ollama 0.40.17, we warmed both models and
+sent the benchmark prompt once to populate their caches (retry 0). We
+then timed six resends per server in alternating order. erllama reported
+a partial hit with 43 tokens read on every retry. Ollama's runner logged
+43 cached tokens on every retry. All replies reached the 128-token cap.
+
+| Server | Prompt tokens reused | First visible text (median) | Full reply (median) |
+|---|---:|---:|---:|
+| erllama | 43 of 44 | 6.9 ms | 597 ms |
+| Ollama | 43 of 44 | 8.5 ms | 706 ms |
+
+We used a 128 MiB RAM cache on erllama. The benchmark set `min_tokens`
+and `cold_min_tokens` to 32 and both `boundary_trim_tokens` and
+`boundary_align_tokens` to 1. All sampling and context settings matched
+the full-reply benchmark. Retry 0 is included in the data and excluded
+from the medians. [Cache-hit counts, timings and output](mac-cache-hits.json)
