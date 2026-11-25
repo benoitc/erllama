@@ -33,6 +33,11 @@ forced off, and it links `vendor/{stb,miniaudio,hash,sheredom}`.
 The vendor script applies every patch in `scripts/patches/`, in name
 order, to the extracted tarball before copying it:
 
+- [cuda-dgx-spark-q4k-moe-mmq.patch](scripts/patches/cuda-dgx-spark-q4k-moe-mmq.patch)
+  sends an eight-row Q4_K `MUL_MAT_ID` (a mixture-of-experts layer with
+  eight rows, as an MTP verify of four requests gives) through MMQ
+  instead of MMVQ on DGX Spark (GB10), where it is faster; other GPUs,
+  types and row counts are unchanged.
 - [hybrid-k-graph-reuse.patch](scripts/patches/hybrid-k-graph-reuse.patch)
   checks the dense attention mask built for the hybrid K-only input, so
   GLM can reuse its decode graph with unified KV and fused K/V rows
@@ -41,6 +46,12 @@ order, to the extracted tarball before copying it:
   lets the split backend (`ggml-backend-meta.cpp`) split a view that
   walks the split axis one window at a time, which GLM's recurrent-state
   snapshots take; without it a split GLM with snapshots aborts.
+- [meta-split-mirrored-read.patch](scripts/patches/meta-split-mirrored-read.patch)
+  makes the split backend read a mirrored tensor from the first device
+  that holds data (its reg's `ggml_backend_dev_holds_data`), not always
+  device 0. erllama's tensor-parallel ranks hold one real device; the
+  others are placeholders that read as zeros, so a checkpoint of a
+  mirrored tensor on any rank but the first held zeros.
 
 When updating the pin, check whether upstream has fixed each one; once
 it has, remove that patch. A patch failure leaves the current vendored

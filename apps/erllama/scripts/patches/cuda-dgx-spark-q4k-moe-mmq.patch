@@ -1,0 +1,16 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -279,6 +279,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+ 
+ // Host function: returns the max batch size for the current arch+type at runtime.
+ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
++    // DGX Spark (GB10): eight rows of a Q4_K MUL_MAT_ID run faster through MMQ than through
++    // MMVQ (an 8-row MTP verify of GLM-5.3-Flash split over two GB10s: expert kernels
++    // 86.6 -> 67.8 ms a step), so MMVQ takes at most seven there.
++    if (type == GGML_TYPE_Q4_K && cc == GGML_CUDA_CC_DGX_SPARK) {
++        return MMVQ_MAX_BATCH_SIZE - 1;
++    }
+     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
+     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+         cc = ggml_cuda_highest_compiled_arch(cc);

@@ -298,7 +298,7 @@ the raw model distribution, before any sampler stage.
 -doc "Handle of an attached LoRA adapter; treat as opaque.".
 -type adapter() :: term().
 -doc "Parser handle produced by `chat_apply/3` for `chat_parse/3`; treat as opaque.".
--type chat_params() :: reference().
+-type chat_params() :: reference() | {thinking_closed, reference(), binary()}.
 -type chat_request() :: erllama_model_backend:chat_request().
 -doc "Assistant message parsed by `chat_parse/3` / returned by `chat/3`.".
 -type parsed_message() :: #{

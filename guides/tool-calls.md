@@ -218,7 +218,10 @@ only; call `chat_apply/3` again for the next turn.
 
 - `enable_thinking => false` suppresses the thinking preamble on
   templates that support it; `chat_apply/3` reports
-  `supports_thinking` plus the template's thinking tags.
+  `supports_thinking` plus the template's thinking tags. A template
+  that always opens its thinking block (GLM-5.3-Flash) gets the block
+  closed in the prompt, so the model answers at once and the reply is
+  parsed as `content`.
 - `reasoning_format` (default `deepseek`) extracts thinking text into
   `reasoning_content`; `reasoning_format => none` leaves it inline in
   `content`.

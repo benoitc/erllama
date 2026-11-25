@@ -69,6 +69,10 @@
     spec_rollback/1
 ]).
 
+-ifdef(TEST).
+-export([kv_format/2]).
+-endif.
+
 -record(tp, {
     %% This VM's copy of the vocabulary.
     vocab :: erllama_nif:model_ref() | undefined,
@@ -157,9 +161,15 @@ step(S, Ops) -> remote(S, step, [Ops]).
 sampler_new(S, Cfg) -> remote(S, sampler_new, [Cfg]).
 extra_metadata(#tp{layout = L} = S) ->
     case remote(S, extra_metadata, []) of
-        #{kv_format := F} = Meta -> Meta#{kv_format => <<F/binary, "/tp=", L/binary>>};
+        #{kv_format := F} = Meta -> Meta#{kv_format => kv_format(F, L)};
         Other -> Other
     end.
+
+%% A checkpoint of the split model is laid out by the backend's format
+%% and the group's layout. `tp2': checkpoints saved before the split
+%% backend read mirrored tensors from the rank's own device hold zeros
+%% for them on every rank but the first, so they must not be found.
+kv_format(F, Layout) -> <<F/binary, "/tp2=", Layout/binary>>.
 
 sampler_free({erllama_tp_ref, Worker, Id}) ->
     case call(#tp{worker = Worker}, {hosting, {free_ref, Id}}, 30000) of

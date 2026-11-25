@@ -43,6 +43,9 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- On DGX Spark (GB10), a step that decodes eight tokens at once on a
+  mixture-of-experts model in Q4_K is faster: on GLM-5.3-Flash split
+  over two GB10s it went from 146 to 129 ms.
 - Tokenising, detokenising and rendering a chat template no longer wait
   for a model that is generating. They used to queue behind its decode
   step, so a new request on a busy model waited about one step for each
@@ -50,6 +53,19 @@ this project adheres to [Semantic Versioning](https://semver.org).
   caller's process, alongside the running requests.
 
 ### Fixed
+
+- A KV cache entry of a model split over several machines now restores
+  correctly on every machine. For models that keep part of their
+  attention state on every machine, such as GLM-5.3-Flash, every
+  machine but the first came back with that state empty, so a request
+  resumed from the cache gave subtly different, worse output. Entries
+  saved before this fix are no longer found and those requests start
+  cold.
+- Turning thinking off (`enable_thinking => false`, or `reasoning_effort:
+  "none"` on the server) now works for models whose chat template
+  always opens a thinking block, such as GLM-5.3-Flash. Such a model
+  used to think anyway, and its whole reply came back as reasoning
+  with empty content.
 
 - A hybrid model such as GLM-5.3-Flash split over several machines can
   now keep recurrent-state snapshots (`n_rs_seq`), so its last tokens
