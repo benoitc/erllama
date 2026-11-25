@@ -92,6 +92,12 @@ typedef struct {
  * batch that is. nif_step's decode pre-sample maps this to -1. */
 #define ERLLAMA_LOGITS_LAST (-2)
 
+/* per_seq.last_logits_idx when a decode that did not hold the seq has
+ * replaced the logits buffer since its row was written: sampling it
+ * would read another seq's row (or none). The sampling NIFs answer
+ * {error, stale_logits}. */
+#define ERLLAMA_LOGITS_STALE (-3)
+
 #define ERLLAMA_GRAMMAR_CACHE_N 4
 
 /* One cached compiled grammar. `bytes` is an owned copy of the GBNF used
@@ -245,6 +251,7 @@ extern ERL_NIF_TERM atom_oom;
 extern ERL_NIF_TERM atom_deferred;
 extern ERL_NIF_TERM atom_exception;
 extern ERL_NIF_TERM atom_no_logits;
+extern ERL_NIF_TERM atom_stale_logits;
 extern ERL_NIF_TERM atom_no_template;
 extern ERL_NIF_TERM atom_template_failed;
 extern ERL_NIF_TERM atom_grammar_failed;
@@ -278,6 +285,10 @@ void model_release_tp(erllama_model_t *m);
  * or ERLLAMA_TP_REDUCE_FAILED. */
 #define ERLLAMA_TP_REDUCE_FAILED (-1000)
 int erllama_ctx_decode(ErlNifEnv *env, erllama_context_t *c, struct llama_batch batch);
+/* After a decode of `batch': mark the logits row of every seq the batch
+ * did not hold as stale (ERLLAMA_LOGITS_STALE). erllama_ctx_decode does
+ * it; a decode that does not go through it must too. */
+void erllama_ctx_stale_other_rows(erllama_context_t *c, const struct llama_batch *batch);
 /* Send a command (built in `menv', which is freed) to the context's
  * tensor-parallel sink with the next sequence number. */
 void erllama_tp_send(ErlNifEnv *env, erllama_context_t *c, ErlNifEnv *menv, ERL_NIF_TERM cmd);
@@ -309,6 +320,7 @@ ERL_NIF_TERM nif_mtp_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_mtp_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_mtp_free(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM nif_mtp_trace(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_step_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 
 /* Decode guards (definitions in erllama_nif_context.c). */
 void arm_decode(erllama_context_t *c);

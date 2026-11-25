@@ -390,9 +390,9 @@ ERL_NIF_TERM nif_mtp_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
         return erllama_error(env, atom_released);
     }
     int32_t li = c->per_seq[seq].last_logits_idx;
-    if (!c->decode_ready || li == -1) {
+    if (!c->decode_ready || li == -1 || li == ERLLAMA_LOGITS_STALE) {
         pthread_mutex_unlock(&c->mu);
-        return erllama_error(env, atom_no_logits);
+        return erllama_error(env, li == ERLLAMA_LOGITS_STALE ? atom_stale_logits : atom_no_logits);
     }
     int32_t n_vocab = 0;
     const struct llama_vocab *vocab = erllama_ctx_vocab(c, &n_vocab);
@@ -521,4 +521,332 @@ ERL_NIF_TERM nif_mtp_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     return enif_make_tuple2(env, atom_ok,
                             enif_make_tuple4(env, enif_make_atom(env, "spec"), list,
                                              enif_make_int(env, eog), enif_make_int(env, n_acc)));
+}
+
+/* =========================================================================
+ * nif_mtp_step_batch(Ctx, Mtp, [{Sampler, Seq, Drafts}], MaxDraft)
+ *   -> {ok, [{Seq, [Tok], Eog, NAcc}], #{draft_us, verify_us, rollback_us, rows}}
+ *    | {error, _}
+ *
+ * One round of nif_mtp_step for several sequences at once: sample each
+ * sequence's next token K from its own logits row, draft after every K
+ * in one drafter call, decode every K and draft in one batch with every
+ * row out, then keep or take back each sequence's drafts on its own.
+ * Same contract as nif_mtp_step for each sequence.
+ *
+ * Drafts: `auto' (up to MaxDraft), `{auto, Cap}' (up to Cap, at most
+ * MaxDraft), or a list of tokens to verify instead (tests); `[]' or a
+ * Cap of 0 decodes K alone, with any sampler. A sequence that drafts
+ * needs a greedy sampler (argmax verify); a sampler with logprobs is
+ * refused (not_supported). The call holds every sequence that needs a
+ * token this tick: a sequence it leaves out loses its logits row
+ * (stale_logits on its next sample).
+ * ========================================================================= */
+
+#define ERLLAMA_MTP_MAX_SEQS 16
+
+ERL_NIF_TERM nif_mtp_step_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    erllama_mtp_res_t *r;
+    int max_draft;
+    unsigned int n;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c) ||
+        !enif_get_resource(env, argv[1], MTP_RT, (void **) &r) || !enif_get_list_length(env, argv[2], &n) ||
+        n < 1 || n > ERLLAMA_MTP_MAX_SEQS || !enif_get_int(env, argv[3], &max_draft) || max_draft < 0 ||
+        max_draft > ERLLAMA_MTP_MAX_DRAFT) {
+        return enif_make_badarg(env);
+    }
+    erllama_sampler_t *smp[ERLLAMA_MTP_MAX_SEQS];
+    int32_t seqs[ERLLAMA_MTP_MAX_SEQS];
+    int forced_n[ERLLAMA_MTP_MAX_SEQS];
+    int cap[ERLLAMA_MTP_MAX_SEQS];
+    llama_token forced[ERLLAMA_MTP_MAX_SEQS][ERLLAMA_MTP_MAX_DRAFT];
+    {
+        ERL_NIF_TERM head, tail = argv[2];
+        for (unsigned int i = 0; enif_get_list_cell(env, tail, &head, &tail); i++) {
+            int arity;
+            const ERL_NIF_TERM *t;
+            int seq;
+            if (!enif_get_tuple(env, head, &arity, &t) || arity != 3 ||
+                !enif_get_resource(env, t[0], SAMPLER_RT, (void **) &smp[i]) || !enif_get_int(env, t[1], &seq) ||
+                seq < 0 || seq >= ERLLAMA_N_SEQ_MAX_CAP) {
+                return enif_make_badarg(env);
+            }
+            for (unsigned int j = 0; j < i; j++) {
+                if (seqs[j] == seq) {
+                    return enif_make_badarg(env);
+                }
+            }
+            seqs[i] = seq;
+            forced_n[i] = -1;
+            cap[i] = max_draft;
+            {
+                int ta;
+                const ERL_NIF_TERM *tt;
+                int cv;
+                if (enif_get_tuple(env, t[2], &ta, &tt)) {
+                    if (ta != 2 || !enif_is_identical(tt[0], enif_make_atom(env, "auto")) ||
+                        !enif_get_int(env, tt[1], &cv) || cv < 0) {
+                        return enif_make_badarg(env);
+                    }
+                    cap[i] = cv < max_draft ? cv : max_draft;
+                } else if (!enif_is_list(env, t[2]) && !enif_is_identical(t[2], enif_make_atom(env, "auto"))) {
+                    return enif_make_badarg(env);
+                }
+            }
+            if (enif_is_list(env, t[2])) {
+                unsigned int fl;
+                ERL_NIF_TERM fh, ft = t[2];
+                if (!enif_get_list_length(env, t[2], &fl) || fl > (unsigned int) ERLLAMA_MTP_MAX_DRAFT) {
+                    return enif_make_badarg(env);
+                }
+                forced_n[i] = 0;
+                while (enif_get_list_cell(env, ft, &fh, &ft)) {
+                    int v;
+                    if (!enif_get_int(env, fh, &v) || v < 0) {
+                        return enif_make_badarg(env);
+                    }
+                    forced[i][forced_n[i]++] = v;
+                }
+            }
+        }
+    }
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
+    }
+    if (c->mtp != r || !r->m) {
+        pthread_mutex_unlock(&c->mu);
+        return erllama_error(env, atom_released);
+    }
+    int32_t n_vocab = 0;
+    const struct llama_vocab *vocab = erllama_ctx_vocab(c, &n_vocab);
+    uint32_t n_batch_cap = erllama_safe_n_batch(c->ctx);
+    if (!vocab || n_vocab <= 0 || n_batch_cap < n * ((uint32_t) max_draft + 1)) {
+        pthread_mutex_unlock(&c->mu);
+        return erllama_error(env, atom_batch_overflow);
+    }
+    unsigned int locked = 0;
+    ERL_NIF_TERM err = 0;
+    for (; locked < n; locked++) {
+        pthread_mutex_lock(&smp[locked]->mu);
+        const int drafts = forced_n[locked] >= 0 ? forced_n[locked] > 0 : cap[locked] > 0;
+        if (!smp[locked]->chain || smp[locked]->ctx_res != c) {
+            err = atom_released;
+            locked++;
+            break;
+        }
+        if (smp[locked]->n_probs > 0) {
+            err = atom_not_supported;
+            locked++;
+            break;
+        }
+        if (drafts && !erllama_mtp_chain_is_greedy(smp[locked]->chain)) {
+            err = enif_make_atom(env, "not_greedy");
+            locked++;
+            break;
+        }
+        /* Each sequence's own logits row, as nif_step checks: removing
+         * another sequence (a cancel) leaves this row in place; a
+         * decode that left this sequence out does not. */
+        int32_t li = c->per_seq[seqs[locked]].last_logits_idx;
+        if (li == -1 || li == ERLLAMA_LOGITS_STALE) {
+            err = li == -1 ? atom_no_logits : atom_stale_logits;
+            locked++;
+            break;
+        }
+    }
+#define UNLOCK_ALL()                                    \
+    do {                                                \
+        for (unsigned int u = 0; u < locked; u++) {     \
+            pthread_mutex_unlock(&smp[u]->mu);          \
+        }                                               \
+        pthread_mutex_unlock(&c->mu);                   \
+    } while (0)
+    if (err) {
+        UNLOCK_ALL();
+        return erllama_error(env, err);
+    }
+
+    int32_t pos[ERLLAMA_MTP_MAX_SEQS];
+    llama_token k[ERLLAMA_MTP_MAX_SEQS];
+    int eog_k[ERLLAMA_MTP_MAX_SEQS];
+    for (unsigned int i = 0; i < n; i++) {
+        int32_t li = c->per_seq[seqs[i]].last_logits_idx;
+        pos[i] = c->per_seq[seqs[i]].next_pos;
+        k[i] = erllama_safe_sampler_sample(smp[i]->chain, c->ctx, li == ERLLAMA_LOGITS_LAST ? -1 : li);
+        if (k[i] < 0) {
+            for (unsigned int j = 0; j < n; j++) {
+                c->per_seq[seqs[j]].last_logits_idx = -1;
+            }
+            c->decode_ready = 0;
+            UNLOCK_ALL();
+            return erllama_error(env, atom_exception);
+        }
+        eog_k[i] = erllama_safe_vocab_is_eog(vocab, k[i]);
+    }
+
+    /* Drafts: one drafter call for every sequence that drafts. */
+    llama_token draft[ERLLAMA_MTP_MAX_SEQS * ERLLAMA_MTP_MAX_DRAFT];
+    int32_t n_draft[ERLLAMA_MTP_MAX_SEQS];
+    int32_t dseqs[ERLLAMA_MTP_MAX_SEQS], dpos[ERLLAMA_MTP_MAX_SEQS], didx[ERLLAMA_MTP_MAX_SEQS];
+    llama_token dlast[ERLLAMA_MTP_MAX_SEQS];
+    int32_t nd = 0;
+    const uint64_t t0 = mono_us();
+    for (unsigned int i = 0; i < n; i++) {
+        n_draft[i] = 0;
+        if (eog_k[i] || max_draft == 0) {
+            continue;
+        }
+        if (forced_n[i] >= 0) {
+            n_draft[i] = forced_n[i] < max_draft ? forced_n[i] : max_draft;
+        } else if (cap[i] == 0) {
+            continue;
+        }
+        if (forced_n[i] >= 0) {
+            for (int32_t j = 0; j < n_draft[i]; j++) {
+                draft[(size_t) i * ERLLAMA_MTP_MAX_DRAFT + (size_t) j] = forced[i][j];
+            }
+        } else {
+            dseqs[nd] = seqs[i];
+            dlast[nd] = k[i];
+            dpos[nd] = pos[i];
+            didx[nd] = (int32_t) i;
+            nd++;
+        }
+    }
+    if (nd > 0) {
+        llama_token dout[ERLLAMA_MTP_MAX_SEQS * ERLLAMA_MTP_MAX_DRAFT];
+        int32_t dn[ERLLAMA_MTP_MAX_SEQS];
+        erllama_mtp_draft_many(r->m, nd, dseqs, dlast, dpos, max_draft, dout, dn);
+        for (int32_t d = 0; d < nd; d++) {
+            const int32_t i = didx[d];
+            n_draft[i] = dn[d] < cap[i] ? dn[d] : cap[i];
+            for (int32_t j = 0; j < n_draft[i]; j++) {
+                draft[(size_t) i * ERLLAMA_MTP_MAX_DRAFT + (size_t) j] = dout[(size_t) d * (size_t) max_draft + (size_t) j];
+            }
+        }
+    }
+    for (unsigned int i = 0; i < n; i++) {
+        for (int32_t j = 0; j < n_draft[i]; j++) {
+            llama_token t = draft[(size_t) i * ERLLAMA_MTP_MAX_DRAFT + (size_t) j];
+            if (t < 0 || t >= n_vocab) {
+                n_draft[i] = j;
+                break;
+            }
+        }
+    }
+    const uint64_t t1 = mono_us();
+
+    int32_t rows = 0, row0[ERLLAMA_MTP_MAX_SEQS];
+    for (unsigned int i = 0; i < n; i++) {
+        row0[i] = rows;
+        rows += 1 + n_draft[i];
+    }
+    struct llama_batch batch = erllama_safe_batch_init(rows, 0, 1);
+    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+        erllama_safe_batch_free(batch);
+        UNLOCK_ALL();
+        return erllama_error(env, atom_oom);
+    }
+    for (unsigned int i = 0; i < n; i++) {
+        for (int32_t j = 0; j <= n_draft[i]; j++) {
+            const int32_t b = row0[i] + j;
+            batch.token[b] = j == 0 ? k[i] : draft[(size_t) i * ERLLAMA_MTP_MAX_DRAFT + (size_t) (j - 1)];
+            batch.pos[b] = pos[i] + j;
+            batch.n_seq_id[b] = 1;
+            batch.seq_id[b][0] = (llama_seq_id) seqs[i];
+            batch.logits[b] = 1;
+        }
+    }
+    batch.n_tokens = rows;
+    arm_decode(c);
+    int dr = erllama_ctx_decode(env, c, batch);
+    erllama_safe_batch_free(batch);
+    if (dr != 0) {
+        for (unsigned int j = 0; j < n; j++) {
+            c->per_seq[seqs[j]].last_logits_idx = -1;
+        }
+        c->decode_ready = 0;
+        UNLOCK_ALL();
+        return erllama_error(env, dr == ERLLAMA_DECODE_EXC_SENTINEL ? atom_exception : classify_decode_error(env, c, dr));
+    }
+    const uint64_t t2 = mono_us();
+    const float *logits = erllama_safe_get_logits(c->ctx);
+    if (!logits) {
+        c->decode_ready = 0;
+        UNLOCK_ALL();
+        return erllama_error(env, atom_exception);
+    }
+
+    ERL_NIF_TERM out = enif_make_list(env, 0);
+    int64_t drafted = 0, accepted = 0;
+    for (int ii = (int) n - 1; ii >= 0; ii--) {
+        const unsigned int i = (unsigned int) ii;
+        llama_token committed[ERLLAMA_MTP_MAX_DRAFT + 1];
+        int32_t n_committed = 1, n_acc = 0;
+        int eog = eog_k[i];
+        committed[0] = k[i];
+        for (int32_t j = 0; j < n_draft[i] && !eog; j++) {
+            const llama_token g = draft[(size_t) i * ERLLAMA_MTP_MAX_DRAFT + (size_t) j];
+            if (argmax_row(logits + (size_t) (row0[i] + j) * (size_t) n_vocab, n_vocab) != g) {
+                break;
+            }
+            committed[n_committed++] = g;
+            n_acc++;
+            eog = erllama_safe_vocab_is_eog(vocab, g);
+        }
+        const int32_t keep = pos[i] + 1 + n_acc;
+        if (r->trace) {
+            llama_token toks[ERLLAMA_MTP_MAX_DRAFT + 1];
+            toks[0] = k[i];
+            for (int32_t j = 0; j < n_draft[i]; j++) {
+                toks[j + 1] = draft[(size_t) i * ERLLAMA_MTP_MAX_DRAFT + (size_t) j];
+            }
+            trace_round(r, pos[i], toks, n_draft[i] + 1, n_acc, logits + (size_t) row0[i] * (size_t) n_vocab, n_vocab);
+        }
+        if (n_acc < n_draft[i]) {
+            if (erllama_ctx_seq_rm(env, c, seqs[i], keep, -1) != 0) {
+                for (unsigned int j = 0; j < n; j++) {
+                    c->per_seq[seqs[j]].last_logits_idx = -1;
+                }
+                c->decode_ready = 0;
+                UNLOCK_ALL();
+                return erllama_error(env, atom_decode_failed);
+            }
+            erllama_mtp_seq_rm(r->m, seqs[i], keep, -1);
+        }
+        erllama_mtp_accept(r->m, seqs[i], n_acc);
+        if (erllama_mtp_seq_pos_max(r->m, seqs[i]) != keep - 1) {
+            r->misaligned++;
+        }
+        c->per_seq[seqs[i]].next_pos = keep;
+        c->per_seq[seqs[i]].last_logits_idx = row0[i] + n_acc;
+        drafted += n_draft[i];
+        accepted += n_acc;
+        ERL_NIF_TERM list = enif_make_list(env, 0);
+        for (int32_t j = n_committed - 1; j >= 0; j--) {
+            list = enif_make_list_cell(env, enif_make_int(env, committed[j]), list);
+        }
+        out = enif_make_list_cell(
+            env,
+            enif_make_tuple4(env, enif_make_int(env, seqs[i]), list, enif_make_int(env, eog), enif_make_int(env, n_acc)),
+            out);
+    }
+    const uint64_t t3 = mono_us();
+    c->decode_ready = 1;
+    r->rounds++;
+    r->drafted += (uint64_t) drafted;
+    r->accepted += (uint64_t) accepted;
+    r->draft_us += t1 - t0;
+    r->verify_us += t2 - t1;
+    r->rollback_us += t3 - t2;
+    UNLOCK_ALL();
+#undef UNLOCK_ALL
+    ERL_NIF_TERM times = enif_make_new_map(env);
+    times = put_u64(env, times, "draft_us", t1 - t0);
+    times = put_u64(env, times, "verify_us", t2 - t1);
+    times = put_u64(env, times, "rollback_us", t3 - t2);
+    times = put_u64(env, times, "rows", (uint64_t) rows);
+    return enif_make_tuple3(env, atom_ok, out, times);
 }

@@ -20,6 +20,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
+-export([mtp_batch/1, mtp_scheduler/1]).
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([mtp_decode/1, divergence_margin/1, rollback_state_matches/1]).
 
@@ -36,10 +37,14 @@
     kv_unified => true
 }).
 -define(MTP, #{speculative => #{type => mtp, n_max => 2}}).
+%% mtp_scheduler: a token's lead (top logprob minus the next) under which
+%% a difference is numerics; the tokens each request must agree on.
+-define(CLEAR_LEAD, 1.0).
+-define(MIN_SAME, 4).
 -define(TOKENS, 250).
 
 all() ->
-    [mtp_decode, divergence_margin, rollback_state_matches].
+    [mtp_decode, divergence_margin, rollback_state_matches, mtp_batch, mtp_scheduler].
 
 init_per_suite(Config) ->
     case {erllama_tp_hosts:hosts(), os:getenv("ERLLAMA_TP_GLM"), os:getenv("ERLLAMA_TP_GLM_MTP")} of
@@ -304,9 +309,263 @@ logit(Row, Id) ->
 
 argmax(Bin) -> erllama_tp_glm_ref:argmax(Bin).
 
+%% Prototype: four greedy requests, one MTP guess each, every request's
+%% token and guess verified in one 8-row batch and kept or taken back on
+%% its own (erllama_tp_mtp_bench, on the serving node, calling rank 0 as
+%% the scheduler does). First correctness: one request forced to accept
+%% and another to reject in the same round, against ordinary decoding;
+%% the rejected one's next token must be the reference's; a request
+%% cancelled mid-generation while the other three go on; the checkpoint
+%% regression (regression/3), one request alone and four. Then speed:
+%% ordinary co-batched steps against batched MTP rounds, 250 tokens a
+%% request, three repeats in alternating order. Written as JSON to
+%% ERLLAMA_TP_BENCH_OUT.
+mtp_batch(Config) ->
+    serve(Config, maps:put(n_seq_max, 4, ?COPTS), fun(S, G, R0) ->
+        [
+            ok = erllama_tp_hosts:load_module(S, M)
+         || M <- [erllama_tp_mtp_bench, erllama_kv_seq_state]
+        ],
+        Seqs = [0, 1, 2, 3],
+        Prompts = lists:zip(Seqs, [chat(S, G, T) || T <- dec_prompts()]),
+        Ctx = peer:call(S, erllama_tp_mtp_bench, setup, [R0, Seqs], 600000),
+        Call = fun(F, A) -> peer:call(S, erllama_tp_mtp_bench, F, [R0, Ctx | A], 3600000) end,
+        _ = Call(ordinary, [Prompts, 16]),
+        _ = Call(mtp, [Prompts, 16, #{}]),
+        %% The checkpoint regression, one request alone in the cache: its
+        %% restored cells land where the live ones were, so every check
+        %% is byte for byte.
+        [ok = peer:call(S, erllama_tp_rank, backend, [R0, seq_rm, [Q]]) || Q <- Seqs],
+        #{resumed := At1, resume_info := One} = Call(mtp, [[hd(Prompts)], 64, #{resume => 3}]),
+        ct:pal("checkpoint regression, one request, after round ~p: ~p", [At1, One]),
+        ok = regression(One, [0], exact),
+        os:getenv("ERLLAMA_TP_RESUME_ONE") =:= "1" andalso
+            exit({skip, "one-request resume compare only"}),
+        K0 = mtp_stats(S, R0),
+        %% Correctness. Round 1 samples each request's second token K and
+        %% guesses its third: the reference's third for request 0, a wrong
+        %% one for request 1.
+        #{tokens := Ref} = Call(ordinary, [Prompts, 64]),
+        Third = fun(Q) -> lists:nth(3, maps:get(Q, Ref)) end,
+        Forced = #{1 => #{0 => [Third(0)], 1 => [Third(1) + 1]}},
+        #{tokens := A, rounds := [R1, R2 | _]} = Call(mtp, [Prompts, 64, #{forced => Forced}]),
+        Acc = fun(Rd, Q) -> hd([N || {Q1, _, _, N} <- maps:get(results, Rd), Q1 =:= Q]) end,
+        Head = fun(Rd, Q) -> hd(hd([C || {Q1, C, _, _} <- maps:get(results, Rd), Q1 =:= Q])) end,
+        ct:pal(
+            "forced round: request 0 accepted ~b (expect 1), request 1 accepted ~b (expect 0); request 1's next token ~b, reference ~b; tokens the same as ordinary decoding: ~p",
+            [
+                Acc(R1, 0),
+                Acc(R1, 1),
+                Head(R2, 1),
+                Third(1),
+                [{Q, common(maps:get(Q, A), maps:get(Q, Ref))} || Q <- Seqs]
+            ]
+        ),
+        ?assertEqual(1, Acc(R1, 0)),
+        ?assertEqual(0, Acc(R1, 1)),
+        ?assertEqual(Third(1), Head(R2, 1)),
+        #{tokens := U} = Call(mtp, [Prompts, 64, #{}]),
+        #{tokens := Cn} = Call(mtp, [Prompts, 64, #{cancel => {10, 2}}]),
+        ct:pal(
+            "cancel request 2 after round 10: the others' tokens, the same as without the cancel: ~p",
+            [
+                [
+                    {Q, length(maps:get(Q, Cn)), common(maps:get(Q, Cn), maps:get(Q, U))}
+                 || Q <- [0, 1, 3]
+                ]
+            ]
+        ),
+        ?assertNot(maps:is_key(2, Cn)),
+        [?assertEqual(64, length(maps:get(Q, Cn))) || Q <- [0, 1, 3]],
+        %% The checkpoint regression, four requests: with a rollback
+        %% pending, the restore lays the cells out otherwise, so the
+        %% continuation is compared on tokens with a clear lead.
+        #{resumed := At4, resume_info := Four} = Call(mtp, [Prompts, 64, #{resume => 5}]),
+        ct:pal("checkpoint regression, four requests, after round ~p: ~p", [At4, Four]),
+        ok = regression(Four, Seqs, placement_changes),
+        ?assertEqual(0, maps:get(misaligned, diff(mtp_stats(S, R0), K0))),
+        %% Speed (ERLLAMA_TP_BATCH_SPEED=0 skips it).
+        Reps =
+            case os:getenv("ERLLAMA_TP_BATCH_SPEED") of
+                "0" -> [];
+                _ -> [1, 2, 3]
+            end,
+        Legs = lists:append([
+            [
+                {Rep, Mode, Call(Mode, [Prompts, 250 | [#{} || Mode =:= mtp]])}
+             || Mode <-
+                    case Rep rem 2 of
+                        1 -> [ordinary, mtp];
+                        0 -> [mtp, ordinary]
+                    end
+            ]
+         || Rep <- Reps
+        ]),
+        Rows = [batch_row(Rep, Mode, Run) || {Rep, Mode, Run} <- Legs],
+        [ct:pal("~p", [R]) || R <- Rows],
+        OutFile = filename:join(
+            os:getenv("ERLLAMA_TP_BENCH_OUT", ?config(priv_dir, Config)), "mtp_batch.json"
+        ),
+        ok = file:write_file(OutFile, json:encode(#{rows => Rows})),
+        ct:pal("results: ~s", [OutFile])
+    end).
+
+%% The checkpoint regression's results (erllama_tp_mtp_bench:resume/3):
+%% every restore gives the checkpoint back (the same state by token
+%% position, on every rank), with or without a rollback pending; with
+%% none pending the first step leaves the same bytes; with one pending,
+%% the same bytes too for a request alone (`exact'), and for several the
+%% same greedy tokens while the live path's lead is clear.
+regression(Results, Seqs, Mode) ->
+    [
+        begin
+            #{pending := P, none_pending := NP} = maps:get(Q, Results),
+            [?assertEqual(true, St) || #{state := St} <- maps:get(saved_restored, P)],
+            [?assertEqual(true, St) || #{state := St} <- maps:get(saved_restored, NP)],
+            [?assert(Bytes) || #{bytes := Bytes} <- maps:get(first_step, NP)],
+            case Mode of
+                exact -> [?assert(Bytes) || #{bytes := Bytes} <- maps:get(first_step, P)];
+                placement_changes -> ok
+            end,
+            ?assertMatch({ok, _}, maps:get(continuation, P))
+        end
+     || Q <- Seqs
+    ],
+    ok.
+
+batch_row(Rep, Mode, #{tokens := Toks, wall_ms := Wall} = Run) ->
+    N = lists:sum([min(250, length(T)) || T <- maps:values(Toks)]),
+    Base = #{
+        repeat => Rep,
+        mode => Mode,
+        tokens => N,
+        lengths => [length(T) || T <- maps:values(Toks)],
+        tokens_per_s => N / Wall * 1000,
+        wall_ms => Wall
+    },
+    case Mode of
+        ordinary ->
+            St = maps:get(steps_ms, Run),
+            Base#{
+                steps => length(St),
+                step_ms => median(St),
+                tokens_per_step => N / max(1, length(St))
+            };
+        mtp ->
+            Rs = maps:get(rounds, Run),
+            Committed = lists:sum([length(C) || R <- Rs, {_, C, _, _} <- maps:get(results, R)]),
+            Times = [maps:get(times, R) || R <- Rs],
+            Mean = fun(K) -> mean([maps:get(K, T) || T <- Times]) / 1000 end,
+            Base#{
+                rounds => length(Rs),
+                round_ms => median([maps:get(wall_ms, R) || R <- Rs]),
+                committed_per_round => Committed / max(1, length(Rs)),
+                draft_rounds_per_request => maps:from_list([
+                    {Q, length([1 || R <- Rs, lists:member(Q, maps:get(drafted, R))])}
+                 || Q <- maps:keys(Toks)
+                ]),
+                accepted_per_draft =>
+                    lists:sum([A || R <- Rs, {_, _, _, A} <- maps:get(results, R)]) /
+                    max(1, lists:sum([length(maps:get(drafted, R)) || R <- Rs])),
+                draft_ms => Mean(draft_us),
+                verify_ms => Mean(verify_us),
+                rollback_ms => Mean(rollback_us)
+            }
+    end.
+
+median(L) -> lists:nth((length(L) + 1) div 2, lists:sort(L)).
+
+common(A, B) -> length(lists:takewhile(fun({X, Y}) -> X =:= Y end, lists:zip(A, B, trim))).
+
+%% Four concurrent requests through erllama's public API, three of them
+%% drafting with MTP: a request with eight tokens to go (it has no
+%% guess near its end while the others have one), one cancelled after
+%% 12 tokens whose sequence a new request then takes, and one without
+%% MTP (it joins every shared verify with no guess). Each request's
+%% tokens against the same prompt decoded without MTP (four requests
+%% co-batched, with logprobs): the same tokens, up to a first difference
+%% that may only come where the reference's top token leads the next by
+%% less than ?CLEAR_LEAD nats (a skipped or repeated token, or a wrong
+%% row, differs where the lead is clear); every drafting request drafts;
+%% every request ends as asked; the group serves another request after.
+mtp_scheduler(Config) ->
+    serve(Config, maps:put(n_seq_max, 4, ?COPTS), fun(S, #{id := Id} = G, _R0) ->
+        ok = erllama_tp_hosts:load_module(S, erllama_tp_mtp_sched),
+        [P0, P1, P2, P3] = [chat(S, G, T) || T <- dec_prompts()],
+        Mtp = #{speculative => #{type => mtp, n_max => 1}},
+        Run = fun(Specs) -> peer:call(S, erllama_tp_mtp_sched, run, [Id, Specs], 1800000) end,
+        Ref = Run([
+            {I, P, #{response_tokens => 48, logprobs => 2}, none}
+         || {I, P} <- lists:enumerate(0, [P0, P1, P2, P3])
+        ]),
+        Got = Run([
+            {a, P0, Mtp#{response_tokens => 48}, none},
+            {b, P1, Mtp#{response_tokens => 8}, none},
+            {c, P2, Mtp#{response_tokens => 48},
+                {cancel_after, 12, {d, P0, Mtp#{response_tokens => 48}, none}}},
+            {e, P3, #{response_tokens => 48}, none}
+        ]),
+        Against = #{a => 0, b => 1, c => 2, d => 0, e => 3},
+        Rows = [
+            begin
+                #{tokens := Ts, ending := End} = R = maps:get(Name, Got),
+                #{tokens := RefTs, logprobs := RefLps} = maps:get(maps:get(Name, Against), Ref),
+                #{
+                    request => Name,
+                    ending => End,
+                    tokens => length(Ts),
+                    against_reference => against(Ts, RefTs, RefLps),
+                    mtp_rounds => maps:get(rounds, speculative(R), 0),
+                    accepted => maps:get(accepted, speculative(R), 0),
+                    ttft_ms => maps:get(ttft_ms, R)
+                }
+            end
+         || Name <- [a, b, c, d, e]
+        ],
+        [ct:pal("~p", [Row]) || Row <- Rows],
+        [?assertMatch({ok, N} when N >= ?MIN_SAME, A) || #{against_reference := A} <- Rows],
+        [?assertEqual(done, E) || #{request := Q, ending := E} <- Rows, Q =/= c],
+        ?assertEqual(cancelled, maps:get(ending, maps:get(c, Got))),
+        [?assert(N > 0) || #{request := Q, mtp_rounds := N} <- Rows, lists:member(Q, [a, b, d])],
+        ?assertMatch(
+            #{tokens := [_ | _], ending := done},
+            maps:get(z, Run([{z, P0, #{response_tokens => 4}, none}]))
+        )
+    end).
+
+%% `{ok, Same}': the tokens agree with the reference up to the end, or
+%% up to a first difference where the reference's lead is not clear
+%% (Same tokens before it); `{differs_at, Pos, Lead}' where it is.
+against(Ts, RefTs, RefLps) ->
+    Pairs = lists:zip3(
+        lists:sublist(Ts, length(RefTs)),
+        lists:sublist(RefTs, length(Ts)),
+        lists:sublist(RefLps, min(length(Ts), length(RefTs)))
+    ),
+    against(Pairs, 0).
+
+against([], Same) ->
+    {ok, Same};
+against([{T, T, _} | More], Same) ->
+    against(More, Same + 1);
+against([{_, _, #{top := Top}} | _], Same) ->
+    case lead(Top) of
+        L when L >= ?CLEAR_LEAD -> {differs_at, Same + 1, L};
+        _ -> {ok, Same}
+    end.
+
+lead([{_, L1}, {_, L2} | _]) -> L1 - L2;
+lead(_) -> 0.0.
+
+speculative(#{stats := #{speculative := Sp}}) -> Sp;
+speculative(_) -> #{}.
+
 %% -----------------------------------------------------------------------------
 
 serve(Config, Fun) ->
+    serve(Config, ?COPTS, Fun).
+
+serve(Config, COpts, Fun) ->
     Hosts = ?config(hosts, Config),
     os:putenv("ERLLAMA_TP_MODEL", ?config(model, Config)),
     erllama_tp_hosts:with_serving(Hosts, fun(S) ->
@@ -318,7 +577,7 @@ serve(Config, Fun) ->
             ?NO_CACHE,
             #{
                 model_opts => model_opts(),
-                context_opts => ?COPTS,
+                context_opts => COpts,
                 tp_call_timeout => 3600000,
                 draft_model => erllama_tp_hosts:home(P0, ?config(mtp, Config)),
                 draft_model_opts => #{load_mode => direct_io}

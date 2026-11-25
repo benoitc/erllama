@@ -53,6 +53,7 @@
     spec_free/2,
     spec_step/4,
     spec_rollback/1,
+    mtp_step_batch/4,
     media_caps/1,
     media_prefill/4,
     sampler_new/2,
@@ -558,6 +559,12 @@ spec_step(#s{ctx = C}, SamplerRef, SeqId, {mtp, {mtp, Ref}, MaxDraft}) ->
     erllama_nif:mtp_step(C, SamplerRef, Ref, SeqId, MaxDraft);
 spec_step(#s{ctx = C}, SamplerRef, SeqId, Draft) ->
     erllama_nif:spec_step(C, SamplerRef, SeqId, Draft).
+
+%% An MTP round for several sequences in one verify batch
+%% (erllama_nif:mtp_step_batch/4); `Items' are `{SamplerRef, SeqId,
+%% Drafts}'.
+mtp_step_batch(#s{ctx = C}, {mtp, Ref}, Items, MaxDraft) ->
+    erllama_nif:mtp_step_batch(C, Ref, Items, MaxDraft).
 
 %% How many drafted tokens a round can take back: a recurrent or hybrid
 %% model only as many as it keeps recurrent-state snapshots.

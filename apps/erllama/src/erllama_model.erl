@@ -275,6 +275,9 @@
 %% into one llama_decode tick.
 %% Default cap on generated tokens for complete/infer/continue.
 -define(DEFAULT_RESPONSE_TOKENS, 64).
+%% The most requests one MTP round verifies (ERLLAMA_MTP_MAX_SEQS in
+%% c_src/erllama_nif_mtp.c).
+-define(MTP_BATCH_MAX, 16).
 
 -record(req, {
     seq_id :: non_neg_integer(),
@@ -416,6 +419,8 @@
     %% Stats: draft tokens offered to / accepted by spec_step.
     spec_drafted = 0 :: non_neg_integer(),
     spec_accepted = 0 :: non_neg_integer(),
+    %% MTP rounds this request drafted in (alone or with others).
+    spec_rounds = 0 :: non_neg_integer(),
     %% Multimodal request state. `media` holds the decoded-input
     %% list ([{image | audio, Bytes}]); `media_prompt` the rendered
     %% prompt binary (media requests carry no token list - the
@@ -2664,7 +2669,12 @@ step_tick(Data) ->
                 {spec, Req, Draft, DataS} ->
                     run_spec_tick(DataS, Req, Draft);
                 {no, DataS} ->
-                    step_tick_ops(DataS)
+                    case maybe_mtp_batch_tick(DataS) of
+                        {batch, Items, MaxDraft, SpecRef} ->
+                            run_mtp_batch_tick(DataS, Items, MaxDraft, SpecRef);
+                        no ->
+                            step_tick_ops(DataS)
+                    end
             end
     end.
 
@@ -3107,6 +3117,104 @@ run_spec_tick(Data, Req, Draft) ->
 draft_len({mtp, _SpecRef, MaxDraft}) -> MaxDraft;
 draft_len(Draft) -> length(Draft).
 
+%% =============================================================================
+%% MTP rounds for several requests
+%%
+%% With an MTP drafter and two or more requests, a tick can verify every
+%% request's next token, and the guesses of the requests that draft, in
+%% one target decode (backend mtp_step_batch/4). That decode replaces
+%% every logits row, so it must hold every request that is waiting for a
+%% token: the tick runs only when all of them can join it (decode-ready,
+%% no logprobs) and otherwise falls back to the normal co-batched step,
+%% which also holds all of them. A request that does not draft (not MTP,
+%% or one token left) joins with no guess.
+%% =============================================================================
+
+maybe_mtp_batch_tick(#data{spec = {#{type := mtp, n_max := NMax}, SpecRef}} = Data) ->
+    Active = [R || R <- maps:values(Data#data.req_table), not R#req.finishing],
+    Ready = lists:all(fun mtp_batch_ready/1, Active),
+    Drafting = [R || R <- Active, R#req.spec =/= undefined],
+    N = length(Active),
+    MaxDraft = min(NMax, Data#data.total_batch_budget div max(1, N) - 1),
+    case
+        N >= 2 andalso N =< ?MTP_BATCH_MAX andalso Ready andalso Drafting =/= [] andalso
+            MaxDraft >= 1 andalso
+            erlang:function_exported(Data#data.backend, mtp_step_batch, 4)
+    of
+        true ->
+            Items = [
+                {R#req.sampler_ref, R#req.seq_id, mtp_batch_drafts(R, MaxDraft)}
+             || R <- lists:sort(fun(A, B) -> A#req.seq_id =< B#req.seq_id end, Active)
+            ],
+            {batch, Items, MaxDraft, SpecRef};
+        false ->
+            no
+    end;
+maybe_mtp_batch_tick(_Data) ->
+    no.
+
+mtp_batch_ready(#req{media_state = pending}) ->
+    false;
+mtp_batch_ready(#req{prefill_cursor = undefined, sampler_ref = Ref, last_sampler_cfg = Cfg}) when
+    Ref =/= undefined
+->
+    maps:get(logprobs, Cfg, 0) =:= 0;
+mtp_batch_ready(_Req) ->
+    false.
+
+%% A drafting request guesses up to as many tokens as it may still
+%% emit after the next one (so the committed tokens never pass its
+%% target); the others decode their next token alone.
+mtp_batch_drafts(#req{spec = undefined}, _MaxDraft) ->
+    [];
+mtp_batch_drafts(Req, MaxDraft) ->
+    Cap = min(MaxDraft, Req#req.response_target - length(Req#req.generated) - 1),
+    case Cap >= 1 of
+        true -> {auto, Cap};
+        false -> []
+    end.
+
+%% Every request's committed tokens go through the decode commit clause
+%% as in a lone MTP round (stop strings, events, saves, terminal
+%% checks); a request that drafted feeds its acceptance back.
+run_mtp_batch_tick(Data, Items, MaxDraft, SpecRef) ->
+    case backend_call(Data, mtp_step_batch, [SpecRef, Items, MaxDraft]) of
+        {ok, Results, _Times} ->
+            Drafts = maps:from_list([{Seq, D} || {_, Seq, D} <- Items]),
+            Data1 = lists:foldl(
+                fun({Seq, Committed, Eog, NAcc}, D0) ->
+                    {Leftover, D1} = apply_spec_committed(Seq, Committed, Eog, D0),
+                    D2 =
+                        case Leftover of
+                            0 -> D1;
+                            _ -> spec_trim_overshoot(Seq, D1)
+                        end,
+                    case maps:get(Seq, Drafts) of
+                        {auto, Cap} -> spec_record_feedback(Seq, Cap, NAcc, D2);
+                        _ -> D2
+                    end
+                end,
+                Data,
+                Results
+            ),
+            tick_after_step(Data1, [], []);
+        {error, Refused} when Refused =:= not_greedy; Refused =:= not_supported ->
+            %% Refused before any decode, every row intact: the requests
+            %% go on without drafts.
+            Tab = maps:map(
+                fun(_, R) -> R#req{spec = undefined} end, Data#data.req_table
+            ),
+            tick_after_step(Data#data{req_table = Tab}, [], []);
+        {error, Reason} = Err ->
+            case is_recoverable_decode_error(Reason) orelse Reason =:= stale_logits of
+                true ->
+                    recover_in_place(Data, Err);
+                false ->
+                    fail_all_requests(Data, Err),
+                    {stop, {step_failed, Err}, Data}
+            end
+    end.
+
 %% Feed committed tokens one at a time through the decode commit
 %% clause, stopping as soon as the request flips to finishing (a
 %% stop string matched mid-batch). Returns how many committed tokens
@@ -3153,7 +3261,8 @@ spec_record_feedback(SeqId, NDrafted, NAcc, Data) ->
         {ok, Req} ->
             put_req(Data, Req#req{
                 spec_drafted = Req#req.spec_drafted + NDrafted,
-                spec_accepted = Req#req.spec_accepted + NAcc
+                spec_accepted = Req#req.spec_accepted + NAcc,
+                spec_rounds = Req#req.spec_rounds + 1
             });
         error ->
             Data
@@ -4067,8 +4176,8 @@ build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
 
 maybe_add_speculative(Stats, #req{spec = undefined}) ->
     Stats;
-maybe_add_speculative(Stats, #req{spec_drafted = D, spec_accepted = A}) ->
-    Stats#{speculative => #{drafted => D, accepted => A}}.
+maybe_add_speculative(Stats, #req{spec_drafted = D, spec_accepted = A, spec_rounds = N}) ->
+    Stats#{speculative => #{drafted => D, accepted => A, rounds => N}}.
 
 maybe_add_media(Stats, #req{media = undefined}) ->
     Stats;

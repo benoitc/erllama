@@ -186,6 +186,50 @@ extern "C" int32_t erllama_mtp_draft(struct erllama_mtp *m, int32_t seq, llama_t
     return n;
 }
 
+extern "C" void erllama_mtp_draft_many(struct erllama_mtp *m, int32_t n, const int32_t *seqs,
+                                       const llama_token *id_last, const int32_t *pos0, int32_t n_max,
+                                       llama_token *out, int32_t *n_out) {
+    for (int32_t i = 0; i < n; i++) {
+        n_out[i] = 0;
+    }
+    if (!m || n <= 0 || n_max <= 0) {
+        return;
+    }
+    const uint64_t t0 = now_us();
+    try {
+        const int32_t cap = n_max < m->n_max ? n_max : m->n_max;
+        for (int32_t i = 0; i < n; i++) {
+            if (seqs[i] < 0 || (uint32_t) seqs[i] >= m->n_seq) {
+                continue;
+            }
+            auto &dp = common_speculative_get_draft_params(m->spec, seqs[i]);
+            m->results[seqs[i]].clear();
+            dp.drafting = true;
+            dp.n_max = cap;
+            dp.pos0 = pos0[i];
+            dp.id_last = id_last[i];
+            dp.prompt = &m->prompts[seqs[i]];
+            dp.result = &m->results[seqs[i]];
+        }
+        common_speculative_draft(m->spec);
+        for (int32_t i = 0; i < n; i++) {
+            if (seqs[i] < 0 || (uint32_t) seqs[i] >= m->n_seq) {
+                continue;
+            }
+            const auto &r = m->results[seqs[i]];
+            for (size_t k = 0; k < r.size() && n_out[i] < cap; k++) {
+                out[(size_t) i * (size_t) n_max + (size_t) n_out[i]++] = r[k];
+            }
+        }
+    } catch (...) {
+        for (int32_t i = 0; i < n; i++) {
+            n_out[i] = 0;
+        }
+    }
+    m->counters.drafts++;
+    m->counters.draft_us += now_us() - t0;
+}
+
 extern "C" void erllama_mtp_accept(struct erllama_mtp *m, int32_t seq, int32_t n_acc) {
     if (!m || seq < 0 || (uint32_t) seq >= m->n_seq || n_acc < 0) {
         return;

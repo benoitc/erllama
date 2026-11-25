@@ -68,6 +68,7 @@ ERL_NIF_TERM atom_oom;
 ERL_NIF_TERM atom_deferred;
 ERL_NIF_TERM atom_exception;
 ERL_NIF_TERM atom_no_logits;
+ERL_NIF_TERM atom_stale_logits;
 ERL_NIF_TERM atom_no_template;
 ERL_NIF_TERM atom_template_failed;
 ERL_NIF_TERM atom_grammar_failed;
@@ -316,6 +317,7 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_deferred = enif_make_atom(env, "deferred");
     atom_exception = enif_make_atom(env, "exception");
     atom_no_logits = enif_make_atom(env, "no_logits");
+    atom_stale_logits = enif_make_atom(env, "stale_logits");
     atom_no_template = enif_make_atom(env, "no_template");
     atom_template_failed = enif_make_atom(env, "template_failed");
     atom_grammar_failed = enif_make_atom(env, "grammar_failed");
@@ -557,6 +559,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_mtp_stats",   1, nif_mtp_stats,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_mtp_free",    1, nif_mtp_free,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_mtp_trace",   2, nif_mtp_trace,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_step_batch", 4, nif_mtp_step_batch, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_mtmd_init",      3, nif_mtmd_init,      ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_mtmd_free",      1, nif_mtmd_free,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_mtmd_caps",      1, nif_mtmd_caps,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
