@@ -2,7 +2,7 @@
 # See the LICENSE file at the project root.
 """One benchmark leg against an OpenAI-compatible chat endpoint.
 
-    bench_client.py URL MODEL STREAMS THINKING_OFF [EXTRA_JSON]
+    bench_client.py URL MODEL STREAMS|probe THINKING_OFF [EXTRA_JSON]
 
 The four prompts of TensorFold's docs/dec.py, greedy, 250 tokens,
 streamed. STREAMS=1 sends them one after another; STREAMS=4 sends all
@@ -11,8 +11,9 @@ four at once. THINKING_OFF is how the endpoint turns thinking off:
 EXTRA_JSON is merged into each request body (e.g. erllama's
 `{"speculative": {"type": "mtp", "n_max": 1}}').
 
-Prints one JSON object: each request's time to the first content
-token, its completion tokens (the usage block), cached prompt tokens,
+`probe' sends the first prompt alone. Prints one JSON object: each
+request's time to the first content token, its completion tokens (the
+usage block), the bytes that arrived as reasoning, cached prompt tokens,
 finish reason, the server's speculative block when it sends one and a
 hash of the text; and the leg's aggregate output tokens/s (completion
 tokens over the leg's wall time).
@@ -53,7 +54,8 @@ def one(url, model, prompt, thinking_off, extra, out, i):
                  {"Content-Type": "application/json"})
     r = conn.getresponse()
     rec = {"prompt": i, "status": r.status, "start": t0, "ttft": None, "completion_tokens": None,
-           "cached_tokens": None, "finish_reason": None, "speculative": None, "chunks": 0}
+           "cached_tokens": None, "finish_reason": None, "speculative": None, "chunks": 0,
+           "reasoning_bytes": 0}
     text = []
     if r.status != 200:
         rec["error"] = r.read().decode(errors="replace")[:300]
@@ -66,7 +68,12 @@ def one(url, model, prompt, thinking_off, extra, out, i):
             if data == "[DONE]":
                 break
             ev = json.loads(data)
+            if ev.get("error"):
+                rec["error"] = json.dumps(ev["error"])[:300]
             for ch in ev.get("choices", []):
+                rc = (ch.get("delta") or {}).get("reasoning_content")
+                if rc:
+                    rec["reasoning_bytes"] += len(rc.encode())
                 c = (ch.get("delta") or {}).get("content")
                 if c:
                     if rec["ttft"] is None:
@@ -90,8 +97,15 @@ def one(url, model, prompt, thinking_off, extra, out, i):
 
 
 def main():
-    url, model, streams, thinking_off = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+    url, model, mode, thinking_off = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
     extra = json.loads(sys.argv[5]) if len(sys.argv) > 5 else {}
+    if mode == "probe":
+        # One request, the first prompt: where its text arrives.
+        out = [None]
+        one(url, model, PROMPTS[0], thinking_off, extra, out, 0)
+        print(json.dumps(out[0]))
+        return
+    streams = int(mode)
     out = [None] * len(PROMPTS)
     t0 = time.time()
     if streams == 1:
