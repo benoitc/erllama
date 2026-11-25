@@ -76,12 +76,16 @@ with `RunPid ! {ack, self(), Seq}`; one that falls too far behind gets
     conversation_export/2,
     conversation_compact/1,
     agent_start/1,
+    agent_load/1,
     agent_send/2,
     agent_approve/3,
     agent_interrupt/1,
     agent_stop/1,
     agent_compact/1,
+    agent_set_model/2,
+    agent_set_policy/2,
     agents/0,
+    agent_sessions/0,
     mcp/0,
     mcp_tools/0,
     mcp_resources/1,
@@ -583,7 +587,10 @@ directory on the release machine. `Spec`:
 Returns the session id, which is also its job id for `attach/3`.
 """.
 -spec agent_start(map()) ->
-    {ok, #{agent_id := binary(), conversation_id := binary()}} | {error, term()}.
+    {ok, #{
+        agent_id := binary(), conversation_id := binary(), model := binary(), workspace := binary()
+    }}
+    | {error, term()}.
 agent_start(#{workspace := Dir} = Spec) ->
     case
         {
@@ -604,13 +611,21 @@ agent_start(#{workspace := Dir} = Spec) ->
             {error, {workspace, R}}
     end;
 agent_start(#{conversation_id := Conv} = Spec) ->
-    %% Resuming: the workspace the conversation was last worked in.
+    %% Resuming: the workspace the conversation was last worked in, and
+    %% its model unless the caller names another one.
     case erllama_server_convs:get(to_binary(Conv)) of
-        {ok, #{workspace := Ws}} when is_binary(Ws) -> agent_start(Spec#{workspace => Ws});
-        _ -> {error, {missing, workspace}}
+        {ok, #{workspace := Ws} = C} when is_binary(Ws) ->
+            agent_start(Spec#{workspace => Ws, model => resume_model(Spec, C)});
+        _ ->
+            {error, {missing, workspace}}
     end;
 agent_start(_Spec) ->
     {error, {missing, workspace}}.
+
+%% The conversation's model, kept as the resume default.
+resume_model(#{model := M}, _C) -> M;
+resume_model(_Spec, #{model := M}) when is_binary(M) -> M;
+resume_model(_Spec, _C) -> undefined.
 
 to_binary(B) when is_binary(B) -> B;
 to_binary(L) -> unicode:characters_to_binary(L).
@@ -624,7 +639,12 @@ start_agent(Spec, Model, Ws) ->
         {ok, #{id := Conv} = Held} ->
             case erllama_server_runs:start(agent_spec(Spec, Id, Model, Ws, Held)) of
                 {ok, _} ->
-                    {ok, #{agent_id => Id, conversation_id => Conv}};
+                    {ok, #{
+                        agent_id => Id,
+                        conversation_id => Conv,
+                        model => Model,
+                        workspace => Ws
+                    }};
                 {error, _} = E ->
                     ok = erllama_server_convs:release(Conv, Id),
                     E
@@ -702,6 +722,92 @@ agents() ->
      || #{kind := agent, pid := P} <- erllama_server_runs:list(),
         {ok, S} <- [erllama_server_job:info(P)]
     ]}.
+
+-doc """
+Attach to the agent session working on conversation `Conv': the live
+agent holding it when there is one, else a new session resuming the
+conversation (its stored workspace and model). Used by ACP
+`session/load'.
+""".
+-spec agent_load(binary()) ->
+    {ok, #{
+        agent_id := binary(), conversation_id := binary(), model := binary(), workspace := binary()
+    }}
+    | {error, term()}.
+agent_load(Conv) ->
+    case erllama_server_convs:get(to_binary(Conv)) of
+        {ok, _} ->
+            Live = [
+                A
+             || A <- element(2, agents()),
+                maps:get(conversation_id, A, undefined) =:= to_binary(Conv)
+            ],
+            case Live of
+                [A | _] ->
+                    {ok, #{
+                        agent_id => maps:get(run_id, A),
+                        conversation_id => to_binary(Conv),
+                        model => maps:get(model, A, <<>>),
+                        workspace => maps:get(workspace, A, <<>>)
+                    }};
+                [] ->
+                    agent_start(#{conversation_id => Conv})
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+-doc "Switch the session's model; the next generation round uses it.".
+-spec agent_set_model(binary(), binary()) -> ok | {error, term()}.
+agent_set_model(Id, Model) ->
+    case erllama_server_models:resolve(Model) of
+        {ok, _} ->
+            with_agent(Id, fun(Pid) -> erllama_server_agent:set_model(Pid, Model) end);
+        {error, _} = E ->
+            E
+    end.
+
+-doc "Switch the session's policy mode: `default', `yes' or `read_only'.".
+-spec agent_set_policy(binary(), default | yes | read_only) -> ok | {error, term()}.
+agent_set_policy(Id, Policy) when Policy =:= default; Policy =:= yes; Policy =:= read_only ->
+    with_agent(Id, fun(Pid) -> erllama_server_agent:set_policy(Pid, Policy) end);
+agent_set_policy(_Id, _Policy) ->
+    {error, invalid_policy}.
+
+-doc """
+The sessions a client can list or load: one entry per conversation,
+with the live agent's model and workspace when it is being worked on.
+""".
+-spec agent_sessions() -> {ok, [map()]}.
+agent_sessions() ->
+    {ok, Agents} = agents(),
+    Live = maps:from_list([
+        {maps:get(conversation_id, A), A}
+     || A <- Agents, is_binary(maps:get(conversation_id, A, undefined))
+    ]),
+    {ok, [
+        session_entry(C, Live)
+     || C <- erllama_server_convs:list()
+    ]}.
+
+session_entry(#{id := Id} = C, Live) ->
+    Base = #{
+        session_id => Id,
+        cwd => maps:get(workspace, C, <<>>),
+        model => maps:get(model, C, <<>>),
+        updated_at => maps:get(updated_at, C, 0)
+    },
+    case maps:get(Id, Live, undefined) of
+        undefined ->
+            Base#{live => false};
+        A ->
+            Base#{
+                live => true,
+                agent_id => maps:get(run_id, A),
+                model => maps:get(model, A, maps:get(model, C, <<>>)),
+                cwd => maps:get(workspace, A, maps:get(workspace, C, <<>>))
+            }
+    end.
 
 with_agent(Id, Fun) ->
     case erllama_server_runs:lookup(Id) of

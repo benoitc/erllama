@@ -46,6 +46,9 @@ commands_do_not_load_erllama_test_() ->
         try
             {0, _} = peer:call(Peer, erllama_server_cli, run, [["--version"]]),
             {0, _} = peer:call(Peer, erllama_server_cli, run, [["help"]]),
+            %% `acp' with no release running fails cleanly (exit 1) and
+            %% still loads no inference module.
+            {1, _} = peer:call(Peer, erllama_server_cli, run, [["acp"]]),
             Loaded = [M || {M, _} <- peer:call(Peer, code, all_loaded, [])],
             ?assertNot(lists:member(erllama, Loaded)),
             ?assertNot(lists:member(erllama_nif, Loaded)),

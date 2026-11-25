@@ -41,10 +41,11 @@ your OTP application          CLI   HTTP clients   Erlang nodes
 | Use erllama as a dependency (Hex package `erllama`) | [apps/erllama](apps/erllama/README.md), [examples/embedded_app](examples/embedded_app) |
 | Run the server release | [apps/erllama_server](apps/erllama_server/README.md) |
 | See the server at work: several clients, a slow tool, a restart | [the walkthrough](guides/server/demo.md) |
+| Drive server agents from editors (Zed, OpenCode...) over ACP | [ACP: `erllama acp`](guides/server/acp.md) |
 | Call the server from Erlang | [examples/service_client](examples/service_client) |
 | Serve `wasi:nn` components of erlang_wasm from your models | [apps/erllama_wasi_nn](apps/erllama_wasi_nn/README.md) |
 | Read the library guides | [loading a model](guides/loading.md), [generating text](guides/generation.md), [sessions](guides/sessions.md), [caching](guides/caching.md), [configuration](guides/configuration.md), [tensor parallelism](guides/tensor-parallel.md), [troubleshooting](guides/troubleshooting.md) |
-| Read the server guides | [CLI](guides/server/rpc.md), [models](guides/server/models.md), [HTTP APIs](guides/server/http.md), [conversations](guides/server/conversations.md), [agent sessions](guides/server/agent.md), [MCP](guides/server/mcp.md), [operations](guides/server/operations.md) |
+| Read the server guides | [CLI](guides/server/rpc.md), [models](guides/server/models.md), [HTTP APIs](guides/server/http.md), [conversations](guides/server/conversations.md), [agent sessions](guides/server/agent.md), [MCP](guides/server/mcp.md), [operations](guides/server/operations.md), [ACP](guides/server/acp.md) |
 | Understand how the code fits together | [internals/overview.md](internals/overview.md), then the design records it links |
 | Contribute | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | See what is planned | [ROADMAP.md](ROADMAP.md) |

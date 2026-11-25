@@ -106,6 +106,10 @@ commands there, asking before it changes anything. `/quit` leaves the
 session running; `erllama agent --attach AGENT` goes back to it from
 any terminal. See [Agent sessions](../../guides/server/agent.md).
 
+Editors and agent clients speaking the Agent Client Protocol (Zed,
+OpenCode, ...) can drive the same sessions with `$R/bin/erllama acp`.
+See [ACP](../../guides/server/acp.md).
+
 Conversations, sessions' included, are kept on disk and survive a
 restart. See [Conversations](../../guides/server/conversations.md).
 
