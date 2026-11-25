@@ -571,11 +571,12 @@ speculative(_) -> #{}.
 %% text. Written as JSON to ERLLAMA_TP_BENCH_OUT.
 server_bench(Config) ->
     {ok, Client} = file:read_file(os:getenv("ERLLAMA_TP_BENCH_CLIENT")),
-    serve(Config, maps:put(n_seq_max, 4, ?COPTS), fun(S, #{id := Id}, _R0) ->
+    serve(Config, maps:put(n_seq_max, 4, ?COPTS), fun(S, #{id := Id}, R0) ->
         Url = start_server(S, 8090),
         ok = peer:call(S, file, write_file, ["/tmp/erllama_bench_client.py", Client]),
         Cfgs = [{ordinary, #{}}, {mtp1, #{speculative => #{type => mtp, n_max => 1}}}],
         Leg = fun(Name, Extra, Rep) ->
+            K0 = mtp_stats(S, R0),
             Cmd = lists:flatten(
                 io_lib:format(
                     "python3 -I /tmp/erllama_bench_client.py ~s ~s 4 reasoning_effort '~s'",
@@ -583,9 +584,17 @@ server_bench(Config) ->
                 )
             ),
             Out = peer:call(S, os, cmd, [Cmd], 1800000),
+            %% Rank 0's drafter over the leg: its rounds (one a tick
+            %% that drafted, whatever the requests in it) and the time
+            %% they spent drafting and verifying.
+            K = diff(mtp_stats(S, R0), K0),
             L = json:decode(list_to_binary(lists:last(string:lexemes(Out, "\n")))),
             Rqs = maps:get(<<"requests">>, L),
             #{
+                drafter => maps:with(
+                    [rounds, drafted, accepted, draft_us, verify_us, rollback_us], K
+                ),
+                wall_s => maps:get(<<"wall">>, L),
                 config => Name,
                 repeat => Rep,
                 aggregate_tps => maps:get(<<"aggregate_tps">>, L),

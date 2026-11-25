@@ -16,9 +16,10 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([a_decode_without_the_seq_leaves_its_row_stale/1]).
+-export([another_seq_removed_keeps_the_row/1]).
 
 all() ->
-    [a_decode_without_the_seq_leaves_its_row_stale].
+    [a_decode_without_the_seq_leaves_its_row_stale, another_seq_removed_keeps_the_row].
 
 init_per_suite(Config) ->
     case os:getenv("LLAMA_TEST_MODEL") of
@@ -61,6 +62,35 @@ a_decode_without_the_seq_leaves_its_row_stale(Config) ->
             {ok, _} = erllama_nif:step(C, [{1, {prefill, [lists:last(PB)]}}]),
             {ok, R1} = erllama_nif:step(C, [{1, {decode, Sb}}]),
             ?assertEqual(RefB, token(1, R1))
+        end)
+    after
+        erllama_nif:free_model(M)
+    end.
+
+%% Two sequences decoded together, then the second one removed (its
+%% request finished): the first one's row stays, and a speculative step
+%% verifies a draft from it (before, the removal cleared the context's
+%% decode_ready and the step answered no_logits, which stopped the
+%% model).
+another_seq_removed_keeps_the_row(Config) ->
+    {ok, M} =
+        case erllama_nif:load_model(?config(model, Config), #{n_gpu_layers => 0}) of
+            {ok, X} -> {ok, X};
+            {ok, X, _} -> {ok, X}
+        end,
+    try
+        Tok = fun(T) ->
+            erllama_nif:tokenize(M, T, #{add_special => true, parse_special => false})
+        end,
+        PA = Tok(<<"The history of ocean navigation begins with">>),
+        PB = Tok(<<"A modern operating system schedules its threads with">>),
+        with_context(M, fun(C, Sa, Sb) ->
+            {ok, _} = erllama_nif:step(C, [{0, {prefill, PA}}, {1, {prefill, PB}}]),
+            {ok, _} = erllama_nif:step(C, [{0, {decode, Sa}}, {1, {decode, Sb}}]),
+            ok = erllama_nif:kv_seq_rm(C, 1, 0, -1),
+            ?assertMatch(
+                {ok, {spec, [_ | _], _, _}}, erllama_nif:spec_step(C, Sa, 0, [lists:last(PA)])
+            )
         end)
     after
         erllama_nif:free_model(M)

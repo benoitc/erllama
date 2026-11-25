@@ -390,7 +390,10 @@ ERL_NIF_TERM nif_mtp_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
         return erllama_error(env, atom_released);
     }
     int32_t li = c->per_seq[seq].last_logits_idx;
-    if (!c->decode_ready || li == -1 || li == ERLLAMA_LOGITS_STALE) {
+    /* The seq's own row, as nif_step and the batched round check:
+     * removing another seq (a request that finished) clears the
+     * context's decode_ready but leaves this row in place. */
+    if (li == -1 || li == ERLLAMA_LOGITS_STALE) {
         pthread_mutex_unlock(&c->mu);
         return erllama_error(env, li == ERLLAMA_LOGITS_STALE ? atom_stale_logits : atom_no_logits);
     }
