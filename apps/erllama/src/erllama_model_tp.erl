@@ -1,31 +1,39 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 -module(erllama_model_tp).
--moduledoc false.
-%% Experimental: the backend of a model split over a tensor-parallel
-%% group whose GPUs are in other OS processes. The serving VM loads the
-%% model with this backend (`erllama:load_model/2', `backend =>
-%% erllama_model_tp'), so it is used like any loaded model; every rank,
-%% the sampling one included, is a separate node, and a collective that
-%% fails or wedges takes down a rank, never the serving VM.
-%%
-%% Tokenizing, detokenizing and chat templates run here, on a copy of
-%% the GGUF's vocabulary (no weights). Everything that decodes, samples
-%% or changes the KV runs on rank 0, which hosts erllama_model_llama
-%% for this backend (erllama_tp_rank:host/3).
-%%
-%% Config, on top of erllama_model_llama's: `tp_worker' (rank 0's
-%% erllama_tp_rank pid, joined to its group), `tp_followers' (the other
-%% ranks' pids with their erllama_tp_rank:describe/3, every one loaded
-%% with load/3), `tp_call_timeout' (ms, default 120000) and
-%% `tp_kv_timeout' (how long rank 0 waits for the other ranks' shares of
-%% a checkpoint, ms, default 30000).
-%%
-%% A rank lost (its node down, or a call past the timeout) makes every
-%% call answer `{error, {tp_rank_lost, Why}}': the model fails its
-%% requests once and stops, and the caller forms a new group. Past the
-%% timeout rank 0 is killed: a native call blocked in a collective
-%% ends only with its OS process.
+-moduledoc """
+Experimental. The backend of a model split over a tensor-parallel
+group whose GPUs are in other OS processes. You load the model on a
+serving node that holds no rank, with `backend => erllama_model_tp`,
+and use it like any loaded model (`complete`, `stream`, `cancel`). A
+collective that fails or hangs takes down a rank, never the serving
+node.
+
+Load options, on top of those of a local model (`model_path`,
+`model_opts`, `context_opts`):
+
+- `tp_worker`: rank 0's `erllama_tp_rank` pid, joined to its group.
+- `tp_followers`: `[{Pid, erllama_tp_rank:describe/3}]` for every other
+  rank, each of which has run `erllama_tp_rank:load/3` with the same
+  file and options.
+- `tp_call_timeout`: ms a call to rank 0 may take (default 120000).
+- `tp_kv_timeout`: ms rank 0 waits for the other ranks' shares of a
+  checkpoint (default 30000).
+
+Tokenizing, detokenizing and chat templates run on the serving node,
+on a copy of the GGUF's vocabulary (no weights). Decoding, sampling and
+KV changes run on rank 0. MTP drafting (`speculative => #{type =>
+mtp}`, with a `draft_model` on rank 0) works. Ngram speculation,
+embeddings, `erllama:verify/4` and media input are not available on a
+split model.
+
+A lost rank (its node down, or a call past the timeout) makes every
+call answer `{error, {tp_rank_lost, Why}}`: the model fails its
+requests once and stops, and you form a new group. Past the timeout
+rank 0 is killed, since a native call blocked in a collective ends
+only with its OS process. The tensor-parallel guide walks through a
+full setup.
+""".
 -behaviour(erllama_model_backend).
 
 -export([
@@ -147,8 +155,8 @@ apply_chat_template(#tp{vocab = M}, Request) ->
 prefill(S, Tokens) -> remote(S, prefill, [Tokens]).
 decode_one(S, ContextTokens) -> remote(S, decode_one, [ContextTokens]).
 %% A checkpoint holds every rank's share, packed at the same token
-%% (erllama_tp_rank:kv_pack/2); one share missing fails the save, so
-%% nothing is published.
+%% (rank 0's `{hosting, {kv_pack, Seq}}'); one share missing fails the
+%% save, so nothing is published.
 kv_pack(S, Tokens) -> kv_pack(S, Tokens, 0).
 kv_pack(#tp{timeout = T} = S, _Tokens, SeqId) -> call(S, {hosting, {kv_pack, SeqId}}, T).
 kv_unpack(S, Bin) -> kv_unpack(S, Bin, 0).

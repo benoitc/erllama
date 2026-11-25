@@ -443,7 +443,7 @@ kv_pack(#s{ctx = C}, Tokens) ->
     erllama_nif:kv_pack(C, Tokens, length(Tokens)).
 
 %% Seq-aware kv_pack. The 2-arity above keeps the v0.1 contract
-%% (seq_id=0); the 3-arity is driven by the multi-sequence scheduler.
+%% (seq_id=0); the 3-arity is driven by the request scheduler.
 kv_pack(#s{ctx = C}, Tokens, SeqId) when is_integer(SeqId), SeqId >= 0 ->
     erllama_nif:kv_pack(C, Tokens, length(Tokens), SeqId).
 
@@ -473,7 +473,7 @@ seq_cp(#s{ctx = C}, SrcSeq, DstSeq) when
 ->
     erllama_nif:kv_seq_cp(C, SrcSeq, DstSeq).
 
-%% Free all KV cells of a specific seq_id. Used by the scheduler when
+%% Free all KV cells of a specific seq_id. Used by the request scheduler when
 %% a request finishes and its seq_id returns to the idle pool.
 seq_rm(#s{ctx = C}, SeqId) when is_integer(SeqId), SeqId >= 0 ->
     erllama_nif:kv_seq_rm(C, SeqId, 0, -1).
@@ -609,7 +609,7 @@ get_context_ref(#s{ctx = Ctx}) -> Ctx.
 shared_state(#s{model = Model}) -> #s{model = Model}.
 
 %% Build a per-request sampler chain. The opaque sampler_ref is held
-%% by the scheduler for the request's lifetime and freed when the
+%% by the request scheduler for the request's lifetime and freed when the
 %% request finishes.
 sampler_new(#s{ctx = C}, Cfg) when is_map(Cfg) ->
     erllama_nif:sampler_new(C, Cfg).

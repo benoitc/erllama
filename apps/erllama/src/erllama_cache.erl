@@ -203,7 +203,7 @@ evict_bytes(TargetBytes) ->
 -doc """
 Like `evict_bytes/1`, but only considers rows whose tier is in
 Tiers. Pass `all` to match every tier, or a subset of
-`[ram, ram_file, disk]`. The system-pressure scheduler uses this to
+`[ram, ram_file, disk]`. The cache eviction scheduler (`erllama_scheduler`) uses this to
 evict only RAM-resident slabs while leaving the disk tier alone.
 """.
 -spec evict_bytes(non_neg_integer(), all | [tier()]) ->

@@ -8,8 +8,8 @@ Behaviour and helpers for memory-pressure samplers used by
 the current `{Used, Total}` byte tuple for the resource it tracks
 (system RAM, GPU VRAM, or a custom source).
 
-A sampler MUST be cheap. The scheduler invokes `sample/0` on every
-tick (default 5 s); slow samplers will block the scheduler's mailbox.
+A sampler MUST be cheap. The cache eviction scheduler invokes `sample/0` on every
+tick (default 5 s); slow samplers will block the cache eviction scheduler's mailbox.
 If a sampler needs to spawn a port (e.g. `nvidia-smi`), it should
 cache the previous reading and return it when the call would block,
 or run its own background poller.

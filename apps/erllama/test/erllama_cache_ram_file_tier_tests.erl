@@ -1,20 +1,21 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
--module(erllama_cache_ramfile_srv_tests).
+-module(erllama_cache_ram_file_tier_tests).
 -include_lib("eunit/include/eunit.hrl").
 -include("erllama_cache.hrl").
 
-%% The ram_file tier reuses erllama_cache_disk_srv internals via a
-%% thin delegating wrapper. The tests below exercise the wrapper API
-%% surface plus the tier-label propagation into the meta server; the
-%% bulk of file-tier behaviour is covered by the disk_srv suite.
+%% The ram_file tier is an erllama_cache_disk_srv started with tier
+%% `ram_file' (its root is normally a tmpfs mount). The tests below
+%% check the round trip and that the tier label reaches the meta
+%% server; the bulk of file-tier behaviour is covered by the disk_srv
+%% suite.
 
 with_ramfile(Body) ->
     {ok, _} = erllama_cache_meta_srv:start_link(),
     {ok, _} = erllama_cache_ram:start_link(),
     Dir = make_tmp_dir(),
-    {ok, _} = erllama_cache_ramfile_srv:start_link(test_ramfile, Dir),
+    {ok, _} = erllama_cache_disk_srv:start_link(test_ramfile, ram_file, Dir),
     try
         Body(Dir)
     after
@@ -58,9 +59,9 @@ save_then_load_round_trip_test() ->
         Meta = base_meta([1, 2, 3]),
         Payload = <<"ramfile payload">>,
         {ok, Key, _Header, _Size} =
-            erllama_cache_ramfile_srv:save(test_ramfile, Meta, Payload),
+            erllama_cache_disk_srv:save(test_ramfile, Meta, Payload),
         ?assertEqual(Key, key_for(Meta)),
-        {ok, _Info, P} = erllama_cache_ramfile_srv:load(test_ramfile, Key),
+        {ok, _Info, P} = erllama_cache_disk_srv:load(test_ramfile, Key),
         ?assertEqual(Payload, P)
     end).
 
@@ -74,7 +75,7 @@ init_registers_with_ram_file_tier_label_test() ->
         ok = file:write_file(Path, <<Prefix/binary, "x">>),
         {ok, _} = erllama_cache_meta_srv:start_link(),
         {ok, _} = erllama_cache_ram:start_link(),
-        {ok, _} = erllama_cache_ramfile_srv:start_link(scan_ramfile, Dir),
+        {ok, _} = erllama_cache_disk_srv:start_link(scan_ramfile, ram_file, Dir),
         try
             {ok, Row} = erllama_cache_meta_srv:lookup_exact(Key),
             ?assertEqual(ram_file, element(?POS_TIER, Row)),
@@ -92,7 +93,7 @@ eviction_deletes_ram_file_too_test() ->
     with_ramfile(fun(Dir) ->
         Meta = base_meta([1, 2, 3]),
         {ok, Key, _, _} =
-            erllama_cache_ramfile_srv:save(test_ramfile, Meta, <<"abc">>),
+            erllama_cache_disk_srv:save(test_ramfile, Meta, <<"abc">>),
         %% Register manually since save here does not currently route
         %% through the reservation protocol (writer pool wires that up
         %% in step 10). Use insert_available to make the row visible.
@@ -106,7 +107,7 @@ eviction_deletes_ram_file_too_test() ->
             {ram_file, filename:join(Dir, bin_to_hex(Key) ++ ".kvc")}
         ),
         {evicted, 1} = erllama_cache_meta_srv:gc(),
-        ?assertEqual(miss, erllama_cache_ramfile_srv:load(test_ramfile, Key))
+        ?assertEqual(miss, erllama_cache_disk_srv:load(test_ramfile, Key))
     end).
 
 %% =============================================================================
@@ -117,7 +118,7 @@ make_tmp_dir() ->
     Base = os:getenv("TMPDIR", "/tmp"),
     Dir = filename:join(
         Base,
-        "erllama_cache_ramfile_srv_tests_" ++
+        "erllama_cache_ram_file_tier_tests_" ++
             integer_to_list(erlang:unique_integer([positive]))
     ),
     ok = file:make_dir(Dir),

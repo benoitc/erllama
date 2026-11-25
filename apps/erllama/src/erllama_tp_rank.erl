@@ -1,30 +1,33 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 -module(erllama_tp_rank).
--moduledoc false.
-%% Experimental: a process owning one rank's erllama_tp handle on its
-%% node, so a coordinator elsewhere can drive the rank by pid (a NIF
-%% resource cannot be used from another node). Not linked to whoever
-%% starts it: the rank lives until stop/1, or until its node goes.
-%%
-%% It can also hold a model split over the rank's group (load/3, then
-%% decode/2 in lockstep with the other ranks) and, for comparisons, a
-%% single-GPU reference copy of a model (ref_load/3, ref_decode/2).
-%%
-%% Serving: rank 0 hosts the model's backend (host/3) for
-%% erllama_model_tp, the backend a serving VM loads the model with, so
-%% it is used like any loaded model (complete, stream, cancel) while
-%% the GPUs stay in other OS processes. Rank 0 samples. Its context
-%% sends every batch and KV change to a forwarder that sends them, in
-%% order and tagged with the group's generation, to the other ranks,
-%% which have loaded the same file with load/3 and apply them
-%% (tp_follow).
+-moduledoc """
+Experimental. One rank of a tensor-parallel group, as a process on the
+rank's node: it owns the node's `erllama_tp` handle, so a serving node
+or a coordinator elsewhere can drive the rank by pid (a NIF resource
+cannot be used from another node).
+
+You start one per host with `start/1`, which joins the group. On every
+rank but 0 you load the model with `load/3`. You then load the model on
+the serving node with `backend => erllama_model_tp`, passing rank 0's
+pid as `tp_worker` and the others with their `describe/3` as
+`tp_followers`. The tensor-parallel guide walks through it.
+
+The process is not linked to whoever starts it: the rank lives until
+`stop/1`, or until its node goes.
+
+It has three roles. Every rank is a group member (the communicator and
+its collectives). Rank 0 hosts the model's backend for the serving node
+and samples. The other ranks follow rank 0's command stream (every
+batch and KV change, in order and tagged with the group's generation).
+Its other exports are test and tooling hooks, left out of these docs.
+""".
 -behaviour(gen_server).
 
 -export([start/1, matvec/3, reduce/2, info/1, stop/1]).
 -export([load/3, decode/2, stats/1, ref_load/3, ref_decode/2]).
 -export([seq_op/2]).
--export([host/3, backend/3, free_ref/2, follow_stats/1, describe/3, time_reduce/3, kill/1]).
+-export([backend/3, follow_stats/1, describe/3, time_reduce/3, kill/1]).
 -export([checkpoint_stats/1, fault/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -58,35 +61,44 @@
 }).
 -type state() :: #state{}.
 
-%% Joins the group before returning: `{ok, Pid}' once every rank joined,
-%% `{error, Reason}' as erllama_tp:open/5 gives it. Opts: gpu (default
-%% 0), rank, world, join, timeout (ms, default 60000), generation (the
-%% group's, default 0).
+-doc """
+Start this node's rank and join the group. Returns `{ok, Pid}` once
+every rank has joined, or `{error, Reason}` as `erllama_tp:open/5`
+gives it. Options: `gpu` (default 0), `rank`, `world`, `join`,
+`timeout` (ms, default 60000) and `generation` (the group's, default 0).
+""".
 -spec start(map()) -> {ok, pid()} | {error, term()}.
 start(Opts) ->
     gen_server:start(?MODULE, Opts, []).
 
+-doc false.
 -spec matvec(pid(), [[float()]], [float()]) -> {ok, [float()], [float()]} | {error, term()}.
 matvec(Pid, W, X) -> gen_server:call(Pid, {matvec, W, X}, infinity).
 
+-doc false.
 -spec reduce(pid(), [float()] | binary()) -> {ok, [float()] | binary()} | {error, term()}.
 reduce(Pid, Values) -> gen_server:call(Pid, {reduce, Values}, infinity).
 
-%% The rank, its OS process and its GPU's memory as the backend reports it.
+-doc "The rank, its OS process and its GPU's memory as the backend reports it.".
 -spec info(pid()) -> map().
 info(Pid) -> gen_server:call(Pid, info, infinity).
 
+-doc "Stop the rank. A model loaded on it is freed.".
 -spec stop(pid()) -> ok.
 stop(Pid) -> gen_server:stop(Pid).
 
-%% Load `Path' split over the group (every rank at once, same model and
-%% options) and create its context. The options are those of
-%% erllama_nif:load_model/2 and new_context/2.
+-doc """
+Load `Path` split over the group and create its context. Every rank but
+0 makes this call with the same file and `{ModelOpts, ContextOpts}`
+(those of `erllama_nif:load_model/2` and `new_context/2`); rank 0 loads
+it when the serving node loads the model.
+""".
 -spec load(pid(), string(), {map(), map()}) -> ok | {error, term()}.
 load(Pid, Path, Opts) -> gen_server:call(Pid, {load, Path, Opts}, infinity).
 
 %% Decode `Tokens' after what the context holds; the last token's
 %% logits, summed over the group (every rank makes the same call).
+-doc false.
 -spec decode(pid(), [non_neg_integer()]) -> {ok, binary()} | {error, term()}.
 decode(Pid, Tokens) -> gen_server:call(Pid, {decode, Tokens}, infinity).
 
@@ -95,55 +107,48 @@ decode(Pid, Tokens) -> gen_server:call(Pid, {decode, Tokens}, infinity).
 %% group), `{cp, Src, Dst}', `{drop, Seq}', `{trim, Seq, Keep}' (keep
 %% the first Keep positions), `{pos_max, Seq}', `{diag, arm | read |
 %% perf}' (erllama_nif:ctx_diag/2). Returns `{Ms, Result}'.
+-doc false.
 -spec seq_op(pid(), tuple()) -> {number(), term()}.
 seq_op(Pid, Op) -> gen_server:call(Pid, {seq_op, Op}, infinity).
 
 %% What the placeholders reserve and the reductions made so far.
+-doc false.
 -spec stats(pid()) -> {ok, map()}.
 stats(Pid) -> gen_server:call(Pid, stats, infinity).
 
 %% A single-device copy of `Path' on this rank's GPU, for comparisons.
+-doc false.
 -spec ref_load(pid(), string(), {map(), map()}) -> ok | {error, term()}.
 ref_load(Pid, Path, Opts) -> gen_server:call(Pid, {ref_load, Path, Opts}, infinity).
 
+-doc false.
 -spec ref_decode(pid(), [non_neg_integer()]) -> {ok, binary()} | {error, term()}.
 ref_decode(Pid, Tokens) -> gen_server:call(Pid, {ref_decode, Tokens}, infinity).
 
-%% On rank 0: load the model of `Config' (erllama_model_llama's) split
-%% over the group and host its backend, once every rank in `Followers'
-%% (pids of the other ranks' processes, which have run load/3 with the
-%% same file and options) has been checked to hold the same model.
--spec host(pid(), map(), [{pid(), map()}]) -> ok | {error, term()}.
-host(Pid, Config, Followers) ->
-    gen_server:call(Pid, {hosting, {host, Config, Followers}}, infinity).
-
 %% Run backend callback `Fn' on the hosted state (references in `Args'
 %% and in the result travel as `{erllama_tp_ref, Pid, Id}').
+-doc false.
 -spec backend(pid(), atom(), [term()]) -> term().
 backend(Pid, Fn, Args) ->
     gen_server:call(Pid, {hosting, {backend, Fn, Args}}, infinity).
 
-%% Release a reference handed out by backend/3 (a sampler or an MTP
-%% drafter).
--spec free_ref(pid(), pos_integer()) -> ok | {error, term()}.
-free_ref(Pid, Id) ->
-    gen_server:call(Pid, {hosting, {free_ref, Id}}, infinity).
-
-%% On rank 0: how long the last checkpoint and restore took, in ms.
+-doc "On rank 0: how long the last checkpoint and restore took, in ms.".
 -spec checkpoint_stats(pid()) -> #{atom() => number()}.
 checkpoint_stats(Pid) -> gen_server:call(Pid, {hosting, checkpoint_stats}, infinity).
 
 %% Tests only: `drop_kv_pack' makes this rank send no share for the next
 %% checkpoint, as if the save were interrupted after the other shares.
+-doc false.
 -spec fault(pid(), drop_kv_pack) -> ok.
 fault(Pid, drop_kv_pack) -> gen_server:call(Pid, {hosting, {fault, drop_kv_pack}}, infinity).
 
-%% The serving rank's commands this rank applied and dropped.
+-doc "On a following rank: how many of rank 0's commands it applied, and how many it dropped as stale or duplicate.".
 -spec follow_stats(pid()) -> #{atom() => non_neg_integer()}.
 follow_stats(Pid) -> gen_server:call(Pid, follow_stats, infinity).
 
 %% End the rank's OS process at once, even if a native call holds it:
 %% the way out of a collective that lost a peer.
+-doc false.
 -spec kill(pid() | node()) -> ok.
 kill(Pid) when is_pid(Pid) -> kill(node(Pid));
 kill(Node) when is_atom(Node) ->
@@ -152,11 +157,16 @@ kill(Node) when is_atom(Node) ->
 
 %% `K' reductions of `N' values in a row, timed in this rank's process:
 %% the mean in microseconds (every rank makes the same call).
+-doc false.
 -spec time_reduce(pid(), pos_integer(), pos_integer()) -> float().
 time_reduce(Pid, N, K) -> gen_server:call(Pid, {time_reduce, N, K}, infinity).
 
-%% What every rank must agree on before serving: the file (size and the
-%% hash of its first MiB), the options and the engine build.
+-doc """
+What every rank must agree on before serving: the file (its size and
+the hash of its first MiB), the options, the world size and the engine
+build. Pass it with each follower's pid in `tp_followers`; a rank that
+differs is refused with `{error, {incompatible_ranks, _}}`.
+""".
 -spec describe(string(), {map(), map()}, pos_integer()) -> map().
 describe(Path, {MOpts, COpts}, World) ->
     Head =

@@ -2,19 +2,52 @@
 %% See the LICENSE file at the project root.
 %%
 %% Opt-in, on CUDA hosts (ERLLAMA_TP_HOSTS) with their GPUs free: MTP
-%% speculative decoding of GLM-5.3-Flash split over the group. Rank 0
-%% drafts two tokens a round with the model's MTP head on its own GPU;
-%% the round is one 3-row batch on every rank, and a rejected draft is
-%% taken back with the recurrent-state snapshots (n_rs_seq 2 on every
-%% rank).
+%% speculative decoding of GLM-5.3-Flash, split over the group or on one
+%% host. Rank 0 drafts with the model's MTP head on its own GPU; a
+%% rejected guess is taken back with the recurrent-state snapshots
+%% (n_rs_seq 2 on every rank).
 %%
-%%   ERLLAMA_TP_GLM      the GGUF to serve (the first part of a split one)
-%%   ERLLAMA_TP_GLM_MTP  the companion MTP GGUF, on the first host
-%%   ERLLAMA_TP_MTP_SPLIT  optional shares of the model per rank (e.g.
-%%                         "0.46,0.54"), to leave rank 0 room for the
-%%                         MTP head
+%% Cases:
 %%
-%% Paths are relative to the hosts' home.
+%%   mtp_decode             four fixed prompts, one stream, with and
+%%                          without drafting: rate, acceptance, timings
+%%   divergence_margin      where MTP output first differs, the margin
+%%                          of the ordinary run's top two there
+%%   rollback_state_matches every row after rounds against a fresh
+%%                          prefill of the same tokens
+%%   mtp_batch              batched rounds for several sequences:
+%%                          forced accept and reject, cancel, the
+%%                          checkpoint regression, then speed
+%%   mtp_scheduler          four requests through erllama_model: tokens
+%%                          against decoding without MTP
+%%   server_bench           four streams through erllama_server, with
+%%                          and without MTP (needs the bench client)
+%%   cache_multiturn        two turns over HTTP with the KV cache: the
+%%                          second restores the checkpoint and drafts
+%%   mtp_batch_repeated_sampler  one sampler for two sequences is badarg
+%%   mtp_batch_refusal_names_sequence  mixed samplers: each refusal
+%%                          names its sequence, the greedy one drafts on
+%%
+%% The last two run on one host's GPU (ERLLAMA_TP_GLM_ONE) and skip
+%% without it.
+%%
+%% Environment:
+%%
+%%   ERLLAMA_TP_GLM          the GGUF to serve (first part of a split one)
+%%   ERLLAMA_TP_GLM_MTP      the companion MTP GGUF, on the first host
+%%   ERLLAMA_TP_GLM_ONE      a GLM GGUF that fits one GPU (last two cases)
+%%   ERLLAMA_TP_MTP_SPLIT    optional shares per rank (e.g. "0.46,0.54"),
+%%                           to leave rank 0 room for the MTP head
+%%   ERLLAMA_TP_BENCH_CLIENT scripts/glm_serving/bench_client.py, for
+%%                           server_bench
+%%   ERLLAMA_TP_BENCH_OUT    where the speed cases write their JSON
+%%                           (default: the case's priv_dir)
+%%   ERLLAMA_TP_BATCH_SPEED  "0" skips mtp_batch's speed part
+%%   ERLLAMA_TP_RESUME_ONE   "1" stops mtp_batch after the one-request
+%%                           checkpoint compare
+%%
+%% Paths are relative to the hosts' home. internals/hardware-suites.md
+%% lists every opt-in suite.
 -module(erllama_tp_mtp_SUITE).
 
 -include_lib("common_test/include/ct.hrl").

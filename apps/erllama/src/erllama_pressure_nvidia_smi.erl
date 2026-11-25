@@ -9,7 +9,7 @@
 %%
 %% Returns `{TotalUsedBytes, TotalCapacityBytes}` summed over all GPUs.
 %% A host with no GPU or where `nvidia-smi` is missing reports
-%% `{0, 1}` so the scheduler treats it as zero pressure.
+%% `{0, 1}` so the cache eviction scheduler treats it as zero pressure.
 -behaviour(erllama_pressure).
 
 -export([sample/0]).

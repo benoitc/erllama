@@ -90,6 +90,79 @@ facade_ops_run_through_global_chain_test() ->
         ?assertEqual([load_model, tokenize, detokenize, complete, stream, unload], Ops)
     end).
 
+%% Every other wrapped facade call goes through the chain under its
+%% own operation name, whatever the backend answers (the stub has no
+%% chat templates, so the chat calls fail after the chain ran).
+facade_ops_all_wrapped_test() ->
+    with_app(fun() ->
+        Self = self(),
+        Spy = fun(Req = #{op := Op}, Next) ->
+            Self ! {op, Op},
+            Next(Req)
+        end,
+        {ok, Id} = erllama:load_model(#{backend => erllama_model_stub}),
+        {ok, Toks} = erllama:tokenize(Id, <<"a b">>),
+        Session = make_ref(),
+        {ok, _} = erllama:complete(Id, <<"a b c">>, #{response_tokens => 1, session_id => Session}),
+        application:set_env(erllama, middleware, [Spy]),
+        Msgs = [#{role => user, content => <<"hi">>}],
+        Calls = [
+            fun() -> erllama:fork_session(Id, Session, make_ref()) end,
+            fun() -> erllama:vocab_info(Id) end,
+            fun() -> erllama:detokenize(Id, Toks, #{}) end,
+            fun() -> erllama:chat(Id, Msgs, #{}) end,
+            fun() -> erllama:chat_apply(Id, Msgs, #{}) end,
+            fun() -> erllama:chat_parse(make_ref(), <<"x">>, false) end,
+            fun() -> erllama:embed(Id, <<"a b">>) end,
+            fun() -> erllama:embed_batch(Id, [<<"a b">>]) end,
+            fun() -> erllama:prefill_only(Id, Toks, #{}) end,
+            fun() -> erllama:continue(Id, Toks, #{session_id => Session, response_tokens => 1}) end
+        ],
+        [catch F() || F <- Calls],
+        Ops = [Op || {op, Op} <- collect(length(Calls))],
+        ?assertEqual(
+            [
+                fork_session,
+                vocab_info,
+                detokenize,
+                chat,
+                chat_apply,
+                chat_parse,
+                embed,
+                embed_batch,
+                prefill_only,
+                continue
+            ],
+            Ops
+        ),
+        application:set_env(erllama, middleware, []),
+        ok = erllama:unload(Id)
+    end).
+
+%% These calls bypass the chain: access control must not rely on it
+%% for them.
+facade_ops_not_wrapped_test() ->
+    with_app(fun() ->
+        Self = self(),
+        application:set_env(erllama, middleware, [
+            fun(Req = #{op := Op}, Next) ->
+                Self ! {op, Op},
+                Next(Req)
+            end
+        ]),
+        {ok, Id} = erllama:load_model(#{backend => erllama_model_stub}),
+        [{op, load_model}] = collect(1),
+        Session = make_ref(),
+        _ = erllama:cancel(make_ref()),
+        _ = erllama:end_session(Id, Session),
+        _ = erllama:reset_session(Id, Session),
+        _ = erllama:evict(Id),
+        _ = erllama:shutdown(Id),
+        ?assertEqual([], collect(1)),
+        application:set_env(erllama, middleware, []),
+        ok = erllama:unload(Id)
+    end).
+
 per_call_chain_replaces_global_test() ->
     with_app(fun() ->
         Self = self(),
