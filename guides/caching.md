@@ -215,7 +215,19 @@ delivered the first text about 51 ms earlier and finished about 40 ms
 earlier. Compare the servers within each machine because the prompt
 history and Ollama versions differ between machines.
 
-[Exact prompt, build versions and raw measurements](https://github.com/benoitc/erllama/tree/6ab2df24cae1819c9ba50a66641860c27f305a13/bench/reports/2026-11-25-tinyllama-ollama)
+### Resending the same prompt with both caches warm
+
+On the M4 Pro, we enabled short-prompt checkpoints in erllama's RAM
+tier and sent the 44-token prompt once to populate both caches. On all
+six retries, both servers reused 43 tokens. Median time to first visible
+text was **6.9 ms for erllama** and **8.5 ms for Ollama**.
+
+The default cold-save minimum is 512 tokens. For this short-prompt test
+we set `min_tokens` and `cold_min_tokens` to 32, and `boundary_trim_tokens`
+and `boundary_align_tokens` to 1. That saves the first 43 tokens and leaves
+one token to process on the retry.
+
+[Exact prompt, build versions and raw measurements](https://github.com/benoitc/erllama/tree/8e54df7a45ac9cd217698162e128b097fa9bab84/bench/reports/2026-11-25-tinyllama-ollama)
 
 ## Disabling the cache
 
