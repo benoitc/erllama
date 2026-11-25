@@ -73,6 +73,10 @@ paths).
     wedge_next_step/1,
     %% Test helper: the same, for the next speculative step only.
     wedge_next_spec_step/1,
+    %% Test helpers: hold every step/2 call until released, so a test
+    %% can keep a request (and a cancel of it) from finishing.
+    hold_steps/0,
+    release_steps/0,
     %% Test helpers: read / clear the list of cfgs passed to
     %% sampler_new/2 since the last reset.
     sampler_new_cfgs/0,
@@ -325,6 +329,7 @@ step(#stub{step_delay_ms = D} = S, Ops) when D > 0 ->
     timer:sleep(D),
     step(S#stub{step_delay_ms = 0}, Ops);
 step(S, Ops) ->
+    ok = wait_while_held(),
     case take_wedge() of
         undefined ->
             Results = [stub_step_op(Op, S) || Op <- Ops],
@@ -585,6 +590,25 @@ abort_handle(_S) ->
 wedge_next_step(Reason) ->
     persistent_term:put({?MODULE, wedge}, Reason),
     ok.
+
+%% Test knob: hold every step/2 call (it waits inside the backend, so
+%% the model process is busy) until release_steps/0.
+hold_steps() ->
+    persistent_term:put({?MODULE, hold}, true),
+    ok.
+
+release_steps() ->
+    _ = persistent_term:erase({?MODULE, hold}),
+    ok.
+
+wait_while_held() ->
+    case persistent_term:get({?MODULE, hold}, false) of
+        true ->
+            timer:sleep(10),
+            wait_while_held();
+        false ->
+            ok
+    end.
 
 %% Test knob: arm the next speculative step (spec_step/4) to return
 %% {error, Reason} once; plain steps are left alone.

@@ -7,8 +7,11 @@
 %% `response.created', `response.in_progress', the output text item
 %% (`output_item.added', `content_part.added', `output_text.delta' ...
 %% `.done'), each function call whole (`function_call_arguments.delta'
-%% and `.done'), then `response.completed' (or `response.failed').
-%% Every event carries its `sequence_number'.
+%% and `.done'), then the response as it ended: `response.completed',
+%% `response.incomplete' (stopped at `max_output_tokens', or cancelled:
+%% status `cancelled') or `response.failed'. The terminal response is
+%% the object a stored response reads back. Every event carries its
+%% `sequence_number'.
 
 -export([stream/2]).
 
@@ -21,8 +24,10 @@ stream(#{run := Run} = Ctx, Emit) ->
         end
     end,
     Fun = fun(E, Acc) -> event(Ctx, Send, E, Acc) end,
-    _ = erllama_server_http_kit:drive(Run, Fun, #{seq => 0, text => none}),
-    ok.
+    case erllama_server_http_kit:drive(Run, Fun, #{seq => 0, text => none}) of
+        {gone, _} -> erllama_server_openai_responses:keep_gone(Ctx);
+        {done, _, _} -> ok
+    end.
 
 event(Ctx, Send, #{type := started}, Acc) ->
     Obj = erllama_server_openai_responses:base_object(Ctx, in_progress),
@@ -85,14 +90,15 @@ text_delta(Send, ItemId, D, Acc) ->
     ).
 
 %% Close the text item, send each function call whole, then the
-%% completed response (stored when asked).
+%% response as it ended (stored when asked).
 finish(#{run := Run} = Ctx, Send, R, Acc) ->
+    ItemStatus = erllama_server_openai_responses:item_status(R),
     TextSteps =
         case maps:get(text, Acc) of
             none ->
                 [];
             {ItemId, Text} ->
-                Done = erllama_server_openai_responses:message_item(Run, Text, <<"completed">>),
+                Done = erllama_server_openai_responses:message_item(Run, Text, ItemStatus),
                 Part = #{
                     <<"type">> => <<"output_text">>, <<"text">> => Text, <<"annotations">> => []
                 },
@@ -136,19 +142,24 @@ finish(#{run := Run} = Ctx, Send, R, Acc) ->
             _ -> 1
         end,
     CallSteps = lists:append([
-        call_steps(Run, Send, I, I + Offset, C)
+        call_steps(Run, Send, I, I + Offset, C, ItemStatus)
      || {I, C} <- erllama_server_openai_responses:indexed(maps:get(tool_calls, R, []))
     ]),
     Obj = erllama_server_openai_responses:response_object(Ctx, R),
     ok = erllama_server_openai_responses:keep(Ctx, Obj),
     run_steps(
         TextSteps ++ CallSteps ++
-            [fun(A) -> Send(<<"response.completed">>, #{<<"response">> => Obj}, A) end],
+            [fun(A) -> Send(terminal(Obj), #{<<"response">> => Obj}, A) end],
         Acc
     ).
 
-call_steps(Run, Send, I, Index, Call) ->
-    Item = erllama_server_openai_responses:call_item(Run, I, Call, <<"completed">>),
+%% OpenAI has no event for a cancelled response: like one cut short at
+%% `max_output_tokens', it ends the stream as `response.incomplete'.
+terminal(#{<<"status">> := <<"completed">>}) -> <<"response.completed">>;
+terminal(_Obj) -> <<"response.incomplete">>.
+
+call_steps(Run, Send, I, Index, Call, ItemStatus) ->
+    Item = erllama_server_openai_responses:call_item(Run, I, Call, ItemStatus),
     #{<<"id">> := ItemId, <<"arguments">> := Args} = Item,
     [
         fun(A) ->

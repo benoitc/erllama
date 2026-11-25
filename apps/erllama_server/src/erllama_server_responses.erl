@@ -12,10 +12,14 @@
 %% Each stored response is a file, `<data_dir>/responses/<id>.json',
 %% written before it is visible and loaded again when the release
 %% starts; its snapshot is a persisted conversation (kind `snapshot').
+%%
+%% A response whose client went away is kept by a process of this
+%% server's (`keep_when_done/1'), which waits for the run to end, so
+%% the save does not depend on the request that started it.
 
 -behaviour(gen_server).
 
--export([start_link/0, put/3, get/1, continue/1, delete/1]).
+-export([start_link/0, put/3, get/1, continue/1, delete/1, keep_when_done/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 -compile({no_auto_import, [put/2, get/1]}).
 
@@ -54,6 +58,12 @@ get(Id) ->
 -spec delete(binary()) -> ok | {error, not_found}.
 delete(Id) ->
     gen_server:call(?MODULE, {delete, Id}).
+
+%% Run `Keep' in a process of this server's: it outlives the caller,
+%% and a crash is logged, not propagated.
+-spec keep_when_done(fun(() -> term())) -> ok.
+keep_when_done(Keep) when is_function(Keep, 0) ->
+    gen_server:cast(?MODULE, {keep_when_done, Keep}).
 
 -spec init([]) -> {ok, state()}.
 init([]) ->
@@ -98,8 +108,16 @@ handle_call({delete, Id}, _From, S) ->
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
+handle_cast({keep_when_done, Keep}, S) ->
+    _ = spawn_monitor(Keep),
+    {noreply, S};
 handle_cast(_Msg, S) ->
     {noreply, S}.
 
+handle_info({'DOWN', _, process, _, normal}, S) ->
+    {noreply, S};
+handle_info({'DOWN', _, process, _, Reason}, S) ->
+    logger:warning(#{msg => "keeping a response failed", reason => Reason}),
+    {noreply, S};
 handle_info(_Msg, S) ->
     {noreply, S}.
