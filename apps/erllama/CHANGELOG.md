@@ -6,8 +6,103 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Experimental: a node's GPU can join a group of ranks on other hosts
+  and sum buffers with them on the GPUs' own network path
+  (`erllama_tp`), and a model can be split over such a group with
+  llama.cpp's own tensor split, each machine holding and computing its
+  share (`tp_rank` load option), and served through the usual
+  `complete`, `stream` and `cancel` calls from a machine that holds no
+  part of it (`erllama_model_tp` backend). If one machine is lost while
+  a request streams, the request ends with a single error, the serving
+  node keeps running, and a group formed again serves the next request.
+  A cancel never interrupts a step halfway through. A split model's KV
+  cache entry holds every machine's share, saved at the same point, so
+  a group formed again resumes from it; a save missing a share is not
+  kept. This needs a CUDA build with NCCL. The machines can be joined
+  by RDMA or by ordinary Ethernet (TCP); the tensor-parallel page shows
+  how to choose TCP and the network interface on each machine.
+
+- `media_add_special`, a request option for streams with media: set it
+  to `false` when the prompt comes from a chat template, so the BOS
+  token is not added a second time. `chat/3` already did this; streamed
+  multimodal chat can now do the same.
+
+- Experimental: speculative decoding with a model's MTP head
+  (`speculative => #{type => mtp}`, with the head's GGUF as
+  `draft_model`). The head guesses the next two tokens and the model
+  checks them in one step, so a step can produce up to three tokens. It
+  works on a model split over several machines, including a hybrid one
+  such as GLM-5.3-Flash when every machine keeps recurrent-state
+  snapshots (`n_rs_seq => 2`). Greedy requests only. On GLM-5.3-Flash
+  Q4_K split over two DGX Spark machines, one stream went from 19.5 to
+  26.2 tokens/s. The text can differ from decoding without drafts where
+  the two most likely tokens are almost tied, because the model checks
+  three tokens at once.
+- MTP drafting now goes on when several requests run on the model: each
+  step checks every request's next token, and the guesses of those that
+  draft, together. Before, a request drafted only while it was alone.
+
+### Changed
+
+- On DGX Spark (GB10), a step that decodes eight tokens at once on a
+  mixture-of-experts model in Q4_K is faster: on GLM-5.3-Flash split
+  over two GB10s it went from 146 to 129 ms.
+- Tokenising, detokenising and rendering a chat template no longer wait
+  for a model that is generating. They used to queue behind its decode
+  step, so a new request on a busy model waited about one step for each
+  of them before its prompt was even admitted. They now run in the
+  caller's process, alongside the running requests.
+
 ### Fixed
 
+- A KV cache entry of a model split over several machines now restores
+  correctly on every machine. For models that keep part of their
+  attention state on every machine, such as GLM-5.3-Flash, every
+  machine but the first came back with that state empty, so a request
+  resumed from the cache gave subtly different, worse output. Entries
+  saved before this fix are no longer found and those requests start
+  cold.
+- A request using speculative decoding no longer stops the model when
+  another request on the same model finishes or is cancelled while it
+  runs. Its next speculative step refused to run, and the model stopped
+  with every request still in flight.
+- Turning thinking off (`enable_thinking => false`, or `reasoning_effort:
+  "none"` on the server) now works for models whose chat template
+  always opens a thinking block, such as GLM-5.3-Flash. Such a model
+  used to think anyway, and its whole reply came back as reasoning
+  with empty content.
+
+- A hybrid model such as GLM-5.3-Flash split over several machines can
+  now keep recurrent-state snapshots (`n_rs_seq`), so its last tokens
+  can be taken back. Every machine used to stop at the first decode
+  when they were on. This is a local fix to the vendored llama.cpp
+  until upstream carries it; split loads still keep no snapshot unless
+  asked.
+
+- Hybrid models such as GLM-5.3-Flash rebuilt their decode graph for
+  every token when the KV cache was unified (one cache shared by all
+  sequences), which cost about 10 ms a token on GB10 hosts. They now
+  reuse it between tokens as other models do. This is a local fix to
+  the vendored llama.cpp until upstream carries it.
+
+- A model split over several machines now opens the same kind of
+  context on every machine. The machines that follow the first one
+  missed the extra state erllama keeps for hybrid models (those mixing
+  attention and recurrent layers, such as GLM-5.3-Flash), so the first
+  removal of a token would fail on them. Split hybrid models now keep
+  no such state at all, since llama.cpp cannot split it: a cache hit
+  on a whole prompt is then served from scratch.
+
+- A malformed request to a loaded model, such as a chat message list
+  the template renderer rejects or an invalid token id, crashed the
+  model process, so every request on that model failed with it. The
+  caller now gets `{error, badarg}` and the model keeps serving.
+- The cache counters `bytes_ram`, `bytes_ramfile` and `bytes_disk`
+  were always 0. They now report the bytes each tier holds.
+- A model loaded again under the same id could render chat prompts
+  with the template of its previous load. Each load now uses its own.
 - A streaming request kept generating until its token limit when the
   process receiving its events exited, holding a sequence and compute
   that nobody would use. erllama now watches the receiver of every

@@ -1,0 +1,11 @@
+{application, summarizer, [
+    {description, "erllama example: a supervised summarizer inside an OTP application"},
+    {vsn, "0.1.0"},
+    {registered, [summarizer_sup, summarizer]},
+    {mod, {summarizer_app, []}},
+    {applications, [kernel, stdlib, erllama]},
+    %% model_path: the GGUF to load (SUMMARIZER_MODEL overrides it).
+    {env, [{model_path, undefined}, {n_ctx, 4096}, {parallel, 4}]},
+    {modules, []},
+    {licenses, ["MIT"]}
+]}.

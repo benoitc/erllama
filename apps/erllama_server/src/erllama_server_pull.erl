@@ -12,7 +12,9 @@
 %% `Range' request (the part file is re-hashed first); a server that
 %% answers `200' to a range restarts it from zero. A file whose size or
 %% sha256 does not match is deleted and the pull fails with
-%% `integrity_mismatch'. Cancelling keeps the part file, so the next
+%% `integrity_mismatch'. A blob already on disk (another model shares
+%% it) is reused only once its sha256 checks out; otherwise it is
+%% deleted and fetched again. Cancelling keeps the part file, so the next
 %% pull of the same model resumes it. Redirects are followed by hand,
 %% and the Authorization header is only sent to the origin it was
 %% meant for.
@@ -55,6 +57,8 @@
     todo = [] :: [erllama_server_source:file()],
     fetched = [] :: [{model | projector, binary(), binary(), non_neg_integer()}],
     dl :: #dl{} | undefined,
+    %% A blob already on disk being checked before it is reused.
+    verify :: {reference(), erllama_server_source:file(), binary()} | undefined,
     result :: map() | undefined
 }).
 -type state() :: #state{}.
@@ -122,6 +126,8 @@ handle_cast(_Msg, St) ->
 
 handle_info({livery_response, Ref, Msg}, #state{dl = #dl{ref = Ref}, status = running} = St) ->
     {noreply, transfer(Msg, St)};
+handle_info({verified, Ref, Result}, #state{verify = {Ref, _, _}, status = running} = St) ->
+    {noreply, verified(Result, St)};
 handle_info({retry, Ref}, #state{dl = #dl{ref = {retry, Ref}} = Dl, status = running} = St) ->
     {noreply, request(Dl, St)};
 handle_info({ack, Sub, Seq}, #state{events = Ev} = St) when is_integer(Seq) ->
@@ -146,12 +152,30 @@ next_file(#state{todo = [#{sha256 := Sha, size := Size} = File | Rest]} = St) ->
     Final = blob_path(Sha, St),
     case Sha =/= undefined andalso Size =/= undefined andalso filelib:file_size(Final) =:= Size of
         true ->
-            %% Already downloaded (another model shares this blob).
-            next_file(St#state{
-                todo = Rest, fetched = [{role(File), Final, Sha, Size} | St#state.fetched]
-            });
+            %% Already on disk: check it in a helper (it can be large),
+            %% so this job keeps answering attach and cancel.
+            Self = self(),
+            Ref = make_ref(),
+            _ = spawn(fun() -> Self ! {verified, Ref, blob_sha256(Final)} end),
+            St#state{todo = Rest, verify = {Ref, File, Final}};
         false ->
             start_file(File, St#state{todo = Rest})
+    end.
+
+verified(Result, #state{verify = {_, #{sha256 := Sha, size := Size} = File, Final}} = St0) ->
+    St = St0#state{verify = undefined},
+    case Result of
+        {ok, Sha} ->
+            next_file(St#state{fetched = [{role(File), Final, Sha, Size} | St#state.fetched]});
+        _ ->
+            _ = file:delete(Final),
+            start_file(File, St)
+    end.
+
+blob_sha256(Path) ->
+    case resume_point(Path) of
+        {ok, _, H} -> {ok, binary:encode_hex(crypto:hash_final(H), lowercase)};
+        {error, _} = E -> E
     end.
 
 start_file(#{url := Url} = File, St) ->

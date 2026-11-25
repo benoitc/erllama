@@ -23,6 +23,7 @@
  */
 #include <erl_nif.h>
 #include "erllama_chat_nif.h"
+#include "erllama_tp_nif.h"
 #include "erllama_spec_nif.h"
 #include "erllama_mtmd_nif.h"
 
@@ -67,6 +68,7 @@ ERL_NIF_TERM atom_oom;
 ERL_NIF_TERM atom_deferred;
 ERL_NIF_TERM atom_exception;
 ERL_NIF_TERM atom_no_logits;
+ERL_NIF_TERM atom_stale_logits;
 ERL_NIF_TERM atom_no_template;
 ERL_NIF_TERM atom_template_failed;
 ERL_NIF_TERM atom_grammar_failed;
@@ -108,6 +110,15 @@ static int model_unreferenced(const erllama_model_t *m) {
            m->active_mtmd == 0;
 }
 
+/* A model split over a tensor-parallel rank lets the rank go once
+ * llama has freed it (or never loaded it). */
+void model_release_tp(erllama_model_t *m) {
+    if (m->tp_rank) {
+        erllama_tp_model_released(m->tp_rank);
+        m->tp_rank = NULL;
+    }
+}
+
 void context_drops_model(erllama_model_t *m) {
     pthread_mutex_lock(&m->mu);
     if (m->active_contexts > 0) {
@@ -116,6 +127,7 @@ void context_drops_model(erllama_model_t *m) {
     if (m->release_pending && model_unreferenced(m) && m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
+        model_release_tp(m);
         m->release_pending = 0;
     }
     pthread_mutex_unlock(&m->mu);
@@ -129,6 +141,7 @@ static void model_drops_adapter(erllama_model_t *m) {
     if (m->release_pending && model_unreferenced(m) && m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
+        model_release_tp(m);
         m->release_pending = 0;
     }
     pthread_mutex_unlock(&m->mu);
@@ -144,6 +157,7 @@ void model_drops_mtmd(erllama_model_t *m) {
     if (m->release_pending && model_unreferenced(m) && m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
+        model_release_tp(m);
         m->release_pending = 0;
     }
     pthread_mutex_unlock(&m->mu);
@@ -180,11 +194,13 @@ static void model_dtor(ErlNifEnv *env, void *obj) {
     if (m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
+        model_release_tp(m);
     }
     if (m->tbo) {
         enif_free(m->tbo);
         m->tbo = NULL;
     }
+    model_release_tp(m);
     if (m->mu_inited) {
         pthread_mutex_destroy(&m->mu);
         m->mu_inited = 0;
@@ -192,8 +208,9 @@ static void model_dtor(ErlNifEnv *env, void *obj) {
 }
 
 static void ctx_dtor(ErlNifEnv *env, void *obj) {
-    (void) env;
     erllama_context_t *c = (erllama_context_t *) obj;
+    /* A drafter keeps its context, so none is attached by now. */
+    erllama_ctx_mtp_release(env, c);
     grammar_cache_clear(c);
     if (c->smpl) {
         (void) erllama_safe_sampler_free(c->smpl);
@@ -207,6 +224,10 @@ static void ctx_dtor(ErlNifEnv *env, void *obj) {
         context_drops_model(c->model_res);
         enif_release_resource(c->model_res);
         c->model_res = NULL;
+    }
+    if (c->diag) {
+        erllama_diag_free(c->diag);
+        c->diag = NULL;
     }
     if (c->mu_inited) {
         pthread_mutex_destroy(&c->mu);
@@ -296,6 +317,7 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_deferred = enif_make_atom(env, "deferred");
     atom_exception = enif_make_atom(env, "exception");
     atom_no_logits = enif_make_atom(env, "no_logits");
+    atom_stale_logits = enif_make_atom(env, "stale_logits");
     atom_no_template = enif_make_atom(env, "no_template");
     atom_template_failed = enif_make_atom(env, "template_failed");
     atom_grammar_failed = enif_make_atom(env, "grammar_failed");
@@ -341,9 +363,18 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
         return -1;
     }
 
+    /* Register the tensor-parallel bridge and rank resources (defined
+     * in erllama_tp_nif.cpp). */
+    if (tp_nif_load(env) != 0) {
+        return -1;
+    }
+
     /* Register the ngram-speculator resource (defined in
      * erllama_spec_nif.cpp). */
     if (spec_nif_load(env) != 0) {
+        return -1;
+    }
+    if (erllama_mtp_nif_load(env) != 0) {
         return -1;
     }
 
@@ -523,11 +554,35 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_spec_accept", 3, nif_spec_accept, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_spec_free",   1, nif_spec_free,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_spec_step",   4, nif_spec_step,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_new",     3, nif_mtp_new,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_step",    5, nif_mtp_step,    ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_mtp_stats",   1, nif_mtp_stats,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_free",    1, nif_mtp_free,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_trace",   2, nif_mtp_trace,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_mtp_step_batch", 4, nif_mtp_step_batch, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_mtmd_init",      3, nif_mtmd_init,      ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_mtmd_free",      1, nif_mtmd_free,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_mtmd_caps",      1, nif_mtmd_caps,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_mtmd_caps_file", 1, nif_mtmd_caps_file, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_media_prefill",  6, nif_media_prefill,  ERL_NIF_DIRTY_JOB_CPU_BOUND}
+    {"nif_media_prefill",  6, nif_media_prefill,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    /* Tensor parallelism (experimental): open, matvec, reduce and the
+     * self-test block on other ranks, so they run on dirty IO. */
+    {"nif_tp_caps",            0, nif_tp_caps,            ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_tp_open",            5, nif_tp_open,            ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_bootstrap_reply", 3, nif_tp_bootstrap_reply, 0},
+    {"nif_tp_matvec",          5, nif_tp_matvec,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_reduce",          2, nif_tp_reduce,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_close",           1, nif_tp_close,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_tp_bootstrap_selftest", 5, nif_tp_bootstrap_selftest, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_stats",           1, nif_tp_stats,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_tp_decode",          2, nif_tp_decode,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_decode_seq",      4, nif_tp_decode_seq,      ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_kv_seq_pos_max",     2, nif_kv_seq_pos_max,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_ctx_diag",           2, nif_ctx_diag,           ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_tp_follow",          2, nif_tp_follow,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_tp_send",            2, nif_tp_send,            ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_tp_kv_pack",         2, nif_tp_kv_pack,         ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_tp_kv_unpack",       3, nif_tp_kv_unpack,       ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)

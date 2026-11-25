@@ -1,6 +1,6 @@
 # Updating the vendored llama.cpp
 
-erllama vendors a pinned, unmodified copy of llama.cpp under
+erllama vendors a pinned copy of llama.cpp under
 `c_src/llama.cpp/`. The pinned tag is in `c_src/llama.cpp/.version`
 (currently **v1.0.0**). You need this page when you bump that pin.
 Paths on this page are relative to `apps/erllama/`; run the commands
@@ -30,7 +30,34 @@ and then removes whole directories we never build:
 the upstream `LLAMA_BUILD_MTMD` standalone hook with `MTMD_VIDEO`
 forced off, and it links `vendor/{stb,miniaudio,hash,sheredom}`.
 
-No file is edited. `common/` is needed for the chat template pipeline
+The vendor script applies every patch in `scripts/patches/`, in name
+order, to the extracted tarball before copying it:
+
+- [cuda-dgx-spark-q4k-moe-mmq.patch](scripts/patches/cuda-dgx-spark-q4k-moe-mmq.patch)
+  sends an eight-row Q4_K `MUL_MAT_ID` (a mixture-of-experts layer with
+  eight rows, as an MTP verify of four requests gives) through MMQ
+  instead of MMVQ on DGX Spark (GB10), where it is faster; other GPUs,
+  types and row counts are unchanged.
+- [hybrid-k-graph-reuse.patch](scripts/patches/hybrid-k-graph-reuse.patch)
+  checks the dense attention mask built for the hybrid K-only input, so
+  GLM can reuse its decode graph with unified KV and fused K/V rows
+  enabled.
+- [meta-recurrent-snapshot-view.patch](scripts/patches/meta-recurrent-snapshot-view.patch)
+  lets the split backend (`ggml-backend-meta.cpp`) split a view that
+  walks the split axis one window at a time, which GLM's recurrent-state
+  snapshots take; without it a split GLM with snapshots aborts.
+- [meta-split-mirrored-read.patch](scripts/patches/meta-split-mirrored-read.patch)
+  makes the split backend read a mirrored tensor from the first device
+  that holds data (its reg's `ggml_backend_dev_holds_data`), not always
+  device 0. erllama's tensor-parallel ranks hold one real device; the
+  others are placeholders that read as zeros, so a checkpoint of a
+  mirrored tensor on any rank but the first held zeros.
+
+When updating the pin, check whether upstream has fixed each one; once
+it has, remove that patch. A patch failure leaves the current vendored
+tree intact.
+
+`common/` is needed for the chat template pipeline
 (`common_chat_*`, the PEG autoparser, the jinja runtime). It links
 `vendor/cpp-httplib` for its Hugging Face download helpers, which the
 NIF never calls; `c_src/CMakeLists.txt` sets `LLAMA_OPENSSL=OFF` so that
@@ -53,8 +80,8 @@ rebar3 eunit && rebar3 proper
 LLAMA_TEST_MODEL=/path/to/small.gguf rebar3 ct
 ```
 
-The script fails if any vendored file differs from the tarball, so a
-clean run proves the tree is upstream. Update the tag in this page and
+The script checks the retained files against the patched tarball.
+Update the tag in this page and
 add a CHANGELOG line, then commit with a message naming the new tag.
 
 ## Build knobs

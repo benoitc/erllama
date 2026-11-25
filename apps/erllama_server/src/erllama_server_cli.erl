@@ -10,13 +10,16 @@
 %% or loads its NIF.
 
 -export([main/1, run/1, parse_opts/2, format_error/1]).
+%% For erllama_server_cli_agent.
+-export([reply/2, fail/1, usage/1, to_bin/1, print_event/1, follow/3, follow_cancelling/2]).
 
 -define(USAGE, [
     "usage: erllama <command> [options]\n",
     "\n",
     "commands:\n",
     "  ping                          check that the release is running\n",
-    "  status                        versions, loaded models, active jobs\n",
+    "  status                        what runs, waits and failed: models, runs,\n",
+    "                                agents, MCP servers, cache, recent failures\n",
     "  models                        the registry's models and what is loaded\n",
     "  pull SOURCE [--name NAME] [--sha256 HEX] [--detach]\n",
     "                                download a model: hf://ORG/REPO[:QUANT],\n",
@@ -24,7 +27,7 @@
     "                                ollama://NAME[:TAG] or NAME[:TAG]\n",
     "  show MODEL                    a model's entry and GGUF metadata\n",
     "  ps                            loaded models, holders and keep-alive\n",
-    "  load MODEL|PATH.gguf [--name NAME] [--n-ctx N] [--gpu-layers N] [--mmproj PATH]\n",
+    "  load MODEL|PATH.gguf [--name NAME] [--n-ctx N] [--gpu-layers N] [--parallel N] [--mmproj PATH]\n",
     "                                load a model (registering a file first)\n",
     "  unload MODEL                  unload a model\n",
     "  cp SRC DST                    a second name for a model\n",
@@ -33,8 +36,24 @@
     "  run MODEL [--conversation ID] [--max-tokens N] [--detach] PROMPT...\n",
     "                                one chat turn, streamed\n",
     "  chat MODEL [--conversation ID] [--max-tokens N]\n",
-    "                                chat line by line (/quit or end of input)\n",
+    "                                chat line by line; /help lists the commands\n",
+    "  agent MODEL --workspace PATH | --conversation ID [--yes | --read-only] [--max-rounds N]\n",
+    "  agent --attach AGENT          go back to a running session: its pending\n",
+    "                                approvals and tools, then its latest turn\n",
+    "                                work with tools in PATH on the release machine;\n",
+    "                                /help lists the commands of a session\n",
+    "  agents                        list the agent sessions\n",
+    "  agent-stop AGENT              end an agent session\n",
+    "  mcp [tools | resources SERVER | read SERVER URI | prompts SERVER\n",
+    "      | prompt SERVER NAME [KEY=VALUE ...]]\n",
+    "                                the MCP servers agent sessions use\n",
+    "  conversations                 list the conversations (kept across restarts)\n",
+    "  conversation show|export|fork|compact|rm|attach ID [--format json|md]\n",
+    "                                read, export, copy, shorten or delete a\n",
+    "                                conversation, or follow what runs in it\n",
     "  runs                          list the runs and downloads the release holds\n",
+    "  inspect JOB                   a run or agent session in detail: phase,\n",
+    "                                approvals, tools, background jobs, budgets\n",
     "  attach JOB [--from SEQ]       follow a run or download from an event sequence\n",
     "  cancel JOB                    cancel a run or download\n",
     "  result JOB                    print a finished run's or download's result\n",
@@ -46,9 +65,23 @@
 
 -spec main([string()]) -> no_return().
 main(Args) ->
+    ok = log_to_stderr(),
+    %% A terminal: Ctrl-C is handled here (see erllama_server_cli_term).
+    _ = erllama_server_cli_term:start(),
     {Code, Output} = run(Args),
-    io:put_chars(Output),
+    ok = erllama_server_cli_term:finish(),
+    ok = erllama_server_cli_term:safe_put(standard_io, Output),
     halt(Code).
+
+%% Diagnostics go to standard error: standard output is the command's
+%% result, and may be a pipe its reader closes.
+log_to_stderr() ->
+    _ = logger:remove_handler(default),
+    %% The CLI reports its own errors; of OTP's reports, only the
+    %% critical ones (a closed output pipe is logged as an error).
+    logger:add_handler(default, logger_std_h, #{
+        level => critical, config => #{type => standard_error}
+    }).
 
 %% Run one command and return its exit code and remaining output, so
 %% commands can be tested without halting the VM. Streaming commands
@@ -84,6 +117,7 @@ command("load") ->
             {"--id", name, string},
             {"--n-ctx", n_ctx, int},
             {"--gpu-layers", n_gpu_layers, int},
+            {"--parallel", parallel, int},
             {"--mmproj", mmproj, string}
         ],
         fun load/4
@@ -108,9 +142,33 @@ command("unload") ->
 command("run") ->
     {[{"--detach", detach, flag} | turn_opts()], fun run_turn/4};
 command("chat") ->
-    {turn_opts(), fun chat/4};
+    {turn_opts(), fun erllama_server_cli_chat:chat/4};
+command("agent") ->
+    {
+        [
+            {"--workspace", workspace, string},
+            {"--conversation", conversation_id, string},
+            {"--attach", attach, string},
+            {"--yes", yes, flag},
+            {"--read-only", read_only, flag},
+            {"--max-rounds", max_rounds, int}
+        ],
+        fun erllama_server_cli_agent:agent/4
+    };
+command("agents") ->
+    {[], fun erllama_server_cli_agent:agents/4};
+command("agent-stop") ->
+    {[], fun erllama_server_cli_agent:stop/4};
+command("mcp") ->
+    {[], fun erllama_server_cli_mcp:mcp/4};
+command("conversations") ->
+    {[], fun erllama_server_cli_conv:list/4};
+command("conversation") ->
+    {[{"--format", format, string}], fun erllama_server_cli_conv:conversation/4};
 command("runs") ->
     {[], fun runs/4};
+command("inspect") ->
+    {[], fun inspect/4};
 command("attach") ->
     {[{"--from", from, int}], fun attach/4};
 command("cancel") ->
@@ -140,12 +198,16 @@ ping(_, _, _, _) ->
     usage("ping").
 
 status(Node, _Info, _Opts, []) ->
-    reply(erllama_server_client:call(Node, status, []), fun format_status/1);
+    reply(
+        erllama_server_client:call(Node, status, []), fun erllama_server_cli_status:format_status/1
+    );
 status(_, _, _, _) ->
     usage("status").
 
 models(Node, _Info, _Opts, []) ->
-    reply(erllama_server_client:call(Node, models, []), fun format_models/1);
+    reply(
+        erllama_server_client:call(Node, models, []), fun erllama_server_cli_format:format_models/1
+    );
 models(_, _, _, _) ->
     usage("models").
 
@@ -180,7 +242,8 @@ pull(Node, _Info, Opts, [Source]) ->
         {ok, #{job_id := Id}} when is_map_key(detach, Opts) ->
             {0, [Id, "\n"]};
         {ok, #{job_id := Id}} ->
-            follow(Node, Id, 0);
+            %% Ctrl-C cancels the download; the part file is kept.
+            follow_cancelling(Node, Id);
         {error, Reason} ->
             fail(Reason)
     end;
@@ -188,12 +251,15 @@ pull(_, _, _, _) ->
     usage("pull").
 
 show(Node, _Info, _Opts, [Name]) ->
-    reply(erllama_server_client:call(Node, show, [list_to_binary(Name)]), fun format_show/1);
+    reply(
+        erllama_server_client:call(Node, show, [list_to_binary(Name)]),
+        fun erllama_server_cli_format:format_show/1
+    );
 show(_, _, _, _) ->
     usage("show").
 
 ps(Node, _Info, _Opts, []) ->
-    reply(erllama_server_client:call(Node, ps, []), fun format_ps/1);
+    reply(erllama_server_client:call(Node, ps, []), fun erllama_server_cli_format:format_ps/1);
 ps(_, _, _, _) ->
     usage("ps").
 
@@ -221,44 +287,12 @@ run_turn(Node, _Info, Opts, [Model | [_ | _] = Words]) ->
         {ok, #{run_id := RunId}} when is_map_key(detach, Opts) ->
             {0, [RunId, "\n"]};
         {ok, #{run_id := RunId}} ->
-            follow(Node, RunId, 0);
+            follow_cancelling(Node, RunId);
         {error, Reason} ->
             fail(Reason)
     end;
 run_turn(_, _, _, _) ->
     usage("run").
-
-chat(Node, _Info, Opts, [Model]) ->
-    chat_loop(Node, Model, Opts);
-chat(_, _, _, _) ->
-    usage("chat").
-
-%% `Opts' carries the conversation id once the first turn created it.
-chat_loop(Node, Model, Opts) ->
-    case io:get_line("> ") of
-        eof ->
-            {0, ""};
-        {error, _} ->
-            {0, ""};
-        Line ->
-            case string:trim(Line) of
-                "/quit" -> {0, ""};
-                "" -> chat_loop(Node, Model, Opts);
-                Text -> chat_turn(Node, Model, Opts, unicode:characters_to_binary(Text))
-            end
-    end.
-
-chat_turn(Node, Model, Opts, Text) ->
-    case start_turn(Node, Model, Text, Opts) of
-        {ok, #{run_id := RunId, conversation_id := Conv}} ->
-            {_, Out} = follow(Node, RunId, 0),
-            io:put_chars(Out),
-            chat_loop(Node, Model, Opts#{conversation_id => Conv});
-        {error, Reason} ->
-            {_, Out} = fail(Reason),
-            io:put_chars(standard_error, Out),
-            chat_loop(Node, Model, Opts)
-    end.
 
 start_turn(Node, Model, Text, Opts) ->
     Spec0 = #{
@@ -274,14 +308,32 @@ start_turn(Node, Model, Text, Opts) ->
     erllama_server_client:call(Node, start_run, [Spec]).
 
 runs(Node, _Info, _Opts, []) ->
-    reply(erllama_server_client:call(Node, runs, []), fun format_runs/1);
+    reply(erllama_server_client:call(Node, runs, []), fun erllama_server_cli_format:format_runs/1);
 runs(_, _, _, _) ->
     usage("runs").
 
+inspect(Node, _Info, _Opts, [Id]) ->
+    reply(
+        erllama_server_client:call(Node, inspect, [list_to_binary(Id)]),
+        fun erllama_server_cli_status:format_inspect/1
+    );
+inspect(_, _, _, _) ->
+    usage("inspect").
+
 attach(Node, _Info, Opts, [RunId]) ->
-    follow(Node, list_to_binary(RunId), maps:get(from, Opts, 0));
+    %% Ctrl-C detaches: the run goes on.
+    erllama_server_cli_term:interrupt(
+        fun detach/0,
+        fun() -> follow(Node, list_to_binary(RunId), maps:get(from, Opts, 0)) end
+    );
 attach(_, _, _, _) ->
     usage("attach").
+
+-spec detach() -> no_return().
+detach() ->
+    erllama_server_cli_term:err("[detached; the run goes on]\n"),
+    ok = erllama_server_cli_term:finish(),
+    halt(0).
 
 cancel(Node, _Info, _Opts, [RunId]) ->
     reply(erllama_server_client:call(Node, cancel, [list_to_binary(RunId)]), fun(_) -> "" end);
@@ -289,13 +341,24 @@ cancel(_, _, _, _) ->
     usage("cancel").
 
 result(Node, _Info, _Opts, [RunId]) ->
-    reply(erllama_server_client:call(Node, result, [list_to_binary(RunId)]), fun format_result/1);
+    reply(
+        erllama_server_client:call(Node, result, [list_to_binary(RunId)]),
+        fun erllama_server_cli_format:format_result/1
+    );
 result(_, _, _, _) ->
     usage("result").
 
 %% -----------------------------------------------------------------------------
 %% Streaming
 %% -----------------------------------------------------------------------------
+
+%% Follow a job to its end; Ctrl-C cancels it.
+-spec follow_cancelling(node(), binary()) -> {non_neg_integer(), iodata()}.
+follow_cancelling(Node, Id) ->
+    erllama_server_cli_term:interrupt(
+        fun() -> erllama_server_client:call(Node, cancel, [Id]) end,
+        fun() -> follow(Node, Id, 0) end
+    ).
 
 follow(Node, RunId, Cursor) ->
     case erllama_server_client:follow(Node, RunId, Cursor, fun print_event/1) of
@@ -312,17 +375,32 @@ follow(Node, RunId, Cursor) ->
     end.
 
 print_event(#{type := token, data := Bin}) ->
-    io:put_chars(Bin);
+    erllama_server_cli_term:out(Bin);
+print_event(#{type := thinking, data := Bin}) ->
+    erllama_server_cli_term:dim(Bin);
+print_event(#{type := started}) ->
+    erllama_server_cli_term:status("waiting");
 print_event(#{type := loading, data := #{model := M}}) ->
-    io:format(standard_error, "[loading ~ts]~n", [M]);
+    ok = erllama_server_cli_term:status("loading"),
+    erllama_server_cli_term:err(io_lib:format("[loading ~ts]~n", [M]));
+print_event(#{type := compacting}) ->
+    ok = erllama_server_cli_term:status("compacting"),
+    erllama_server_cli_term:err("[compacting the conversation]\n");
+print_event(#{type := compacted, data := #{before := B, 'after' := A}}) ->
+    ok = erllama_server_cli_term:status("prefill"),
+    erllama_server_cli_term:err(io_lib:format("[compacted: ~b messages, now ~b]~n", [B, A]));
+print_event(#{type := tool_call, data := #{name := N}}) ->
+    erllama_server_cli_term:err(["\n[call ", N, "]\n"]);
 print_event(#{type := progress, data := #{file := F, done := D, total := T}}) ->
-    io:put_chars(standard_error, ["\r", progress_line(F, D, T)]);
+    erllama_server_cli_term:err(["\r", erllama_server_cli_format:progress_line(F, D, T)]);
 print_event({gap, Wanted, Oldest}) ->
-    io:format(standard_error, "~n[events ~b to ~b are no longer held by the release]~n", [
-        Wanted, Oldest - 1
-    ]);
+    erllama_server_cli_term:err(
+        io_lib:format("~n[events ~b to ~b are no longer held by the release]~n", [
+            Wanted, Oldest - 1
+        ])
+    );
 print_event({reconnecting, _}) ->
-    io:put_chars(standard_error, "\n[connection lost, reconnecting]\n");
+    erllama_server_cli_term:err("\n[connection lost, reconnecting]\n");
 print_event(_) ->
     ok.
 
@@ -377,147 +455,6 @@ request_error({run_failed, R}) ->
     io_lib:format("run failed: ~p", [R]);
 request_error(Other) ->
     io_lib:format("~p", [Other]).
-
-format_status(S) ->
-    #{node := Node, server_vsn := Sv, erllama_vsn := Ev, api := Api, active_runs := N, models := Ms} =
-        S,
-    [
-        io_lib:format("release   ~s~n", [Node]),
-        io_lib:format("versions  erllama_server ~s, erllama ~s, api ~b~n", [Sv, Ev, Api]),
-        io_lib:format("runs      ~b active~n", [N]),
-        format_pressure(maps:get(pressure, S, undefined)),
-        "models\n",
-        case Ms of
-            [] -> "  (none loaded)\n";
-            _ -> [["  ", L] || L <- model_lines(Ms)]
-        end
-    ].
-
-format_pressure(#{used_b := U, total_b := T, source := Src}) when T > 0 ->
-    io_lib:format("memory    ~b of ~b MiB used (~p)~n", [U bsr 20, T bsr 20, Src]);
-format_pressure(_) ->
-    "".
-
-format_models([]) ->
-    "no model registered or loaded\n";
-format_models(Ms) ->
-    [
-        io_lib:format("~ts~ts  ~ts  ~ts~ts~n", [
-            maps:get(name, M),
-            case maps:get(default, M, false) of
-                true -> " (default)";
-                false -> ""
-            end,
-            case maps:get(loaded, M, false) of
-                true -> "loaded";
-                false -> "-"
-            end,
-            size_text(maps:get(size, M, undefined)),
-            case maps:get(status, M, ok) of
-                missing -> "  FILE MISSING";
-                _ -> ""
-            end
-        ])
-     || M <- Ms
-    ].
-
-format_ps([]) ->
-    "no model loaded\n";
-format_ps(Ms) ->
-    [
-        io_lib:format("~ts  ~p  ctx ~p  ~ts  ~ts~n", [
-            maps:get(id, M),
-            maps:get(status, M, unknown),
-            maps:get(context_size, M, 0),
-            maps:get(quant_tag, M, <<"-">>),
-            keep_alive_text(M)
-        ])
-     || M <- Ms
-    ].
-
-keep_alive_text(#{managed := true, holders := H}) when H > 0 ->
-    io_lib:format("in use by ~b", [H]);
-keep_alive_text(#{managed := true, expires_at := undefined, keep_alive := infinity}) ->
-    "kept loaded";
-keep_alive_text(#{managed := true, expires_at := E}) when is_integer(E) ->
-    io_lib:format("unloads in ~bs", [max(0, (E - erlang:system_time(millisecond)) div 1000)]);
-keep_alive_text(#{managed := false}) ->
-    "loaded outside the registry";
-keep_alive_text(_) ->
-    "".
-
-format_show(#{name := N} = E) ->
-    Meta = maps:get(metadata, E, #{}),
-    Line = fun(K, V) -> io_lib:format("~-14s ~ts~n", [K, value_text(V)]) end,
-    [
-        Line("name", N),
-        Line("source", maps:get(ref, maps:get(source, E, #{}), <<"-">>)),
-        Line("file", maps:get(path, E, <<"-">>)),
-        Line("size", size_text(maps:get(size, E, undefined))),
-        Line("sha256", maps:get(sha256, E, undefined)),
-        Line("projector", maps:get(mmproj, E, undefined)),
-        Line("architecture", maps:get(architecture, Meta, undefined)),
-        Line("parameters", maps:get(size_label, Meta, undefined)),
-        Line("quantisation", maps:get(file_type, Meta, undefined)),
-        Line("context", maps:get(context_length, Meta, undefined)),
-        Line("chat template", maps:get(chat_template, Meta, undefined) =/= undefined),
-        Line("loaded", maps:get(loaded, E, false))
-    ].
-
-value_text(undefined) -> "-";
-value_text(true) -> "yes";
-value_text(false) -> "no";
-value_text(V) when is_integer(V) -> integer_to_list(V);
-value_text(V) when is_binary(V) -> V;
-value_text(V) when is_list(V) -> V;
-value_text(V) -> io_lib:format("~p", [V]).
-
-size_text(undefined) -> "-";
-size_text(B) when B >= 1 bsl 30 -> io_lib:format("~.1f GiB", [B / (1 bsl 30)]);
-size_text(B) -> io_lib:format("~.1f MiB", [B / (1 bsl 20)]).
-
-progress_line(File, Done, undefined) ->
-    io_lib:format("pulling ~p: ~ts", [File, size_text(Done)]);
-progress_line(File, Done, Total) when Total > 0 ->
-    io_lib:format("pulling ~p: ~b% (~ts of ~ts)", [
-        File, Done * 100 div Total, size_text(Done), size_text(Total)
-    ]);
-progress_line(File, Done, _) ->
-    progress_line(File, Done, undefined).
-
-model_lines(Ms) ->
-    [
-        io_lib:format("~s  ~p  ctx ~p  ~s~n", [
-            maps:get(id, M),
-            maps:get(status, M, unknown),
-            maps:get(context_size, M, 0),
-            maps:get(quant_tag, M, <<"-">>)
-        ])
-     || M <- Ms
-    ].
-
-format_runs([]) ->
-    "no runs\n";
-format_runs(Rs) ->
-    [
-        io_lib:format("~s  ~p  ~p  ~ts  ~ts~n", [
-            Id,
-            maps:get(kind, R, run),
-            Status,
-            Model,
-            case Conv of
-                undefined -> <<"-">>;
-                _ -> Conv
-            end
-        ])
-     || #{run_id := Id, status := Status, model := Model, conversation_id := Conv} = R <- Rs
-    ].
-
-format_result(#{status := error, error := R}) ->
-    io_lib:format("error: ~p~n", [R]);
-format_result(#{content := C} = R) ->
-    #{finish_reason := F, usage := #{prompt_tokens := P, completion_tokens := G}} = R,
-    [C, io_lib:format("~n[~p, ~b prompt tokens, ~b generated]~n", [F, P, G])].
 
 %% -----------------------------------------------------------------------------
 %% Argument parsing

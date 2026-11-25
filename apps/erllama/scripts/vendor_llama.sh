@@ -6,10 +6,10 @@
 #
 #   scripts/vendor_llama.sh v1.0.0
 #
-# The vendored tree is upstream, unmodified. Only whole directories are
-# removed (backends we never build, unused vendor libs, repo dotfiles);
-# no file is edited. The script ends by diffing the result against the
-# tarball and fails if any file differs from upstream.
+# The vendored tree is upstream with the local fixes in scripts/patches/
+# applied in name order (each until upstream carries it). Only whole directories are removed (backends we never build,
+# unused vendor libs, repo dotfiles). The script ends by diffing the
+# result against the patched tarball and fails if any file differs.
 set -euo pipefail
 
 TAG="${1:-}"
@@ -28,6 +28,9 @@ echo "fetching $URL"
 curl -fsSL "$URL" | tar -xz -C "$WORK"
 # GitHub drops the leading `v' of a semver tag in the tarball's top dir.
 SRC="$WORK/llama.cpp-${TAG#v}"
+for P in "$ROOT"/scripts/patches/*.patch; do
+    patch -f -F 0 -p1 -d "$SRC" < "$P"
+done
 
 # Paths we vendor wholesale.
 KEEP="cmake CMakeLists.txt common ggml include src LICENSE vendor tools/mtmd"
@@ -56,14 +59,14 @@ done
 find "$DEST" -name .gitignore -delete
 echo "$TAG" > "$DEST/.version"
 
-# Verify: every vendored file must be byte-identical to upstream.
+# Verify every retained file against the patched reference.
 CHANGED="$(for p in $KEEP; do
     diff -rq "$SRC/$p" "$DEST/$p" 2>/dev/null | grep -v "^Only in $SRC" || true
 done)"
 if [ -n "$CHANGED" ]; then
-    echo "vendored tree differs from upstream $TAG:" >&2
+    echo "vendored tree differs from patched reference $TAG:" >&2
     echo "$CHANGED" >&2
     exit 1
 fi
-echo "vendored llama.cpp $TAG into c_src/llama.cpp (upstream, unmodified)"
+echo "vendored llama.cpp $TAG into c_src/llama.cpp with the hybrid K graph-reuse fix"
 du -sh "$DEST"

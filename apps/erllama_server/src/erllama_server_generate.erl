@@ -14,6 +14,7 @@
 %% to the legacy template renderer and an unparsed reply.
 
 -export([start/4, finish/4, option_keys/0, check_opts/1, message/1, reply_message/1, constrain/3]).
+-export([stream_parser/1, feed/2, count_tokens/3]).
 
 -define(CHAT_KEYS, [
     tools, tool_choice, parallel_tool_calls, json_schema, enable_thinking, reasoning_format
@@ -34,12 +35,25 @@
     presence_penalty,
     penalty_last_n,
     grammar,
-    logprobs
+    logprobs,
+    speculative
 ]).
 
 -type input() :: {messages, [map()]} | {prompt, binary()}.
 -type parser() :: erllama:chat_params() | undefined.
 -export_type([input/0, parser/0]).
+
+%% Streaming parse state (see feed/2).
+-type delta() :: {token, binary()} | {thinking, binary()} | {tool_call, map()}.
+-record(sp, {
+    params :: erllama:chat_params(),
+    text = <<>> :: binary(),
+    content = <<>> :: binary(),
+    reasoning = <<>> :: binary(),
+    calls = 0 :: non_neg_integer()
+}).
+-opaque stream_parser() :: #sp{}.
+-export_type([stream_parser/0, delta/0]).
 
 %% The options a client may pass. Keys the server controls
 %% (`parent_key', `session_id', `to', middleware) are not among them.
@@ -89,7 +103,28 @@ start(Model, {messages, Msgs}, Opts, To) when is_list(Msgs) ->
         {error, _} = E -> E
     end.
 
-start_chat(Model, Msgs, ChatOpts, Req, To) ->
+start_chat(Model, Msgs0, ChatOpts, Req, To) ->
+    case extract_media(Msgs0) of
+        {Msgs, []} -> start_text_chat(Model, Msgs, ChatOpts, Req, To);
+        {Msgs, Media} -> start_media_chat(Model, Msgs, Media, ChatOpts, Req, To)
+    end.
+
+%% Images and audio go to the model's projector: the prompt carries one
+%% media marker per item and is evaluated whole (no KV cache reuse, so
+%% the cache options are dropped). The template already put the BOS
+%% token at the start of the prompt.
+start_media_chat(Model, Msgs, Media, ChatOpts, Req, To) ->
+    case erllama:chat_apply(Model, Msgs, ChatOpts) of
+        {ok, #{prompt := P, params := Params, sampler_opts := S, stop_sequences := Stops}} ->
+            Req1 = maps:without([parent_key, session_id], constrain(S, Stops, Req)),
+            stream(Model, P, Req1#{media => Media, media_add_special => false}, To, Params);
+        {error, chat_not_supported} ->
+            {error, {media_not_supported, Model}};
+        {error, _} = E ->
+            E
+    end.
+
+start_text_chat(Model, Msgs, ChatOpts, Req, To) ->
     case erllama:chat_apply(Model, Msgs, ChatOpts) of
         {ok, #{prompt := P, params := Params, sampler_opts := S, stop_sequences := Stops}} ->
             case erllama:tokenize(Model, P, #{add_special => false, parse_special => true}) of
@@ -109,6 +144,29 @@ start_chat(Model, Msgs, ChatOpts, Req, To) ->
 
 request_opts(Opts) ->
     maps:without(?CHAT_KEYS, Opts).
+
+%% Media parts become the media marker the template renders verbatim;
+%% the media, in order, travels beside the prompt.
+extract_media(Msgs) ->
+    {Rev, Media} = lists:foldl(
+        fun
+            (#{content := Parts} = M, {MAcc, DAcc}) when is_list(Parts) ->
+                {Parts1, DAcc1} = lists:foldl(fun media_part/2, {[], DAcc}, Parts),
+                {[M#{content := lists:reverse(Parts1)} | MAcc], DAcc1};
+            (M, {MAcc, DAcc}) ->
+                {[M | MAcc], DAcc}
+        end,
+        {[], []},
+        Msgs
+    ),
+    {lists:reverse(Rev), lists:reverse(Media)}.
+
+media_part(#{type := T, data := D}, {PAcc, DAcc}) when T =:= image; T =:= audio ->
+    {[#{type => <<"media_marker">>, text => erllama:media_marker()} | PAcc], [
+        #{type => T, data => D} | DAcc
+    ]};
+media_part(Part, {PAcc, DAcc}) ->
+    {[Part | PAcc], DAcc}.
 
 template_request(Msgs, #{tools := Tools}) -> #{messages => Msgs, tools => Tools};
 template_request(Msgs, _) -> #{messages => Msgs}.
@@ -155,9 +213,16 @@ finish(Parser, Text, Thinking, Stats) ->
             prefill_ms => maps:get(prefill_ms, Stats, 0),
             generation_ms => maps:get(generation_ms, Stats, 0)
         },
-        cache_hit_kind => maps:get(cache_hit_kind, Stats, cold)
+        cache_hit_kind => maps:get(cache_hit_kind, Stats, cold),
+        stop_sequence => maps:get(stop_sequence, Stats, undefined)
     },
-    parse(Parser, Text, Base).
+    %% A request that asked for speculative decoding: what it drafted.
+    Base1 =
+        case Stats of
+            #{speculative := Spec} -> Base#{speculative => Spec};
+            _ -> Base
+        end,
+    parse(Parser, Text, Base1).
 
 parse(undefined, _Text, Base) ->
     Base;
@@ -215,6 +280,11 @@ message(<<"tool">>, M) ->
     {error, {invalid_message, M}};
 message(Role, #{content := C}) when is_binary(C) ->
     {ok, #{role => Role, content => C}};
+message(Role, #{content := [_ | _] = Parts} = M) ->
+    case parts(Parts) of
+        {ok, Ps} -> {ok, #{role => Role, content => Ps}};
+        error -> {error, {invalid_message, M}}
+    end;
 message(_Role, M) ->
     {error, {invalid_message, M}}.
 
@@ -222,6 +292,29 @@ role(R) when is_atom(R) -> role(atom_to_binary(R));
 role(R) when R =:= <<"system">>; R =:= <<"user">>; R =:= <<"assistant">>; R =:= <<"tool">> ->
     {ok, R};
 role(_) ->
+    error.
+
+%% Content parts: text, and image or audio bytes for a model with a
+%% projector.
+parts(Parts) ->
+    all_ok([part(P) || P <- Parts]).
+
+%% `{ok, List}' unless an element failed to convert.
+all_ok(Normal) ->
+    case lists:member(error, Normal) of
+        true -> error;
+        false -> {ok, Normal}
+    end.
+
+part(#{type := text, text := Text}) when is_binary(Text) ->
+    #{type => <<"text">>, text => Text};
+part(#{type := <<"text">>, text := Text}) when is_binary(Text) ->
+    #{type => <<"text">>, text => Text};
+part(#{type := T, data := D}) when
+    T =:= image, is_binary(D), D =/= <<>>; T =:= audio, is_binary(D), D =/= <<>>
+->
+    #{type => T, data => D};
+part(_) ->
     error.
 
 %% An assistant message may omit its content (or set it to null) only
@@ -232,11 +325,7 @@ content(M, true) when not is_map_key(content, M) -> {ok, null};
 content(_, _) -> {error, content}.
 
 tool_calls(Calls) when is_list(Calls) ->
-    Normal = [tool_call(C) || C <- Calls],
-    case lists:member(error, Normal) of
-        true -> error;
-        false -> {ok, Normal}
-    end;
+    all_ok([tool_call(C) || C <- Calls]);
 tool_calls(_) ->
     error.
 
@@ -288,4 +377,74 @@ reply_message(#{content := Content, tool_calls := Calls}) ->
     case Content of
         <<>> -> Msg#{content := null};
         _ -> Msg
+    end.
+
+%% -----------------------------------------------------------------------------
+%% Streaming parse
+%% -----------------------------------------------------------------------------
+
+%% With a parser, the reply is parsed again after every token
+%% (llama.cpp's partial parsing holds back what may still turn into a
+%% tool call), and only what is new is emitted: content and reasoning
+%% deltas, and each tool call once its name is known. The complete
+%% arguments come with the final result.
+
+-spec stream_parser(parser()) -> stream_parser() | undefined.
+stream_parser(undefined) -> undefined;
+stream_parser(Params) -> #sp{params = Params}.
+
+-spec feed(binary(), stream_parser()) -> {[delta()], stream_parser()}.
+feed(Bin, #sp{params = P, text = T} = Sp) ->
+    Text = <<T/binary, Bin/binary>>,
+    case erllama:chat_parse(P, Text, true) of
+        {ok, Msg} -> diff(Msg, Sp#sp{text = Text});
+        {error, _} -> {[], Sp#sp{text = Text}}
+    end.
+
+diff(Msg, #sp{content = C0, reasoning = R0, calls = N0} = Sp) ->
+    C = maps:get(content, Msg, <<>>),
+    R =
+        case maps:get(reasoning_content, Msg, undefined) of
+            B when is_binary(B) -> B;
+            _ -> <<>>
+        end,
+    Calls = maps:get(tool_calls, Msg, []),
+    {DC, C1} = suffix(C0, C),
+    {DR, R1} = suffix(R0, R),
+    New = [
+        {tool_call, #{index => I, id => call_id(maps:get(id, Call, undefined)), name => Name}}
+     || {I, #{name := Name} = Call} <- lists:zip(lists:seq(0, length(Calls) - 1), Calls),
+        I >= N0,
+        Name =/= <<>>
+    ],
+    Deltas = [{thinking, DR} || DR =/= <<>>] ++ [{token, DC} || DC =/= <<>>] ++ New,
+    {Deltas, Sp#sp{content = C1, reasoning = R1, calls = N0 + length(New)}}.
+
+%% What `New' adds to `Old'. A parse that rewrote what was already sent
+%% (it should not) sends nothing until it extends it again.
+suffix(Old, New) ->
+    case string:prefix(New, Old) of
+        nomatch -> {<<>>, Old};
+        Rest -> {iolist_to_binary(Rest), New}
+    end.
+
+%% The number of tokens `Msgs' (and the tools in `Opts') take once
+%% rendered through the model's template.
+-spec count_tokens(erllama:model(), [map()], map()) -> {ok, non_neg_integer()} | {error, term()}.
+count_tokens(Model, Msgs0, Opts) ->
+    {Msgs, _Media} = extract_media(Msgs0),
+    ChatOpts = maps:with(?CHAT_KEYS, Opts),
+    case erllama:chat_apply(Model, Msgs, ChatOpts) of
+        {ok, #{prompt := P}} ->
+            case erllama:tokenize(Model, P, #{add_special => false, parse_special => true}) of
+                {ok, Tokens} -> {ok, length(Tokens)};
+                {error, _} = E -> E
+            end;
+        {error, chat_not_supported} ->
+            case erllama:render_chat_template(Model, template_request(Msgs, ChatOpts)) of
+                {ok, Tokens} -> {ok, length(Tokens)};
+                {error, _} = E -> E
+            end;
+        {error, _} = E ->
+            E
     end.

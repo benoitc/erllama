@@ -298,7 +298,7 @@ the raw model distribution, before any sampler stage.
 -doc "Handle of an attached LoRA adapter; treat as opaque.".
 -type adapter() :: term().
 -doc "Parser handle produced by `chat_apply/3` for `chat_parse/3`; treat as opaque.".
--type chat_params() :: reference().
+-type chat_params() :: reference() | {thinking_closed, reference(), binary()}.
 -type chat_request() :: erllama_model_backend:chat_request().
 -doc "Assistant message parsed by `chat_parse/3` / returned by `chat/3`.".
 -type parsed_message() :: #{
@@ -517,6 +517,10 @@ Options for `complete/3`, `stream/3` and `continue/3`.
   reject `session_id` / `parent_key` / `expect_committed` /
   `speculative` / `prefix_checkpoint_len`. Stats gain
   `media => #{items, n_tokens, n_pos}`.
+- `media_add_special`: with `media`, whether the model's BOS token is
+  added when the prompt is evaluated (default `true`). Pass `false`
+  for a prompt rendered by a chat template, which already starts with
+  it (`chat_apply/3` output).
 - `speculative`: `true` or `#{n_match | n_max | n_min => pos_integer()}`
   (defaults 24/64/48) enables draft-model-free ngram speculation: a
   per-model hash table over previously seen tokens drafts likely
@@ -524,7 +528,7 @@ Options for `complete/3`, `stream/3` and `continue/3`.
   byte-identical to non-speculative decoding (including seeded
   sampling). Pauses while other requests run concurrently; silently
   disabled on recurrent/hybrid models, with `thinking`, or with
-  `logprobs`. Stats gain `speculative => #{drafted, accepted}`.
+  `logprobs`. Stats gain `speculative => #{drafted, accepted, rounds}`.
 """.
 -type request_opts() :: #{
     response_tokens => pos_integer(),

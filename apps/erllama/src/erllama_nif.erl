@@ -70,6 +70,12 @@
     spec_accept/3,
     spec_free/1,
     spec_step/4,
+    mtp_new/3,
+    mtp_step/5,
+    mtp_step_batch/4,
+    mtp_stats/1,
+    mtp_free/1,
+    mtp_trace/2,
     mtmd_init/3,
     mtmd_free/1,
     mtmd_caps/1,
@@ -77,15 +83,36 @@
     media_prefill/6,
     chat_templates_init/2,
     chat_templates_apply/2,
-    chat_parse/3
+    chat_parse/3,
+    tp_caps/0,
+    tp_open/5,
+    tp_bootstrap_reply/3,
+    tp_matvec/5,
+    tp_reduce/2,
+    tp_close/1,
+    tp_bootstrap_selftest/5,
+    tp_stats/1,
+    tp_decode/2,
+    tp_decode_seq/4,
+    kv_seq_pos_max/2,
+    ctx_diag/2,
+    tp_follow/2,
+    tp_send/2,
+    tp_kv_pack/2,
+    tp_kv_unpack/3
 ]).
+
+-export_type([tp_rank_ref/0, tp_bridge_ref/0]).
+-type tp_rank_ref() :: reference().
+-type tp_bridge_ref() :: reference().
 
 -export_type([chat_templates_ref/0, chat_params_ref/0]).
 -type chat_templates_ref() :: reference().
 -type chat_params_ref() :: reference().
 
--export_type([spec_ref/0]).
+-export_type([spec_ref/0, mtp_ref/0]).
 -type spec_ref() :: reference().
+-type mtp_ref() :: reference().
 
 -export_type([mtmd_ref/0]).
 -type mtmd_ref() :: reference().
@@ -590,6 +617,56 @@ spec_free(Spec) ->
 spec_step(Ctx, Sampler, SeqId, Draft) when is_list(Draft), Draft =/= [] ->
     nif_spec_step(Ctx, Sampler, SeqId, Draft).
 
+%% Experimental. An MTP drafter on `Ctx' from `DraftModel' (loaded
+%% with `load_mtp => true'), proposing up to `n_max' (default 2) tokens
+%% a round; see nif_mtp_step in c_src/erllama_nif_mtp.c. One per
+%% context; it turns on the context's nextn embeddings.
+-spec mtp_new(context_ref(), model_ref(), map()) -> {ok, mtp_ref()} | {error, term()}.
+mtp_new(Ctx, DraftModel, Opts) when is_map(Opts) -> nif_mtp_new(Ctx, DraftModel, Opts).
+
+%% One MTP round on `SeqId': sample the next token, draft up to
+%% `MaxDraft' after it, verify them in one decode and drop the rejected
+%% ones. Returns the tokens now in the KV (the sampled one and the
+%% accepted drafts) and how many drafts were accepted. Needs a greedy
+%% sampler (`{error, not_greedy}' otherwise).
+-spec mtp_step(context_ref(), sampler_ref(), mtp_ref(), non_neg_integer(), non_neg_integer()) ->
+    {ok, {spec, [token_id()], 0 | 1, non_neg_integer()}} | {error, term()}.
+mtp_step(Ctx, Sampler, Mtp, SeqId, MaxDraft) -> nif_mtp_step(Ctx, Sampler, Mtp, SeqId, MaxDraft).
+
+%% One mtp_step/5 round for several sequences in one verify batch. Each
+%% item is `{Sampler, SeqId, Drafts}': `auto' (up to MaxDraft),
+%% `{auto, Cap}', `[]' (the next token alone, any sampler) or a list of
+%% tokens to verify (tests). The call must hold every sequence that
+%% needs a token: one it leaves out answers `{error, stale_logits}' on
+%% its next sample. Each item has its own sequence and its own sampler
+%% (badarg otherwise). Returns `{Seq, Committed, Eog, NAcc, NDrafted}'
+%% per item (NDrafted: the guesses verified for it) and the round's
+%% draft, verify and rollback microseconds.
+-spec mtp_step_batch(
+    context_ref(),
+    mtp_ref(),
+    [{sampler_ref(), non_neg_integer(), auto | {auto, non_neg_integer()} | [token_id()]}],
+    non_neg_integer()
+) ->
+    {ok, [{non_neg_integer(), [token_id()], 0 | 1, non_neg_integer(), non_neg_integer()}], map()}
+    | {error, term()}.
+mtp_step_batch(Ctx, Mtp, Items, MaxDraft) when is_list(Items) ->
+    nif_mtp_step_batch(Ctx, Mtp, Items, MaxDraft).
+
+%% Rounds, drafted and accepted tokens, and the microseconds spent
+%% drafting, verifying and rolling back.
+-spec mtp_stats(mtp_ref()) -> #{atom() => non_neg_integer()} | {error, released}.
+mtp_stats(Mtp) -> nif_mtp_stats(Mtp).
+
+-spec mtp_free(mtp_ref()) -> ok | {error, released}.
+mtp_free(Mtp) -> nif_mtp_free(Mtp).
+
+%% Tests: record every round from `on' (the batch, the drafts kept and
+%% the top 8 logits of each row), stop with `off', or `read' the rounds
+%% recorded as `#{pos, tokens, n_acc, rows => [[{Id, Logit}]]}'.
+-spec mtp_trace(mtp_ref(), on | off | read) -> ok | [map()] | {error, term()}.
+mtp_trace(Mtp, Op) -> nif_mtp_trace(Mtp, Op).
+
 %% Multimodal projector (libmtmd): load an mmproj GGUF against a
 %% loaded text model. Opts: use_gpu (default true), n_threads,
 %% image_min_tokens, image_max_tokens.
@@ -721,6 +798,12 @@ nif_spec_draft(_Spec, _SeqId, _IdLast, _Delta) -> erlang:nif_error(nif_not_loade
 nif_spec_accept(_Spec, _SeqId, _N) -> erlang:nif_error(nif_not_loaded).
 nif_spec_free(_Spec) -> erlang:nif_error(nif_not_loaded).
 nif_spec_step(_Ctx, _Sampler, _SeqId, _Draft) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_new(_Ctx, _Model, _Opts) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_step(_Ctx, _Sampler, _Mtp, _SeqId, _MaxDraft) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_step_batch(_Ctx, _Mtp, _Items, _MaxDraft) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_stats(_Mtp) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_free(_Mtp) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_trace(_Mtp, _Op) -> erlang:nif_error(nif_not_loaded).
 nif_mtmd_init(_Model, _Path, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_mtmd_free(_Mtmd) -> erlang:nif_error(nif_not_loaded).
 nif_mtmd_caps(_Mtmd) -> erlang:nif_error(nif_not_loaded).
@@ -730,3 +813,95 @@ nif_media_prefill(_Ctx, _Mtmd, _Prompt, _Media, _SeqId, _Opts) ->
 nif_chat_templates_init(_Model, _Override) -> erlang:nif_error(nif_not_loaded).
 nif_chat_templates_apply(_Templates, _Inputs) -> erlang:nif_error(nif_not_loaded).
 nif_chat_parse(_Params, _Input, _IsPartial) -> erlang:nif_error(nif_not_loaded).
+
+%% =============================================================================
+%% Tensor parallelism (experimental, rank-local; see erllama_tp)
+%% =============================================================================
+
+-spec tp_caps() -> {ok, map()} | {error, atom()}.
+tp_caps() -> nif_tp_caps().
+
+-spec tp_open(non_neg_integer(), non_neg_integer(), pos_integer(), pid(), non_neg_integer()) ->
+    {ok, tp_rank_ref()} | {error, atom()}.
+tp_open(Gpu, Rank, World, Agent, TimeoutMs) -> nif_tp_open(Gpu, Rank, World, Agent, TimeoutMs).
+
+-spec tp_bootstrap_reply(tp_bridge_ref(), pos_integer(), binary() | error) -> ok | {error, stale}.
+tp_bootstrap_reply(Bridge, Round, Reply) -> nif_tp_bootstrap_reply(Bridge, Round, Reply).
+
+-spec tp_matvec(tp_rank_ref(), pos_integer(), pos_integer(), binary(), binary()) ->
+    {ok, binary(), binary()} | {error, atom()}.
+tp_matvec(Rank, Rows, Cols, W, X) -> nif_tp_matvec(Rank, Rows, Cols, W, X).
+
+-spec tp_reduce(tp_rank_ref(), binary()) -> {ok, binary()} | {error, atom()}.
+tp_reduce(Rank, F32) -> nif_tp_reduce(Rank, F32).
+
+-spec tp_close(tp_rank_ref()) -> ok.
+tp_close(Rank) -> nif_tp_close(Rank).
+
+-spec tp_bootstrap_selftest(pos_integer(), binary(), pos_integer(), pid(), non_neg_integer()) ->
+    {ok, [binary()]} | {error, atom()}.
+tp_bootstrap_selftest(World, Payload, Rounds, Agent, TimeoutMs) ->
+    nif_tp_bootstrap_selftest(World, Payload, Rounds, Agent, TimeoutMs).
+
+nif_tp_caps() -> erlang:nif_error(nif_not_loaded).
+nif_tp_open(_Gpu, _Rank, _World, _Agent, _TimeoutMs) -> erlang:nif_error(nif_not_loaded).
+nif_tp_bootstrap_reply(_Bridge, _Round, _Reply) -> erlang:nif_error(nif_not_loaded).
+nif_tp_matvec(_Rank, _Rows, _Cols, _W, _X) -> erlang:nif_error(nif_not_loaded).
+nif_tp_reduce(_Rank, _F32) -> erlang:nif_error(nif_not_loaded).
+nif_tp_close(_Rank) -> erlang:nif_error(nif_not_loaded).
+nif_tp_bootstrap_selftest(_World, _Payload, _Rounds, _Agent, _TimeoutMs) ->
+    erlang:nif_error(nif_not_loaded).
+
+-spec tp_stats(tp_rank_ref()) -> {ok, map()}.
+tp_stats(Rank) -> nif_tp_stats(Rank).
+
+-spec tp_decode(context_ref(), [token_id()]) -> {ok, binary()} | {error, atom()}.
+tp_decode(Ctx, Tokens) -> nif_tp_decode(Ctx, Tokens).
+
+nif_tp_stats(_Rank) -> erlang:nif_error(nif_not_loaded).
+nif_tp_decode(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
+
+%% tp_decode/2 on sequence `Seq', with the logits of every row (`true')
+%% or of the last one, summed over the group; and the microseconds the
+%% decode took on this rank, then the logits reduction.
+-spec tp_decode_seq(context_ref(), non_neg_integer(), [token_id()], boolean()) ->
+    {ok, binary(), non_neg_integer(), non_neg_integer()} | {error, atom()}.
+tp_decode_seq(Ctx, Seq, Tokens, All) -> nif_tp_decode_seq(Ctx, Seq, Tokens, All).
+
+nif_tp_decode_seq(_Ctx, _Seq, _Tokens, _All) -> erlang:nif_error(nif_not_loaded).
+
+%% The highest position sequence `Seq' holds, -1 when empty.
+-spec kv_seq_pos_max(context_ref(), non_neg_integer()) -> integer() | {error, atom()}.
+kv_seq_pos_max(Ctx, Seq) -> nif_kv_seq_pos_max(Ctx, Seq).
+
+nif_kv_seq_pos_max(_Ctx, _Seq) -> erlang:nif_error(nif_not_loaded).
+
+%% Diagnostics of a context opened with `diag_inputs => true': `arm'
+%% records the input tensors of the next decodes' graphs, `read' returns
+%% them as `{Name, Type, [Ne0, Ne1, Ne2, Ne3]}' and disarms. `perf'
+%% (any context): llama.cpp's graph reuse and reallocation counters.
+-spec ctx_diag(context_ref(), arm | read | perf) -> ok | list() | map() | {error, atom()}.
+ctx_diag(Ctx, Op) -> nif_ctx_diag(Ctx, Op).
+
+nif_ctx_diag(_Ctx, _Op) -> erlang:nif_error(nif_not_loaded).
+
+-spec tp_follow(context_ref(), tuple()) -> ok | {error, atom()}.
+tp_follow(Ctx, Cmd) -> nif_tp_follow(Ctx, Cmd).
+
+nif_tp_follow(_Ctx, _Cmd) -> erlang:nif_error(nif_not_loaded).
+
+%% On the serving rank of a split model: put `Cmd' in the stream the
+%% other ranks follow, after every batch decoded so far.
+-spec tp_send(context_ref(), term()) -> ok | {error, atom()}.
+tp_send(Ctx, Cmd) -> nif_tp_send(Ctx, Cmd).
+
+%% This rank's share of a split model's KV for `SeqId', and its restore.
+-spec tp_kv_pack(context_ref(), non_neg_integer()) -> binary() | {error, atom()}.
+tp_kv_pack(Ctx, SeqId) -> nif_tp_kv_pack(Ctx, SeqId).
+
+-spec tp_kv_unpack(context_ref(), binary(), non_neg_integer()) -> ok | {error, atom()}.
+tp_kv_unpack(Ctx, Bin, SeqId) -> nif_tp_kv_unpack(Ctx, Bin, SeqId).
+
+nif_tp_send(_Ctx, _Cmd) -> erlang:nif_error(nif_not_loaded).
+nif_tp_kv_pack(_Ctx, _SeqId) -> erlang:nif_error(nif_not_loaded).
+nif_tp_kv_unpack(_Ctx, _Bin, _SeqId) -> erlang:nif_error(nif_not_loaded).

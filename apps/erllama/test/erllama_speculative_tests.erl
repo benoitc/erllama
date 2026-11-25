@@ -172,7 +172,7 @@ no_draft_available_falls_back_test() ->
         ?assertEqual(6, length(maps:get(generated, R))),
         %% Option accepted (stats key present) but nothing drafted.
         ?assertEqual(
-            #{drafted => 0, accepted => 0}, maps:get(speculative, R)
+            #{drafted => 0, accepted => 0, rounds => 0}, maps:get(speculative, R)
         )
     end).
 
@@ -216,7 +216,7 @@ pauses_under_concurrency_test() ->
             {Out, Stats} = collect_stream(SpecRef, 30000),
             ?assertEqual(5, length(Out)),
             ?assertEqual(
-                #{drafted => 0, accepted => 0},
+                #{drafted => 0, accepted => 0, rounds => 0},
                 maps:get(speculative, Stats)
             ),
             ok = erllama:cancel(HolderRef)

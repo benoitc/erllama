@@ -46,7 +46,12 @@ config_rejects_bad_values_test() ->
         {error, {invalid_config, max_active_runs, many}},
         erllama_server_config:validate(#{max_active_runs => many})
     ),
-    ?assertEqual(ok, erllama_server_config:validate(#{run_retention_ms => 0})).
+    ?assertEqual(ok, erllama_server_config:validate(#{run_retention_ms => 0})),
+    V = fun erllama_server_config:validate/1,
+    ?assertEqual(ok, V(#{default_parallel => 1, kv_unified => false})),
+    ?assertMatch({error, {invalid_config, default_parallel, 0}}, V(#{default_parallel => 0})),
+    ?assertMatch({error, {invalid_config, default_parallel, 65}}, V(#{default_parallel => 65})),
+    ?assertMatch({error, {invalid_config, kv_unified, yes}}, V(#{kv_unified => yes})).
 
 bad_config_fails_the_start_test() ->
     application:set_env(erllama_server, run_buffer_events, -1),
@@ -62,12 +67,25 @@ bad_config_fails_the_start_test() ->
 conversations_test_() ->
     {setup,
         fun() ->
+            %% Conversations are persisted: keep them in a scratch directory,
+            %% never in the user's data directory.
+            Dir = filename:join([
+                os:getenv("TMPDIR", "/tmp"),
+                "erllama_api_tests",
+                os:getpid() ++ "-" ++ integer_to_list(erlang:unique_integer([positive]))
+            ]),
+            ok = application:set_env(erllama_server, data_dir, Dir),
             {ok, Pid} = gen_server:start(
                 {local, erllama_server_convs}, erllama_server_convs, [], []
             ),
-            Pid
+            {Pid, Dir}
         end,
-        fun(Pid) -> gen_server:stop(Pid) end, [
+        fun({Pid, Dir}) ->
+            gen_server:stop(Pid),
+            application:unset_env(erllama_server, data_dir),
+            file:del_dir_r(Dir)
+        end,
+        [
             fun one_run_at_a_time/0,
             fun turn_records_messages_and_parent_key/0,
             fun parent_key_is_per_model/0,

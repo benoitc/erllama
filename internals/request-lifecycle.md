@@ -18,6 +18,30 @@ The default context has `n_seq_max => 1`, which keeps single-request
 behavior simple and deterministic. Setting `context_opts.n_seq_max > 1`
 opts into concurrent prefill/decode across multiple active sequences.
 
+## Before admission: work outside the model process
+
+While the model generates, its process spends most of its time in the
+decode step, so any call it has to answer waits for that step. Reading
+the vocabulary or the chat templates does not need the context, so it
+does not go through the model process:
+
+- At init the model publishes its backend's shared state
+  (`shared_state/1` in `erllama_model_backend`, the model reference for
+  the llama.cpp backend) in its `erllama_registry` row. The row goes
+  away with the process.
+- `tokenize`, `detokenize` and, once the templates are built,
+  `chat_apply` run in the caller's process with it. Tokenising takes
+  the model's lock, a decode step takes the context's, so they run side
+  by side; a read racing an unload gets `{error, not_loaded}`.
+- The model process alone builds the chat templates (on the first
+  `chat_apply`) and stores them in `erllama_chat_cache` under its id and
+  pid, so a model loaded again under the same id builds its own.
+
+Called with a pid, or on a backend without `shared_state/1`, these
+calls still go through the model process. Tests:
+`erllama_model_tests` (the stub) and the `shared_reads_*` cases in
+`erllama_real_model_SUITE`.
+
 ## Admission
 
 Every request starts by taking a sequence id from the model's idle pool. If

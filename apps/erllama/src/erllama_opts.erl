@@ -43,7 +43,15 @@
     fail_media_prefill,
     %% multimodal projector (libmtmd)
     mmproj_path,
-    mmproj_opts
+    mmproj_opts,
+    %% MTP draft model (speculative => #{type => mtp}), experimental
+    draft_model,
+    draft_model_opts,
+    %% erllama_model_tp (experimental tensor parallelism)
+    tp_worker,
+    tp_followers,
+    tp_call_timeout,
+    tp_kv_timeout
 ]).
 
 -define(MODEL_OPT_KEYS, [
@@ -58,7 +66,10 @@
     devices,
     cpu_moe,
     tensor_buft_overrides,
-    fit
+    fit,
+    load_mtp,
+    %% experimental: split over an erllama_tp rank's group
+    tp_rank
 ]).
 
 -define(CONTEXT_OPT_KEYS, [
@@ -77,7 +88,9 @@
     type_v,
     moe_cache_size,
     moe_cache_cpu_share,
-    decode_budget_ms
+    decode_budget_ms,
+    %% experimental: on the serving rank of a split model
+    tp_sink
 ]).
 
 -define(POLICY_KEYS, [
@@ -154,7 +167,8 @@
             expect_committed,
             middleware,
             speculative,
-            media
+            media,
+            media_add_special
         ]
 ).
 
@@ -281,7 +295,13 @@ base_load_checks() ->
         {context_opts, fun is_map/1},
         {policy, fun is_map/1},
         {mmproj_path, fun is_path/1},
-        {mmproj_opts, fun mmproj_opts_check/1}
+        {mmproj_opts, fun mmproj_opts_check/1},
+        {draft_model, fun is_path/1},
+        {draft_model_opts, fun is_map/1},
+        {tp_worker, fun is_pid/1},
+        {tp_followers, fun is_list/1},
+        {tp_call_timeout, fun(V) -> V =:= infinity orelse pos_int(V) end},
+        {tp_kv_timeout, fun pos_int/1}
     ].
 
 %% Stub-backend test knobs.
@@ -330,7 +350,9 @@ model_opt_checks() ->
         {devices, fun devices_opt/1},
         {cpu_moe, fun cpu_moe_opt/1},
         {tensor_buft_overrides, fun tbo_opt/1},
-        {fit, fun fit_opt/1}
+        {fit, fun fit_opt/1},
+        {load_mtp, fun is_boolean/1},
+        {tp_rank, fun is_reference/1}
     ].
 
 %% `cpu_moe => true | N`: all expert tensors to CPU, or the first N
@@ -407,7 +429,8 @@ context_opt_checks() ->
         {type_v, fun(V) -> lists:member(V, ?KV_TYPES) end},
         {moe_cache_size, fun non_neg_int/1},
         {moe_cache_cpu_share, fun(V) -> is_number(V) andalso V >= 0 andalso V =< 1 end},
-        {decode_budget_ms, fun pos_int/1}
+        {decode_budget_ms, fun pos_int/1},
+        {tp_sink, fun is_pid/1}
     ].
 
 policy_checks() ->
@@ -527,7 +550,8 @@ base_request_checks() ->
         {trigger_tokens, fun(V) -> is_list(V) andalso lists:all(fun non_neg_int/1, V) end},
         {grammar_prefill, fun is_binary/1},
         {speculative, fun speculative_opt/1},
-        {media, fun media_opt/1}
+        {media, fun media_opt/1},
+        {media_add_special, fun is_boolean/1}
     ].
 
 %% `media => [#{type := image | audio, data := binary()}]` - encoded
@@ -551,9 +575,21 @@ media_opt(_) ->
     false.
 
 %% `speculative => true | false | #{type => ngram_mod, n_match | n_max
-%% | n_min => pos_int()}`. `true` = ngram_mod with upstream defaults.
+%% | n_min => pos_int()} | #{type => mtp, n_max => pos_int()}`. `true` =
+%% ngram_mod with upstream defaults; `mtp` drafts with the model's
+%% `draft_model` (experimental).
 speculative_opt(V) when is_boolean(V) ->
     true;
+speculative_opt(#{type := mtp} = V) ->
+    maps:fold(
+        fun
+            (type, _, Acc) -> Acc;
+            (n_max, N, Acc) -> Acc andalso pos_int(N) andalso N =< 16;
+            (_, _, _) -> false
+        end,
+        true,
+        V
+    );
 speculative_opt(V) when is_map(V) ->
     Known = [type, n_match, n_max, n_min],
     maps:fold(

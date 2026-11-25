@@ -27,6 +27,8 @@ from `NextSeq`.
     api_version/0,
     hello/1,
     status/0,
+    inspect/1,
+    failures/1,
     models/0,
     show/1,
     ps/0,
@@ -48,7 +50,25 @@ from `NextSeq`.
     run/1,
     runs/0,
     conversation/1,
-    conversations/0
+    conversations/0,
+    conversation_fork/1,
+    conversation_delete/1,
+    conversation_export/2,
+    conversation_compact/1,
+    agent_start/1,
+    agent_send/2,
+    agent_approve/3,
+    agent_interrupt/1,
+    agent_stop/1,
+    agent_compact/1,
+    agents/0,
+    mcp/0,
+    mcp_tools/0,
+    mcp_resources/1,
+    mcp_read/2,
+    mcp_prompts/1,
+    mcp_prompt/3,
+    agent_prompt/4
 ]).
 
 -include("erllama_server_api.hrl").
@@ -74,37 +94,33 @@ hello(?API_VSN) ->
 hello(Client) ->
     {error, {incompatible_api, #{server => ?API_VSN, client => Client}}}.
 
--doc "Versions, loaded models, active jobs, memory pressure and VRAM.".
+-doc """
+What the release is doing: versions; loaded models with their
+sequences in use and requests waiting for one; runs by phase; agent
+sessions with pending approvals, running tools and background jobs; MCP
+servers; cache activity; memory pressure and VRAM; and the latest
+failures with what happened next. Cheap enough to poll: it reads
+tables, and asks each agent session for a summary.
+""".
 -spec status() -> {ok, map()}.
 status() ->
-    Pressure =
-        case erllama:pressure() of
-            {ok, P} -> P;
-            {error, _} -> undefined
-        end,
-    {ok, #{
-        api => ?API_VSN,
-        server_vsn => app_vsn(erllama_server),
-        erllama_vsn => app_vsn(erllama),
-        node => node(),
-        models => ps_or_empty(),
-        active_runs => erllama_server_runs:active_count(run),
-        active_pulls => erllama_server_runs:active_count(pull),
-        pressure => Pressure,
-        vram => vram()
-    }}.
+    {ok, erllama_server_status:status(?API_VSN, app_vsn(erllama_server), app_vsn(erllama))}.
 
-ps_or_empty() ->
-    {ok, Ps} = ps(),
-    Ps.
+-doc """
+One job in detail: a run (its phase, model, conversation, the next
+event sequence), an agent session (its state, pending approvals with
+their arguments, running tools, background jobs, budgets and the
+current turn's use of them, and `turn_seq`, where its latest turn
+starts in the event stream) or a download.
+""".
+-spec inspect(binary()) -> {ok, map()} | {error, term()}.
+inspect(Id) ->
+    erllama_server_status:inspect(Id).
 
-vram() ->
-    try erllama:vram_info() of
-        {ok, V} -> V;
-        _ -> undefined
-    catch
-        _:_ -> undefined
-    end.
+-doc "The last `N` failures, newest first: kind, subject, reason, outcome.".
+-spec failures(non_neg_integer()) -> {ok, [map()]}.
+failures(N) when is_integer(N), N >= 0 ->
+    {ok, erllama_server_failures:recent(N)}.
 
 -doc """
 The registry's models, with whether each is loaded, plus models loaded
@@ -158,7 +174,8 @@ ps() ->
 
 -doc """
 Register a GGUF file on the release machine. `Opts`: `name`, `mmproj`,
-`n_ctx`, `n_gpu_layers`, `chat_template`, `keep_alive`.
+`n_ctx`, `n_gpu_layers`, `parallel` (requests served at once, default
+`default_parallel`), `kv_unified`, `chat_template`, `keep_alive`.
 """.
 -spec register_model(binary() | string(), map()) -> {ok, map()} | {error, term()}.
 register_model(Path, Opts) when is_map(Opts) ->
@@ -229,7 +246,7 @@ Download a model and register it; returns the job id to follow with
 `attach/3`. `Source`: `hf://ORG/REPO[:QUANT]`, `hf://ORG/REPO/FILE.gguf`,
 `https://...gguf`, `ollama://NAME[:TAG]` or `NAME[:TAG]`. `Opts`:
 `name`, `sha256` (https), `revision` (hf), `n_ctx`, `n_gpu_layers`,
-`keep_alive`.
+`parallel`, `kv_unified`, `keep_alive`.
 """.
 -spec pull(binary() | string(), map()) -> {ok, #{job_id := binary()}} | {error, term()}.
 pull(Source, Opts) when is_map(Opts) ->
@@ -352,7 +369,7 @@ go(Pid) ->
 
 input(#{messages := Msgs, prompt := _}) when is_list(Msgs) ->
     {error, {invalid_spec, messages_and_prompt}};
-input(#{prompt := _, conversation_id := _}) ->
+input(#{prompt := _, conversation_id := C}) when C =/= none ->
     {error, {invalid_spec, prompt_with_conversation}};
 input(#{prompt := P}) when is_binary(P), P =/= <<>> ->
     {prompt, P};
@@ -422,6 +439,45 @@ conversation(Id) ->
 conversations() ->
     {ok, [maps:remove(last_finish_key, C) || C <- erllama_server_convs:list()]}.
 
+-doc "A new conversation with a copy of `Id`'s history; the two then go their own ways.".
+-spec conversation_fork(binary()) -> {ok, #{conversation_id := binary()}} | {error, not_found}.
+conversation_fork(Id) ->
+    case erllama_server_convs:fork(Id) of
+        {ok, New} -> {ok, #{conversation_id => New}};
+        {error, _} = E -> E
+    end.
+
+-doc """
+Compact a conversation now, as happens before a turn when it nears the
+model's context: system messages, the first request and the recent
+messages are kept, the middle is summarised by the conversation's
+model. Refused while a run or a session holds it (`agent_compact/1`
+compacts a session's conversation). Returns the message counts before
+and after, or `compacted => false` when there was nothing to drop.
+""".
+-spec conversation_compact(binary()) -> {ok, map()} | {error, term()}.
+conversation_compact(Id) ->
+    case erllama_server_convs:get(Id) of
+        {ok, #{model := Model}} -> erllama_server_compact:conversation(Id, Model);
+        {error, _} = E -> E
+    end.
+
+-doc "Forget a conversation and its log. Refused while a run or a session holds it.".
+-spec conversation_delete(binary()) -> ok | {error, conversation_busy}.
+conversation_delete(Id) ->
+    erllama_server_convs:delete(Id).
+
+-doc """
+A conversation as one document: `json` (its fields and messages, media
+as base64) or `markdown` (readable, one section per message).
+""".
+-spec conversation_export(binary(), json | markdown) -> {ok, binary()} | {error, not_found}.
+conversation_export(Id, Format) ->
+    case erllama_server_convs:get(Id) of
+        {ok, C} -> {ok, erllama_server_conv_export:export(Format, C)};
+        {error, _} = E -> E
+    end.
+
 with_run(RunId, Fun) ->
     case erllama_server_runs:lookup(RunId) of
         {ok, #{pid := Pid}} -> Fun(Pid);
@@ -433,3 +489,216 @@ app_vsn(App) ->
         {ok, V} -> list_to_binary(V);
         undefined -> <<"unknown">>
     end.
+
+%% -----------------------------------------------------------------------------
+%% Agent sessions
+%% -----------------------------------------------------------------------------
+
+-doc """
+Start an agent session: a model working with tools in `workspace`, a
+directory on the release machine. `Spec`:
+
+- `model` (registry name or alias; default model when absent) and
+  `workspace` (required, unless `conversation_id` names a conversation
+  an agent already worked in: its workspace is used);
+- `conversation_id`: continue that conversation (it must be free);
+- `policy`: `yes` (every tool runs without asking), `read_only` (tools
+  that change the workspace are denied), or `#{ToolName => auto | ask |
+  deny}`; by default reading runs and changing asks;
+- `budgets`: `max_rounds`, `max_tokens`, `max_elapsed_ms` per turn;
+- `system`: the system prompt (`WORKSPACE` is replaced by the path).
+
+Returns the session id, which is also its job id for `attach/3`.
+""".
+-spec agent_start(map()) ->
+    {ok, #{agent_id := binary(), conversation_id := binary()}} | {error, term()}.
+agent_start(#{workspace := Dir} = Spec) ->
+    case
+        {
+            erllama_server_models:resolve(maps:get(model, Spec, undefined)),
+            erllama_server_workspace:open(Dir)
+        }
+    of
+        {{ok, Target}, {ok, Ws}} ->
+            Model =
+                case Target of
+                    {registry, #{name := N}} -> N;
+                    {loaded, N} -> N
+                end,
+            start_agent(Spec, Model, Ws);
+        {{error, _} = E, _} ->
+            E;
+        {_, {error, R}} ->
+            {error, {workspace, R}}
+    end;
+agent_start(#{conversation_id := Conv} = Spec) ->
+    %% Resuming: the workspace the conversation was last worked in.
+    case erllama_server_convs:get(to_binary(Conv)) of
+        {ok, #{workspace := Ws}} when is_binary(Ws) -> agent_start(Spec#{workspace => Ws});
+        _ -> {error, {missing, workspace}}
+    end;
+agent_start(_Spec) ->
+    {error, {missing, workspace}}.
+
+to_binary(B) when is_binary(B) -> B;
+to_binary(L) -> unicode:characters_to_binary(L).
+
+start_agent(Spec, Model, Ws) ->
+    Id = erllama_server_ids:agent(),
+    Info = #{kind => agent, workspace => Ws},
+    case
+        erllama_server_convs:begin_run(maps:get(conversation_id, Spec, undefined), Model, Id, Info)
+    of
+        {ok, #{id := Conv} = Held} ->
+            case erllama_server_runs:start(agent_spec(Spec, Id, Model, Ws, Held)) of
+                {ok, _} ->
+                    {ok, #{agent_id => Id, conversation_id => Conv}};
+                {error, _} = E ->
+                    ok = erllama_server_convs:release(Conv, Id),
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+agent_spec(Spec, Id, Model, Ws, #{id := Conv, messages := History, parent_key := PK}) ->
+    Base = #{
+        run_id => Id,
+        kind => agent,
+        model => Model,
+        workspace => Ws,
+        conversation_id => Conv,
+        history => History,
+        parent_key => PK,
+        policy => agent_policy(maps:get(policy, Spec, #{})),
+        mode => agent_mode(maps:get(policy, Spec, #{})),
+        budgets => maps:with(
+            [max_rounds, max_tokens, max_elapsed_ms], maps:get(budgets, Spec, #{})
+        )
+    },
+    maps:merge(Base, maps:with([system, generator], Spec)).
+
+agent_mode(P) when P =:= yes; P =:= read_only -> P;
+agent_mode(_) -> default.
+
+agent_policy(yes) ->
+    maps:from_list([{N, auto} || N <- erllama_server_tools:names()]);
+agent_policy(read_only) ->
+    maps:from_list([
+        {N, deny}
+     || N <- erllama_server_tools:names(), erllama_server_tools:class(N) =:= write
+    ]);
+agent_policy(M) when is_map(M) ->
+    maps:filter(fun(K, V) -> is_binary(K) andalso lists:member(V, [auto, ask, deny]) end, M);
+agent_policy(_) ->
+    #{}.
+
+-doc "Input for a session: starts a turn, or waits for the current one (`{queued, N}`).".
+-spec agent_send(binary(), binary()) -> ok | {queued, pos_integer()} | {error, term()}.
+agent_send(Id, Text) ->
+    with_agent(Id, fun(Pid) ->
+        erllama_server_agent:send(Pid, unicode:characters_to_binary(Text))
+    end).
+
+-doc "Answer an `approval_request`: `allow`, `deny`, or `always` (allow this tool for the session).".
+-spec agent_approve(binary(), binary(), allow | deny | always) -> ok | {error, term()}.
+agent_approve(Id, CallId, Decision) when
+    Decision =:= allow; Decision =:= deny; Decision =:= always
+->
+    with_agent(Id, fun(Pid) -> erllama_server_agent:approve(Pid, CallId, Decision) end).
+
+-doc "Stop the session's current turn (generation and tools). Queued input then runs.".
+-spec agent_interrupt(binary()) -> ok | {error, term()}.
+agent_interrupt(Id) ->
+    with_agent(Id, fun erllama_server_agent:interrupt/1).
+
+-doc "End a session. Its conversation stays and can be continued.".
+-spec agent_stop(binary()) -> ok | {error, term()}.
+agent_stop(Id) ->
+    with_agent(Id, fun erllama_server_agent:stop/1).
+
+-doc "Compact an idle session's conversation now (see `conversation_compact/1`).".
+-spec agent_compact(binary()) -> {ok, map()} | {error, term()}.
+agent_compact(Id) ->
+    with_agent(Id, fun erllama_server_agent:compact/1).
+
+-doc "The agent sessions the release holds.".
+-spec agents() -> {ok, [map()]}.
+agents() ->
+    {ok, [
+        S
+     || #{kind := agent, pid := P} <- erllama_server_runs:list(),
+        {ok, S} <- [erllama_server_job:info(P)]
+    ]}.
+
+with_agent(Id, Fun) ->
+    case erllama_server_runs:lookup(Id) of
+        {ok, #{kind := agent, pid := Pid}} -> Fun(Pid);
+        {ok, _} -> {error, not_an_agent};
+        {error, _} = E -> E
+    end.
+
+%% -----------------------------------------------------------------------------
+%% MCP servers
+%% -----------------------------------------------------------------------------
+
+-doc """
+The configured MCP servers: `name`, `transport`, `status` (`connecting`,
+`ready` or `down`), the number of `tools`, and the last `error`.
+""".
+-spec mcp() -> {ok, [map()]}.
+mcp() ->
+    {ok, erllama_server_mcp:status()}.
+
+-doc """
+The MCP tools agent sessions are offered now, by their namespaced name,
+with the server, the server's own name for the tool, the policy, and
+`class` (`read` when the server marks the tool read-only).
+""".
+-spec mcp_tools() -> {ok, [map()]}.
+mcp_tools() ->
+    {ok, [maps:without([parameters], T) || T <- erllama_server_mcp:catalog()]}.
+
+-doc "The resources an MCP server lists, one per line.".
+-spec mcp_resources(binary()) -> {ok, binary()} | {error, binary()}.
+mcp_resources(Server) ->
+    erllama_server_mcp:resources(Server).
+
+-doc "The text of a resource of an MCP server.".
+-spec mcp_read(binary(), binary()) -> {ok, binary()} | {error, binary()}.
+mcp_read(Server, Uri) ->
+    erllama_server_mcp:read_resource(Server, Uri).
+
+-doc "The prompts an MCP server offers: `name`, `description`, `arguments`.".
+-spec mcp_prompts(binary()) -> {ok, [map()]} | {error, binary()}.
+mcp_prompts(Server) ->
+    erllama_server_mcp:prompts(Server).
+
+-doc "An MCP server's prompt filled with `Args`: the messages it expands to.".
+-spec mcp_prompt(binary(), binary(), #{binary() => binary()}) -> {ok, [map()]} | {error, binary()}.
+mcp_prompt(Server, Name, Args) ->
+    erllama_server_mcp:get_prompt(Server, Name, Args).
+
+-doc """
+Send an MCP server's prompt to an agent session as its input, as
+`agent_send/2` would send text. A prompt's assistant messages are kept,
+marked as such.
+""".
+-spec agent_prompt(binary(), binary(), binary(), #{binary() => binary()}) ->
+    ok | {queued, pos_integer()} | {error, term()}.
+agent_prompt(Id, Server, Name, Args) ->
+    case erllama_server_mcp:get_prompt(Server, Name, Args) of
+        {ok, Msgs} -> agent_send(Id, prompt_text(Msgs));
+        {error, _} = E -> E
+    end.
+
+prompt_text(Msgs) ->
+    iolist_to_binary(
+        lists:join(<<"\n\n">>, [
+            case R of
+                <<"assistant">> -> [<<"Assistant: ">>, C];
+                _ -> C
+            end
+         || #{role := R, content := C} <- Msgs
+        ])
+    ).

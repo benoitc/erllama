@@ -59,9 +59,23 @@ struct ggml_backend_meta_device_context {
     std::string name;
     std::string description;
 
+    // the simple device whose copy of a mirrored tensor is read: the first one that holds tensor data
+    // (one whose reg answers "ggml_backend_dev_holds_data" with false stands in for a device held elsewhere,
+    // e.g. by another process); 0 when no device says
+    size_t mirror_slot = 0;
+
     ggml_backend_meta_device_context(
             std::vector<ggml_backend_dev_t> simple_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) :
             simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
+        typedef bool (*holds_data_t)(ggml_backend_dev_t);
+        for (size_t i = 0; i < this->simple_devs.size(); i++) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(this->simple_devs[i]);
+            holds_data_t holds = reg ? (holds_data_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_holds_data") : nullptr;
+            if (holds == nullptr || holds(this->simple_devs[i])) {
+                mirror_slot = i;
+                break;
+            }
+        }
         name        = std::string("Meta(");
         description = std::string("Meta(");
         for (size_t i = 0; i < simple_devs.size(); i++) {
@@ -210,6 +224,12 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
     return meta_dev_ctx->simple_devs[index];
+}
+
+static size_t ggml_backend_meta_dev_mirror_slot(ggml_backend_dev_t meta_dev) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+    return meta_dev_ctx->mirror_slot;
 }
 
 ggml_backend_dev_t ggml_backend_meta_device(
@@ -748,6 +768,34 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
+        }
+        // a view with one dim walking the split axis in steps of whole elements (e.g. one channel of a
+        // [d_conv-1, channel] window), spanning one repetition of the axis and starting on one, while every
+        // other dim stays inside that step or moves across rows: split that dim in the same ratio
+        // (the recurrent-state snapshots of a conv cache holding the q, k and v windows one after the other)
+        if (axis >= 0 && axis < GGML_MAX_DIMS-1 && !ggml_is_permuted(tensor->src[0]) && src_ss[0].n_segments == 1 &&
+                src_ss[0].nr[0] > 0 && tensor->src[0]->ne[axis] % src_ss[0].nr[0] == 0) {
+            const ggml_tensor * src = tensor->src[0];
+            const size_t nb_axis = src->nb[axis];
+            const size_t nb_row  = src->nb[axis+1];
+            const size_t rep     = (size_t) (src->ne[axis] / src_ss[0].nr[0]) * nb_axis;
+            const size_t offs    = (tensor->view_offs - src->view_offs) % nb_row;
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                if (tensor->ne[dim] <= 1 || tensor->nb[dim] % nb_axis != 0 || tensor->nb[dim] >= nb_row ||
+                        (size_t) tensor->ne[dim]*tensor->nb[dim] != rep || offs % rep != 0) {
+                    continue;
+                }
+                bool others_ok = true;
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                    if (i == dim || tensor->ne[i] <= 1) {
+                        continue;
+                    }
+                    others_ok = others_ok && ((size_t) tensor->ne[i]*tensor->nb[i] <= tensor->nb[dim] || tensor->nb[i] % nb_row == 0);
+                }
+                if (others_ok) {
+                    return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
+                }
+            }
         }
         // a view that only regroups dims inside one slab of the split axis keeps the split,
         // the per-device strides are only rescaled above nb[axis] (e.g. the KV streams of a permuted q)
@@ -1720,8 +1768,8 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            // TODO other simple backend may be better
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+            const size_t slot = ggml_backend_meta_dev_mirror_slot(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer)));
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, slot);
             ggml_backend_tensor_get(simple_tensor, data, offset, size);
         } break;
         default: {
@@ -2037,9 +2085,9 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            // TODO other simple backend may be better
-            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+            const size_t slot = ggml_backend_meta_dev_mirror_slot(ggml_backend_get_device(backend));
+            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, slot);
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, slot);
             ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
         } break;
         default: {

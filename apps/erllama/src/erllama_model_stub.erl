@@ -34,6 +34,7 @@ paths).
 -export([
     init/1,
     terminate/1,
+    shared_state/1,
     tokenize/2,
     detokenize/2,
     detokenize/3,
@@ -203,6 +204,9 @@ step_delay_opt(Key, Config) ->
 
 terminate(_S) ->
     ok.
+
+%% The stub's tokeniser is a pure function of the text.
+shared_state(S) -> S.
 
 tokenize(_S, Text) when is_binary(Text) ->
     [

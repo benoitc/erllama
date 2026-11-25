@@ -121,7 +121,10 @@ bytes held per tier backend.
     }.
 info() ->
     Rows = erllama_cache_meta_srv:dump(),
-    Bytes = lists:foldl(
+    #{tiers => list_tiers(), entries => length(Rows), bytes => tier_bytes(Rows)}.
+
+tier_bytes(Rows) ->
+    lists:foldl(
         fun(Row, Acc) ->
             Tier = element(?POS_TIER, Row),
             Size = element(?POS_SIZE, Row),
@@ -129,8 +132,7 @@ info() ->
         end,
         #{ram => 0, ram_file => 0, disk => 0},
         Rows
-    ),
-    #{tiers => list_tiers(), entries => length(Rows), bytes => Bytes}.
+    ).
 
 -doc false.
 %% Started by `erllama_cache_sup' after the tier supervisor: adds every
@@ -157,11 +159,21 @@ start_configured_tiers() ->
 -doc """
 Snapshot of operational counters as a map of slot name to
 non-negative integer. Suitable for forwarding to a metrics exporter
-(Prometheus, statsd, OpenTelemetry).
+(Prometheus, statsd, OpenTelemetry). `bytes_ram`, `bytes_ramfile` and
+`bytes_disk` are the bytes each tier backend holds now (as `info/0`).
 """.
 -spec get_counters() -> #{atom() => non_neg_integer()}.
 get_counters() ->
-    erllama_cache_counters:snapshot().
+    #{ram := Ram, ram_file := RamFile, disk := Disk} =
+        try
+            tier_bytes(erllama_cache_meta_srv:dump())
+        catch
+            %% The cache is not running: nothing is held.
+            error:badarg -> tier_bytes([])
+        end,
+    (erllama_cache_counters:snapshot())#{
+        bytes_ram => Ram, bytes_ramfile => RamFile, bytes_disk => Disk
+    }.
 
 -doc """
 Reset all counters to 0. Mostly for tests; production callers should

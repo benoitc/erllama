@@ -6,6 +6,8 @@
 
 #include "erllama_nif_int.h"
 #include "erllama_safe.h"
+#include "erllama_tp_nif.h"
+#include "erllama_mtp.h"
 
 #include <math.h>
 #include <string.h>
@@ -57,6 +59,103 @@ static void free_step_ops(erllama_step_op_t *ops, unsigned int n) {
         if (ops[i].lp_vals) enif_free(ops[i].lp_vals);
     }
     enif_free(ops);
+}
+
+/* =========================================================================
+ * Decoding a context of a tensor-parallel model
+ *
+ * A model split over a tensor-parallel rank (`tp_rank' load option)
+ * runs on every rank of its group, and each llama_decode reaches the
+ * same collectives on every rank. The serving rank's context has a sink
+ * (`tp_sink'): every batch it decodes, and every KV change, is first
+ * sent there as `{erllama_tp, Seq, Cmd}', and the other ranks apply the
+ * commands in order (nif_tp_follow). After the decode, the output
+ * logits (each rank holds its slice of the vocabulary) are summed over
+ * the ranks, so the serving rank samples from the full logits.
+ * ========================================================================= */
+
+/* A batch as `{decode, Bin}': n, then token, pos, seq_id, logits per
+ * row, all native int32. */
+static ERL_NIF_TERM tp_batch_cmd(ErlNifEnv *menv, struct llama_batch *b) {
+    ERL_NIF_TERM bin;
+    int32_t *p = (int32_t *) enif_make_new_binary(
+        menv, sizeof(int32_t) * (1 + 4 * (size_t) b->n_tokens), &bin);
+    p[0] = b->n_tokens;
+    for (int32_t i = 0; i < b->n_tokens; i++) {
+        int32_t *row = p + 1 + 4 * (size_t) i;
+        row[0] = b->token[i];
+        row[1] = b->pos[i];
+        row[2] = b->seq_id[i][0];
+        row[3] = b->logits[i] ? 1 : 0;
+    }
+    return enif_make_tuple2(menv, enif_make_atom(menv, "decode"), bin);
+}
+
+/* Send `cmd' (built in `menv') to the context's sink with the next
+ * sequence number; frees `menv'. */
+void erllama_tp_send(ErlNifEnv *env, erllama_context_t *c, ErlNifEnv *menv, ERL_NIF_TERM cmd) {
+    c->tp_seq++;
+    ERL_NIF_TERM msg = enif_make_tuple3(menv, enif_make_atom(menv, "erllama_tp"),
+                                        enif_make_uint64(menv, c->tp_seq), cmd);
+    (void) enif_send(env, &c->tp_sink, menv, msg);
+    enif_free_env(menv);
+}
+
+/* A decode replaces every logits row: a seq it does not hold keeps an
+ * index into rows that are gone. */
+void erllama_ctx_stale_other_rows(erllama_context_t *c, const struct llama_batch *batch) {
+    unsigned char held[ERLLAMA_N_SEQ_MAX_CAP] = {0};
+    if (!batch->n_seq_id || !batch->seq_id) {
+        /* llama_batch_get_one: every token is seq 0's. */
+        held[0] = 1;
+    }
+    for (int32_t i = 0; batch->n_seq_id && batch->seq_id && i < batch->n_tokens; i++) {
+        for (int32_t j = 0; j < batch->n_seq_id[i]; j++) {
+            const llama_seq_id s = batch->seq_id[i][j];
+            if (s >= 0 && s < ERLLAMA_N_SEQ_MAX_CAP) {
+                held[s] = 1;
+            }
+        }
+    }
+    for (int s = 0; s < ERLLAMA_N_SEQ_MAX_CAP; s++) {
+        if (!held[s] && c->per_seq[s].last_logits_idx != -1) {
+            c->per_seq[s].last_logits_idx = ERLLAMA_LOGITS_STALE;
+        }
+    }
+}
+
+int erllama_ctx_decode(ErlNifEnv *env, erllama_context_t *c, struct llama_batch batch) {
+    void *tp = c->model_res ? c->model_res->tp_rank : NULL;
+    if (tp && c->tp_sink_set) {
+        ErlNifEnv *menv = enif_alloc_env();
+        erllama_tp_send(env, c, menv, tp_batch_cmd(menv, &batch));
+    }
+    int dr = erllama_safe_decode(c->ctx, batch);
+    if (dr != 0) {
+        return dr;
+    }
+    erllama_ctx_stale_other_rows(c, &batch);
+    if (!tp) {
+        erllama_ctx_mtp_after_decode(c, &batch);
+        return 0;
+    }
+    int32_t n_vocab = 0;
+    (void) erllama_ctx_vocab(c, &n_vocab);
+    size_t n_out = 0;
+    for (int32_t i = 0; i < batch.n_tokens; i++) {
+        n_out += batch.logits[i] ? 1 : 0;
+    }
+    float *logits = erllama_safe_get_logits(c->ctx);
+    if (n_out == 0) {
+        erllama_ctx_mtp_after_decode(c, &batch);
+        return 0;
+    }
+    if (!logits || n_vocab <= 0 ||
+        erllama_tp_reduce_host(tp, logits, n_out * (size_t) n_vocab) != 0) {
+        return ERLLAMA_TP_REDUCE_FAILED;
+    }
+    erllama_ctx_mtp_after_decode(c, &batch);
+    return 0;
 }
 
 ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
@@ -162,7 +261,7 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
         } else if (li < 0) {
             pthread_mutex_unlock(&c->mu);
             free_step_ops(ops, n_ops);
-            return erllama_error(env, atom_no_logits);
+            return erllama_error(env, li == ERLLAMA_LOGITS_STALE ? atom_stale_logits : atom_no_logits);
         }
         pthread_mutex_lock(&ops[i].sampler->mu);
         if (!ops[i].sampler->chain) {
@@ -277,7 +376,7 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     }
 
     arm_decode(c);
-    int dr = erllama_safe_decode(c->ctx, batch);
+    int dr = erllama_ctx_decode(env, c, batch);
     if (dr != 0) {
         erllama_safe_batch_free(batch);
         enif_free(last_logits_idx_new);
@@ -405,7 +504,7 @@ ERL_NIF_TERM nif_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
         return erllama_error(env, atom_batch_overflow);
     }
     struct llama_batch batch = erllama_safe_batch_get_one(tokens, n);
-    int dr = erllama_safe_decode(c->ctx, batch);
+    int dr = erllama_ctx_decode(env, c, batch);
     if (dr == 0) c->decode_ready = 1;
     pthread_mutex_unlock(&c->mu);
     enif_free(tokens);
@@ -471,7 +570,7 @@ ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     llama_token tok_buf = tok;
     struct llama_batch batch = erllama_safe_batch_get_one(&tok_buf, 1);
     arm_decode(c);
-    int rc = erllama_safe_decode(c->ctx, batch);
+    int rc = erllama_ctx_decode(env, c, batch);
     if (rc == 0) c->decode_ready = 1;
     else c->decode_ready = 0;
     ERL_NIF_TERM why = atom_ok;
@@ -505,6 +604,11 @@ ERL_NIF_TERM nif_embed(ErlNifEnv *env, int argc,
     erllama_context_t *c;
     if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
         return enif_make_badarg(env);
+    }
+    /* A split model's KV, embeddings and speculative or media decodes
+     * are not kept in step across its ranks yet. */
+    if (ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
     }
     llama_token *tokens = NULL;
     int32_t n = 0;
@@ -646,6 +750,11 @@ ERL_NIF_TERM nif_forward_with_argmax(ErlNifEnv *env, int argc,
     if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
         return enif_make_badarg(env);
     }
+    /* A split model's KV, embeddings and speculative or media decodes
+     * are not kept in step across its ranks yet. */
+    if (ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
+    }
     llama_token *tokens = NULL;
     int32_t n = 0;
     int rc = read_token_list(env, argv[1], &tokens, &n);
@@ -781,6 +890,9 @@ static int spec_decode_single(erllama_context_t *c, llama_token tok,
     b.logits[0] = 1;
     arm_decode(c);
     int rc = erllama_safe_decode(c->ctx, b);
+    if (rc == 0) {
+        erllama_ctx_stale_other_rows(c, &b);
+    }
     erllama_safe_batch_free(b);
     return rc;
 }
@@ -801,6 +913,11 @@ ERL_NIF_TERM nif_spec_step(ErlNifEnv *env, int argc,
     erllama_context_t *c;
     if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
         return enif_make_badarg(env);
+    }
+    /* A split model's KV, embeddings and speculative or media decodes
+     * are not kept in step across its ranks yet. */
+    if (ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
     }
     erllama_sampler_t *s;
     if (!enif_get_resource(env, argv[1], SAMPLER_RT, (void **) &s)) {
@@ -825,10 +942,13 @@ ERL_NIF_TERM nif_spec_step(ErlNifEnv *env, int argc,
         return erllama_error(env, atom_released);
     }
     int32_t li = c->per_seq[seq_id].last_logits_idx;
-    if (!c->decode_ready || li < 0) {
+    /* The seq's own row, as nif_step checks: another request finishing
+     * (its seq removed) clears the context's decode_ready but leaves
+     * this row in place. */
+    if (li < 0) {
         pthread_mutex_unlock(&c->mu);
         enif_free(draft);
-        return erllama_error(env, atom_no_logits);
+        return erllama_error(env, li == ERLLAMA_LOGITS_STALE ? atom_stale_logits : atom_no_logits);
     }
     int32_t n_vocab = 0;
     const struct llama_vocab *vocab = erllama_ctx_vocab(c, &n_vocab);
@@ -1092,6 +1212,11 @@ ERL_NIF_TERM nif_media_prefill(ErlNifEnv *env, int argc,
     if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
         return enif_make_badarg(env);
     }
+    /* A split model's KV, embeddings and speculative or media decodes
+     * are not kept in step across its ranks yet. */
+    if (ERLLAMA_IS_TP(c)) {
+        return erllama_error(env, atom_not_supported);
+    }
     void *mres;
     if (!enif_get_resource(env, argv[1], ERLLAMA_MTMD_RT, &mres)) {
         return enif_make_badarg(env);
@@ -1198,9 +1323,237 @@ ERL_NIF_TERM nif_media_prefill(ErlNifEnv *env, int argc,
     }
 
     c->per_seq[seq_id].next_pos = new_n_past;
+    /* The media eval's decodes replaced every logits row. */
+    for (int s = 0; s < ERLLAMA_N_SEQ_MAX_CAP; s++) {
+        if (s != seq_id && c->per_seq[s].last_logits_idx != -1) {
+            c->per_seq[s].last_logits_idx = ERLLAMA_LOGITS_STALE;
+        }
+    }
     c->per_seq[seq_id].last_logits_idx = ERLLAMA_LOGITS_LAST;
     c->decode_ready = 1;
     pthread_mutex_unlock(&c->mu);
     return enif_make_tuple3(env, atom_ok, enif_make_int(env, n_tokens),
                             enif_make_int(env, new_n_past - n_past));
+}
+
+/* =========================================================================
+ * nif_tp_decode(Ctx, Tokens) -> {ok, LogitsF32Bin} | {error, Reason}
+ *
+ * Experimental, for tensor-parallel models: decodes `Tokens' on seq 0
+ * after what the context already holds and returns the last token's
+ * logits. For a model split over a tensor-parallel rank (`tp_rank'
+ * load option) each rank computes only its slice of the vocabulary,
+ * so the logits are summed over the group, exactly; every rank of the
+ * group must make the same call. For any other model it is a plain
+ * decode, the single-device reference.
+ * ========================================================================= */
+ERL_NIF_TERM nif_tp_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    llama_token *tokens = NULL;
+    int32_t n = 0;
+    int rc = read_token_list(env, argv[1], &tokens, &n);
+    if (rc != 1) return token_list_error(env, rc);
+    if (n == 0) {
+        if (tokens) enif_free(tokens);
+        return enif_make_badarg(env);
+    }
+    if (!erllama_lock_ctx(c)) {
+        enif_free(tokens);
+        return erllama_error(env, atom_released);
+    }
+    int32_t n_vocab = 0;
+    (void) erllama_ctx_vocab(c, &n_vocab);
+    long pos_max = erllama_safe_memory_seq_pos_max(c->ctx, 0);
+    if (n_vocab <= 0 || pos_max == -2) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return erllama_error(env, atom_exception);
+    }
+    if (erllama_first_oob_token(tokens, n, n_vocab) >= 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return erllama_error(env, atom_invalid_token);
+    }
+    ERL_NIF_TERM bin;
+    float *out = (float *) enif_make_new_binary(env, sizeof(float) * (size_t) n_vocab, &bin);
+    int frc = erllama_safe_forward_last_logits(c->ctx, tokens, n, n_vocab,
+                                               pos_max < 0 ? 0 : pos_max + 1, out);
+    enif_free(tokens);
+    if (frc == 0) {
+        c->decode_ready = 1;
+        void *tp = c->model_res ? c->model_res->tp_rank : NULL;
+        if (tp && erllama_tp_reduce_host(tp, out, (size_t) n_vocab) != 0) {
+            frc = -4;
+        }
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (frc != 0) {
+        ERL_NIF_TERM why = frc == -2   ? atom_oom
+                           : frc == -3 ? atom_exception
+                           : frc == -4 ? enif_make_atom(env, "reduce_failed")
+                                       : atom_decode_failed;
+        return erllama_error(env, why);
+    }
+    return enif_make_tuple2(env, atom_ok, bin);
+}
+
+/* =========================================================================
+ * nif_tp_follow(Ctx, Cmd) -> ok | {error, Reason}
+ *
+ * On a rank that does not serve: apply one command the serving rank's
+ * sink received, in order: `{decode, Bin}' (the same batch, then the
+ * same logits reduction), `{seq_rm, Seq, P0, P1}', `{seq_cp, Src, Dst}',
+ * `{nextn, On}' (the serving rank's drafter reads the nextn embeddings,
+ * which change the graph).
+ * ========================================================================= */
+ERL_NIF_TERM nif_tp_follow(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    int arity;
+    const ERL_NIF_TERM *cmd;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c) ||
+        !enif_get_tuple(env, argv[1], &arity, &cmd) || arity < 2) {
+        return enif_make_badarg(env);
+    }
+    char op[16];
+    if (!enif_get_atom(env, cmd[0], op, sizeof(op), ERL_NIF_LATIN1)) {
+        return enif_make_badarg(env);
+    }
+    if (!c->model_res || !c->model_res->tp_rank || c->tp_sink_set) {
+        return erllama_error(env, atom_not_supported);
+    }
+    if (!erllama_lock_ctx(c)) {
+        return erllama_error(env, atom_released);
+    }
+    int rc = 0;
+    if (strcmp(op, "decode") == 0 && arity == 2) {
+        ErlNifBinary bin;
+        if (!enif_inspect_binary(env, cmd[1], &bin) || bin.size < sizeof(int32_t)) {
+            pthread_mutex_unlock(&c->mu);
+            return enif_make_badarg(env);
+        }
+        const int32_t *p = (const int32_t *) bin.data;
+        int32_t n = p[0];
+        if (n <= 0 || bin.size != sizeof(int32_t) * (1 + 4 * (size_t) n)) {
+            pthread_mutex_unlock(&c->mu);
+            return enif_make_badarg(env);
+        }
+        struct llama_batch batch = erllama_safe_batch_init(n, 0, 1);
+        if (!batch.token) {
+            pthread_mutex_unlock(&c->mu);
+            return erllama_error(env, atom_oom);
+        }
+        for (int32_t i = 0; i < n; i++) {
+            const int32_t *row = p + 1 + 4 * (size_t) i;
+            batch.token[i] = row[0];
+            batch.pos[i] = row[1];
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = row[2];
+            batch.logits[i] = (int8_t) row[3];
+        }
+        batch.n_tokens = n;
+        rc = erllama_ctx_decode(env, c, batch);
+        erllama_safe_batch_free(batch);
+    } else if (strcmp(op, "seq_rm") == 0 && arity == 4) {
+        int seq, p0, p1;
+        if (!enif_get_int(env, cmd[1], &seq) || !enif_get_int(env, cmd[2], &p0) ||
+            !enif_get_int(env, cmd[3], &p1)) {
+            pthread_mutex_unlock(&c->mu);
+            return enif_make_badarg(env);
+        }
+        rc = erllama_safe_memory_seq_rm(c->ctx, seq, p0, p1);
+    } else if (strcmp(op, "nextn") == 0 && arity == 2) {
+        int on;
+        if (!enif_get_int(env, cmd[1], &on)) {
+            pthread_mutex_unlock(&c->mu);
+            return enif_make_badarg(env);
+        }
+        erllama_mtp_target_nextn(c->ctx, on);
+    } else if (strcmp(op, "seq_cp") == 0 && arity == 3) {
+        int src, dst;
+        if (!enif_get_int(env, cmd[1], &src) || !enif_get_int(env, cmd[2], &dst)) {
+            pthread_mutex_unlock(&c->mu);
+            return enif_make_badarg(env);
+        }
+        rc = erllama_safe_memory_seq_cp(c->ctx, src, dst);
+    } else {
+        pthread_mutex_unlock(&c->mu);
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return rc == 0 ? atom_ok : erllama_error(env, atom_decode_failed);
+}
+
+/* =========================================================================
+ * nif_tp_decode_seq(Ctx, SeqId, Tokens, AllRows) ->
+ *     {ok, LogitsF32Bin, DecodeUs, ReduceUs} | {error, Reason}
+ *
+ * Experimental, for tensor-parallel models: nif_tp_decode on any
+ * sequence, returning the logits of every row of the batch (AllRows)
+ * or of the last one, summed over the group (every rank makes the same
+ * call). Positions continue the sequence. Used to verify a draft on a
+ * spare sequence. DecodeUs: llama_decode until this rank holds the
+ * logits (its share of the compute and the collectives inside the
+ * graph); ReduceUs: summing the logits over the group through host
+ * buffers.
+ * ========================================================================= */
+ERL_NIF_TERM nif_tp_decode_seq(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    int seq;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c) || !enif_get_int(env, argv[1], &seq) ||
+        seq < 0 || seq >= ERLLAMA_N_SEQ_MAX_CAP) {
+        return enif_make_badarg(env);
+    }
+    int all = enif_is_identical(argv[3], enif_make_atom(env, "true"));
+    llama_token *tokens = NULL;
+    int32_t n = 0;
+    int rc = read_token_list(env, argv[2], &tokens, &n);
+    if (rc != 1) return token_list_error(env, rc);
+    if (n == 0) {
+        if (tokens) enif_free(tokens);
+        return enif_make_badarg(env);
+    }
+    if (!erllama_lock_ctx(c)) {
+        enif_free(tokens);
+        return erllama_error(env, atom_released);
+    }
+    int32_t n_vocab = 0;
+    (void) erllama_ctx_vocab(c, &n_vocab);
+    long pos_max = erllama_safe_memory_seq_pos_max(c->ctx, seq);
+    if (n_vocab <= 0 || pos_max == -2 || erllama_first_oob_token(tokens, n, n_vocab) >= 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return erllama_error(env, n_vocab <= 0 || pos_max == -2 ? atom_exception : atom_invalid_token);
+    }
+    const size_t rows = all ? (size_t) n : 1;
+    ERL_NIF_TERM bin;
+    float *out = (float *) enif_make_new_binary(env, sizeof(float) * rows * (size_t) n_vocab, &bin);
+    ErlNifTime t0 = enif_monotonic_time(ERL_NIF_USEC);
+    int frc = erllama_safe_forward_rows(c->ctx, seq, tokens, n, n_vocab, pos_max < 0 ? 0 : pos_max + 1,
+                                        all, out);
+    ErlNifTime t1 = enif_monotonic_time(ERL_NIF_USEC);
+    enif_free(tokens);
+    if (frc == 0) {
+        c->decode_ready = 1;
+        void *tp = c->model_res ? c->model_res->tp_rank : NULL;
+        if (tp && erllama_tp_reduce_host(tp, out, rows * (size_t) n_vocab) != 0) {
+            frc = -4;
+        }
+    }
+    ErlNifTime t2 = enif_monotonic_time(ERL_NIF_USEC);
+    pthread_mutex_unlock(&c->mu);
+    if (frc != 0) {
+        ERL_NIF_TERM why = frc == -2   ? atom_oom
+                           : frc == -3 ? atom_exception
+                           : frc == -4 ? enif_make_atom(env, "reduce_failed")
+                                       : atom_decode_failed;
+        return erllama_error(env, why);
+    }
+    return enif_make_tuple4(env, atom_ok, bin, enif_make_int64(env, (int64_t) (t1 - t0)),
+                            enif_make_int64(env, (int64_t) (t2 - t1)));
 }

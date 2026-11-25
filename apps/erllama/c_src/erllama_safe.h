@@ -258,6 +258,16 @@ extern long erllama_safe_memory_seq_pos_max(struct llama_context *c,
                                             int seq_id) ERLLAMA_SAFE_NOEXCEPT;
 extern void erllama_safe_set_log_receiver(ErlNifPid pid, int min_level) ERLLAMA_SAFE_NOEXCEPT;
 extern void erllama_safe_clear_log_receiver(void) ERLLAMA_SAFE_NOEXCEPT;
+extern float *erllama_safe_get_logits(struct llama_context *c) ERLLAMA_SAFE_NOEXCEPT;
+/* Decode `tokens' at positions start_pos.. on `seq_id' and copy the
+ * logits of every row (`all') or of the last one into `out' (n_vocab
+ * floats a row). 0 ok, -1 decode failed, -2 bad arguments, -3 exception. */
+extern int erllama_safe_forward_rows(struct llama_context *c, int seq_id, const llama_token *tokens,
+                                     int32_t n_tokens, int32_t n_vocab, long start_pos, int all,
+                                     float *out) ERLLAMA_SAFE_NOEXCEPT;
+extern int erllama_safe_forward_last_logits(struct llama_context *c, const llama_token *tokens,
+                                            int32_t n_tokens, int32_t n_vocab, long start_pos,
+                                            float *out) ERLLAMA_SAFE_NOEXCEPT;
 extern int erllama_safe_forward_with_argmax(struct llama_context *c,
                                             const llama_token *tokens,
                                             int32_t n_tokens,

@@ -52,6 +52,9 @@ typedef struct {
      * model_dtor. NULL when no overrides were requested. Kept as
      * void* so this header stays free of llama.h (see above). */
     void *tbo;
+    /* The tensor-parallel rank a model is split over (`tp_rank' load
+     * option), kept until the model is freed; NULL otherwise. */
+    void *tp_rank;
 } erllama_model_t;
 
 extern ErlNifResourceType *MODEL_RT;

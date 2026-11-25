@@ -22,7 +22,10 @@
     evictor_unloads_least_recently_used/1,
     unload_then_run_reloads/1,
     two_models_at_once/1,
-    load_failure_reaches_every_waiter/1
+    load_failure_reaches_every_waiter/1,
+    acquire_waits_for_eviction/1,
+    second_request_is_not_queued/1,
+    waiting_run_answers_and_cancels/1
 ]).
 
 all() ->
@@ -35,7 +38,10 @@ all() ->
         evictor_unloads_least_recently_used,
         unload_then_run_reloads,
         two_models_at_once,
-        load_failure_reaches_every_waiter
+        load_failure_reaches_every_waiter,
+        acquire_waits_for_eviction,
+        second_request_is_not_queued,
+        waiting_run_answers_and_cancels
     ].
 
 init_per_testcase(TC, Config) ->
@@ -210,3 +216,109 @@ load_failure_reaches_every_waiter(Config) ->
     ?assert(lists:all(fun(R) -> element(1, R) =:= error end, Results)),
     Run = run(<<"broken">>, #{}),
     ?assertMatch(#{status := error}, wait_done(Run)).
+
+%% The evictor picked a model and is unloading it: an acquisition in that
+%% window waits for the unload, then gets a freshly loaded model, never
+%% one about to go. The interleaving is forced by driving the evictor's
+%% two steps by hand.
+acquire_waits_for_eviction(Config) ->
+    M = add_model(Config, <<"evicted">>),
+    {ok, Id} = erllama_server_models:acquire(M, self(), undefined),
+    ok = erllama_server_models:release(Id, self()),
+    {ok, Id} = gen_server:call(erllama_server_models, pick_evictable),
+    Parent = self(),
+    Holder = spawn(fun() ->
+        Parent ! {acquired, erllama_server_models:acquire(M, self(), undefined)},
+        receive
+            stop -> ok
+        end
+    end),
+    receive
+        {acquired, Early} -> ct:fail({granted_during_unload, Early})
+    after 300 -> ok
+    end,
+    %% A second unload while the first is in progress joins it.
+    {UPid, _} =
+        Unloader = spawn_monitor(fun() -> exit({unload, erllama_server_models:unload(Id)}) end),
+    wait(fun() -> process_info(UPid, current_function) =:= {current_function, {gen, do_call, 4}} end),
+    _ = erllama:unload(Id),
+    gen_server:cast(erllama_server_models, {unloaded, Id}),
+    receive
+        {acquired, Got} -> ?assertEqual({ok, Id}, Got)
+    after 5000 -> ct:fail(acquire_never_answered)
+    end,
+    {_, UMon} = Unloader,
+    receive
+        {'DOWN', UMon, process, _, {unload, R}} -> ?assertEqual(ok, R)
+    after 5000 -> ct:fail(unload_never_answered)
+    end,
+    ?assert(loaded(Id)),
+    Holder ! stop.
+
+%% Two users of one model: a short request that arrives while a long
+%% generation streams is served alongside it, not after it.
+second_request_is_not_queued(Config) ->
+    M = add_model(Config, <<"shared">>, #{step_delay_ms => 20}),
+    %% About 40 s of generation.
+    Long = run(M, #{opts => #{response_tokens => 2000}}),
+    ok = wait(fun() -> lists:member(token, events(Long)) end),
+    T0 = erlang:monotonic_time(millisecond),
+    Short = run(M, #{conversation_id => none, opts => #{response_tokens => 3}}),
+    Done = wait_short(Short, 5000),
+    Waited = erlang:monotonic_time(millisecond) - T0,
+    ct:log("the short request took ~b ms (~p)", [Waited, Done]),
+    ?assertMatch(#{status := done}, Done),
+    ?assertMatch({ok, #{status := running}}, erllama_server_api:run(Long)),
+    ok = erllama_server_api:cancel(Long).
+
+%% With every sequence busy, a run waits for one. It still answers
+%% (its phase is `waiting', in the job table too), and cancelling it ends it at once without
+%% touching the run that holds the sequence.
+waiting_run_answers_and_cancels(Config) ->
+    M = add_model(Config, <<"single">>, #{step_delay_ms => 20, parallel => 1}),
+    Long = run(M, #{opts => #{response_tokens => 2000}}),
+    ok = wait(fun() -> lists:member(token, events(Long)) end),
+    Waiting = run(M, #{conversation_id => none, opts => #{response_tokens => 3}}),
+    ok = wait(fun() ->
+        case erllama_server_api:run(Waiting) of
+            {ok, #{status := running, phase := waiting}} -> true;
+            _ -> false
+        end
+    end),
+    ?assertMatch(
+        [#{phase := waiting}], [
+            R
+         || #{run_id := Id} = R <- erllama_server_runs:list(), Id =:= Waiting
+        ]
+    ),
+    T0 = erlang:monotonic_time(millisecond),
+    ok = erllama_server_api:cancel(Waiting),
+    ?assertMatch({ok, #{status := cancelled}}, erllama_server_api:result(Waiting)),
+    Took = erlang:monotonic_time(millisecond) - T0,
+    ct:log("cancelling the waiting run took ~b ms", [Took]),
+    ?assert(Took < 1000),
+    ?assertMatch({ok, #{status := running}}, erllama_server_api:run(Long)),
+    ok = erllama_server_api:cancel(Long).
+
+%% The run's result within `Ms', or what it was then.
+wait_short(Run, Ms) ->
+    Deadline = erlang:monotonic_time(millisecond) + Ms,
+    wait_short_until(Run, Deadline).
+
+wait_short_until(Run, Deadline) ->
+    case [R || #{run_id := Id, status := done} = R <- erllama_server_runs:list(), Id =:= Run] of
+        [_] ->
+            {ok, R} = erllama_server_api:result(Run),
+            R;
+        [] ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true ->
+                    %% Its process is parked in erllama waiting for a free
+                    %% sequence: read its state from the job table.
+                    [Info] = [R || #{run_id := Id} = R <- erllama_server_runs:list(), Id =:= Run],
+                    ct:fail({queued_behind_the_long_run, maps:with([status, model], Info)});
+                false ->
+                    timer:sleep(20),
+                    wait_short_until(Run, Deadline)
+            end
+    end.

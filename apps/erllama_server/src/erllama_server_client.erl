@@ -16,7 +16,7 @@
 
 -include("erllama_server_api.hrl").
 
--export([connect/0, connect/1, call/3, follow/4, release_node/0, client_name/1]).
+-export([connect/0, connect/1, call/3, follow/4, follow/5, release_node/0, client_name/1]).
 
 -define(DEFAULT_NODE, "erllama_server@127.0.0.1").
 -define(DEFAULT_TIMEOUT, 10000).
@@ -86,85 +86,106 @@ timeout() ->
 %% the sequence all resume by reattaching from the next wanted event.
 -spec follow(node(), binary(), non_neg_integer(), sink()) -> {ok, map()} | {error, term()}.
 follow(Node, RunId, Cursor, Sink) ->
-    follow(Node, RunId, Cursor, Sink, 0).
+    follow(Node, RunId, Cursor, Sink, fun terminal/1).
 
-follow(Node, RunId, Cursor, Sink, Tries) ->
+%% Follow until `Stop(Event)' holds (an agent turn's end) or the job
+%% ends; detach when stopping early.
+-spec follow(node(), binary(), non_neg_integer(), sink(), fun((map()) -> boolean())) ->
+    {ok, map()} | {error, term()}.
+follow(Node, RunId, Cursor, Sink, Stop) ->
+    W = #{
+        node => Node, run => RunId, sink => Sink, stop => fun(E) -> Stop(E) orelse terminal(E) end
+    },
+    case follow_from(W, Cursor, 0) of
+        {ok, E} = Done ->
+            case terminal(E) of
+                true ->
+                    ok;
+                false ->
+                    leave(Node, RunId)
+            end,
+            Done;
+        Other ->
+            Other
+    end.
+
+follow_from(#{node := Node, run := RunId, sink := Sink} = W, Cursor, Tries) ->
     case call(Node, attach, [RunId, self(), Cursor]) of
         {ok, #{run_pid := RunPid, replay := Replay, status := Status}} ->
-            case consume(Replay, Cursor, Sink) of
+            case consume(Replay, Cursor, W) of
                 {terminal, E} ->
                     {ok, E};
                 {next, Next} when Status =:= running ->
                     Mon = erlang:monitor(process, RunPid),
-                    loop(
-                        #{node => Node, run => RunId, pid => RunPid, mon => Mon, sink => Sink},
-                        Next,
-                        0
-                    );
+                    loop(W#{pid => RunPid, mon => Mon}, Next, 0);
                 {next, _} ->
                     {error, {run_ended, Status}}
             end;
         {error, {gap, Oldest}} ->
             _ = Sink({gap, Cursor, Oldest}),
-            follow(Node, RunId, Oldest, Sink, Tries);
+            follow_from(W, Oldest, Tries);
         {error, {unreachable, _} = Reason} when Tries < ?RETRIES ->
             _ = Sink({reconnecting, Reason}),
             timer:sleep(backoff(Tries)),
-            follow(Node, RunId, Cursor, Sink, Tries + 1);
+            follow_from(W, Cursor, Tries + 1);
         {error, _} = E ->
             E
     end.
 
 backoff(Tries) -> min(5000, 100 bsl Tries).
 
-consume([], Next, _Sink) ->
+consume([], Next, _W) ->
     {next, Next};
-consume([#{seq := Seq} = E | Rest], Next, Sink) when Seq >= Next ->
+consume([#{seq := Seq} = E | Rest], Next, #{sink := Sink, stop := Stop} = W) when Seq >= Next ->
     _ = Sink(E),
-    case terminal(E) of
+    case Stop(E) of
         true -> {terminal, E};
-        false -> consume(Rest, Seq + 1, Sink)
+        false -> consume(Rest, Seq + 1, W)
     end;
-consume([_ | Rest], Next, Sink) ->
-    consume(Rest, Next, Sink).
+consume([_ | Rest], Next, W) ->
+    consume(Rest, Next, W).
 
-loop(#{run := RunId, pid := RunPid, mon := Mon, sink := Sink} = C, Next, Unacked) ->
+loop(#{run := RunId, pid := RunPid, mon := Mon, sink := Sink, stop := Stop} = W, Next, Unacked) ->
     receive
         {erllama_server_run, RunId, #{seq := Seq} = E} when Seq =:= Next ->
             _ = Sink(E),
-            case terminal(E) of
+            case Stop(E) of
                 true ->
                     erlang:demonitor(Mon, [flush]),
                     {ok, E};
                 false when Unacked + 1 >= ?ACK_EVERY ->
                     RunPid ! {ack, self(), Seq},
-                    loop(C, Seq + 1, 0);
+                    loop(W, Seq + 1, 0);
                 false ->
-                    loop(C, Seq + 1, Unacked + 1)
+                    loop(W, Seq + 1, Unacked + 1)
             end;
         {erllama_server_run, RunId, #{seq := Seq}} when Seq < Next ->
-            loop(C, Next, Unacked);
+            loop(W, Next, Unacked);
         {erllama_server_run, RunId, #{seq := _}} ->
-            resume(C, Next);
+            resume(W, Next);
         {erllama_server_run, RunId, {dropped, Seq}} ->
-            resume(C, min(Seq, Next));
+            resume(W, min(Seq, Next));
         {'DOWN', Mon, process, RunPid, noconnection} ->
             _ = Sink({reconnecting, noconnection}),
-            resume(C, Next);
+            resume(W, Next);
         {'DOWN', Mon, process, RunPid, Reason} ->
             {error, {run_exited, Reason}}
     after ?IDLE_CHECK ->
-        case call(maps:get(node, C), run, [RunId]) of
-            {ok, #{status := running}} -> loop(C, Next, Unacked);
-            _ -> resume(C, Next)
+        case call(maps:get(node, W), run, [RunId]) of
+            {ok, #{status := running}} -> loop(W, Next, Unacked);
+            _ -> resume(W, Next)
         end
     end.
 
-resume(#{node := Node, run := RunId, mon := Mon, sink := Sink}, Next) ->
+resume(#{node := Node, run := RunId, mon := Mon} = W, Next) ->
     erlang:demonitor(Mon, [flush]),
+    leave(Node, RunId),
+    follow_from(maps:without([pid, mon], W), Next, 0).
+
+%% Stop receiving a job's events and drop those already delivered.
+leave(Node, RunId) ->
     _ = call(Node, detach, [RunId, self()]),
-    flush(RunId),
-    follow(Node, RunId, Next, Sink, 0).
+    flush(RunId).
 
 %% Discard events already in the mailbox; the reattach replays them.
 flush(RunId) ->

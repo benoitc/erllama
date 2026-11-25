@@ -70,6 +70,7 @@
     verify_does_not_mutate_caller_visible_state/1,
     verify_accepted_count_le_k/1,
     ngram_speculation_matches_plain/1,
+    spec_step_after_another_seq_removed/1,
     ngram_speculation_stop_sequence_trims_kv/1,
     spec_step_nif_greedy_paths/1,
     devices_none_loads_cpu_only/1,
@@ -80,7 +81,10 @@
     continue_multi_turn_cache_delta/1,
     tokenize_large_input/1,
     apply_chat_template_large_input/1,
-    tokenize_over_text_cap/1
+    tokenize_over_text_cap/1,
+    shared_reads_during_generation/1,
+    shared_reads_during_unload/1,
+    bad_request_leaves_the_model_running/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -136,6 +140,7 @@ all() ->
         verify_does_not_mutate_caller_visible_state,
         verify_accepted_count_le_k,
         ngram_speculation_matches_plain,
+        spec_step_after_another_seq_removed,
         ngram_speculation_stop_sequence_trims_kv,
         spec_step_nif_greedy_paths,
         devices_none_loads_cpu_only,
@@ -146,7 +151,10 @@ all() ->
         continue_multi_turn_cache_delta,
         tokenize_large_input,
         apply_chat_template_large_input,
-        tokenize_over_text_cap
+        tokenize_over_text_cap,
+        shared_reads_during_generation,
+        shared_reads_during_unload,
+        bad_request_leaves_the_model_running
     ].
 
 init_per_suite(Config) ->
@@ -1091,6 +1099,40 @@ ngram_speculation_matches_plain(Config) ->
     end,
     ok.
 
+%% Two sequences decoded together, then the second one removed (its
+%% request finished or was cancelled): a speculative step on the first
+%% verifies its draft from the first one's own row. It used to answer
+%% no_logits (the removal cleared the context's decode_ready), and the
+%% model stopped when a speculating request outlived another one.
+spec_step_after_another_seq_removed(Config) ->
+    {ok, M} =
+        case erllama_nif:load_model(?config(model_path, Config), #{n_gpu_layers => 0}) of
+            {ok, X} -> {ok, X};
+            {ok, X, _} -> {ok, X}
+        end,
+    try
+        {ok, C} = erllama_nif:new_context(M, #{n_ctx => 512, n_batch => 128, n_seq_max => 2}),
+        try
+            {ok, Sa} = erllama_nif:sampler_new(C, #{temperature => 0.0}),
+            {ok, Sb} = erllama_nif:sampler_new(C, #{temperature => 0.0}),
+            Tok = fun(T) ->
+                erllama_nif:tokenize(M, T, #{add_special => true, parse_special => false})
+            end,
+            PA = Tok(<<"The history of ocean navigation begins with">>),
+            PB = Tok(<<"A modern operating system schedules its threads with">>),
+            {ok, _} = erllama_nif:step(C, [{0, {prefill, PA}}, {1, {prefill, PB}}]),
+            {ok, _} = erllama_nif:step(C, [{0, {decode, Sa}}, {1, {decode, Sb}}]),
+            ok = erllama_nif:kv_seq_rm(C, 1, 0, -1),
+            ?assertMatch(
+                {ok, {spec, [_ | _], _, _}}, erllama_nif:spec_step(C, Sa, 0, [lists:last(PA)])
+            )
+        after
+            erllama_nif:free_context(C)
+        end
+    after
+        erllama_nif:free_model(M)
+    end.
+
 %% Deterministic nif_spec_step coverage on any model: derive the
 %% greedy continuation with plain step decodes, reset the sequence,
 %% and verify the same tokens as a draft. A perfect draft must
@@ -1420,3 +1462,105 @@ fit_returns_info_and_generates(Config) ->
     ?assert(is_integer(maps:get(n_gpu_layers, Fit))),
     ?assert(is_integer(maps:get(n_ctx, Fit))),
     ok.
+
+%% =============================================================================
+%% Tokenising and rendering from the caller's process
+%% =============================================================================
+
+%% While the model generates, tokenise, detokenise and render a chat
+%% template from this process: the answers match the idle ones.
+shared_reads_during_generation(Config) ->
+    Model = ?config(model, Config),
+    Msgs = [#{role => user, content => <<"What is the capital of France?">>}],
+    {ok, #{prompt := Prompt}} = erllama:chat_apply(Model, Msgs, #{}),
+    {ok, Tokens} = erllama:tokenize(Model, Prompt, #{parse_special => true}),
+    {ok, Text} = erllama:detokenize(Model, Tokens),
+    %% The first render built the templates in the model process; the
+    %% next ones read them from the cache.
+    Pid = erllama_registry:whereis_name(Model),
+    ?assertMatch({ok, _}, erllama_chat_cache:cached(Model, Pid)),
+    {ok, Ref} = erllama:stream(Model, Tokens, #{response_tokens => 48}),
+    receive
+        {erllama, Ref, {token, _}} -> ok
+    after 60000 -> ct:fail(no_first_token)
+    end,
+    [
+        begin
+            ?assertMatch({ok, #{prompt := Prompt}}, erllama:chat_apply(Model, Msgs, #{})),
+            ?assertEqual({ok, Tokens}, erllama:tokenize(Model, Prompt, #{parse_special => true})),
+            ?assertEqual({ok, Text}, erllama:detokenize(Model, Tokens))
+        end
+     || _ <- lists:seq(1, 5)
+    ],
+    ok = erllama:cancel(Ref),
+    ?assertNotEqual(timeout, drain(Ref, 60000)).
+
+%% Readers racing an unload get an answer or `not_loaded`, never a
+%% crash: the model's lock keeps a free from overlapping a read.
+shared_reads_during_unload(Config) ->
+    Path = ?config(model_path, Config),
+    DiskSrv = ?config(disk_srv, Config),
+    Id = <<"shared_reads_unload">>,
+    Msgs = [#{role => user, content => <<"Hello">>}],
+    {ok, _} = erllama:load_model(Id, model_config(Path, DiskSrv)),
+    {ok, _} = erllama:chat_apply(Id, Msgs, #{}),
+    Self = self(),
+    Readers = [
+        spawn_link(fun() -> Self ! {reader, self(), read_until_gone(Id, Msgs, #{})} end)
+     || _ <- lists:seq(1, 4)
+    ],
+    timer:sleep(50),
+    ok = erllama:unload(Id),
+    Seen = lists:foldl(
+        fun(R, Acc) ->
+            receive
+                {reader, R, Counts} -> maps:merge_with(fun(_, A, B) -> A + B end, Acc, Counts)
+            after 30000 -> ct:fail(reader_stuck)
+            end
+        end,
+        #{},
+        Readers
+    ),
+    ct:log("results by kind while unloading: ~p", [Seen]),
+    ?assertEqual([], maps:keys(Seen) -- [ok, not_loaded]),
+    ?assert(maps:get(ok, Seen, 0) > 0).
+
+read_until_gone(Id, Msgs, Counts) ->
+    Results = [
+        erllama:tokenize(Id, <<"The quick brown fox">>),
+        erllama:detokenize(Id, [1, 2, 3]),
+        erllama:chat_apply(Id, Msgs, #{})
+    ],
+    Kinds = [
+        case R of
+            {ok, _} -> ok;
+            {error, not_loaded} -> not_loaded;
+            Other -> Other
+        end
+     || R <- Results
+    ],
+    Counts1 = lists:foldl(
+        fun(K, C) -> maps:update_with(K, fun(N) -> N + 1 end, 1, C) end, Counts, Kinds
+    ),
+    case lists:member(not_loaded, Kinds) of
+        true -> Counts1;
+        false -> read_until_gone(Id, Msgs, Counts1)
+    end.
+
+%% Requests the native code rejects answer `{error, badarg}` to their
+%% caller; the model process, shared by everyone, keeps running.
+bad_request_leaves_the_model_running(Config) ->
+    Model = ?config(model, Config),
+    Pid = erllama_registry:whereis_name(Model),
+    %% Atom roles: the legacy renderer wants binaries.
+    ?assertEqual(
+        {error, badarg},
+        erllama:render_chat_template(Model, #{messages => [#{role => user, content => <<"hi">>}]})
+    ),
+    ?assertMatch({error, _}, erllama:detokenize(Pid, [-1])),
+    ?assertMatch({error, _}, erllama:detokenize(Model, [-1])),
+    ?assertEqual(Pid, erllama_registry:whereis_name(Model)),
+    ?assertMatch(
+        {ok, #{generated := [_ | _]}},
+        erllama:complete(Model, ?SHORT_PROMPT, #{response_tokens => 2})
+    ).

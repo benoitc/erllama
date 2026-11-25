@@ -15,6 +15,15 @@ for d in "$REL_ROOT"/erts-*/bin; do
         ESCRIPT="$d/escript"
     fi
 done
+# Ctrl-C: in a terminal the CLI reads it as a key (cancel a run,
+# interrupt a turn; erllama_server_cli_term); otherwise it ends the CLI
+# at once.
+if [ -t 0 ]; then
+    ERL_FLAGS="${ERL_FLAGS:-} +Bc"
+else
+    ERL_FLAGS="${ERL_FLAGS:-} +Bd"
+fi
+export ERL_FLAGS
 if [ -n "${ERLLAMA_DIST_OPTFILE:-}" ]; then
     ERL_FLAGS="${ERL_FLAGS:-} -proto_dist inet_tls -ssl_dist_optfile $ERLLAMA_DIST_OPTFILE"
     export ERL_FLAGS

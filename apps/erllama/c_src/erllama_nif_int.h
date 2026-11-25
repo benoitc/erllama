@@ -92,6 +92,12 @@ typedef struct {
  * batch that is. nif_step's decode pre-sample maps this to -1. */
 #define ERLLAMA_LOGITS_LAST (-2)
 
+/* per_seq.last_logits_idx when a decode that did not hold the seq has
+ * replaced the logits buffer since its row was written: sampling it
+ * would read another seq's row (or none). The sampling NIFs answer
+ * {error, stale_logits}. */
+#define ERLLAMA_LOGITS_STALE (-3)
+
 #define ERLLAMA_GRAMMAR_CACHE_N 4
 
 /* One cached compiled grammar. `bytes` is an owned copy of the GBNF used
@@ -110,6 +116,19 @@ typedef struct erllama_context_s {
     int mu_inited;
     struct llama_context *ctx;     /* NULL after successful release */
     erllama_model_t *model_res;    /* keep_resource'd by new_context */
+    /* Tensor parallelism, on the rank that serves (`tp_sink' option):
+     * every decode batch and KV change is first sent to this process
+     * as `{erllama_tp, Seq, Cmd}' (Seq from 1, in order) for the other
+     * ranks to apply. Unset on the other ranks. */
+    int tp_sink_set;
+    ErlNifPid tp_sink;
+    uint64_t tp_seq;
+    /* `diag_inputs' option: the graph's input tensors seen during an
+     * armed decode (erllama_nif_context.c). NULL when off. */
+    struct erllama_diag_s *diag;
+    /* The MTP drafter fed after every decode (erllama_nif_mtp.c), or
+     * NULL. Set and cleared under `mu'. */
+    struct erllama_mtp_res *mtp;
     int decode_ready;              /* set after llama_decode; cleared after kv ops */
     /* Decode interrupt/budget. The abort callback (installed on the
      * llama_context at new_context time) reads these from ggml worker
@@ -232,6 +251,7 @@ extern ERL_NIF_TERM atom_oom;
 extern ERL_NIF_TERM atom_deferred;
 extern ERL_NIF_TERM atom_exception;
 extern ERL_NIF_TERM atom_no_logits;
+extern ERL_NIF_TERM atom_stale_logits;
 extern ERL_NIF_TERM atom_no_template;
 extern ERL_NIF_TERM atom_template_failed;
 extern ERL_NIF_TERM atom_grammar_failed;
@@ -259,7 +279,48 @@ int get_map_int32(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
                   int32_t *out);
 
 /* Deferred-free protocol (definition in erllama_nif.c). */
+void model_release_tp(erllama_model_t *m);
+/* Decode on a context, through its tensor-parallel group when its model
+ * is split (see erllama_nif_decode.c); erllama_safe_decode's results,
+ * or ERLLAMA_TP_REDUCE_FAILED. */
+#define ERLLAMA_TP_REDUCE_FAILED (-1000)
+int erllama_ctx_decode(ErlNifEnv *env, erllama_context_t *c, struct llama_batch batch);
+/* After a decode of `batch': mark the logits row of every seq the batch
+ * did not hold as stale (ERLLAMA_LOGITS_STALE). erllama_ctx_decode does
+ * it; a decode that does not go through it must too. */
+void erllama_ctx_stale_other_rows(erllama_context_t *c, const struct llama_batch *batch);
+/* Send a command (built in `menv', which is freed) to the context's
+ * tensor-parallel sink with the next sequence number. */
+void erllama_tp_send(ErlNifEnv *env, erllama_context_t *c, ErlNifEnv *menv, ERL_NIF_TERM cmd);
+/* A split model is served only through the decode paths that keep the
+ * ranks in step. */
+#define ERLLAMA_IS_TP(c) ((c)->model_res && (c)->model_res->tp_rank)
+ERL_NIF_TERM nif_tp_follow(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_send(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_tp_decode_seq(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_kv_seq_pos_max(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_ctx_diag(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+void erllama_diag_free(struct erllama_diag_s *d);
 void context_drops_model(erllama_model_t *m);
+
+/* Remove positions [p0, p1) of `seq', on every rank of a split model;
+ * erllama_safe_memory_seq_rm's result. Caller holds c->mu. */
+int erllama_ctx_seq_rm(ErlNifEnv *env, erllama_context_t *c, int seq, int p0, int p1);
+
+/* MTP drafting (erllama_nif_mtp.c). The hooks take c->mu held. */
+int erllama_mtp_nif_load(ErlNifEnv *env);
+void erllama_ctx_mtp_after_decode(erllama_context_t *c, const struct llama_batch *b);
+void erllama_ctx_mtp_seq_reset(erllama_context_t *c, int seq);
+void erllama_ctx_mtp_release(ErlNifEnv *env, erllama_context_t *c);
+ERL_NIF_TERM nif_mtp_new(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_free(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_trace(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_step_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 
 /* Decode guards (definitions in erllama_nif_context.c). */
 void arm_decode(erllama_context_t *c);

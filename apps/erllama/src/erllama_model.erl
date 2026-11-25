@@ -275,6 +275,9 @@
 %% into one llama_decode tick.
 %% Default cap on generated tokens for complete/infer/continue.
 -define(DEFAULT_RESPONSE_TOKENS, 64).
+%% The most requests one MTP round verifies (ERLLAMA_MTP_MAX_SEQS in
+%% c_src/erllama_nif_mtp.c).
+-define(MTP_BATCH_MAX, 16).
 
 -record(req, {
     seq_id :: non_neg_integer(),
@@ -416,6 +419,8 @@
     %% Stats: draft tokens offered to / accepted by spec_step.
     spec_drafted = 0 :: non_neg_integer(),
     spec_accepted = 0 :: non_neg_integer(),
+    %% MTP rounds this request drafted in (alone or with others).
+    spec_rounds = 0 :: non_neg_integer(),
     %% Multimodal request state. `media` holds the decoded-input
     %% list ([{image | audio, Bytes}]); `media_prompt` the rendered
     %% prompt binary (media requests carry no token list - the
@@ -828,16 +833,31 @@ model_info(Model) ->
 Tokenise a string using the model's tokenizer. Returns a list of
 token IDs. Safe to call concurrently with `complete/2,3`; tokenisation
 runs against the model's static vocabulary, not the live KV cache.
+
+With a model id and a backend that shares its state (the llama.cpp
+backend does), it runs in the caller's process, so it does not wait
+for the decode step of a model that is generating. With a pid, it goes
+through the model process.
 """.
 -spec tokenize(model(), binary()) ->
     {ok, [non_neg_integer()]} | {error, term()}.
 tokenize(Model, Text) when is_binary(Text) ->
-    call(Model, {tokenize, Text}, infinity).
+    case shared(Model) of
+        {_Pid, {Mod, S}} -> shared_result(guarded(fun() -> wrap_ok(Mod:tokenize(S, Text)) end));
+        undefined -> call(Model, {tokenize, Text}, infinity)
+    end.
 
 -spec tokenize(model(), binary(), map()) ->
     {ok, [non_neg_integer()]} | {error, term()}.
 tokenize(Model, Text, Opts) when is_binary(Text), is_map(Opts) ->
-    call(Model, {tokenize, Text, Opts}, infinity).
+    case shared(Model) of
+        {_Pid, {Mod, S}} ->
+            shared_result(
+                guarded(fun() -> wrap_ok(backend_tokenize_with_opts(Mod, S, Text, Opts)) end)
+            );
+        undefined ->
+            call(Model, {tokenize, Text, Opts}, infinity)
+    end.
 
 -doc """
 Detokenise a list of token IDs back to a string. Safe to call
@@ -846,7 +866,10 @@ concurrently with `complete/2,3`.
 -spec detokenize(model(), [non_neg_integer()]) ->
     {ok, binary()} | {error, term()}.
 detokenize(Model, Tokens) when is_list(Tokens) ->
-    call(Model, {detokenize, Tokens}, infinity).
+    case shared(Model) of
+        {_Pid, {Mod, S}} -> shared_result(guarded(fun() -> wrap_ok(Mod:detokenize(S, Tokens)) end));
+        undefined -> call(Model, {detokenize, Tokens}, infinity)
+    end.
 
 -doc """
 Detokenise with options: `remove_special` strips a leading BOS /
@@ -857,7 +880,14 @@ arity-2 form drops them).
 -spec detokenize(model(), [non_neg_integer()], map()) ->
     {ok, binary()} | {error, term()}.
 detokenize(Model, Tokens, Opts) when is_list(Tokens), is_map(Opts) ->
-    call(Model, {detokenize, Tokens, Opts}, infinity).
+    case shared(Model) of
+        {_Pid, {Mod, S}} ->
+            shared_result(
+                guarded(fun() -> wrap_ok(backend_detokenize_with_opts(Mod, S, Tokens, Opts)) end)
+            );
+        undefined ->
+            call(Model, {detokenize, Tokens, Opts}, infinity)
+    end.
 
 -doc """
 Special / FIM vocab token map for the loaded model; see
@@ -887,8 +917,38 @@ apply_chat_template(Model, Request) when is_map(Request) ->
 %% stops, generation prompt, thinking tags) for this model. `Inputs'
 %% is the map fed verbatim to `erllama_chat:apply/2'. Returns
 %% `{ok, ParamsRef, Render}'.
+%%
+%% Once the model process has built the templates (its first
+%% chat_apply), later renders run in the caller's process.
 chat_apply(Model, Inputs) when is_map(Inputs) ->
-    call(Model, {chat_apply, Inputs}, infinity).
+    Cached =
+        case shared(Model) of
+            {Pid, _} -> erllama_chat_cache:cached(Model, Pid);
+            undefined -> not_found
+        end,
+    case Cached of
+        {ok, Templates} -> guarded(fun() -> erllama_chat:apply(Templates, Inputs) end);
+        not_found -> call(Model, {chat_apply, Inputs}, infinity)
+    end.
+
+%% The state the backend shares for calls from other processes
+%% (shared_state/1), published in the registry at init.
+shared(ModelId) when is_binary(ModelId) -> erllama_registry:shared(ModelId);
+shared(_Pid) -> undefined.
+
+%% The model was freed between the registry lookup and the call (an
+%% unload in progress): the same answer the model process gives once
+%% it is gone.
+shared_result({error, released}) -> {error, not_loaded};
+shared_result(Result) -> Result.
+
+publish_shared(ModelId, Backend, BState) ->
+    case erlang:function_exported(Backend, shared_state, 1) of
+        true ->
+            erllama_registry:set_shared(ModelId, {Backend, Backend:shared_state(BState)});
+        false ->
+            ok
+    end.
 
 %% Drop every chat-cache entry for this model. Called on model
 %% terminate so the cache does not extend templates_ref / params_ref
@@ -1027,6 +1087,7 @@ init([ModelId, Config0]) ->
             Data = build_init_data(ModelId, Config, Backend, BState),
             ok = obs_install_initial(Data),
             ok = publish_abort_handle(Data),
+            ok = publish_shared(ModelId, Backend, BState),
             {ok, idle, Data};
         {error, Reason} ->
             {stop, Reason}
@@ -1152,6 +1213,12 @@ terminate(Reason, _State, #data{model_id = ModelId, backend = B, backend_state =
                 ok
         end,
     B:terminate(S),
+    _ =
+        try
+            erllama_chat_cache:purge(ModelId)
+        catch
+            exit:_ -> ok
+        end,
     ok;
 terminate(_Reason, _State, _Data) ->
     ok.
@@ -2223,26 +2290,40 @@ handle_common(_State, {call, From}, {reset_session, SessionId}, Data) ->
     {NewData, Outcome} = reset_session_seq(SessionId, Data),
     reply(From, {ok, Outcome}, NewData);
 handle_common(_State, {call, From}, {tokenize, Text}, Data) ->
-    reply(From, wrap_ok(backend_call(Data, tokenize, [Text])), Data);
-handle_common(_State, {call, From}, {tokenize, Text, Opts}, Data) ->
-    reply(From, wrap_ok(backend_tokenize_with_opts(Data, Text, Opts)), Data);
+    reply(From, guarded(fun() -> wrap_ok(backend_call(Data, tokenize, [Text])) end), Data);
+handle_common(
+    _State, {call, From}, {tokenize, Text, Opts}, #data{backend = Mod, backend_state = S} = Data
+) ->
+    reply(
+        From, guarded(fun() -> wrap_ok(backend_tokenize_with_opts(Mod, S, Text, Opts)) end), Data
+    );
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
-    reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
-handle_common(_State, {call, From}, {detokenize, Tokens, Opts}, Data) ->
-    reply(From, wrap_ok(backend_detokenize_with_opts(Data, Tokens, Opts)), Data);
+    reply(From, guarded(fun() -> wrap_ok(backend_call(Data, detokenize, [Tokens])) end), Data);
+handle_common(
+    _State, {call, From}, {detokenize, Tokens, Opts}, #data{backend = Mod, backend_state = S} = Data
+) ->
+    reply(
+        From,
+        guarded(fun() -> wrap_ok(backend_detokenize_with_opts(Mod, S, Tokens, Opts)) end),
+        Data
+    );
 handle_common(_State, {call, From}, vocab_info, Data) ->
     reply(From, optional_backend_call(Data, vocab_info, []), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
-    reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
+    reply(
+        From,
+        guarded(fun() -> optional_backend_call(Data, apply_chat_template, [Request]) end),
+        Data
+    );
 handle_common(_State, {call, From}, {chat_apply, Inputs}, Data) ->
-    reply(From, do_chat_apply(Data, Inputs), Data);
+    reply(From, guarded(fun() -> do_chat_apply(Data, Inputs) end), Data);
 handle_common(_State, {call, From}, chat_purge, Data) ->
     erllama_chat_cache:purge(Data#data.model_id),
     reply(From, ok, Data);
 handle_common(_State, {call, From}, {embed, Tokens}, Data) ->
-    reply(From, optional_backend_call(Data, embed, [Tokens]), Data);
+    reply(From, guarded(fun() -> optional_backend_call(Data, embed, [Tokens]) end), Data);
 handle_common(_State, {call, From}, {embed_batch, TokenLists}, Data) ->
-    reply(From, embed_each(Data, TokenLists, []), Data);
+    reply(From, guarded(fun() -> embed_each(Data, TokenLists, []) end), Data);
 handle_common(State, {call, From}, {load_adapter, Path}, Data) ->
     handle_load_adapter(State, From, Path, Data);
 handle_common(State, {call, From}, {unload_adapter, Handle}, Data) ->
@@ -2418,6 +2499,16 @@ reply(From, Reply, Data) ->
 
 %% Wrap a backend tokenize/detokenize raw result in `{ok, _}` so the
 %% public API surface stays uniform across backends.
+%% A request the native code rejects (a malformed message list, a token
+%% id out of range) is that caller's error, not the model's: the model
+%% process serves everyone else and must not crash on it.
+guarded(Fun) ->
+    try
+        Fun()
+    catch
+        error:badarg -> {error, badarg}
+    end.
+
 wrap_ok({error, _} = E) -> E;
 wrap_ok(Result) -> {ok, Result}.
 
@@ -2459,7 +2550,7 @@ do_chat_apply(
             ModelRef = Mod:get_model_ref(S),
             case
                 erllama_chat_cache:get_or_init(
-                    ModelId, ModelRef, Tmpl
+                    ModelId, self(), ModelRef, Tmpl
                 )
             of
                 {ok, Templates} ->
@@ -2578,7 +2669,12 @@ step_tick(Data) ->
                 {spec, Req, Draft, DataS} ->
                     run_spec_tick(DataS, Req, Draft);
                 {no, DataS} ->
-                    step_tick_ops(DataS)
+                    case maybe_mtp_batch_tick(DataS) of
+                        {batch, Items, MaxDraft, SpecRef} ->
+                            run_mtp_batch_tick(DataS, Items, MaxDraft, SpecRef);
+                        no ->
+                            step_tick_ops(DataS)
+                    end
             end
     end.
 
@@ -2823,7 +2919,7 @@ spec_request_cfg(Req, Opts, Data) ->
         undefined ->
             undefined;
         Cfg ->
-            case spec_gates_ok(Req, Data) of
+            case spec_gates_ok(Req, Cfg, Data) of
                 true -> Cfg;
                 false -> undefined
             end
@@ -2833,6 +2929,8 @@ normalize_spec_opt(false) ->
     undefined;
 normalize_spec_opt(true) ->
     normalize_spec_opt(#{});
+normalize_spec_opt(#{type := mtp} = Map) ->
+    #{type => mtp, n_max => maps:get(n_max, Map, 2)};
 normalize_spec_opt(Map) when is_map(Map) ->
     #{
         n_match => maps:get(n_match, Map, 24),
@@ -2845,10 +2943,12 @@ normalize_spec_opt(Map) when is_map(Map) ->
 %%    (the llama backend vetoes when thinking markers are
 %%    configured: spec_step bypasses its marker mapping);
 %%  - recurrent / hybrid memories refuse the partial seq_rm every
-%%    draft mismatch needs;
+%%    draft mismatch needs, unless an MTP draft is short enough for
+%%    the backend's recurrent-state snapshots (spec_rollback/1);
+%%  - an MTP draft is verified by argmax: greedy requests only;
 %%  - thinking-enabled requests route tokens off context_tokens;
 %%  - logprobs ride the normal per-token sampling path.
-spec_gates_ok(Req, Data) ->
+spec_gates_ok(Req, Cfg, Data) ->
     B = Data#data.backend,
     Family = Data#data.family,
     %% Every admission path that reaches here built a sampler, so
@@ -2858,9 +2958,20 @@ spec_gates_ok(Req, Data) ->
     Hybrid = maps:get(hybrid, Family, false),
     spec_backend_ok(B) andalso
         B:spec_supported(Data#data.backend_state) andalso
-        not (Recurrent orelse Hybrid) andalso
+        (not (Recurrent orelse Hybrid) orelse spec_rollback_ok(Cfg, Data)) andalso
+        (maps:get(type, Cfg, ngram_mod) =/= mtp orelse spec_greedy(SamplerCfg)) andalso
         Req#req.thinking =:= disabled andalso
         maps:get(logprobs, SamplerCfg, 0) =:= 0.
+
+spec_rollback_ok(#{type := mtp, n_max := N}, #data{backend = B, backend_state = S}) ->
+    erlang:function_exported(B, spec_rollback, 1) andalso B:spec_rollback(S) >= N;
+spec_rollback_ok(_Cfg, _Data) ->
+    false.
+
+%% The sampler picks the most likely token; the backend refuses the
+%% MTP step otherwise (and the request then decodes without drafts).
+spec_greedy(SamplerCfg) ->
+    maps:get(temperature, SamplerCfg, 0.0) =< 0 andalso not maps:is_key(grammar, SamplerCfg).
 
 spec_backend_ok(B) ->
     lists:all(
@@ -2936,6 +3047,10 @@ spec_draft_for(#req{spec = Cfg} = Req, #data{spec = {_C, SpecRef}} = Data) ->
     case MaxDraft >= 1 of
         false ->
             {no, Data};
+        true when map_get(type, Cfg) =:= mtp ->
+            %% The MTP drafter drafts inside the step, after sampling the
+            %% token it drafts from.
+            {spec, Req, {mtp, SpecRef, MaxDraft}, Data};
         true ->
             K = Req#req.spec_prompt_len + GenLen,
             Cursor = Req#req.spec_cursor,
@@ -2983,10 +3098,116 @@ run_spec_tick(Data, Req, Draft) ->
                     0 -> Data1;
                     _ -> spec_trim_overshoot(SeqId, Data1)
                 end,
-            Data3 = spec_record_feedback(SeqId, length(Draft), NAcc, Data2),
+            Data3 = spec_record_feedback(SeqId, draft_len(Draft), NAcc, Data2),
             tick_after_step(Data3, [], []);
+        {error, not_greedy} ->
+            %% Refused before any decode: the request goes on without
+            %% drafts.
+            tick_after_step(put_req(Data, Req#req{spec = undefined}), [], []);
         {error, Reason} = Err ->
             case is_recoverable_decode_error(Reason) of
+                true ->
+                    recover_in_place(Data, Err);
+                false ->
+                    fail_all_requests(Data, Err),
+                    {stop, {step_failed, Err}, Data}
+            end
+    end.
+
+draft_len({mtp, _SpecRef, MaxDraft}) -> MaxDraft;
+draft_len(Draft) -> length(Draft).
+
+%% =============================================================================
+%% MTP rounds for several requests
+%%
+%% With an MTP drafter and two or more requests, a tick can verify every
+%% request's next token, and the guesses of the requests that draft, in
+%% one target decode (backend mtp_step_batch/4). That decode replaces
+%% every logits row, so it must hold every request that is waiting for a
+%% token: the tick runs only when all of them can join it (decode-ready,
+%% no logprobs) and otherwise falls back to the normal co-batched step,
+%% which also holds all of them. A request that does not draft (not MTP,
+%% or one token left) joins with no guess.
+%% =============================================================================
+
+maybe_mtp_batch_tick(#data{spec = {#{type := mtp, n_max := NMax}, SpecRef}} = Data) ->
+    Active = [R || R <- maps:values(Data#data.req_table), not R#req.finishing],
+    Ready = lists:all(fun mtp_batch_ready/1, Active),
+    Drafting = [R || R <- Active, R#req.spec =/= undefined],
+    N = length(Active),
+    MaxDraft = min(NMax, Data#data.total_batch_budget div max(1, N) - 1),
+    case
+        N >= 2 andalso N =< ?MTP_BATCH_MAX andalso Ready andalso Drafting =/= [] andalso
+            MaxDraft >= 1 andalso
+            erlang:function_exported(Data#data.backend, mtp_step_batch, 4)
+    of
+        true ->
+            Items = [
+                {R#req.sampler_ref, R#req.seq_id, mtp_batch_drafts(R, MaxDraft)}
+             || R <- lists:sort(fun(A, B) -> A#req.seq_id =< B#req.seq_id end, Active)
+            ],
+            {batch, Items, MaxDraft, SpecRef};
+        false ->
+            no
+    end;
+maybe_mtp_batch_tick(_Data) ->
+    no.
+
+mtp_batch_ready(#req{media_state = pending}) ->
+    false;
+mtp_batch_ready(#req{prefill_cursor = undefined, sampler_ref = Ref, last_sampler_cfg = Cfg}) when
+    Ref =/= undefined
+->
+    maps:get(logprobs, Cfg, 0) =:= 0;
+mtp_batch_ready(_Req) ->
+    false.
+
+%% A drafting request guesses up to as many tokens as it may still
+%% emit after the next one (so the committed tokens never pass its
+%% target); the others decode their next token alone.
+mtp_batch_drafts(#req{spec = undefined}, _MaxDraft) ->
+    [];
+mtp_batch_drafts(Req, MaxDraft) ->
+    Cap = min(MaxDraft, Req#req.response_target - length(Req#req.generated) - 1),
+    case Cap >= 1 of
+        true -> {auto, Cap};
+        false -> []
+    end.
+
+%% Every request's committed tokens go through the decode commit clause
+%% as in a lone MTP round (stop strings, events, saves, terminal
+%% checks); a request that drafted feeds its acceptance back.
+run_mtp_batch_tick(Data, Items, MaxDraft, SpecRef) ->
+    case backend_call(Data, mtp_step_batch, [SpecRef, Items, MaxDraft]) of
+        {ok, Results, _Times} ->
+            Data1 = lists:foldl(
+                fun({Seq, Committed, Eog, NAcc, NDrafted}, D0) ->
+                    {Leftover, D1} = apply_spec_committed(Seq, Committed, Eog, D0),
+                    D2 =
+                        case Leftover of
+                            0 -> D1;
+                            _ -> spec_trim_overshoot(Seq, D1)
+                        end,
+                    %% What the drafter actually gave (fewer than the cap,
+                    %% or none after an end-of-generation token).
+                    case NDrafted of
+                        0 -> D2;
+                        _ -> spec_record_feedback(Seq, NDrafted, NAcc, D2)
+                    end
+                end,
+                Data,
+                Results
+            ),
+            tick_after_step(Data1, [], []);
+        {error, Refused} when Refused =:= not_greedy; Refused =:= not_supported ->
+            %% Refused before any decode, every row intact: the requests
+            %% go on without drafts.
+            Tab = maps:map(
+                fun(_, R) -> R#req{spec = undefined} end, Data#data.req_table
+            ),
+            tick_after_step(Data#data{req_table = Tab}, [], []);
+        {error, Reason} = Err ->
+            case is_recoverable_decode_error(Reason) orelse Reason =:= stale_logits of
                 true ->
                     recover_in_place(Data, Err);
                 false ->
@@ -3041,7 +3262,8 @@ spec_record_feedback(SeqId, NDrafted, NAcc, Data) ->
         {ok, Req} ->
             put_req(Data, Req#req{
                 spec_drafted = Req#req.spec_drafted + NDrafted,
-                spec_accepted = Req#req.spec_accepted + NAcc
+                spec_accepted = Req#req.spec_accepted + NAcc,
+                spec_rounds = Req#req.spec_rounds + 1
             });
         error ->
             Data
@@ -3955,8 +4177,8 @@ build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
 
 maybe_add_speculative(Stats, #req{spec = undefined}) ->
     Stats;
-maybe_add_speculative(Stats, #req{spec_drafted = D, spec_accepted = A}) ->
-    Stats#{speculative => #{drafted => D, accepted => A}}.
+maybe_add_speculative(Stats, #req{spec_drafted = D, spec_accepted = A, spec_rounds = N}) ->
+    Stats#{speculative => #{drafted => D, accepted => A, rounds => N}}.
 
 maybe_add_media(Stats, #req{media = undefined}) ->
     Stats;
@@ -4291,6 +4513,14 @@ fire_save_if(true, Reason, Tokens, Req, Data) ->
     Payload = backend_kv_pack(Tokens, Req#req.seq_id, Data),
     Elapsed = erlang:monotonic_time(nanosecond) - T0,
     erllama_cache_counters:add(?C_PACK_TOTAL_NS, max(Elapsed, 0)),
+    publish_packed(Payload, BuildMeta, Data).
+
+%% A pack that failed (`{error, _}', e.g. a split model's checkpoint
+%% missing a rank's share) publishes nothing.
+publish_packed(Payload, _BuildMeta, _Data) when not is_binary(Payload) ->
+    erllama_cache_counters:incr(?C_SAVES_DROPPED),
+    not_fired;
+publish_packed(Payload, BuildMeta, Data) ->
     case
         erllama_cache_writer:save(
             Data#data.tier_srv, Data#data.tier, BuildMeta, Payload, 0
@@ -4403,7 +4633,7 @@ backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
 %% Tokenize via the backend's optional 3-arity callback (forwards
 %% caller-supplied options like `parse_special'). Falls back to the
 %% 2-arity callback when the backend hasn't been updated.
-backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) ->
+backend_tokenize_with_opts(Mod, S, Text, Opts) ->
     case erlang:function_exported(Mod, tokenize, 3) of
         true -> Mod:tokenize(S, Text, Opts);
         false -> Mod:tokenize(S, Text)
@@ -4412,7 +4642,7 @@ backend_tokenize_with_opts(#data{backend = Mod, backend_state = S}, Text, Opts) 
 %% Detokenize via the backend's optional 3-arity callback (special
 %% token rendering options). Backends without it fall back to the
 %% plain arity-2 form, ignoring the options.
-backend_detokenize_with_opts(#data{backend = Mod, backend_state = S}, Tokens, Opts) ->
+backend_detokenize_with_opts(Mod, S, Tokens, Opts) ->
     case erlang:function_exported(Mod, detokenize, 3) of
         true -> Mod:detokenize(S, Tokens, Opts);
         false -> Mod:detokenize(S, Tokens)

@@ -39,7 +39,11 @@
     models = #{} :: #{binary() => #model{}},
     %% A load in progress: the loader's monitor, and who waits for it.
     loading = #{} :: #{binary() => {reference(), [{gen_server:from(), pid(), term()}]}},
-    unloading = #{} :: #{binary() => true}
+    %% An unload in progress, and the acquisitions waiting for it to
+    %% finish: they then load the model again.
+    unloading = #{} :: #{
+        binary() => [{gen_server:from(), {acquire, map(), pid(), term()} | unloaded}]
+    }
 }).
 -type state() :: #state{}.
 
@@ -103,8 +107,7 @@ unload(Name) ->
             {ok, {loaded, N}} -> N;
             {error, _} -> Name
         end,
-    gen_server:call(?MODULE, {forget, Id}),
-    erllama:unload(Id).
+    gen_server:call(?MODULE, {unload, Id}, infinity).
 
 %% Loaded models with what this module knows of them.
 -spec ps() -> [map()].
@@ -113,12 +116,31 @@ ps() ->
     [
         maps:merge(
             maps:with(
-                [id, status, backend, context_size, quant_tag, vram_estimate_b, n_seq_max], Info
+                [
+                    id,
+                    status,
+                    backend,
+                    context_size,
+                    quant_tag,
+                    vram_estimate_b,
+                    n_seq_max,
+                    available_seqs
+                ],
+                Info
             ),
-            maps:get(maps:get(id, Info), Managed, #{managed => false})
+            (maps:get(maps:get(id, Info), Managed, #{managed => false}))#{
+                waiting => waiting(maps:get(id, Info))
+            }
         )
      || Info <- erllama:list_models()
     ].
+
+%% Requests queued for a free sequence (read without the model process).
+waiting(Id) ->
+    case erllama:pending_len(Id) of
+        {ok, N} -> N;
+        {error, _} -> 0
+    end.
 
 %% erllama_model_evictor: called by erllama's scheduler process.
 -spec evict_one() -> {unloaded, binary()} | none.
@@ -138,6 +160,12 @@ evict_one() ->
 init([]) ->
     {ok, #state{}}.
 
+handle_call({acquire, #{name := Id}, _, _} = Req, From, #state{unloading = U} = St) when
+    is_map_key(Id, U)
+->
+    %% Being unloaded: granting it now would hand out a model about to
+    %% go. Wait, then load it again.
+    {noreply, St#state{unloading = U#{Id := [{From, Req} | maps:get(Id, U)]}}};
 handle_call(
     {acquire, #{name := Id} = Entry, Holder, KA}, From, #state{models = Ms, loading = L} = St
 ) ->
@@ -161,15 +189,17 @@ handle_call(
     end;
 handle_call(managed, _From, #state{models = Ms} = St) ->
     {reply, maps:map(fun(_, M) -> describe(M) end, Ms), St};
-handle_call({forget, Id}, _From, #state{models = Ms} = St) ->
+handle_call({unload, Id}, From, #state{unloading = U} = St) when is_map_key(Id, U) ->
+    %% Already going: answer when it is gone.
+    {noreply, St#state{unloading = U#{Id := [{From, unloaded} | maps:get(Id, U)]}}};
+handle_call({unload, Id}, From, #state{models = Ms} = St) ->
     case maps:take(Id, Ms) of
         {M, Ms1} ->
-            cancel_timer(M),
-            maps:foreach(fun(_, Mon) -> erlang:demonitor(Mon, [flush]) end, M#model.holders),
-            {reply, ok, St#state{models = Ms1}};
+            maps:foreach(fun(_, Mon) -> erlang:demonitor(Mon, [flush]) end, M#model.holders);
         error ->
-            {reply, ok, St}
-    end;
+            Ms1 = Ms
+    end,
+    {noreply, begin_unload(Id, From, St#state{models = Ms1})};
 handle_call(pick_evictable, _From, #state{models = Ms, unloading = U} = St) ->
     Idle = [
         {M#model.last_used, Id}
@@ -178,7 +208,7 @@ handle_call(pick_evictable, _From, #state{models = Ms, unloading = U} = St) ->
     case lists:sort(Idle) of
         [{_, Id} | _] ->
             cancel_timer(maps:get(Id, Ms)),
-            {reply, {ok, Id}, St#state{unloading = U#{Id => true}}};
+            {reply, {ok, Id}, St#state{unloading = U#{Id => []}}};
         [] ->
             {reply, none, St}
     end;
@@ -191,7 +221,9 @@ handle_cast({release, Id, Holder}, #state{models = Ms} = St) ->
         _ -> {noreply, St}
     end;
 handle_cast({unloaded, Id}, #state{models = Ms, unloading = U} = St) ->
-    {noreply, St#state{models = maps:remove(Id, Ms), unloading = maps:remove(Id, U)}};
+    Waiting = lists:reverse(maps:get(Id, U, [])),
+    St1 = St#state{models = maps:remove(Id, Ms), unloading = maps:remove(Id, U)},
+    {noreply, lists:foldl(fun retry_acquire/2, St1, Waiting)};
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
@@ -205,11 +237,13 @@ handle_info({'DOWN', Mon, process, _, Reason}, #state{loading = L} = St) ->
         [Id] -> {noreply, loaded(Id, Reason, St)};
         [] -> {noreply, holder_down(Mon, St)}
     end;
+handle_info({keep_alive, Id, _Ref}, #state{unloading = U} = St) when is_map_key(Id, U) ->
+    {noreply, St};
 handle_info({keep_alive, Id, Ref}, #state{models = Ms} = St) ->
     case Ms of
         #{Id := #model{timer = Ref, holders = H} = M} when map_size(H) =:= 0 ->
-            spawn_unload(Id),
-            {noreply, St#state{models = Ms#{Id := M#model{timer = undefined}}}};
+            St1 = St#state{models = Ms#{Id := M#model{timer = undefined}}},
+            {noreply, begin_unload(Id, undefined, St1)};
         _ ->
             {noreply, St}
     end;
@@ -257,20 +291,36 @@ load_model(#{name := Id} = Entry) ->
 
 %% The erllama load config of a registry entry. `context_size' is the
 %% cache's copy of `n_ctx' and must match it.
+%%
+%% A model serves `parallel' sequences at once (default
+%% `default_parallel'), batched into one decode per step, so a request
+%% is not queued behind another one's generation. With `kv_unified' the
+%% sequences share one KV pool of `n_ctx' cells and each may use up to
+%% `n_ctx' (as llama-server with automatic slots); without it each
+%% sequence gets `n_ctx / parallel'.
 load_config(#{path := Path} = Entry) ->
     Load = maps:get(load, Entry, #{}),
     NCtx = n_ctx(Entry, Load),
     Base = #{
         model_path => Path,
         model_opts => maps:with([n_gpu_layers], Load),
-        context_opts => #{n_ctx => NCtx},
+        context_opts => #{
+            n_ctx => NCtx,
+            n_seq_max => maps:get(parallel, Load, erllama_server_config:get(default_parallel)),
+            kv_unified => maps:get(kv_unified, Load, erllama_server_config:get(kv_unified))
+        },
         context_size => NCtx
     },
     with_extras(Base, Entry, Load).
 
-with_extras(_Base, _Entry, #{backend := erllama_model_stub} = Load) ->
-    %% Tests: the same entry on erllama's stub backend.
-    #{backend => erllama_model_stub, step_delay_ms => maps:get(step_delay_ms, Load, 0)};
+with_extras(Base, _Entry, #{backend := erllama_model_stub} = Load) ->
+    %% Tests: the same entry on erllama's stub backend, with the same
+    %% sequences.
+    #{
+        backend => erllama_model_stub,
+        step_delay_ms => maps:get(step_delay_ms, Load, 0),
+        context_opts => maps:with([n_seq_max], maps:get(context_opts, Base))
+    };
 with_extras(Base, Entry, Load) ->
     WithProj =
         case Entry of
@@ -344,8 +394,10 @@ idle_check(Id, #model{holders = H, keep_alive = KA} = M) when map_size(H) =:= 0 
         infinity ->
             M;
         0 ->
-            spawn_unload(Id),
-            M;
+            %% Through the timer path, so the unload is marked in the state.
+            Ref = make_ref(),
+            self() ! {keep_alive, Id, Ref},
+            M#model{timer = Ref};
         Ms when is_integer(Ms) ->
             Ref = make_ref(),
             _ = erlang:send_after(Ms, self(), {keep_alive, Id, Ref}),
@@ -354,13 +406,28 @@ idle_check(Id, #model{holders = H, keep_alive = KA} = M) when map_size(H) =:= 0 
 idle_check(_Id, M) ->
     M.
 
-spawn_unload(Id) ->
+%% Unload in a helper (it can take a while) and mark it, so
+%% acquisitions wait for it; `From', if any, gets the unload's result.
+begin_unload(Id, From, #state{unloading = U} = St) ->
     Self = self(),
     _ = spawn(fun() ->
-        _ = erllama:unload(Id),
+        R = erllama:unload(Id),
+        _ = From =/= undefined andalso gen_server:reply(From, R),
         gen_server:cast(Self, {unloaded, Id})
     end),
-    ok.
+    St#state{unloading = U#{Id => maps:get(Id, U, [])}}.
+
+retry_acquire({From, unloaded}, St) ->
+    gen_server:reply(From, ok),
+    St;
+retry_acquire({From, Req}, St) ->
+    case handle_call(Req, From, St) of
+        {reply, R, St1} ->
+            gen_server:reply(From, R),
+            St1;
+        {noreply, St1} ->
+            St1
+    end.
 
 cancel_timer(_M) ->
     %% Timers are matched by reference on arrival; a stale one is

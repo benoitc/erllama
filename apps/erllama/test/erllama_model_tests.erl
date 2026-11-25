@@ -2278,3 +2278,73 @@ make_tmp_dir() ->
     ),
     ok = file:make_dir(Dir),
     Dir.
+
+%% =============================================================================
+%% Tokenising from the caller's process
+%% =============================================================================
+
+%% A model that is generating spends most of its time in a decode
+%% step. Tokenising only reads the vocabulary, so it must not wait for
+%% that step: the stub sleeps 400 ms per step here.
+tokenize_does_not_wait_for_a_decode_step_test() ->
+    with_model(#{}, #{step_delay_ms => 400}, fun(_Cfg) ->
+        {ok, Ref} = erllama_model:infer(
+            <<"test_model">>, prompt_tokens(long_prompt()), #{response_tokens => 6}, self()
+        ),
+        receive
+            {erllama, Ref, {token, _}} -> ok
+        after 5000 -> erlang:error(no_first_token)
+        end,
+        Text = <<"one two three">>,
+        T0 = erlang:monotonic_time(millisecond),
+        Tok = erllama_model:tokenize(<<"test_model">>, Text),
+        TokOpts = erllama_model:tokenize(<<"test_model">>, Text, #{add_special => false}),
+        Detok = erllama_model:detokenize(<<"test_model">>, [1, 2, 3]),
+        DetokOpts = erllama_model:detokenize(<<"test_model">>, [1, 2, 3], #{}),
+        Elapsed = erlang:monotonic_time(millisecond) - T0,
+        Expected = erllama_model_stub:tokenize(undefined, Text),
+        ?assertEqual({ok, Expected}, Tok),
+        ?assertEqual({ok, Expected}, TokOpts),
+        ?assertEqual({ok, <<"1 2 3">>}, Detok),
+        ?assertEqual({ok, <<"1 2 3">>}, DetokOpts),
+        ?assert(Elapsed < 200, {tokenize_waited_for_the_step, Elapsed}),
+        ok = erllama_model:cancel(Ref),
+        _ = drain_done(Ref, 10000)
+    end).
+
+%% A pid goes through the model process and gives the same answer.
+tokenize_by_pid_matches_by_id_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        Pid = erllama_registry:whereis_name(<<"test_model">>),
+        Text = <<"alpha beta">>,
+        ?assertEqual(
+            erllama_model:tokenize(<<"test_model">>, Text),
+            erllama_model:tokenize(Pid, Text)
+        ),
+        ?assertEqual(
+            erllama_model:detokenize(<<"test_model">>, [7, 8]),
+            erllama_model:detokenize(Pid, [7, 8])
+        )
+    end).
+
+%% Once the model is stopped its shared state is gone with it, and
+%% tokenising answers as for any model that is not loaded.
+tokenize_after_stop_is_not_loaded_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ?assertMatch({_, _}, erllama_registry:shared(<<"test_model">>)),
+        erllama_test_helpers:stop_model_quiet(<<"test_model">>),
+        wait_until(fun() -> erllama_registry:shared(<<"test_model">>) =:= undefined end, 2000),
+        ?assertEqual({error, not_loaded}, erllama_model:tokenize(<<"test_model">>, <<"x">>)),
+        ?assertEqual({error, not_loaded}, erllama_model:detokenize(<<"test_model">>, [1]))
+    end).
+
+wait_until(Fun, TimeoutMs) when TimeoutMs =< 0 ->
+    ?assert(Fun());
+wait_until(Fun, TimeoutMs) ->
+    case Fun() of
+        true ->
+            ok;
+        false ->
+            timer:sleep(10),
+            wait_until(Fun, TimeoutMs - 10)
+    end.

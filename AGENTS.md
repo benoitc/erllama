@@ -19,7 +19,7 @@ apps/erllama/          the library (published to Hex)
   priv/                Build artefact: erllama_nif.so
   config/              sys.config for `rebar3 shell`
   rebar.config         NIF build hooks, Hex and ex_doc config
-apps/erllama_server/   the server release (in progress) and the CLI
+apps/erllama_server/   the server release and the CLI
                        (erllama_server_cli, built as the `erllama` escript)
 apps/erllama_wasi_nn/  wasi:nn backend for erlang_wasm (one module, no
                        process); depends on erlang_wasm by git, so it is

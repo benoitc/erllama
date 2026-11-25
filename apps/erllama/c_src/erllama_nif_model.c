@@ -5,6 +5,7 @@
 
 #include "erllama_nif_int.h"
 #include "erllama_safe.h"
+#include "erllama_tp_nif.h"
 
 #include <math.h>
 #include <string.h>
@@ -645,6 +646,8 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         }
     }
     if (get_map_bool(env, argv[1], "vocab_only", &b)) params.vocab_only = b ? true : false;
+    /* A file's MTP layers (a draft model for nif_mtp_new). */
+    if (get_map_bool(env, argv[1], "load_mtp", &b)) params.load_mtp = b ? true : false;
 
     int enum_v;
     int sm_rc = get_map_atom_enum(
@@ -697,6 +700,24 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
                 env,
                 enif_make_tuple2(
                     env, enif_make_atom(env, "unknown_device"), bad_name));
+        }
+    }
+
+    /* Tensor parallelism: `tp_rank => Rank' splits the model over the
+     * rank's group with llama's tensor split, one device per rank (this
+     * rank's GPU and placeholders for the others; see
+     * erllama_tp_nif.cpp). The rank stays alive with the model. */
+    ggml_backend_dev_t tp_devs[ERLLAMA_MAX_DEVICES + 1];
+    {
+        ERL_NIF_TERM tpv;
+        if (enif_get_map_value(env, argv[1], enif_make_atom(env, "tp_rank"), &tpv)) {
+            if (erllama_tp_model_devices(env, tpv, tp_devs, ERLLAMA_MAX_DEVICES + 1,
+                                         &res->tp_rank) < 0) {
+                enif_release_resource(res);
+                return enif_make_badarg(env);
+            }
+            params.devices = tp_devs;
+            params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
         }
     }
 
@@ -942,6 +963,7 @@ ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
      * object rather than risk UB. */
     int rc = erllama_safe_model_free(to_free);
     m->model = NULL;
+    model_release_tp(m);
     m->release_pending = 0;
     pthread_mutex_unlock(&m->mu);
     if (rc != 0) {
