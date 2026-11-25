@@ -1568,8 +1568,9 @@ decode_timeout_recovers_in_place_test_() ->
                 #{response_tokens => 4},
                 self()
             ),
+            %% The bare reason, wrapped once.
             receive
-                {erllama, Ref1, {error, _Reason}} -> ok
+                {erllama, Ref1, {error, Reason}} -> ?assertEqual(decode_timeout, Reason)
             after 5000 -> erlang:error(no_error_on_wedge)
             end,
             %% Same gen_statem pid: recovered in place, not restarted.
@@ -1602,7 +1603,7 @@ decode_failed_recovers_in_place_test_() ->
                 self()
             ),
             receive
-                {erllama, Ref1, {error, _Reason}} -> ok
+                {erllama, Ref1, {error, Reason}} -> ?assertEqual({decode_failed, 1}, Reason)
             after 5000 -> erlang:error(no_error_on_decode_failed)
             end,
             %% Same pid: recovered in place, not restarted.
@@ -1626,8 +1627,8 @@ decode_failed_sync_caller_replies_test_() ->
     {timeout, 30, fun() ->
         with_model(#{}, fun(_Cfg) ->
             ok = erllama_model_stub:wedge_next_step({decode_failed, 1}),
-            ?assertMatch(
-                {error, _},
+            ?assertEqual(
+                {error, {decode_failed, 1}},
                 erllama_model:complete(
                     <<"test_model">>, long_prompt(), #{response_tokens => 4}
                 )
@@ -1635,6 +1636,79 @@ decode_failed_sync_caller_replies_test_() ->
             ?assertEqual(idle, erllama_model:status(<<"test_model">>))
         end)
     end}.
+
+%% A decode timeout reaches a synchronous caller as {error,
+%% decode_timeout}, and the recovered model completes the next request.
+decode_timeout_sync_caller_gets_the_reason_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, fun(_Cfg) ->
+            ok = erllama_model_stub:wedge_next_step(decode_timeout),
+            ?assertEqual(
+                {error, decode_timeout},
+                erllama_model:complete(
+                    <<"test_model">>, long_prompt(), #{response_tokens => 4}
+                )
+            ),
+            ?assertMatch(
+                {ok, #{generated := [_, _]}},
+                erllama_model:complete(
+                    <<"test_model">>, long_prompt(), #{response_tokens => 2}
+                )
+            )
+        end)
+    end}.
+
+%% A caller queued behind the only sequence when the decode times out
+%% gets the same {error, decode_timeout} as the request in flight, and
+%% the recovered model then serves a new request.
+decode_timeout_fails_queued_admission_test_() ->
+    {timeout, 30, fun() ->
+        with_model(#{}, #{step_delay_ms => 50}, fun(_Cfg) ->
+            {ok, R1} = erllama_model:infer(
+                <<"test_model">>,
+                prompt_tokens(long_prompt()),
+                #{response_tokens => 1000},
+                self()
+            ),
+            wait_first_token(R1),
+            Parent = self(),
+            _ = spawn(fun() ->
+                Parent !
+                    {queued,
+                        erllama_model:complete(
+                            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+                        )}
+            end),
+            ok = wait_pending(<<"test_model">>, 1, 5000),
+            ok = erllama_model_stub:wedge_next_step(decode_timeout),
+            receive
+                {erllama, R1, {error, Reason}} -> ?assertEqual(decode_timeout, Reason)
+            after 5000 -> erlang:error(no_error_on_wedge)
+            end,
+            receive
+                {queued, Queued} -> ?assertEqual({error, decode_timeout}, Queued)
+            after 5000 -> erlang:error(queued_caller_not_failed)
+            end,
+            _ = drain_stream_messages(R1),
+            ?assertMatch(
+                {ok, #{generated := [_, _]}},
+                erllama_model:complete(
+                    <<"test_model">>, long_prompt(), #{response_tokens => 2}
+                )
+            )
+        end)
+    end}.
+
+wait_pending(Model, N, Timeout) when Timeout =< 0 ->
+    {timeout, N, erllama:pending_len(Model)};
+wait_pending(Model, N, Timeout) ->
+    case erllama:pending_len(Model) of
+        {ok, N} ->
+            ok;
+        _ ->
+            timer:sleep(10),
+            wait_pending(Model, N, Timeout - 10)
+    end.
 
 %% Recovery clears sticky sessions: after a wedge the seq pool is fully
 %% available again and the old session is gone.

@@ -71,6 +71,8 @@ paths).
     %% simulating a wedged/aborted decode so recovery can be tested
     %% without a real backend.
     wedge_next_step/1,
+    %% Test helper: the same, for the next speculative step only.
+    wedge_next_spec_step/1,
     %% Test helpers: read / clear the list of cfgs passed to
     %% sampler_new/2 since the last reset.
     sampler_new_cfgs/0,
@@ -323,6 +325,18 @@ step(S, Ops) ->
             {error, Reason}
     end.
 
+%% Test knob: a one-shot wedge armed by wedge_next_spec_step/1 fails
+%% the next speculative step; one armed by wedge_next_step/1 fails the
+%% next step of either kind.
+take_spec_wedge() ->
+    case persistent_term:get({?MODULE, spec_wedge}, undefined) of
+        undefined ->
+            take_wedge();
+        Reason ->
+            persistent_term:erase({?MODULE, spec_wedge}),
+            Reason
+    end.
+
 %% Test knob: consume a one-shot wedge armed by wedge_next_step/1
 %% (shared by step/2 and spec_step/4).
 take_wedge() ->
@@ -427,7 +441,7 @@ spec_step(#stub{step_delay_ms = D} = S, Sampler, SeqId, Draft) when D > 0 ->
     timer:sleep(D),
     spec_step(S#stub{step_delay_ms = 0}, Sampler, SeqId, Draft);
 spec_step(_S, Sampler, SeqId, Draft) ->
-    case take_wedge() of
+    case take_spec_wedge() of
         undefined ->
             T = stub_token(SeqId, Sampler),
             Matched = matched_prefix(Draft, T),
@@ -491,6 +505,12 @@ abort_handle(_S) ->
 %% Test knob: arm the next step/2 to return {error, Reason} once.
 wedge_next_step(Reason) ->
     persistent_term:put({?MODULE, wedge}, Reason),
+    ok.
+
+%% Test knob: arm the next speculative step (spec_step/4) to return
+%% {error, Reason} once; plain steps are left alone.
+wedge_next_spec_step(Reason) ->
+    persistent_term:put({?MODULE, spec_wedge}, Reason),
     ok.
 
 %% Test helper: cfgs passed to sampler_new/2 since the last reset.

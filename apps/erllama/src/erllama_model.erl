@@ -1231,7 +1231,7 @@ fail_callers_on_stop(Reason, Data) when
     Reason =:= normal; Reason =:= shutdown; element(1, Reason) =:= shutdown
 ->
     ok = fail_all_requests(Data, not_loaded),
-    fail_pending_admits(Data, {error, not_loaded});
+    fail_pending_admits(Data, not_loaded);
 fail_callers_on_stop(_Reason, _Data) ->
     ok.
 
@@ -1583,11 +1583,13 @@ publish_abort_handle(#data{backend = Mod, backend_state = S}) ->
 %% Recover a wedged/aborted context in place: notify every in-flight
 %% caller, recreate the backend context (model stays loaded), reset
 %% all per-seq bookkeeping, drop sticky sessions, fail queued admits,
-%% and return to idle. Falls back to the supervisor-restart stop if
-%% the backend can't recreate (or has no reset_context callback).
-recover_in_place(Data, Err) ->
-    fail_all_requests(Data, Err),
-    fail_pending_admits(Data, Err),
+%% and return to idle. `Reason' is the bare backend reason: each
+%% caller gets `{error, Reason}'. If the backend cannot recreate its
+%% context (or has no reset_context callback) the model stops; it is a
+%% temporary child, so it stays down until loaded again.
+recover_in_place(Data, Reason) ->
+    fail_all_requests(Data, Reason),
+    fail_pending_admits(Data, Reason),
     Mod = Data#data.backend,
     case erlang:function_exported(Mod, reset_context, 1) of
         true ->
@@ -1601,7 +1603,7 @@ recover_in_place(Data, Err) ->
                     {stop, {recover_failed, ResetErr}, Data}
             end;
         false ->
-            {stop, {step_failed, Err}, Data}
+            {stop, {step_failed, Reason}, Data}
     end.
 
 reset_after_recovery(Data, NewBState) ->
@@ -1613,14 +1615,14 @@ reset_after_recovery(Data, NewBState) ->
         pending = []
     }.
 
-%% Reply {error, Err} to every queued (not-yet-admitted) caller so a
+%% Reply {error, Reason} to every queued (not-yet-admitted) caller so a
 %% recovery doesn't leave them parked on their gen_statem:call.
-fail_pending_admits(#data{pending = Pending}, Err) ->
+fail_pending_admits(#data{pending = Pending}, Reason) ->
     lists:foreach(
         fun(Item) ->
             case pending_from_of(Item) of
                 undefined -> ok;
-                From -> _ = gen_statem:reply(From, Err)
+                From -> _ = gen_statem:reply(From, {error, Reason})
             end
         end,
         Pending
@@ -2690,19 +2692,19 @@ step_tick_ops(Data1) ->
                     Pairs = pair_ops_with_results(OpList, Results),
                     Data2 = apply_step_results(Pairs, Data1),
                     tick_after_step(Data2, FinishersFirst, []);
-                {error, Reason} = Err ->
+                {error, Reason} ->
                     case is_recoverable_decode_error(Reason) of
                         true ->
                             %% Bounded/interrupted decode: recover the
                             %% context in place, keep the model loaded.
-                            recover_in_place(Data1, Err);
+                            recover_in_place(Data1, Reason);
                         false ->
                             %% Any other backend error poisons every
                             %% in-flight request and cannot be attributed
-                            %% to a single row. Stop; the supervisor
-                            %% restarts the gen_statem.
-                            fail_all_requests(Data1, Err),
-                            {stop, {step_failed, Err}, Data1}
+                            %% to a single row. Stop: the model is a
+                            %% temporary child, so it needs a fresh load.
+                            fail_all_requests(Data1, Reason),
+                            {stop, {step_failed, Reason}, Data1}
                     end
             end
     end.
@@ -3104,13 +3106,13 @@ run_spec_tick(Data, Req, Draft) ->
             %% Refused before any decode: the request goes on without
             %% drafts.
             tick_after_step(put_req(Data, Req#req{spec = undefined}), [], []);
-        {error, Reason} = Err ->
+        {error, Reason} ->
             case is_recoverable_decode_error(Reason) of
                 true ->
-                    recover_in_place(Data, Err);
+                    recover_in_place(Data, Reason);
                 false ->
-                    fail_all_requests(Data, Err),
-                    {stop, {step_failed, Err}, Data}
+                    fail_all_requests(Data, Reason),
+                    {stop, {step_failed, Reason}, Data}
             end
     end.
 
@@ -3206,13 +3208,13 @@ run_mtp_batch_tick(Data, Items, MaxDraft, SpecRef) ->
                 fun(_, R) -> R#req{spec = undefined} end, Data#data.req_table
             ),
             tick_after_step(Data#data{req_table = Tab}, [], []);
-        {error, Reason} = Err ->
+        {error, Reason} ->
             case is_recoverable_decode_error(Reason) orelse Reason =:= stale_logits of
                 true ->
-                    recover_in_place(Data, Err);
+                    recover_in_place(Data, Reason);
                 false ->
-                    fail_all_requests(Data, Err),
-                    {stop, {step_failed, Err}, Data}
+                    fail_all_requests(Data, Reason),
+                    {stop, {step_failed, Reason}, Data}
             end
     end.
 
@@ -3269,8 +3271,8 @@ spec_record_feedback(SeqId, NDrafted, NAcc, Data) ->
             Data
     end.
 
-%% Decode errors the engine recovers from in place (without a
-%% supervisor reload): the per-step budget tripped (`decode_timeout`),
+%% Decode errors the engine recovers from in place (the model stays
+%% loaded): the per-step budget tripped (`decode_timeout`),
 %% an external `request_abort` fired (`decode_aborted`), or `llama_decode`
 %% returned a hard failure (`decode_failed`, e.g. "no KV slot" from a
 %% prompt that overflows the context). Recovery resets the context and
@@ -3933,9 +3935,10 @@ send_done_for_req(#req{request_ref = Ref, caller_pid = Pid}, Stats) when
 send_done_for_req(_Req, _Stats) ->
     ok.
 
-%% Fail every in-flight request with the same error. Used when a
-%% backend:step/2 call returns an error that cannot be attributed
-%% to a single row (e.g. llama_decode exception).
+%% Fail every in-flight request with the same bare reason (each caller
+%% gets `{error, Reason}'). Used when a backend:step/2 call returns an
+%% error that cannot be attributed to a single row (e.g. llama_decode
+%% exception).
 fail_all_requests(Data, Err) ->
     Reqs = maps:values(Data#data.req_table),
     lists:foreach(fun(R) -> fail_request(R, Data, Err) end, Reqs),

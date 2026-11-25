@@ -276,3 +276,29 @@ session_turns_keep_speculating_test() ->
         ?assert(D2 > 0),
         ?assertEqual(D2, A2)
     end).
+
+%% =============================================================================
+%% Recovery
+%% =============================================================================
+
+%% A speculative step that times out fails its caller with the bare
+%% reason, wrapped once, and the recovered model serves the next one.
+spec_step_timeout_reaches_callers_test() ->
+    with_model(#{}, fun(Id) ->
+        ok = erllama_model_stub:wedge_next_spec_step(decode_timeout),
+        {ok, Ref} = erllama:stream(Id, <<"stream me now">>, #{
+            response_tokens => 8, speculative => true
+        }),
+        ?assertEqual({error, decode_timeout}, collect_stream(Ref, 5000)),
+        ok = erllama_model_stub:wedge_next_spec_step(decode_timeout),
+        ?assertEqual(
+            {error, decode_timeout},
+            erllama:complete(Id, <<"hello world foo">>, #{
+                response_tokens => 8, speculative => true
+            })
+        ),
+        {ok, R} = erllama:complete(Id, <<"hello world foo">>, #{
+            response_tokens => 8, speculative => true
+        }),
+        ?assertEqual(8, length(maps:get(generated, R)))
+    end).

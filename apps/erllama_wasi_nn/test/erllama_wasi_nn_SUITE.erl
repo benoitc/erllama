@@ -45,6 +45,7 @@
     a_name_outside_the_grant_is_not_found/1,
     the_backend_may_refuse_a_granted_name/1,
     a_backend_error_reaches_the_guest/1,
+    a_decode_timeout_reaches_the_guest_as_timeout/1,
     a_command_runs_a_model/1,
     without_the_option_the_import_is_missing/1,
     an_embedding_comes_back_as_fp32/1,
@@ -79,6 +80,7 @@ all() ->
         a_name_outside_the_grant_is_not_found,
         the_backend_may_refuse_a_granted_name,
         a_backend_error_reaches_the_guest,
+        a_decode_timeout_reaches_the_guest_as_timeout,
         a_command_runs_a_model,
         without_the_option_the_import_is_missing,
         an_embedding_comes_back_as_fp32,
@@ -192,6 +194,20 @@ a_backend_error_reaches_the_guest(Config) ->
         run(I, <<"full">>, ?PROMPT)
     ),
     ?assert(is_process_alive(Holder)),
+    ?assertEqual([], wasm_component:host_live()).
+
+%% erllama recovers the model from a decode that ran past its budget and
+%% fails the request with `decode_timeout`; the guest reads `timeout`,
+%% and the next run is served.
+a_decode_timeout_reaches_the_guest_as_timeout(Config) ->
+    I = instance(Config),
+    ok = erllama_model_stub:wedge_next_step(decode_timeout),
+    ?assertEqual(
+        {error, <<"timeout: decode_timeout">>},
+        run(I, <<"default">>, ?PROMPT)
+    ),
+    {ok, [#{<<"data">> := Data}]} = run(I, <<"default">>, ?PROMPT),
+    ?assertEqual(4, tokens(Data)),
     ?assertEqual([], wasm_component:host_live()).
 
 a_command_runs_a_model(Config) ->
