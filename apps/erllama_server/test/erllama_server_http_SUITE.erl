@@ -33,6 +33,7 @@
     concurrent_requests_on_two_models/1,
     http_request_during_a_long_run/1,
     ops_endpoints/1,
+    chat_completion_speculative/1,
     real_model_tool_call/1,
     real_model_logprobs/1,
     real_model_concurrent_streams/1,
@@ -71,6 +72,7 @@ all() ->
         concurrent_requests_on_two_models,
         http_request_during_a_long_run,
         ops_endpoints,
+        chat_completion_speculative,
         real_model_tool_call,
         real_model_logprobs,
         real_model_concurrent_streams,
@@ -222,6 +224,17 @@ chat_completion(Config) ->
     } = decode(Body),
     ?assertMatch(#{<<"role">> := <<"assistant">>, <<"content">> := C} when byte_size(C) > 0, Msg),
     ?assertEqual(P + 4, T).
+
+%% A request that asks for speculative decoding gets what it drafted
+%% beside `usage'.
+chat_completion_speculative(Config) ->
+    {200, Body} = post(
+        Config, <<"/v1/chat/completions">>, chat(<<"hello">>, #{<<"speculative">> => true})
+    ),
+    #{<<"speculative">> := Spec} = decode(Body),
+    ?assertMatch(#{<<"drafted">> := _, <<"accepted">> := _, <<"rounds">> := _}, Spec),
+    {200, Plain} = post(Config, <<"/v1/chat/completions">>, chat(<<"hello">>)),
+    ?assertNot(maps:is_key(<<"speculative">>, decode(Plain))).
 
 chat_completion_stream(Config) ->
     {200, Body} = post(

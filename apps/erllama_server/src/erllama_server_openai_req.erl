@@ -35,7 +35,9 @@
     <<"top_logprobs">>,
     <<"n">>,
     <<"keep_alive">>,
-    <<"reasoning_effort">>
+    <<"reasoning_effort">>,
+    %% erllama: speculative decoding for this request (see spec_opts/2)
+    <<"speculative">>
 ]).
 -define(COMPLETION_FIELDS, [
     <<"model">>,
@@ -308,7 +310,13 @@ decode64(_) ->
 chat_opts(Body) ->
     case sampling(Body) of
         {ok, Opts0} ->
-            Steps = [fun tool_opts/2, fun format_opts/2, fun thinking_opts/2, fun logprob_opts/2],
+            Steps = [
+                fun tool_opts/2,
+                fun format_opts/2,
+                fun thinking_opts/2,
+                fun logprob_opts/2,
+                fun spec_opts/2
+            ],
             lists:foldl(
                 fun
                     (Step, {ok, Acc}) -> Step(Body, Acc);
@@ -420,6 +428,38 @@ thinking_opts(#{<<"reasoning_effort">> := <<"none">>}, Opts) ->
 thinking_opts(#{<<"reasoning_effort">> := E}, Opts) when is_binary(E) ->
     {ok, Opts#{enable_thinking => true}};
 thinking_opts(_, Opts) ->
+    {ok, Opts}.
+
+%% `"speculative": true | false | {"type": "ngram_mod" | "mtp", ...}'
+%% (erllama's own option): drafts verified by the model, so the reply
+%% does not change. `mtp' drafts with the model's `draft_model'
+%% (`n_max', default 2), for greedy requests only.
+spec_opts(#{<<"speculative">> := V}, Opts) when is_boolean(V) ->
+    {ok, Opts#{speculative => V}};
+spec_opts(#{<<"speculative">> := #{} = M}, Opts) ->
+    Known = #{
+        <<"type">> => type, <<"n_max">> => n_max, <<"n_match">> => n_match, <<"n_min">> => n_min
+    },
+    Types = #{<<"mtp">> => mtp, <<"ngram_mod">> => ngram_mod},
+    case [K || K <- maps:keys(M), not maps:is_key(K, Known)] of
+        [] when is_map_key(<<"type">>, M), not is_map_key(map_get(<<"type">>, M), Types) ->
+            bad(<<"speculative type must be mtp or ngram_mod">>, <<"speculative">>);
+        [] ->
+            Spec = maps:fold(
+                fun
+                    (<<"type">>, T, Acc) -> Acc#{type => maps:get(T, Types)};
+                    (K, V, Acc) -> Acc#{maps:get(K, Known) => V}
+                end,
+                #{},
+                M
+            ),
+            {ok, Opts#{speculative => Spec}};
+        [K | _] ->
+            bad([<<"unsupported speculative parameter: ">>, K], <<"speculative">>)
+    end;
+spec_opts(#{<<"speculative">> := _}, _Opts) ->
+    bad(<<"speculative must be a boolean or an object">>, <<"speculative">>);
+spec_opts(_, Opts) ->
     {ok, Opts}.
 
 logprob_opts(#{<<"logprobs">> := true} = Body, Opts) ->

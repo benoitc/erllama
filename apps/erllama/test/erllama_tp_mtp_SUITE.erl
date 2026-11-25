@@ -20,7 +20,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
--export([mtp_batch/1, mtp_scheduler/1]).
+-export([mtp_batch/1, mtp_scheduler/1, server_bench/1]).
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([mtp_decode/1, divergence_margin/1, rollback_state_matches/1]).
 
@@ -44,7 +44,7 @@
 -define(TOKENS, 250).
 
 all() ->
-    [mtp_decode, divergence_margin, rollback_state_matches, mtp_batch, mtp_scheduler].
+    [mtp_decode, divergence_margin, rollback_state_matches, mtp_batch, mtp_scheduler, server_bench].
 
 init_per_suite(Config) ->
     case {erllama_tp_hosts:hosts(), os:getenv("ERLLAMA_TP_GLM"), os:getenv("ERLLAMA_TP_GLM_MTP")} of
@@ -559,6 +559,89 @@ lead(_) -> 0.0.
 
 speculative(#{stats := #{speculative := Sp}}) -> Sp;
 speculative(_) -> #{}.
+
+%% Four concurrent requests through erllama's normal HTTP server
+%% (erllama_server on the serving node, against the split model loaded
+%% there, data in /tmp), greedy, 250 tokens each, by
+%% scripts/glm_serving/bench_client.py (ERLLAMA_TP_BENCH_CLIENT) run on
+%% the first host: ordinary batching against one MTP guess a request.
+%% A warm-up leg each, then three repeats in alternating order. Per leg:
+%% each request's draft rounds (the response's `speculative' block),
+%% the aggregate tokens/s and each request's time to its first visible
+%% text. Written as JSON to ERLLAMA_TP_BENCH_OUT.
+server_bench(Config) ->
+    {ok, Client} = file:read_file(os:getenv("ERLLAMA_TP_BENCH_CLIENT")),
+    serve(Config, maps:put(n_seq_max, 4, ?COPTS), fun(S, #{id := Id}, _R0) ->
+        Url = start_server(S, 8090),
+        ok = peer:call(S, file, write_file, ["/tmp/erllama_bench_client.py", Client]),
+        Cfgs = [{ordinary, #{}}, {mtp1, #{speculative => #{type => mtp, n_max => 1}}}],
+        Leg = fun(Name, Extra, Rep) ->
+            Cmd = lists:flatten(
+                io_lib:format(
+                    "python3 -I /tmp/erllama_bench_client.py ~s ~s 4 reasoning_effort '~s'",
+                    [Url, Id, json:encode(Extra)]
+                )
+            ),
+            Out = peer:call(S, os, cmd, [Cmd], 1800000),
+            L = json:decode(list_to_binary(lists:last(string:lexemes(Out, "\n")))),
+            Rqs = maps:get(<<"requests">>, L),
+            #{
+                config => Name,
+                repeat => Rep,
+                aggregate_tps => maps:get(<<"aggregate_tps">>, L),
+                ttft_ms => [ttft_ms(R) || R <- Rqs],
+                tokens => [maps:get(<<"completion_tokens">>, R) || R <- Rqs],
+                draft_rounds => [rounds(R) || R <- Rqs],
+                reasoning_bytes => lists:sum([maps:get(<<"reasoning_bytes">>, R) || R <- Rqs]),
+                statuses => lists:usort([maps:get(<<"status">>, R) || R <- Rqs]),
+                leg => L
+            }
+        end,
+        _ = [Leg(N, E, 0) || {N, E} <- Cfgs],
+        Legs = [
+            Leg(N, E, Rep)
+         || Rep <- [1, 2, 3],
+            {N, E} <-
+                case Rep rem 2 of
+                    1 -> Cfgs;
+                    0 -> lists:reverse(Cfgs)
+                end
+        ],
+        [ct:pal("~p", [maps:remove(leg, L)]) || L <- Legs],
+        OutFile = filename:join(
+            os:getenv("ERLLAMA_TP_BENCH_OUT", ?config(priv_dir, Config)), "erllama.bench.json"
+        ),
+        ok = file:write_file(OutFile, json:encode(#{legs => Legs})),
+        [?assertEqual([200], St) || #{statuses := St} <- Legs],
+        [?assertEqual(0, B) || #{reasoning_bytes := B} <- Legs],
+        [
+            [?assert(R > 0) || R <- Rounds]
+         || #{config := mtp1, draft_rounds := Rounds} <- Legs
+        ],
+        ct:pal("results: ~s", [OutFile])
+    end).
+
+rounds(#{<<"speculative">> := #{<<"rounds">> := N}}) -> N;
+rounds(_) -> 0.
+
+ttft_ms(#{<<"ttft">> := null}) -> none;
+ttft_ms(#{<<"ttft">> := T}) -> round(T * 10000) / 10.
+
+%% erllama_server on the serving node, its OpenAI endpoint on
+%% 127.0.0.1:`Port' of the first host, its data in /tmp (never the
+%% user's data directory). It serves the models loaded on the node by
+%% their id.
+start_server(S, Port) ->
+    Home = peer:call(S, os, getenv, ["HOME"]),
+    Libs = peer:call(S, filelib, wildcard, [Home ++ "/erllama-tp/erllama/_build/test/lib/*/ebin"]),
+    ok = peer:call(S, code, add_pathsa, [Libs]),
+    Data = "/tmp/erllama_bench_data_" ++ integer_to_list(erlang:unique_integer([positive])),
+    [
+        ok = peer:call(S, application, set_env, [erllama_server, K, V])
+     || {K, V} <- [{http, #{port => Port, ip => {127, 0, 0, 1}}}, {data_dir, Data}]
+    ],
+    {ok, _} = peer:call(S, application, ensure_all_started, [erllama_server], 60000),
+    "http://127.0.0.1:" ++ integer_to_list(Port).
 
 %% -----------------------------------------------------------------------------
 
