@@ -160,3 +160,19 @@ tool_catalog_test() ->
         {error, <<"unknown tool: nope">>},
         erllama_server_tools:execute(<<"nope">>, #{}, #{workspace => <<"/tmp">>})
     ).
+
+%% A tool's class lives with its definition: every native tool has one,
+%% the schema offered to the model carries no class, and a name the
+%% module does not define is never treated as a read.
+classes_test() ->
+    ?assertEqual(
+        [<<"edit_file">>, <<"shell">>, <<"shell_kill">>, <<"write_file">>],
+        lists:sort([N || N <- erllama_server_tools:names(), erllama_server_tools:class(N) =:= write])
+    ),
+    ?assertEqual(read, erllama_server_tools:class(<<"read_file">>)),
+    ?assertEqual(write, erllama_server_tools:class(<<"no_such_tool">>)),
+    ?assertEqual(ask, erllama_server_tools:default_policy(<<"no_such_tool">>)),
+    [
+        ?assertEqual([description, name, parameters], lists:sort(maps:keys(D)))
+     || D <- erllama_server_tools:definitions()
+    ].

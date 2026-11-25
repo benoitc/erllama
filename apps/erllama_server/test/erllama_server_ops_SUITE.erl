@@ -43,6 +43,7 @@ init_per_testcase(TC, Config) ->
     [{ws, list_to_binary(Ws)}, {dir, Base} | Config].
 
 end_per_testcase(_TC, _Config) ->
+    _ = application:unset_env(erllama_server, agent_generator),
     _ = application:stop(erllama_server),
     [erllama:unload(Id) || #{id := Id} <- erllama:list_models()],
     application:unset_env(erllama_server, data_dir),
@@ -178,6 +179,7 @@ model_crash_stays_with_its_model(Config) ->
 %% A session process that dies is recorded; its conversation is freed
 %% and can be resumed; another session goes on.
 session_crash_stays_with_its_session(Config) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     M = add_model(Config, <<"sessions">>, #{}),
     Doomed = agent(Config, M, [#{text => <<"one">>}]),
     Survivor = agent(Config, M, [#{text => <<"still here">>}, #{text => <<"and again">>}]),
@@ -189,7 +191,7 @@ session_crash_stays_with_its_session(Config) ->
     ok = erllama_server_api:agent_send(Survivor, <<"hello">>),
     ok = wait(fun() -> agent_state(Survivor) =:= idle andalso turns(Survivor) =:= 1 end),
     {ok, #{agent_id := Resumed}} = erllama_server_api:agent_start(#{
-        model => M, conversation_id => Conv, generator => erllama_server_agent_script
+        model => M, conversation_id => Conv
     }),
     ok = erllama_server_agent_script:set(Resumed, [#{text => <<"back">>}]),
     ok = erllama_server_api:agent_send(Resumed, <<"are you there">>),
@@ -219,10 +221,10 @@ run(Model, Opts) ->
     Run.
 
 agent(Config, Model, Script) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     {ok, #{agent_id := Id}} = erllama_server_api:agent_start(#{
         model => Model,
         workspace => ?config(ws, Config),
-        generator => erllama_server_agent_script,
         policy => yes
     }),
     ok = erllama_server_agent_script:set(Id, Script),

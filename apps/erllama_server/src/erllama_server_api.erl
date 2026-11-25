@@ -6,21 +6,36 @@
 The service API of the release: the one module the `erllama` CLI
 calls over Erlang distribution and the HTTP adapters call in process.
 
-Every function returns `ok`, `{ok, Value}` or `{error, Reason}` and
-never raises, so a remote caller can tell a refusal from a crash.
-Clients call `hello/1` first with the API version they speak; the
-release refuses any other version.
+Every function returns `ok`, `{ok, Value}` or `{error, Reason}`, with
+one more success result: `agent_send/2` and `agent_prompt/4` answer
+`{queued, N}` when the session is busy, N being the input's 1-based
+position in the session's queue (each queued input becomes its own
+turn, in order). Called with arguments of the wrong type, a function
+raises like any Erlang function; called correctly it does not, so a
+remote caller can tell a refusal from a crash. Clients call `hello/1`
+first with the API version they speak; the release refuses any other
+version.
 
-A job (a run, or a model download started with `pull/2`) streams its
-events to the processes attached with `attach/3` as
-`{erllama_server_run, JobId, Event}`. An event is
-`#{seq := N, type := Type, data := Data}`. A run emits `started`,
-`loading` (when its model is being loaded), `token`, `thinking`; a
-download emits `started` and `progress`; both end with one of the
-terminal `done`, `cancelled` and `error`. Subscribers ack with
-`RunPid ! {ack, self(), Seq}`; one that falls too far behind gets
-`{erllama_server_run, RunId, {dropped, NextSeq}}` and reattaches
-from `NextSeq`.
+A job (a run, an agent session, or a model download started with
+`pull/2`) streams its events to the processes attached with `attach/3`
+as `{erllama_server_run, JobId, Event}`. An event is
+`#{seq := N, type := Type, data := Data}`:
+
+- a run emits `started`, `loading` (its model is being loaded),
+  `compacting` and `compacted` (its conversation is shortened first),
+  `token`, `thinking`, `tool_call` and `logprobs`;
+- an agent session emits, per turn, `turn_started`, then for each
+  generation round `round`, the round's `token`, `thinking` and
+  `tool_call` events, `approval_request` for a call that needs one,
+  `tool_started` and `tool_result` for each call, and `turn_done`; it
+  also emits `compacting` and `compacted`;
+- a download emits `started` and `progress`.
+
+Runs and downloads end with one of the terminal `done`, `cancelled`
+and `error`; a session ends with `done` when it stops. Subscribers ack
+with `RunPid ! {ack, self(), Seq}`; one that falls too far behind gets
+`{erllama_server_run, RunId, {dropped, NextSeq}}` and reattaches from
+`NextSeq`.
 """.
 
 -export([
@@ -30,8 +45,13 @@ from `NextSeq`.
     inspect/1,
     failures/1,
     models/0,
+    model/1,
+    model_entries/0,
     show/1,
     ps/0,
+    embed/3,
+    count_tokens/3,
+    detokenize/2,
     register_model/2,
     load/2,
     load_model/2,
@@ -147,6 +167,24 @@ models() ->
     ],
     {ok, Registered ++ Direct}.
 
+-doc """
+The model named `Id` (or its registry alias) as `models/0` lists it,
+or `{error, {unknown_model, Id}}`.
+""".
+-spec model(binary()) -> {ok, map()} | {error, {unknown_model, binary()}}.
+model(Id) when is_binary(Id) ->
+    {ok, Models} = models(),
+    Want = erllama_server_registry:normalize(Id),
+    case [M || #{name := N} = M <- Models, N =:= Id orelse N =:= Want] of
+        [M | _] -> {ok, M};
+        [] -> {error, {unknown_model, Id}}
+    end.
+
+-doc "The registry's entries, with every field it keeps (size, digest, details).".
+-spec model_entries() -> {ok, [map()]}.
+model_entries() ->
+    {ok, erllama_server_registry:list()}.
+
 -doc "One model: its registry entry, the GGUF metadata and its load state.".
 -spec show(binary()) -> {ok, map()} | {error, term()}.
 show(Name) ->
@@ -171,6 +209,36 @@ show(Name) ->
 -spec ps() -> {ok, [map()]}.
 ps() ->
     {ok, erllama_server_models:ps()}.
+
+-doc """
+Embed `Inputs` (texts, or token lists) with `Model` (`undefined` for
+the default model). An embedding takes one of the `max_active_runs`
+slots for as long as it runs, like a run: `{error, too_many_runs}`
+when they are all in use. The model is loaded on demand, as for a run;
+`Opts` may carry `keep_alive` (ms). Returns the model's id, one vector
+per input and the number of input tokens.
+""".
+-spec embed(binary() | undefined, [binary() | [non_neg_integer()]], map()) ->
+    {ok, #{model := binary(), vectors := [[float()]], prompt_tokens := non_neg_integer()}}
+    | {error, term()}.
+embed(Model, Inputs, Opts) when is_list(Inputs), is_map(Opts) ->
+    erllama_server_inference:embed(Model, Inputs, Opts).
+
+-doc """
+How many tokens `Messages` take once rendered with `Model`'s chat
+template (`Opts` as for a run's chat options). It takes no run slot,
+so it answers while every slot is in use; a model that is not loaded
+is loaded as for a run.
+""".
+-spec count_tokens(binary() | undefined, [map()], map()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+count_tokens(Model, Messages, Opts) when is_list(Messages), is_map(Opts) ->
+    erllama_server_inference:count_tokens(Model, Messages, Opts).
+
+-doc "Detokenize `Tokens` with a loaded model.".
+-spec detokenize(binary(), [non_neg_integer()]) -> {ok, binary()} | {error, term()}.
+detokenize(Model, Tokens) when is_binary(Model), is_list(Tokens) ->
+    erllama:detokenize(Model, Tokens).
 
 -doc """
 Register a GGUF file on the release machine. `Opts`: `name`, `mmproj`,
@@ -576,7 +644,7 @@ agent_spec(Spec, Id, Model, Ws, #{id := Conv, messages := History, parent_key :=
             [max_rounds, max_tokens, max_elapsed_ms], maps:get(budgets, Spec, #{})
         )
     },
-    maps:merge(Base, maps:with([system, generator], Spec)).
+    maps:merge(Base, maps:with([system], Spec)).
 
 agent_mode(P) when P =:= yes; P =:= read_only -> P;
 agent_mode(_) -> default.

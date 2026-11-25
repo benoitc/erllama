@@ -13,13 +13,14 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-%% rest_for_one, in dependency order: the registry, then the loaded
-%% models (holders are runs), the job table and the conversation store
-%% (they hold the pids and locks of the jobs), then the jobs. When one
+%% rest_for_one, in dependency order: the failure log first (every
+%% other child records into it), the registry, then the loaded models
+%% (holders are runs), the job table and the conversation store (they
+%% hold the pids and locks of the jobs), then the jobs. When one
 %% restarts, everything after it restarts too, so nothing points at a
 %% stale process. The MCP clients come after the agent sessions, so a
-%% restart of theirs never stops a session. The HTTP listener comes last: it only takes requests
-%% once everything it calls is up.
+%% restart of theirs never stops a session. The HTTP listener comes
+%% last: it only takes requests once everything it calls is up.
 init([]) ->
     SupFlags = #{strategy => rest_for_one, intensity => 5, period => 30},
     Children = [

@@ -146,7 +146,9 @@ init(#{run_id := Id, model := Model, workspace := Ws, conversation_id := Conv} =
             #{max_rounds => 20, max_tokens => 32768, max_elapsed_ms => 600000},
             maps:get(budgets, Spec, #{})
         ),
-        generator = maps:get(generator, Spec, erllama_server_agent_gen),
+        %% Tests replace the generator through the application
+        %% environment; a remote caller cannot pick it.
+        generator = application:get_env(erllama_server, agent_generator, erllama_server_agent_gen),
         events = erllama_server_events:new(Id),
         transcript = erllama_server_compact:with_system(System, maps:get(history, Spec, [])),
         finish_key = maps:get(parent_key, Spec, undefined),

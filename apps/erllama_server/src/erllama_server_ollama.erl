@@ -277,7 +277,7 @@ load_only(Spec, Meta) ->
     {Result, Reason} =
         case maps:get(keep_alive, Spec, undefined) of
             0 -> {erllama_server_api:unload(Model), <<"unload">>};
-            KA -> {erllama_server_models:load(Model, KA), <<"load">>}
+            KA -> {erllama_server_api:load(Model, #{keep_alive => KA}), <<"load">>}
         end,
     case Result of
         Ok when Ok =:= ok; element(1, Ok) =:= ok ->
@@ -475,23 +475,9 @@ run_embed(Model, Inputs, Body, Shape) ->
             {ok, Ms} -> Ms;
             error -> undefined
         end,
-    case erllama_server_models:acquire(Model, self(), KA) of
-        {ok, Id} ->
-            try erllama:embed_batch(Id, Inputs) of
-                {ok, Vectors} ->
-                    Count = lists:sum([n_tokens(Id, I) || I <- Inputs]),
-                    erllama_server_http_kit:json(200, Shape(Model, Vectors, Count));
-                {error, R} ->
-                    erllama_server_http_kit:api_error(ollama, {embedding_failed, R})
-            after
-                erllama_server_models:release(Id, self())
-            end;
+    case erllama_server_api:embed(Model, Inputs, #{keep_alive => KA}) of
+        {ok, #{vectors := Vectors, prompt_tokens := Count}} ->
+            erllama_server_http_kit:json(200, Shape(Model, Vectors, Count));
         {error, R} ->
             erllama_server_http_kit:api_error(ollama, R)
-    end.
-
-n_tokens(Id, Text) ->
-    case erllama:tokenize(Id, Text) of
-        {ok, T} -> length(T);
-        _ -> 0
     end.

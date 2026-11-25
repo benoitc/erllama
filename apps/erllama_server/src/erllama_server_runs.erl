@@ -8,6 +8,10 @@
 %% starts the job processes (so the `max_active_runs' check and the
 %% insert are one step) and monitors them: when a job exits, its row is
 %% deleted and any conversation it still held is released.
+%%
+%% It also hands out slots for inference work that is not a run (an
+%% embedding request): a slot counts against `max_active_runs' like a
+%% run, and is freed when released or when its holder exits.
 
 -behaviour(gen_server).
 
@@ -19,7 +23,9 @@
     set_status/2,
     set_phase/2,
     active_count/0,
-    active_count/1
+    active_count/1,
+    hold_slot/1,
+    release_slot/1
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -32,8 +38,12 @@
 %% stay `running'.
 -type phase() :: running | loading | compacting | waiting | generating.
 
-%% Monitor ref of each run process, to its run id.
--record(state, {mons = #{} :: #{reference() => binary()}}).
+%% Monitor ref of each run process, to its run id; monitor ref of each
+%% slot holder, to its pid.
+-record(state, {
+    mons = #{} :: #{reference() => binary()},
+    slots = #{} :: #{reference() => pid()}
+}).
 -type state() :: #state{}.
 -export_type([status/0, kind/0, phase/0]).
 
@@ -70,6 +80,17 @@ set_status(RunId, Status) ->
 set_phase(RunId, Phase) ->
     gen_server:cast(?MODULE, {set_phase, RunId, Phase}).
 
+%% A slot of `max_active_runs' for `Holder', which does inference work
+%% that is not a run. `{error, too_many_runs}' when runs and slots fill
+%% the limit.
+-spec hold_slot(pid()) -> {ok, reference()} | {error, too_many_runs}.
+hold_slot(Holder) when is_pid(Holder) ->
+    gen_server:call(?MODULE, {hold_slot, Holder}, 30000).
+
+-spec release_slot(reference()) -> ok.
+release_slot(Slot) when is_reference(Slot) ->
+    gen_server:call(?MODULE, {release_slot, Slot}, 30000).
+
 -spec active_count() -> non_neg_integer().
 active_count() ->
     active_count(run).
@@ -95,32 +116,28 @@ init([]) ->
     _ = ets:new(?TAB, [named_table, set, protected, {read_concurrency, true}]),
     {ok, #state{}}.
 
-handle_call({start, #{run_id := RunId} = Spec}, _From, #state{mons = Mons} = S) ->
+handle_call({start, #{run_id := RunId} = Spec}, _From, S) ->
     Kind = maps:get(kind, Spec, run),
     {Sup, Limit} = job_sup(Kind),
-    case active_count(Kind) < Limit of
+    case in_use(Kind, S) < Limit of
         false ->
             {reply, {error, too_many(Kind)}, S};
         true ->
-            case supervisor:start_child(Sup, [Spec]) of
-                {ok, Pid} ->
-                    Row = {
-                        RunId,
-                        Pid,
-                        maps:get(conversation_id, Spec, undefined),
-                        maps:get(model, Spec),
-                        erlang:system_time(millisecond),
-                        running,
-                        Kind,
-                        running
-                    },
-                    true = ets:insert(?TAB, Row),
-                    Mon = erlang:monitor(process, Pid),
-                    {reply, {ok, Pid}, S#state{mons = Mons#{Mon => RunId}}};
-                {error, _} = E ->
-                    {reply, E, S}
-            end
+            {Reply, S1} = start_job(Sup, Kind, RunId, Spec, S),
+            {reply, Reply, S1}
     end;
+handle_call({hold_slot, Holder}, _From, #state{slots = Slots} = S) ->
+    {_, Limit} = job_sup(run),
+    case in_use(run, S) < Limit of
+        true ->
+            Mon = erlang:monitor(process, Holder),
+            {reply, {ok, Mon}, S#state{slots = Slots#{Mon => Holder}}};
+        false ->
+            {reply, {error, too_many_runs}, S}
+    end;
+handle_call({release_slot, Mon}, _From, #state{slots = Slots} = S) ->
+    erlang:demonitor(Mon, [flush]),
+    {reply, ok, S#state{slots = maps:remove(Mon, Slots)}};
 handle_call(_Req, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
@@ -133,6 +150,10 @@ handle_cast({set_phase, RunId, Phase}, S) ->
 handle_cast(_Msg, S) ->
     {noreply, S}.
 
+handle_info({'DOWN', Mon, process, _Pid, _Reason}, #state{slots = Slots} = S) when
+    is_map_key(Mon, Slots)
+->
+    {noreply, S#state{slots = maps:remove(Mon, Slots)}};
 handle_info({'DOWN', Mon, process, _Pid, Reason}, #state{mons = Mons} = S) ->
     case maps:take(Mon, Mons) of
         {RunId, Mons1} ->
@@ -172,6 +193,31 @@ release_conv(ConvId, RunId) ->
     catch
         exit:_ -> ok
     end.
+
+start_job(Sup, Kind, RunId, Spec, #state{mons = Mons} = S) ->
+    case supervisor:start_child(Sup, [Spec]) of
+        {ok, Pid} ->
+            Row = {
+                RunId,
+                Pid,
+                maps:get(conversation_id, Spec, undefined),
+                maps:get(model, Spec),
+                erlang:system_time(millisecond),
+                running,
+                Kind,
+                running
+            },
+            true = ets:insert(?TAB, Row),
+            Mon = erlang:monitor(process, Pid),
+            {{ok, Pid}, S#state{mons = Mons#{Mon => RunId}}};
+        {error, _} = E ->
+            {E, S}
+    end.
+
+%% Runs share `max_active_runs' with the slots held for other inference
+%% work.
+in_use(run, #state{slots = Slots}) -> active_count(run) + map_size(Slots);
+in_use(Kind, _S) -> active_count(Kind).
 
 job_sup(run) -> {erllama_server_run_sup, erllama_server_config:get(max_active_runs)};
 job_sup(pull) -> {erllama_server_pull_sup, erllama_server_config:get(max_active_pulls)};

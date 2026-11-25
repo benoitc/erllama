@@ -104,6 +104,7 @@ init_per_testcase(_TC, Config) ->
     [{cli, Cli} | Config].
 
 end_per_testcase(_TC, Config) ->
+    _ = rcall(?config(rel, Config), application, unset_env, [erllama_server, agent_generator]),
     Cli = ?config(cli, Config),
     Leaked =
         case is_process_alive(Cli) of
@@ -669,13 +670,15 @@ tty_ctrl_c_at_the_prompt_drops_the_line(Config) ->
 %% in the terminal.
 tty_agent_switch_and_approval(Config) ->
     skip_without_script(fun() ->
+        ok = rcall(?config(rel, Config), application, set_env, [
+            erllama_server, agent_generator, erllama_server_agent_script
+        ]),
         Ws = filename:join(?config(priv_dir, Config), "tty_ws"),
         ok = filelib:ensure_path(Ws),
         {ok, #{agent_id := Agent}} = ccall(Config, agent_start, [
             #{
                 model => <<"fast">>,
-                workspace => list_to_binary(Ws),
-                generator => erllama_server_agent_script
+                workspace => list_to_binary(Ws)
             }
         ]),
         ok = rcall(?config(rel, Config), erllama_server_agent_script, set, [
@@ -710,13 +713,15 @@ tty_agent_switch_and_approval(Config) ->
 %% rest of the turn.
 tty_agent_attach_shows_what_happened(Config) ->
     skip_without_script(fun() ->
+        ok = rcall(?config(rel, Config), application, set_env, [
+            erllama_server, agent_generator, erllama_server_agent_script
+        ]),
         Ws = filename:join(?config(priv_dir, Config), "tty_attach_ws"),
         ok = filelib:ensure_path(Ws),
         {ok, #{agent_id := Agent}} = ccall(Config, agent_start, [
             #{
                 model => <<"fast">>,
-                workspace => list_to_binary(Ws),
-                generator => erllama_server_agent_script
+                workspace => list_to_binary(Ws)
             }
         ]),
         ok = rcall(?config(rel, Config), erllama_server_agent_script, set, [

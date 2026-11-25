@@ -26,11 +26,9 @@ models(_Req) ->
 
 model(Req) ->
     Id = livery_req:binding(<<"id">>, Req),
-    {ok, Models} = erllama_server_api:models(),
-    Want = erllama_server_registry:normalize(Id),
-    case [M || #{name := N} = M <- Models, N =:= Id orelse N =:= Want] of
-        [M | _] -> erllama_server_http_kit:json(200, model_object(M));
-        [] -> erllama_server_http_kit:api_error(openai, {unknown_model, Id})
+    case erllama_server_api:model(Id) of
+        {ok, M} -> erllama_server_http_kit:json(200, model_object(M));
+        {error, R} -> erllama_server_http_kit:api_error(openai, R)
     end.
 
 model_object(#{name := Name} = M) ->
@@ -207,7 +205,7 @@ logprob_entry(Model, #{token_id := T, logprob := L, top := Top}) ->
 token_text(undefined, T) ->
     integer_to_binary(T);
 token_text(Model, T) ->
-    case erllama:detokenize(Model, [T]) of
+    case erllama_server_api:detokenize(Model, [T]) of
         {ok, B} -> B;
         _ -> <<>>
     end.
@@ -362,24 +360,9 @@ base_chunk(Object, Prefix, Run, Meta) ->
 %% -----------------------------------------------------------------------------
 
 embed(#{inputs := Inputs} = Spec, #{format := Format} = Meta) ->
-    case
-        erllama_server_models:acquire(
-            maps:get(model, Spec, undefined), self(), maps:get(keep_alive, Spec, undefined)
-        )
-    of
-        {ok, Id} ->
-            try
-                embed_with(Id, Inputs, Format, Meta)
-            after
-                erllama_server_models:release(Id, self())
-            end;
-        {error, Reason} ->
-            erllama_server_http_kit:api_error(openai, Reason)
-    end.
-
-embed_with(Id, Inputs, Format, Meta) ->
-    case erllama:embed_batch(Id, Inputs) of
-        {ok, Vectors} ->
+    Opts = maps:with([keep_alive], Spec),
+    case erllama_server_api:embed(maps:get(model, Spec, undefined), Inputs, Opts) of
+        {ok, #{model := Id, vectors := Vectors, prompt_tokens := Tokens}} ->
             Data = [
                 #{
                     <<"object">> => <<"embedding">>,
@@ -388,7 +371,6 @@ embed_with(Id, Inputs, Format, Meta) ->
                 }
              || {I, V} <- indexed(Vectors)
             ],
-            Tokens = lists:sum([count_tokens(Id, X) || X <- Inputs]),
             Model =
                 case maps:get(model, Meta) of
                     null -> Id;
@@ -401,16 +383,8 @@ embed_with(Id, Inputs, Format, Meta) ->
                 <<"usage">> => #{<<"prompt_tokens">> => Tokens, <<"total_tokens">> => Tokens}
             });
         {error, Reason} ->
-            erllama_server_http_kit:api_error(openai, {embedding_failed, Reason})
+            erllama_server_http_kit:api_error(openai, Reason)
     end.
 
 encode_vector(<<"float">>, V) -> V;
 encode_vector(<<"base64">>, V) -> base64:encode(<<<<F:32/float-little>> || F <- V>>).
-
-count_tokens(_Id, Tokens) when is_list(Tokens) ->
-    length(Tokens);
-count_tokens(Id, Text) ->
-    case erllama:tokenize(Id, Text) of
-        {ok, T} -> length(T);
-        _ -> 0
-    end.

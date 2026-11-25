@@ -12,7 +12,8 @@
 -export([tags/1, show/1, ps/1, pull/1, delete/1, copy/1, version/1, root/1, not_supported/1]).
 
 tags(_Req) ->
-    Models = [tag(E) || E <- erllama_server_registry:list()],
+    {ok, Entries} = erllama_server_api:model_entries(),
+    Models = [tag(E) || E <- Entries],
     erllama_server_http_kit:json(200, #{<<"models">> => Models}).
 
 tag(#{name := N} = E) ->
@@ -103,7 +104,7 @@ ps(_Req) ->
             <<"expires_at">> => expires(P),
             <<"size_vram">> => maps:get(vram_estimate_b, P, 0)
         }
-     || #{id := Id} = P <- erllama_server_models:ps()
+     || #{id := Id} = P <- element(2, erllama_server_api:ps())
     ],
     erllama_server_http_kit:json(200, #{<<"models">> => Models}).
 

@@ -25,6 +25,7 @@
     background_job/1,
     stop_frees_the_conversation/1,
     generator_crash_fails_the_turn/1,
+    a_caller_cannot_pick_the_generator/1,
     stop_kills_background_jobs/1,
     time_budget_interrupts/1,
     token_budget_caps_generation/1,
@@ -43,6 +44,7 @@ all() ->
         background_job,
         stop_frees_the_conversation,
         generator_crash_fails_the_turn,
+        a_caller_cannot_pick_the_generator,
         stop_kills_background_jobs,
         time_budget_interrupts,
         token_budget_caps_generation,
@@ -59,6 +61,7 @@ init_per_testcase(TC, Config) ->
     [{ws, list_to_binary(Ws)} | Config].
 
 end_per_testcase(_TC, _Config) ->
+    _ = application:unset_env(erllama_server, agent_generator),
     _ = application:stop(erllama_server),
     [erllama:unload(Id) || #{id := Id} <- erllama:list_models()],
     application:unset_env(erllama_server, data_dir),
@@ -69,11 +72,11 @@ start(Config, Script) ->
     start(Config, Script, #{}).
 
 start(Config, Script, Extra) ->
+    ok = application:set_env(erllama_server, agent_generator, erllama_server_agent_script),
     Spec = maps:merge(
         #{
             model => <<"stub">>,
-            workspace => ?config(ws, Config),
-            generator => erllama_server_agent_script
+            workspace => ?config(ws, Config)
         },
         Extra
     ),
@@ -146,6 +149,17 @@ wait(Fun, N) ->
     end.
 
 %% -----------------------------------------------------------------------------
+
+%% `generator' is a test hook set in the application environment: one
+%% in the caller's spec is ignored, so a remote caller cannot pick the
+%% module a session runs.
+a_caller_cannot_pick_the_generator(Config) ->
+    {Id, _} = start(Config, [#{text => <<"from the script">>}], #{generator => no_such_module}),
+    Events = turn(Id, <<"tell me">>),
+    ?assertEqual(stop, done_reason(Events)),
+    ?assertEqual(
+        <<"from the script">>, iolist_to_binary([D || #{type := token, data := D} <- Events])
+    ).
 
 answers_without_tools(Config) ->
     {Id, Conv} = start(Config, [#{text => <<"hello there">>}]),

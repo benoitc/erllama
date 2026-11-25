@@ -59,16 +59,9 @@ count_tokens(Req) ->
     end.
 
 count(Spec, Msgs, Opts) ->
-    case erllama_server_models:acquire(maps:get(model, Spec, undefined), self(), undefined) of
-        {ok, Id} ->
-            try erllama_server_generate:count_tokens(Id, Msgs, Opts) of
-                {ok, N} -> erllama_server_http_kit:json(200, #{<<"input_tokens">> => N});
-                {error, R} -> erllama_server_http_kit:api_error(anthropic, R)
-            after
-                erllama_server_models:release(Id, self())
-            end;
-        {error, R} ->
-            erllama_server_http_kit:api_error(anthropic, R)
+    case erllama_server_api:count_tokens(maps:get(model, Spec, undefined), Msgs, Opts) of
+        {ok, N} -> erllama_server_http_kit:json(200, #{<<"input_tokens">> => N});
+        {error, R} -> erllama_server_http_kit:api_error(anthropic, R)
     end.
 
 %% A Messages request as a run spec, and what the response needs.
