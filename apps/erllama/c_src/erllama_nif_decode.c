@@ -105,7 +105,11 @@ void erllama_tp_send(ErlNifEnv *env, erllama_context_t *c, ErlNifEnv *menv, ERL_
  * index into rows that are gone. */
 void erllama_ctx_stale_other_rows(erllama_context_t *c, const struct llama_batch *batch) {
     unsigned char held[ERLLAMA_N_SEQ_MAX_CAP] = {0};
-    for (int32_t i = 0; i < batch->n_tokens; i++) {
+    if (!batch->n_seq_id || !batch->seq_id) {
+        /* llama_batch_get_one: every token is seq 0's. */
+        held[0] = 1;
+    }
+    for (int32_t i = 0; batch->n_seq_id && batch->seq_id && i < batch->n_tokens; i++) {
         for (int32_t j = 0; j < batch->n_seq_id[i]; j++) {
             const llama_seq_id s = batch->seq_id[i][j];
             if (s >= 0 && s < ERLLAMA_N_SEQ_MAX_CAP) {

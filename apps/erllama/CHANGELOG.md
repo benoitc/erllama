@@ -40,6 +40,9 @@ this project adheres to [Semantic Versioning](https://semver.org).
   26.2 tokens/s. The text can differ from decoding without drafts where
   the two most likely tokens are almost tied, because the model checks
   three tokens at once.
+- MTP drafting now goes on when several requests run on the model: each
+  step checks every request's next token, and the guesses of those that
+  draft, together. Before, a request drafted only while it was alone.
 
 ### Changed
 
