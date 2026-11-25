@@ -14,5 +14,3 @@ this project adheres to [Semantic Versioning](https://semver.org).
   a text completion, or an embedding. The component sends text and
   reads the reply, or the vector as 32-bit floats. Replies come once,
   without streaming.
-- Not on Hex yet: it needs a version of erlang_wasm that is not
-  released, so it is used from this repository.

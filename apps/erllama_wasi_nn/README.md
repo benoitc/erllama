@@ -21,9 +21,8 @@ The guide is [guides/wasi-nn.md](../../guides/wasi-nn.md).
 
 ## Notes
 
-- The app depends on erlang_wasm by git, pinned to the commit that
-  added `wasi_nn`. It cannot be published to Hex until erlang_wasm
-  releases that module.
+- The app depends on erlang_wasm 0.11 from Hex (package `erlang_wasm`,
+  OTP application `wasm`).
 - The tests run without a model file. Set `LLAMA_TEST_MODEL` to a GGUF
   file to also run one command against a real model:
 

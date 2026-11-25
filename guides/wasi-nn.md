@@ -12,9 +12,9 @@ library does not depend on erlang_wasm.
 
 ## Add the application
 
-`wasi_nn` is not in a Hex release of erlang_wasm yet, so
-`erllama_wasi_nn` depends on it by git and is not on Hex itself. Use
-it from this repository, and start it with its dependencies:
+`erllama_wasi_nn` depends on erlang_wasm 0.11 from Hex (package
+`erlang_wasm`, OTP application `wasm`). Use it from this repository,
+and start it with its dependencies:
 
 ```erlang
 {ok, _} = application:ensure_all_started(erllama_wasi_nn).
