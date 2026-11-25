@@ -42,6 +42,7 @@ your OTP application          CLI   HTTP clients   Erlang nodes
 | Run the server release | [apps/erllama_server](apps/erllama_server/README.md) |
 | See the server at work: several clients, a slow tool, a restart | [the walkthrough](guides/server/demo.md) |
 | Call the server from Erlang | [examples/service_client](examples/service_client) |
+| Serve `wasi:nn` components of erlang_wasm from your models | [apps/erllama_wasi_nn](apps/erllama_wasi_nn/README.md) |
 | Read the usage guides | [guides/](guides/) |
 | Understand the cache, NIF and request design | [internals/](internals/) |
 | Contribute | [AGENTS.md](AGENTS.md) |
@@ -52,6 +53,7 @@ your OTP application          CLI   HTTP clients   Erlang nodes
 ```
 apps/erllama/          the library: Erlang sources, NIF (c_src), tests
 apps/erllama_server/   the server release and the `erllama` CLI
+apps/erllama_wasi_nn/  a wasi:nn backend for erlang_wasm components
 config/, rel/          release configuration and the CLI launcher
 scripts/               checks, e.g. erllama built standalone from its Hex package
 guides/, internals/    documentation, published with the library
