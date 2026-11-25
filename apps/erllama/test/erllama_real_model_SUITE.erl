@@ -70,6 +70,7 @@
     verify_does_not_mutate_caller_visible_state/1,
     verify_accepted_count_le_k/1,
     ngram_speculation_matches_plain/1,
+    spec_step_after_another_seq_removed/1,
     ngram_speculation_stop_sequence_trims_kv/1,
     spec_step_nif_greedy_paths/1,
     devices_none_loads_cpu_only/1,
@@ -139,6 +140,7 @@ all() ->
         verify_does_not_mutate_caller_visible_state,
         verify_accepted_count_le_k,
         ngram_speculation_matches_plain,
+        spec_step_after_another_seq_removed,
         ngram_speculation_stop_sequence_trims_kv,
         spec_step_nif_greedy_paths,
         devices_none_loads_cpu_only,
@@ -1096,6 +1098,40 @@ ngram_speculation_matches_plain(Config) ->
         _ -> ?assert(A > 0)
     end,
     ok.
+
+%% Two sequences decoded together, then the second one removed (its
+%% request finished or was cancelled): a speculative step on the first
+%% verifies its draft from the first one's own row. It used to answer
+%% no_logits (the removal cleared the context's decode_ready), and the
+%% model stopped when a speculating request outlived another one.
+spec_step_after_another_seq_removed(Config) ->
+    {ok, M} =
+        case erllama_nif:load_model(?config(model_path, Config), #{n_gpu_layers => 0}) of
+            {ok, X} -> {ok, X};
+            {ok, X, _} -> {ok, X}
+        end,
+    try
+        {ok, C} = erllama_nif:new_context(M, #{n_ctx => 512, n_batch => 128, n_seq_max => 2}),
+        try
+            {ok, Sa} = erllama_nif:sampler_new(C, #{temperature => 0.0}),
+            {ok, Sb} = erllama_nif:sampler_new(C, #{temperature => 0.0}),
+            Tok = fun(T) ->
+                erllama_nif:tokenize(M, T, #{add_special => true, parse_special => false})
+            end,
+            PA = Tok(<<"The history of ocean navigation begins with">>),
+            PB = Tok(<<"A modern operating system schedules its threads with">>),
+            {ok, _} = erllama_nif:step(C, [{0, {prefill, PA}}, {1, {prefill, PB}}]),
+            {ok, _} = erllama_nif:step(C, [{0, {decode, Sa}}, {1, {decode, Sb}}]),
+            ok = erllama_nif:kv_seq_rm(C, 1, 0, -1),
+            ?assertMatch(
+                {ok, {spec, [_ | _], _, _}}, erllama_nif:spec_step(C, Sa, 0, [lists:last(PA)])
+            )
+        after
+            erllama_nif:free_context(C)
+        end
+    after
+        erllama_nif:free_model(M)
+    end.
 
 %% Deterministic nif_spec_step coverage on any model: derive the
 %% greedy continuation with plain step decodes, reset the sequence,

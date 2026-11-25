@@ -61,6 +61,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
   resumed from the cache gave subtly different, worse output. Entries
   saved before this fix are no longer found and those requests start
   cold.
+- A request using speculative decoding no longer stops the model when
+  another request on the same model finishes or is cancelled while it
+  runs. Its next speculative step refused to run, and the model stopped
+  with every request still in flight.
 - Turning thinking off (`enable_thinking => false`, or `reasoning_effort:
   "none"` on the server) now works for models whose chat template
   always opens a thinking block, such as GLM-5.3-Flash. Such a model
