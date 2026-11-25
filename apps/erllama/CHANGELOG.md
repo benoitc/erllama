@@ -31,6 +31,9 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- On DGX Spark (GB10), a step that decodes eight tokens at once on a
+  mixture-of-experts model in Q4_K is faster: on GLM-5.3-Flash split
+  over two GB10s it went from 146 to 129 ms.
 - Tokenising, detokenising and rendering a chat template no longer wait
   for a model that is generating. They used to queue behind its decode
   step, so a new request on a busy model waited about one step for each

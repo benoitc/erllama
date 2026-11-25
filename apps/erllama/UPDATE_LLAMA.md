@@ -33,6 +33,11 @@ forced off, and it links `vendor/{stb,miniaudio,hash,sheredom}`.
 The vendor script applies every patch in `scripts/patches/`, in name
 order, to the extracted tarball before copying it:
 
+- [cuda-dgx-spark-q4k-moe-mmq.patch](scripts/patches/cuda-dgx-spark-q4k-moe-mmq.patch)
+  sends an eight-row Q4_K `MUL_MAT_ID` (a mixture-of-experts layer with
+  eight rows, as an MTP verify of four requests gives) through MMQ
+  instead of MMVQ on DGX Spark (GB10), where it is faster; other GPUs,
+  types and row counts are unchanged.
 - [hybrid-k-graph-reuse.patch](scripts/patches/hybrid-k-graph-reuse.patch)
   checks the dense attention mask built for the hybrid K-only input, so
   GLM can reuse its decode graph with unified KV and fused K/V rows
