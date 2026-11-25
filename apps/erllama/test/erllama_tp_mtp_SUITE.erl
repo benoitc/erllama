@@ -727,7 +727,7 @@ cache_multiturn(Config) ->
         end,
         T1 = Turn(M1, R1, Hit1),
         T2 = Turn(M2, R2, Hit2),
-        ct:pal("turn 1: ~p~\nturn 2: ~p~\ncheckpoints on rank 0 before turn 2: ~p~\nafter: ~p", [
+        ct:pal("turn 1: ~p~nturn 2: ~p~ncheckpoints on rank 0 before turn 2: ~p~nafter: ~p", [
             T1, T2, Ck0, Ck
         ]),
         [
