@@ -38,6 +38,9 @@ order, to the extracted tarball before copying it:
   eight rows, as an MTP verify of four requests gives) through MMQ
   instead of MMVQ on DGX Spark (GB10), where it is faster; other GPUs,
   types and row counts are unchanged.
+- The [FP32 logits patch](scripts/patches/cuda-fp32-logits.patch) exposes
+  an explicit FP32 NCCL sum for the final vocabulary scores. The graph's
+  normal reduction still uses the upstream precision heuristic.
 - [hybrid-k-graph-reuse.patch](scripts/patches/hybrid-k-graph-reuse.patch)
   checks the dense attention mask built for the hybrid K-only input, so
   GLM can reuse its decode graph with unified KV and fused K/V rows
