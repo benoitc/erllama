@@ -20,7 +20,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
--export([mtp_batch/1, mtp_scheduler/1, server_bench/1]).
+-export([mtp_batch/1, mtp_scheduler/1, server_bench/1, cache_multiturn/1]).
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([mtp_decode/1, divergence_margin/1, rollback_state_matches/1]).
 
@@ -40,11 +40,31 @@
 %% mtp_scheduler: a token's lead (top logprob minus the next) under which
 %% a difference is numerics; the tokens each request must agree on.
 -define(CLEAR_LEAD, 1.0).
+%% cache_multiturn: a cold save at the largest 64-token boundary of a
+%% prompt of 128 tokens or more, and a finish save (as in
+%% erllama_tp_checkpoint_SUITE).
+-define(CACHE_POLICY, #{
+    max_ladder_rows => 0,
+    min_tokens => 64,
+    cold_min_tokens => 128,
+    cold_max_tokens => 1536,
+    boundary_trim_tokens => 32,
+    boundary_align_tokens => 64,
+    continued_interval => infinity
+}).
 -define(MIN_SAME, 4).
 -define(TOKENS, 250).
 
 all() ->
-    [mtp_decode, divergence_margin, rollback_state_matches, mtp_batch, mtp_scheduler, server_bench].
+    [
+        mtp_decode,
+        divergence_margin,
+        rollback_state_matches,
+        mtp_batch,
+        mtp_scheduler,
+        server_bench,
+        cache_multiturn
+    ].
 
 init_per_suite(Config) ->
     case {erllama_tp_hosts:hosts(), os:getenv("ERLLAMA_TP_GLM"), os:getenv("ERLLAMA_TP_GLM_MTP")} of
@@ -652,12 +672,88 @@ start_server(S, Port) ->
     {ok, _} = peer:call(S, application, ensure_all_started, [erllama_server], 60000),
     "http://127.0.0.1:" ++ integer_to_list(Port).
 
+%% The cache with MTP, through erllama's HTTP server: a two-turn
+%% conversation on the split model with the KV cache on. Turn one drafts
+%% and its finish saves a checkpoint; its sequence is released when it
+%% ends, so turn two (the conversation so far and a new message) cannot
+%% use the live state: it restores the checkpoint on every rank, prefills
+%% the rest, returns visible content and drafts again.
+cache_multiturn(Config) ->
+    serve(Config, maps:put(n_seq_max, 4, ?COPTS), ?CACHE_POLICY, fun(S, #{id := Id}, R0) ->
+        Url = start_server(S, 8091) ++ "/v1/chat/completions",
+        {ok, _} = peer:call(S, application, ensure_all_started, [inets]),
+        Chat = fun(Msgs) ->
+            Body = json:encode(#{
+                model => Id,
+                messages => Msgs,
+                temperature => 0.0,
+                max_tokens => 96,
+                reasoning_effort => <<"none">>,
+                speculative => #{type => mtp, n_max => 1}
+            }),
+            {ok, {{_, 200, _}, _, Resp}} = peer:call(
+                S,
+                httpc,
+                request,
+                [
+                    post,
+                    {Url, [], "application/json", Body},
+                    [{timeout, 600000}],
+                    [{body_format, binary}]
+                ],
+                700000
+            ),
+            #{<<"choices">> := [#{<<"message">> := M}]} = R = json:decode(Resp),
+            {M, R, peer:call(S, erllama, last_cache_hit, [Id])}
+        end,
+        User1 = #{role => user, content => lists:nth(1, dec_prompts())},
+        {M1, R1, Hit1} = Chat([User1]),
+        User2 = #{role => user, content => <<"Now say the same in one sentence.">>},
+        Ck0 = peer:call(S, erllama_tp_rank, checkpoint_stats, [R0]),
+        timer:sleep(3000),
+        {M2, R2, Hit2} = Chat([
+            User1, #{role => assistant, content => maps:get(<<"content">>, M1)}, User2
+        ]),
+        Ck = peer:call(S, erllama_tp_rank, checkpoint_stats, [R0]),
+        #{<<"usage">> := #{<<"prompt_tokens">> := P1}} = R1,
+        Turn = fun(M, R, Hit) ->
+            #{
+                content_bytes => byte_size(maps:get(<<"content">>, M)),
+                reasoning => maps:is_key(<<"reasoning_content">>, M),
+                speculative => maps:get(<<"speculative">>, R, none),
+                usage => maps:get(<<"usage">>, R),
+                cache_hit => Hit
+            }
+        end,
+        T1 = Turn(M1, R1, Hit1),
+        T2 = Turn(M2, R2, Hit2),
+        ct:pal("turn 1: ~p~\nturn 2: ~p~\ncheckpoints on rank 0 before turn 2: ~p~\nafter: ~p", [
+            T1, T2, Ck0, Ck
+        ]),
+        [
+            begin
+                ?assert(Bytes > 0),
+                ?assertNot(Reasoning),
+                ?assertMatch(#{<<"rounds">> := N} when N > 0, Spec)
+            end
+         || #{content_bytes := Bytes, reasoning := Reasoning, speculative := Spec} <- [T1, T2]
+        ],
+        ?assertMatch({ok, #{kind := cold}}, Hit1),
+        {ok, #{kind := Kind, prefix_len := Prefix}} = Hit2,
+        ?assertNotEqual(cold, Kind),
+        ?assert(Prefix >= P1),
+        ?assertMatch(#{unpack := ok}, Ck)
+    end).
+
 %% -----------------------------------------------------------------------------
 
 serve(Config, Fun) ->
     serve(Config, ?COPTS, Fun).
 
 serve(Config, COpts, Fun) ->
+    serve(Config, COpts, ?NO_CACHE, Fun).
+
+serve(Config, COpts, Policy, Fun) ->
     Hosts = ?config(hosts, Config),
     os:putenv("ERLLAMA_TP_MODEL", ?config(model, Config)),
     erllama_tp_hosts:with_serving(Hosts, fun(S) ->
@@ -666,7 +762,7 @@ serve(Config, COpts, Fun) ->
         Before = [avail(P) || P <- Peers],
         G = erllama_tp_hosts:load(
             G0,
-            ?NO_CACHE,
+            Policy,
             #{
                 model_opts => model_opts(),
                 context_opts => COpts,
