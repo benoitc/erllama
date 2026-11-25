@@ -66,7 +66,8 @@
     spec_accept/4,
     spec_free/2,
     spec_step/4,
-    spec_rollback/1
+    spec_rollback/1,
+    mtp_step_batch/4
 ]).
 
 -ifdef(TEST).
@@ -204,6 +205,7 @@ spec_accept(S, Ref, SeqId, NAcc) -> remote(S, spec_accept, [Ref, SeqId, NAcc]).
 spec_free(_S, {mtp, Handle}) -> sampler_free(Handle);
 spec_free(S, Ref) -> remote(S, spec_free, [Ref]).
 spec_step(S, SamplerRef, SeqId, Draft) -> remote(S, spec_step, [SamplerRef, SeqId, Draft]).
+mtp_step_batch(S, Mtp, Items, MaxDraft) -> remote(S, mtp_step_batch, [Mtp, Items, MaxDraft]).
 spec_rollback(S) ->
     case remote(S, spec_rollback, []) of
         N when is_integer(N); N =:= infinity -> N;

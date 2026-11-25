@@ -35,7 +35,8 @@
     presence_penalty,
     penalty_last_n,
     grammar,
-    logprobs
+    logprobs,
+    speculative
 ]).
 
 -type input() :: {messages, [map()]} | {prompt, binary()}.
@@ -215,7 +216,13 @@ finish(Parser, Text, Thinking, Stats) ->
         cache_hit_kind => maps:get(cache_hit_kind, Stats, cold),
         stop_sequence => maps:get(stop_sequence, Stats, undefined)
     },
-    parse(Parser, Text, Base).
+    %% A request that asked for speculative decoding: what it drafted.
+    Base1 =
+        case Stats of
+            #{speculative := Spec} -> Base#{speculative => Spec};
+            _ -> Base
+        end,
+    parse(Parser, Text, Base1).
 
 parse(undefined, _Text, Base) ->
     Base;

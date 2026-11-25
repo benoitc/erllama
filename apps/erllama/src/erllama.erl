@@ -528,7 +528,7 @@ Options for `complete/3`, `stream/3` and `continue/3`.
   byte-identical to non-speculative decoding (including seeded
   sampling). Pauses while other requests run concurrently; silently
   disabled on recurrent/hybrid models, with `thinking`, or with
-  `logprobs`. Stats gain `speculative => #{drafted, accepted}`.
+  `logprobs`. Stats gain `speculative => #{drafted, accepted, rounds}`.
 """.
 -type request_opts() :: #{
     response_tokens => pos_integer(),

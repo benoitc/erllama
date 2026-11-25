@@ -300,7 +300,11 @@ Speculation is silently skipped, with the request decoding
 normally, when:
 
 - other requests are active on the same model (it resumes when the
-  request is alone again);
+  request is alone again). MTP drafting goes on with other requests:
+  every request's next token, and the guesses of those that draft, are
+  verified together, in one decode a tick, while every active request
+  can join it (none is still reading its prompt, none asks for
+  `logprobs`);
 - the model family is recurrent or hybrid (their memories refuse
   the partial KV rollback a draft miss needs), unless the request
   drafts with MTP and the context keeps `n_rs_seq >= n_max`
@@ -312,8 +316,9 @@ normally, when:
   with thinking markers configured does not).
 
 Requests that enabled the option report
-`speculative => #{drafted => N, accepted => N}` on the result /
-done stats either way, so you can see whether drafts are landing.
+`speculative => #{drafted => N, accepted => N, rounds => N}` on the
+result / done stats either way (`rounds`: the ticks it drafted in), so
+you can see whether drafts are landing.
 
 ## Inspecting effective config
 

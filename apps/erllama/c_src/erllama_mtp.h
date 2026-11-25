@@ -54,6 +54,12 @@ void erllama_mtp_process(struct erllama_mtp *m, const struct llama_batch *b);
 int32_t erllama_mtp_draft(struct erllama_mtp *m, int32_t seq, llama_token id_last, int32_t pos0,
                           int32_t n_max, llama_token *out);
 
+/* Draft for `n' sequences at once (one drafter batch a step): up to
+ * `n_max' tokens after `id_last[i]' at `pos0[i]' of `seqs[i]' into
+ * `out[i * n_max ...]', how many into `n_out[i]'. */
+void erllama_mtp_draft_many(struct erllama_mtp *m, int32_t n, const int32_t *seqs, const llama_token *id_last,
+                            const int32_t *pos0, int32_t n_max, llama_token *out, int32_t *n_out);
+
 /* The target accepted `n_acc' drafted tokens of the last verified
  * batch of `seq'. */
 void erllama_mtp_accept(struct erllama_mtp *m, int32_t seq, int32_t n_acc);

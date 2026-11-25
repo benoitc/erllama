@@ -72,6 +72,7 @@
     spec_step/4,
     mtp_new/3,
     mtp_step/5,
+    mtp_step_batch/4,
     mtp_stats/1,
     mtp_free/1,
     mtp_trace/2,
@@ -632,6 +633,26 @@ mtp_new(Ctx, DraftModel, Opts) when is_map(Opts) -> nif_mtp_new(Ctx, DraftModel,
     {ok, {spec, [token_id()], 0 | 1, non_neg_integer()}} | {error, term()}.
 mtp_step(Ctx, Sampler, Mtp, SeqId, MaxDraft) -> nif_mtp_step(Ctx, Sampler, Mtp, SeqId, MaxDraft).
 
+%% One mtp_step/5 round for several sequences in one verify batch. Each
+%% item is `{Sampler, SeqId, Drafts}': `auto' (up to MaxDraft),
+%% `{auto, Cap}', `[]' (the next token alone, any sampler) or a list of
+%% tokens to verify (tests). The call must hold every sequence that
+%% needs a token: one it leaves out answers `{error, stale_logits}' on
+%% its next sample. Each item has its own sequence and its own sampler
+%% (badarg otherwise). Returns `{Seq, Committed, Eog, NAcc, NDrafted}'
+%% per item (NDrafted: the guesses verified for it) and the round's
+%% draft, verify and rollback microseconds.
+-spec mtp_step_batch(
+    context_ref(),
+    mtp_ref(),
+    [{sampler_ref(), non_neg_integer(), auto | {auto, non_neg_integer()} | [token_id()]}],
+    non_neg_integer()
+) ->
+    {ok, [{non_neg_integer(), [token_id()], 0 | 1, non_neg_integer(), non_neg_integer()}], map()}
+    | {error, term()}.
+mtp_step_batch(Ctx, Mtp, Items, MaxDraft) when is_list(Items) ->
+    nif_mtp_step_batch(Ctx, Mtp, Items, MaxDraft).
+
 %% Rounds, drafted and accepted tokens, and the microseconds spent
 %% drafting, verifying and rolling back.
 -spec mtp_stats(mtp_ref()) -> #{atom() => non_neg_integer()} | {error, released}.
@@ -779,6 +800,7 @@ nif_spec_free(_Spec) -> erlang:nif_error(nif_not_loaded).
 nif_spec_step(_Ctx, _Sampler, _SeqId, _Draft) -> erlang:nif_error(nif_not_loaded).
 nif_mtp_new(_Ctx, _Model, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_mtp_step(_Ctx, _Sampler, _Mtp, _SeqId, _MaxDraft) -> erlang:nif_error(nif_not_loaded).
+nif_mtp_step_batch(_Ctx, _Mtp, _Items, _MaxDraft) -> erlang:nif_error(nif_not_loaded).
 nif_mtp_stats(_Mtp) -> erlang:nif_error(nif_not_loaded).
 nif_mtp_free(_Mtp) -> erlang:nif_error(nif_not_loaded).
 nif_mtp_trace(_Mtp, _Op) -> erlang:nif_error(nif_not_loaded).

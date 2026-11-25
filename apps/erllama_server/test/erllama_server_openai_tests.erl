@@ -156,6 +156,17 @@ maps_messages_test() ->
     %% They are valid erllama_server_generate messages.
     [?assertMatch({ok, _}, erllama_server_generate:message(M)) || M <- Msgs].
 
+maps_speculative_test() ->
+    ?assertEqual(
+        #{speculative => #{type => mtp, n_max => 1}},
+        opts(#{<<"speculative">> => #{<<"type">> => <<"mtp">>, <<"n_max">> => 1}})
+    ),
+    ?assertEqual(#{speculative => true}, opts(#{<<"speculative">> => true})),
+    Bad = fun(Body) -> element(1, ?O:chat_request(Body)) =:= error end,
+    ?assert(Bad(chat(#{<<"speculative">> => #{<<"type">> => <<"nope">>}}))),
+    ?assert(Bad(chat(#{<<"speculative">> => #{<<"depth">> => 2}}))),
+    ?assert(Bad(chat(#{<<"speculative">> => 3}))).
+
 refuses_test() ->
     Bad = fun(Body) -> element(1, ?O:chat_request(Body)) =:= error end,
     ?assert(Bad(chat(#{<<"logit_bias">> => #{}}))),

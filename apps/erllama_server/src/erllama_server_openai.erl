@@ -117,7 +117,9 @@ completion_object(chat, Run, Meta, R, Logprobs) ->
         <<"finish_reason">> => finish_reason(R),
         <<"logprobs">> => logprobs_object(Meta, Run, Logprobs)
     },
-    envelope(<<"chat.completion">>, <<"chatcmpl-">>, Run, Meta, [Choice], usage(R));
+    with_speculative(
+        R, envelope(<<"chat.completion">>, <<"chatcmpl-">>, Run, Meta, [Choice], usage(R))
+    );
 completion_object(text, Run, Meta, R, Logprobs) ->
     Choice = #{
         <<"index">> => 0,
@@ -330,7 +332,22 @@ usage_chunk(Kind, Run, Meta, R) ->
             chat -> <<"chatcmpl-">>;
             text -> <<"cmpl-">>
         end,
-    (base_chunk(Object, Prefix, Run, Meta))#{<<"choices">> => [], <<"usage">> => usage(R)}.
+    with_speculative(R, (base_chunk(Object, Prefix, Run, Meta))#{
+        <<"choices">> => [], <<"usage">> => usage(R)
+    }).
+
+%% erllama's own field, beside `usage', when the request asked for
+%% speculative decoding: the tokens it drafted and had accepted, and the
+%% steps it drafted in.
+with_speculative(#{speculative := Spec}, Obj) ->
+    Obj#{
+        <<"speculative">> => maps:from_list([
+            {atom_to_binary(K), V}
+         || {K, V} <- maps:to_list(maps:with([drafted, accepted, rounds], Spec))
+        ])
+    };
+with_speculative(_R, Obj) ->
+    Obj.
 
 base_chunk(Object, Prefix, Run, Meta) ->
     #{
