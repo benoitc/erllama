@@ -39,3 +39,29 @@ gather_reports_the_missing_ranks_test() ->
     Tag = make_ref(),
     self() ! {erllama_tp_kv, Tag, 1, one},
     ?assertEqual({missing, [2]}, erllama_tp_checkpoint:gather(Tag, [1, 2], 50)).
+
+%% Frames saved before the mirrored-tensor fix (version 1) are refused.
+a_version_1_frame_is_refused_test() ->
+    <<"ETPK", 2:8, Rest/binary>> = erllama_tp_checkpoint:frame([<<"aaaa">>, <<"bbbb">>]),
+    ?assertEqual(
+        {error, bad_checkpoint}, erllama_tp_checkpoint:unframe(<<"ETPK", 1:8, Rest/binary>>, 2)
+    ).
+
+%% A split checkpoint saved before the fix (`/tp=' in the KV format) is
+%% under another cache key than the same prompt after it, so it misses.
+checkpoints_from_before_the_fix_miss_test() ->
+    Fmt = <<"llama.cpp v1.0.0/state 2/n_ctx=4096">>,
+    Layout = <<"2:even">>,
+    Before = <<Fmt/binary, "/tp=", Layout/binary>>,
+    After = erllama_model_tp:kv_format(Fmt, Layout),
+    ?assertNotEqual(Before, After),
+    Ctx = crypto:hash(sha256, <<"context params">>),
+    Key = fun(F) ->
+        erllama_cache_key:make(#{
+            fingerprint => crypto:hash(sha256, <<"model">>),
+            quant_type => q4_k_m,
+            ctx_params_hash => erllama_cache_key:with_kv_format(Ctx, F),
+            text => <<"the same prompt">>
+        })
+    end,
+    ?assertNotEqual(Key(Before), Key(After)).

@@ -41,6 +41,12 @@ order, to the extracted tarball before copying it:
   lets the split backend (`ggml-backend-meta.cpp`) split a view that
   walks the split axis one window at a time, which GLM's recurrent-state
   snapshots take; without it a split GLM with snapshots aborts.
+- [meta-split-mirrored-read.patch](scripts/patches/meta-split-mirrored-read.patch)
+  makes the split backend read a mirrored tensor from the first device
+  that holds data (its reg's `ggml_backend_dev_holds_data`), not always
+  device 0. erllama's tensor-parallel ranks hold one real device; the
+  others are placeholders that read as zeros, so a checkpoint of a
+  mirrored tensor on any rank but the first held zeros.
 
 When updating the pin, check whether upstream has fixed each one; once
 it has, remove that patch. A patch failure leaves the current vendored

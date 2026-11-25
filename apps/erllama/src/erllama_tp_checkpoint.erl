@@ -6,7 +6,11 @@
 %% group, as one binary holding every rank's share (rank order) with its
 %% size and CRC32C:
 %%
-%%   <<"ETPK", 1:8, World:16, (Size:64, Crc:32) x World, Share x World>>
+%%   <<"ETPK", 2:8, World:16, (Size:64, Crc:32) x World, Share x World>>
+%%
+%% Version 1 frames were saved before the split backend read mirrored
+%% tensors from the rank's own device: their shares hold zeros for those
+%% tensors on every rank but the first, so they are refused.
 %%
 %% One binary, so the cache publishes every share or none; a restore
 %% checks the whole frame before any rank applies its share.
@@ -76,14 +80,14 @@ frame(Shares) ->
     case [E || {error, _} = E <- Shares] of
         [] ->
             Index = [<<(byte_size(B)):64, (erllama_nif:crc32c(B)):32>> || B <- Shares],
-            iolist_to_binary([<<"ETPK", 1:8, (length(Shares)):16>>, Index, Shares]);
+            iolist_to_binary([<<"ETPK", 2:8, (length(Shares)):16>>, Index, Shares]);
         [E | _] ->
             E
     end.
 
 %% The shares of a frame made for `World' ranks, each checked.
 -spec unframe(binary(), pos_integer()) -> {ok, [binary()]} | {error, bad_checkpoint}.
-unframe(<<"ETPK", 1:8, W:16, Rest/binary>>, W) ->
+unframe(<<"ETPK", 2:8, W:16, Rest/binary>>, W) ->
     IndexBytes = W * 12,
     case Rest of
         <<Index:IndexBytes/binary, Data/binary>> ->
