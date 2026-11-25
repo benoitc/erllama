@@ -104,10 +104,9 @@ loop(#st{} = St) ->
             end_of_input(St);
         stop ->
             quit(St)
-    %% The loop exits through `stop', `eof' or a reader error; it only
-    %% ever blocks waiting for one of those messages.
-    after
-        infinity -> ok
+        %% The loop exits through `stop', `eof' or a reader error; it only
+        %% ever blocks waiting for one of those messages.
+    after infinity -> ok
     end.
 
 %% stdin closed: burst input often leaves request handlers with

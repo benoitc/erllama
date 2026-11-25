@@ -43,10 +43,9 @@ read_loop(Port, Sink, Acc) ->
                     read_loop(Port, Sink, <<Acc/binary, Bytes/binary>>);
                 {Port, eof} ->
                     Sink ! eof
-            %% Port messages only: data keeps the parse loop fed, eof
-            %% ends the reader. There is nothing else to time on.
-            after
-                infinity -> ok
+                %% Port messages only: data keeps the parse loop fed, eof
+                %% ends the reader. There is nothing else to time on.
+            after infinity -> ok
             end;
         {error, R} ->
             Sink ! {reader_error, R}
@@ -147,9 +146,8 @@ write_loop(Device) ->
             write_loop(Device);
         stop ->
             ok
-    %% Frames keep coming until `stop'.
-    after
-        infinity -> ok
+        %% Frames keep coming until `stop'.
+    after infinity -> ok
     end.
 
 -spec send(pid(), term()) -> ok.

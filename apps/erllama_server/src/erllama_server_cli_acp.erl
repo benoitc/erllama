@@ -24,10 +24,9 @@ acp(Node, _Info, Opts, _Pos) ->
             {1, erllama_server_cli:format_error(Reason)};
         {'DOWN', Mon, process, Pid, Reason} ->
             {1, erllama_server_cli:format_error({acp_crashed, Reason})}
-    %% The dispatcher answers with `acp_done'/`acp_failed' or exits
-    %% through the monitor; the CLI stays up while the agent runs.
-    after
-        infinity -> ok
+        %% The dispatcher answers with `acp_done'/`acp_failed' or exits
+        %% through the monitor; the CLI stays up while the agent runs.
+    after infinity -> ok
     end.
 
 defaults(Opts) ->
