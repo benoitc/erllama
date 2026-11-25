@@ -5,9 +5,19 @@ endpoints, so existing SDKs and tools can use the models it holds. You need this
 client at the release, to secure the listener, and to know exactly
 which request fields are honoured.
 
-Every request is a run: it shows in `erllama runs`, counts against
-`max_active_runs`, and can be cancelled from the CLI. A request is
-cancelled as soon as its client disconnects, so no model keeps
+What a request costs depends on its work:
+- a generation request (chat, completions, Responses, Anthropic
+  messages, Ollama chat and generate) is a run: it shows in
+  `erllama runs`, counts against `max_active_runs`, and can be
+  cancelled from the CLI;
+- an embedding request takes one of the same `max_active_runs` slots
+  while it runs, and answers `429` when they are all taken; it is not
+  listed as a run;
+- token counts and model lookups (`/v1/models`, `/api/tags`,
+  `/api/show`, `/api/ps`) take no slot, so they answer while the
+  release is full.
+
+A run is cancelled as soon as its client disconnects, so no model keeps
 generating for a closed connection.
 
 ## Turn it on and call it
@@ -210,8 +220,16 @@ you the kind:
 - `429`: the server is at capacity;
 - `500`: anything else.
 
-An error during a stream arrives as a final event with an `error`
-object, followed by `[DONE]`.
+An error during a stream arrives as a final event in the protocol's
+own shape:
+- OpenAI chat and completions: a chunk with an `error` object, then
+  `data: [DONE]` (a stream that ends normally also ends with
+  `[DONE]`);
+- OpenAI Responses: `response.failed`;
+- Anthropic: an `error` event (a stream that ends normally ends with
+  `message_stop`);
+- Ollama: a last NDJSON line `{"error": "message"}` (a stream that
+  ends normally ends with an object whose `done` is `true`).
 
 ## Operations
 

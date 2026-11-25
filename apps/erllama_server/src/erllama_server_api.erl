@@ -24,7 +24,7 @@ as `{erllama_server_run, JobId, Event}`. An event is
 - a run emits `started`, `loading` (its model is being loaded),
   `compacting` and `compacted` (its conversation is shortened first),
   `token`, `thinking`, `tool_call` and `logprobs`;
-- an agent session emits, per turn, `turn_started`, then for each
+- an agent session emits `started` once, then, per turn, `turn_started`, then for each
   generation round `round`, the round's `token`, `thinking` and
   `tool_call` events, `approval_request` for a call that needs one,
   `tool_started` and `tool_result` for each call, and `turn_done`; it
@@ -345,7 +345,11 @@ Start a run and return its id. `Spec`:
   absent; the conversation's history is prepended and the reply
   appended when the turn completes.
 - `prompt`: raw text instead of `messages`, outside any conversation.
-- `opts`: generation options (see `erllama_server_generate:option_keys/0`).
+- `opts`: generation options: erllama's request options (`response_tokens`,
+  `temperature`, `stop_sequences`, the sampler keys, `speculative`, ...)
+  and the chat keys `tools`, `tool_choice`, `parallel_tool_calls`,
+  `json_schema`, `enable_thinking`, `reasoning_format`; any other key
+  answers `{error, {invalid_option, Key}}`.
 """.
 -spec start_run(map()) ->
     {ok, #{run_id := binary(), conversation_id := binary() | undefined}} | {error, term()}.

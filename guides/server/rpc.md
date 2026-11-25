@@ -178,10 +178,56 @@ ERLLAMA_DIST_OPTFILE=$HOME/.erllama/ssl_dist.conf \
     bin/erllama status
 ```
 
-The release carries the `ssl` application for this. Tools that read or
-write files (in later versions) always run on the release machine: a
-workspace is a path on that machine, and the CLI never uploads your
-local files.
+The release carries the `ssl` application for this. Agent tools that
+read or write files always run on the release machine: a workspace is
+a path on that machine, and the CLI never uploads your local files.
+
+## Events you receive
+
+A process attached to a job (`erllama_server_api:attach/3`) receives
+`{erllama_server_run, JobId, Event}`, where `Event` is
+`#{seq := N, type := Type, data := Data}`. Ack with
+`JobPid ! {ack, self(), Seq}`; a subscriber that falls too far behind
+gets `{erllama_server_run, JobId, {dropped, NextSeq}}` and reattaches
+from `NextSeq`.
+
+A run:
+
+| Type | When |
+|---|---|
+| `started` | the run begins: `run_id`, `conversation_id`, `model` |
+| `loading` | its model is not loaded yet and is being loaded |
+| `compacting`, `compacted` | its conversation is shortened first (see [Conversations](conversations.md)) |
+| `token` | a piece of the reply's content |
+| `thinking` | a piece of the reasoning |
+| `tool_call` | a parsed tool call (the run never executes it) |
+| `logprobs` | token log-probabilities, when the request asked for them |
+| `done` | terminal: the result, with `finish_reason`, the text, tool calls and stats |
+| `cancelled` | terminal: the run was cancelled |
+| `error` | terminal: `#{error => Reason}` |
+
+An agent session (see [Agent sessions](agent.md)):
+
+| Type | When |
+|---|---|
+| `started` | the session begins: `agent_id`, `conversation_id`, `model`, `workspace` |
+| `turn_started` | a turn begins with its `input` |
+| `compacting`, `compacted` | the conversation is shortened at the start of a turn, or on request |
+| `round` | a generation round of the turn begins |
+| `token`, `thinking`, `tool_call` | the round's reply, as for a run |
+| `approval_request` | a call waits for `agent_approve/3`: `call_id`, `name`, `arguments` |
+| `tool_started` | a call runs: `call_id`, `name`, `arguments` |
+| `tool_result` | a call finished: `call_id`, `name`, `ok`, a preview of the `output` |
+| `turn_done` | the turn ended: `rounds`, `tokens` and its `reason` |
+| `done` | terminal: the session stopped |
+
+A download (`pull`):
+
+| Type | When |
+|---|---|
+| `started` | the download begins: `job_id`, `source` |
+| `progress` | the `file` being fetched, bytes `done` and `total` |
+| `done`, `cancelled`, `error` | terminal; `done` carries the registered `model` |
 
 ## When something goes wrong
 
@@ -199,8 +245,8 @@ local files.
 - The CLI never starts the inference application or loads the NIF; it
   runs on the release's bundled runtime when the release has one.
 - The CLI and the release check each other's API version on every
-  connection. The HTTP adapters will use the same service API, through
-  the module `erllama_server_api`.
+  connection. The CLI, other Erlang nodes and the HTTP adapters all go
+  through the same service API, the module `erllama_server_api`.
 - When the CLI's input is not a terminal (a pipe, a script), Ctrl-C
   ends the CLI at once and the release keeps any run going; use
   `erllama cancel` to stop it.
