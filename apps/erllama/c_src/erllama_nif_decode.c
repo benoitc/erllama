@@ -7,6 +7,7 @@
 #include "erllama_nif_int.h"
 #include "erllama_safe.h"
 #include "erllama_tp_nif.h"
+#include "erllama_mtp.h"
 
 #include <math.h>
 #include <string.h>
@@ -107,8 +108,12 @@ int erllama_ctx_decode(ErlNifEnv *env, erllama_context_t *c, struct llama_batch 
         erllama_tp_send(env, c, menv, tp_batch_cmd(menv, &batch));
     }
     int dr = erllama_safe_decode(c->ctx, batch);
-    if (dr != 0 || !tp) {
+    if (dr != 0) {
         return dr;
+    }
+    if (!tp) {
+        erllama_ctx_mtp_after_decode(c, &batch);
+        return 0;
     }
     int32_t n_vocab = 0;
     (void) erllama_ctx_vocab(c, &n_vocab);
@@ -118,12 +123,14 @@ int erllama_ctx_decode(ErlNifEnv *env, erllama_context_t *c, struct llama_batch 
     }
     float *logits = erllama_safe_get_logits(c->ctx);
     if (n_out == 0) {
+        erllama_ctx_mtp_after_decode(c, &batch);
         return 0;
     }
     if (!logits || n_vocab <= 0 ||
         erllama_tp_reduce_host(tp, logits, n_out * (size_t) n_vocab) != 0) {
         return ERLLAMA_TP_REDUCE_FAILED;
     }
+    erllama_ctx_mtp_after_decode(c, &batch);
     return 0;
 }
 
@@ -1363,7 +1370,9 @@ ERL_NIF_TERM nif_tp_decode(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
  *
  * On a rank that does not serve: apply one command the serving rank's
  * sink received, in order: `{decode, Bin}' (the same batch, then the
- * same logits reduction), `{seq_rm, Seq, P0, P1}', `{seq_cp, Src, Dst}'.
+ * same logits reduction), `{seq_rm, Seq, P0, P1}', `{seq_cp, Src, Dst}',
+ * `{nextn, On}' (the serving rank's drafter reads the nextn embeddings,
+ * which change the graph).
  * ========================================================================= */
 ERL_NIF_TERM nif_tp_follow(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
@@ -1421,6 +1430,13 @@ ERL_NIF_TERM nif_tp_follow(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) 
             return enif_make_badarg(env);
         }
         rc = erllama_safe_memory_seq_rm(c->ctx, seq, p0, p1);
+    } else if (strcmp(op, "nextn") == 0 && arity == 2) {
+        int on;
+        if (!enif_get_int(env, cmd[1], &on)) {
+            pthread_mutex_unlock(&c->mu);
+            return enif_make_badarg(env);
+        }
+        erllama_mtp_target_nextn(c->ctx, on);
     } else if (strcmp(op, "seq_cp") == 0 && arity == 3) {
         int src, dst;
         if (!enif_get_int(env, cmd[1], &src) || !enif_get_int(env, cmd[2], &dst)) {

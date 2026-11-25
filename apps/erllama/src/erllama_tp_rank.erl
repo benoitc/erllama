@@ -123,7 +123,8 @@ host(Pid, Config, Followers) ->
 backend(Pid, Fn, Args) ->
     gen_server:call(Pid, {hosting, {backend, Fn, Args}}, infinity).
 
-%% Release a reference handed out by backend/3 (a sampler).
+%% Release a reference handed out by backend/3 (a sampler or an MTP
+%% drafter).
 -spec free_ref(pid(), pos_integer()) -> ok | {error, term()}.
 free_ref(Pid, Id) ->
     gen_server:call(Pid, {hosting, {free_ref, Id}}, infinity).
@@ -316,6 +317,8 @@ hosting({kv_unpack, _, _} = Req, S) ->
     checkpointing(Req, S);
 hosting(checkpoint_stats, #state{ckpt = C} = S) ->
     {reply, C, S};
+hosting({mtp, Op}, #state{refs = Refs} = S) ->
+    {reply, drafters(Op, maps:values(Refs)), S};
 hosting({fault, drop_kv_pack}, S) ->
     {reply, ok, S#state{drop_kv_pack = true}};
 hosting({backend, Fn, Args}, #state{host = B} = S) when B =/= undefined ->
@@ -323,7 +326,7 @@ hosting({backend, Fn, Args}, #state{host = B} = S) when B =/= undefined ->
     hosted(apply(erllama_model_llama, Fn, [B | Args1]), Fn, S1);
 hosting({free_ref, Id}, #state{refs = Refs} = S) ->
     case maps:take(Id, Refs) of
-        {Ref, Rest} -> {reply, erllama_model_llama:sampler_free(Ref), S#state{refs = Rest}};
+        {Ref, Rest} -> {reply, release(Ref), S#state{refs = Rest}};
         error -> {reply, {error, released}, S}
     end;
 hosting(_Req, S) ->
@@ -392,6 +395,32 @@ to_remote(T, S) when is_tuple(T) ->
     {list_to_tuple(L), S1};
 to_remote(X, S) ->
     {X, S}.
+
+%% Of the MTP drafters rank 0 hosts (the handles are samplers and
+%% drafters), one answer each: their counters (`stats') or their round
+%% trace (erllama_nif:mtp_trace/2).
+drafters(Op, Refs) ->
+    lists:filtermap(
+        fun(R) ->
+            try
+                {true,
+                    case Op of
+                        stats -> erllama_nif:mtp_stats(R);
+                        _ -> erllama_nif:mtp_trace(R, Op)
+                    end}
+            catch
+                error:badarg -> false
+            end
+        end,
+        Refs
+    ).
+
+release(R) ->
+    try
+        erllama_model_llama:sampler_free(R)
+    catch
+        error:badarg -> erllama_nif:mtp_free(R)
+    end.
 
 to_local({erllama_tp_ref, Pid, Id}, #state{refs = Refs} = S) when Pid =:= self() ->
     {maps:get(Id, Refs, released), S};

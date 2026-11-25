@@ -58,7 +58,15 @@
     clear_sampler/1,
     reset_context/1,
     extra_metadata/1,
-    thinking_signature/3
+    thinking_signature/3,
+    spec_supported/1,
+    spec_new/2,
+    spec_begin/4,
+    spec_draft/5,
+    spec_accept/4,
+    spec_free/2,
+    spec_step/4,
+    spec_rollback/1
 ]).
 
 -ifdef(TEST).
@@ -176,6 +184,31 @@ reset_context(S) -> remote_state(S, reset_context, []).
 
 thinking_signature(_S, SeqId, Bytes) ->
     erllama_model_llama:thinking_signature(undefined, SeqId, Bytes).
+
+%% Speculative decoding, MTP only (experimental): rank 0 drafts with the
+%% draft model's MTP head (`draft_model', loaded on rank 0's GPU) and
+%% verifies on the split model, so every round is one batch on every
+%% rank. A hybrid model needs `n_rs_seq' >= the draft length on every
+%% rank to take a rejected draft back.
+spec_supported(S) ->
+    case remote(S, spec_supported, []) of
+        true -> true;
+        _ -> false
+    end.
+spec_new(S, #{type := mtp} = Cfg) -> remote(S, spec_new, [Cfg]);
+spec_new(_S, _Cfg) -> {error, not_supported}.
+spec_begin(S, Ref, SeqId, Prompt) -> remote(S, spec_begin, [Ref, SeqId, Prompt]).
+spec_draft(S, Ref, SeqId, IdLast, Delta) -> remote(S, spec_draft, [Ref, SeqId, IdLast, Delta]).
+spec_accept(S, Ref, SeqId, NAcc) -> remote(S, spec_accept, [Ref, SeqId, NAcc]).
+%% The drafter goes with its handle on rank 0.
+spec_free(_S, {mtp, Handle}) -> sampler_free(Handle);
+spec_free(S, Ref) -> remote(S, spec_free, [Ref]).
+spec_step(S, SamplerRef, SeqId, Draft) -> remote(S, spec_step, [SamplerRef, SeqId, Draft]).
+spec_rollback(S) ->
+    case remote(S, spec_rollback, []) of
+        N when is_integer(N); N =:= infinity -> N;
+        _ -> 0
+    end.
 
 %% -----------------------------------------------------------------------------
 

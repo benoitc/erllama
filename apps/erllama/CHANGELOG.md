@@ -29,6 +29,18 @@ this project adheres to [Semantic Versioning](https://semver.org).
   token is not added a second time. `chat/3` already did this; streamed
   multimodal chat can now do the same.
 
+- Experimental: speculative decoding with a model's MTP head
+  (`speculative => #{type => mtp}`, with the head's GGUF as
+  `draft_model`). The head guesses the next two tokens and the model
+  checks them in one step, so a step can produce up to three tokens. It
+  works on a model split over several machines, including a hybrid one
+  such as GLM-5.3-Flash when every machine keeps recurrent-state
+  snapshots (`n_rs_seq => 2`). Greedy requests only. On GLM-5.3-Flash
+  Q4_K split over two DGX Spark machines, one stream went from 19.5 to
+  26.2 tokens/s. The text can differ from decoding without drafts where
+  the two most likely tokens are almost tied, because the model checks
+  three tokens at once.
+
 ### Changed
 
 - On DGX Spark (GB10), a step that decodes eight tokens at once on a

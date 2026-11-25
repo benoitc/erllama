@@ -2909,7 +2909,7 @@ spec_request_cfg(Req, Opts, Data) ->
         undefined ->
             undefined;
         Cfg ->
-            case spec_gates_ok(Req, Data) of
+            case spec_gates_ok(Req, Cfg, Data) of
                 true -> Cfg;
                 false -> undefined
             end
@@ -2919,6 +2919,8 @@ normalize_spec_opt(false) ->
     undefined;
 normalize_spec_opt(true) ->
     normalize_spec_opt(#{});
+normalize_spec_opt(#{type := mtp} = Map) ->
+    #{type => mtp, n_max => maps:get(n_max, Map, 2)};
 normalize_spec_opt(Map) when is_map(Map) ->
     #{
         n_match => maps:get(n_match, Map, 24),
@@ -2931,10 +2933,12 @@ normalize_spec_opt(Map) when is_map(Map) ->
 %%    (the llama backend vetoes when thinking markers are
 %%    configured: spec_step bypasses its marker mapping);
 %%  - recurrent / hybrid memories refuse the partial seq_rm every
-%%    draft mismatch needs;
+%%    draft mismatch needs, unless an MTP draft is short enough for
+%%    the backend's recurrent-state snapshots (spec_rollback/1);
+%%  - an MTP draft is verified by argmax: greedy requests only;
 %%  - thinking-enabled requests route tokens off context_tokens;
 %%  - logprobs ride the normal per-token sampling path.
-spec_gates_ok(Req, Data) ->
+spec_gates_ok(Req, Cfg, Data) ->
     B = Data#data.backend,
     Family = Data#data.family,
     %% Every admission path that reaches here built a sampler, so
@@ -2944,9 +2948,20 @@ spec_gates_ok(Req, Data) ->
     Hybrid = maps:get(hybrid, Family, false),
     spec_backend_ok(B) andalso
         B:spec_supported(Data#data.backend_state) andalso
-        not (Recurrent orelse Hybrid) andalso
+        (not (Recurrent orelse Hybrid) orelse spec_rollback_ok(Cfg, Data)) andalso
+        (maps:get(type, Cfg, ngram_mod) =/= mtp orelse spec_greedy(SamplerCfg)) andalso
         Req#req.thinking =:= disabled andalso
         maps:get(logprobs, SamplerCfg, 0) =:= 0.
+
+spec_rollback_ok(#{type := mtp, n_max := N}, #data{backend = B, backend_state = S}) ->
+    erlang:function_exported(B, spec_rollback, 1) andalso B:spec_rollback(S) >= N;
+spec_rollback_ok(_Cfg, _Data) ->
+    false.
+
+%% The sampler picks the most likely token; the backend refuses the
+%% MTP step otherwise (and the request then decodes without drafts).
+spec_greedy(SamplerCfg) ->
+    maps:get(temperature, SamplerCfg, 0.0) =< 0 andalso not maps:is_key(grammar, SamplerCfg).
 
 spec_backend_ok(B) ->
     lists:all(
@@ -3022,6 +3037,10 @@ spec_draft_for(#req{spec = Cfg} = Req, #data{spec = {_C, SpecRef}} = Data) ->
     case MaxDraft >= 1 of
         false ->
             {no, Data};
+        true when map_get(type, Cfg) =:= mtp ->
+            %% The MTP drafter drafts inside the step, after sampling the
+            %% token it drafts from.
+            {spec, Req, {mtp, SpecRef, MaxDraft}, Data};
         true ->
             K = Req#req.spec_prompt_len + GenLen,
             Cursor = Req#req.spec_cursor,
@@ -3069,8 +3088,12 @@ run_spec_tick(Data, Req, Draft) ->
                     0 -> Data1;
                     _ -> spec_trim_overshoot(SeqId, Data1)
                 end,
-            Data3 = spec_record_feedback(SeqId, length(Draft), NAcc, Data2),
+            Data3 = spec_record_feedback(SeqId, draft_len(Draft), NAcc, Data2),
             tick_after_step(Data3, [], []);
+        {error, not_greedy} ->
+            %% Refused before any decode: the request goes on without
+            %% drafts.
+            tick_after_step(put_req(Data, Req#req{spec = undefined}), [], []);
         {error, Reason} = Err ->
             case is_recoverable_decode_error(Reason) of
                 true ->
@@ -3080,6 +3103,9 @@ run_spec_tick(Data, Req, Draft) ->
                     {stop, {step_failed, Err}, Data}
             end
     end.
+
+draft_len({mtp, _SpecRef, MaxDraft}) -> MaxDraft;
+draft_len(Draft) -> length(Draft).
 
 %% Feed committed tokens one at a time through the decode commit
 %% clause, stopping as soon as the request flips to finishing (a

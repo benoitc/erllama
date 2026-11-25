@@ -329,6 +329,8 @@ ERL_NIF_TERM nif_free_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
         (void) erllama_safe_sampler_free(c->smpl);
         c->smpl = NULL;
     }
+    /* The drafter reads this context: it goes first. */
+    erllama_ctx_mtp_release(env, c);
     int free_rc = erllama_safe_free(c->ctx);
     c->ctx = NULL;
     c->decode_ready = 0;

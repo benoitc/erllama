@@ -120,6 +120,9 @@ typedef struct erllama_context_s {
     /* `diag_inputs' option: the graph's input tensors seen during an
      * armed decode (erllama_nif_context.c). NULL when off. */
     struct erllama_diag_s *diag;
+    /* The MTP drafter fed after every decode (erllama_nif_mtp.c), or
+     * NULL. Set and cleared under `mu'. */
+    struct erllama_mtp_res *mtp;
     int decode_ready;              /* set after llama_decode; cleared after kv ops */
     /* Decode interrupt/budget. The abort callback (installed on the
      * llama_context at new_context time) reads these from ggml worker
@@ -291,6 +294,21 @@ ERL_NIF_TERM nif_kv_seq_pos_max(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 ERL_NIF_TERM nif_ctx_diag(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 void erllama_diag_free(struct erllama_diag_s *d);
 void context_drops_model(erllama_model_t *m);
+
+/* Remove positions [p0, p1) of `seq', on every rank of a split model;
+ * erllama_safe_memory_seq_rm's result. Caller holds c->mu. */
+int erllama_ctx_seq_rm(ErlNifEnv *env, erllama_context_t *c, int seq, int p0, int p1);
+
+/* MTP drafting (erllama_nif_mtp.c). The hooks take c->mu held. */
+int erllama_mtp_nif_load(ErlNifEnv *env);
+void erllama_ctx_mtp_after_decode(erllama_context_t *c, const struct llama_batch *b);
+void erllama_ctx_mtp_seq_reset(erllama_context_t *c, int seq);
+void erllama_ctx_mtp_release(ErlNifEnv *env, erllama_context_t *c);
+ERL_NIF_TERM nif_mtp_new(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_free(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM nif_mtp_trace(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 
 /* Decode guards (definitions in erllama_nif_context.c). */
 void arm_decode(erllama_context_t *c);

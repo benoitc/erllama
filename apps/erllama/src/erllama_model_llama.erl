@@ -52,6 +52,7 @@
     spec_accept/4,
     spec_free/2,
     spec_step/4,
+    spec_rollback/1,
     media_caps/1,
     media_prefill/4,
     sampler_new/2,
@@ -115,7 +116,10 @@
     mtmd_caps = undefined :: map() | undefined,
     %% Fingerprint derived from the GGUF file when the config gave
     %% none; `undefined` when the caller passed `fingerprint`.
-    fingerprint = undefined :: binary() | undefined
+    fingerprint = undefined :: binary() | undefined,
+    %% The model whose MTP head drafts for `speculative => #{type =>
+    %% mtp}' (`draft_model' in the config), on this process's GPU.
+    draft = undefined :: erllama_nif:model_ref() | undefined
 }).
 
 init(Config0) ->
@@ -238,10 +242,16 @@ open_context(Model, Config, MOpts, Family, FitInfo) ->
         {ok, Ctx} ->
             case open_mtmd(Model, Config) of
                 {ok, Mtmd, MtmdCaps} ->
-                    {ok,
-                        build_state(
-                            Model, Ctx, Config, MOpts, COpts, Family, FitInfo, Mtmd, MtmdCaps
-                        )};
+                    S = build_state(
+                        Model, Ctx, Config, MOpts, COpts, Family, FitInfo, Mtmd, MtmdCaps
+                    ),
+                    case open_draft(Config) of
+                        {ok, Draft} ->
+                            {ok, S#s{draft = Draft}};
+                        {error, _} = E ->
+                            terminate(S),
+                            E
+                    end;
                 {error, _} = E ->
                     erllama_nif:free_context(Ctx),
                     erllama_nif:free_model(Model),
@@ -268,6 +278,22 @@ open_mtmd(Model, Config) ->
                     end;
                 {error, _} = E ->
                     E
+            end
+    end.
+
+%% Optional MTP draft model: `draft_model` (a GGUF with MTP layers,
+%% such as a model's companion MTP file) loaded whole on this process's
+%% GPU with `draft_model_opts`.
+open_draft(Config) ->
+    case maps:get(draft_model, Config, undefined) of
+        undefined ->
+            {ok, undefined};
+        Path ->
+            MOpts = maps:merge(#{n_gpu_layers => -1}, maps:get(draft_model_opts, Config, #{})),
+            case erllama_nif:load_model(Path, MOpts#{load_mtp => true}) of
+                {ok, M} -> {ok, M};
+                {ok, M, _Fit} -> {ok, M};
+                {error, Why} -> {error, {draft_model, Why}}
             end
     end.
 
@@ -355,7 +381,7 @@ tokenize_marker(Model, Bin) when is_binary(Bin) ->
         _ -> []
     end.
 
-terminate(#s{ctx = Ctx, model = Model, mtmd = Mtmd}) ->
+terminate(#s{ctx = Ctx, model = Model, mtmd = Mtmd, draft = Draft}) ->
     %% The projector borrows the model; free it first so free_model
     %% is not deferred behind the mtmd refcount.
     _ =
@@ -363,8 +389,11 @@ terminate(#s{ctx = Ctx, model = Model, mtmd = Mtmd}) ->
             undefined -> ok;
             _ -> erllama_nif:mtmd_free(Mtmd)
         end,
+    %% Freeing the context frees a drafter on it, which borrows the
+    %% draft model.
     erllama_nif:free_context(Ctx),
     erllama_nif:free_model(Model),
+    _ = Draft =/= undefined andalso erllama_nif:free_model(Draft),
     ok.
 
 %% Recreate the context in place after a wedged/aborted decode. The
@@ -493,23 +522,50 @@ map_marker(R, _S) ->
 spec_supported(#s{} = S) ->
     all_markers_empty(S).
 
+%% MTP (`type => mtp'): a drafter on the context from the draft
+%% model's MTP head; it drafts inside spec_step, after sampling the
+%% token it drafts from, so the draft is `{mtp, MaxDraft}' there, and
+%% it learns what was accepted there too.
+spec_new(#s{draft = undefined}, #{type := mtp}) ->
+    {error, no_draft_model};
+spec_new(#s{ctx = C, draft = D}, #{type := mtp} = Cfg) ->
+    case erllama_nif:mtp_new(C, D, maps:with([n_max], Cfg)) of
+        {ok, Ref} -> {ok, {mtp, Ref}};
+        {error, _} = E -> E
+    end;
 spec_new(#s{}, Cfg) ->
     erllama_nif:spec_new(Cfg).
 
+spec_begin(#s{}, {mtp, _}, _SeqId, _PromptTokens) ->
+    ok;
 spec_begin(#s{}, SpecRef, SeqId, PromptTokens) ->
     erllama_nif:spec_begin(SpecRef, SeqId, PromptTokens).
 
 spec_draft(#s{}, SpecRef, SeqId, IdLast, Delta) ->
     erllama_nif:spec_draft(SpecRef, SeqId, IdLast, Delta).
 
+spec_accept(#s{}, {mtp, _}, _SeqId, _NAcc) ->
+    ok;
 spec_accept(#s{}, SpecRef, SeqId, NAcc) ->
     erllama_nif:spec_accept(SpecRef, SeqId, NAcc).
 
+spec_free(#s{}, {mtp, Ref}) ->
+    erllama_nif:mtp_free(Ref);
 spec_free(#s{}, SpecRef) ->
     erllama_nif:spec_free(SpecRef).
 
+spec_step(#s{ctx = C}, SamplerRef, SeqId, {mtp, {mtp, Ref}, MaxDraft}) ->
+    erllama_nif:mtp_step(C, SamplerRef, Ref, SeqId, MaxDraft);
 spec_step(#s{ctx = C}, SamplerRef, SeqId, Draft) ->
     erllama_nif:spec_step(C, SamplerRef, SeqId, Draft).
+
+%% How many drafted tokens a round can take back: a recurrent or hybrid
+%% model only as many as it keeps recurrent-state snapshots.
+spec_rollback(#s{family = F, context_opts = COpts}) ->
+    case maps:get(recurrent, F, false) orelse maps:get(hybrid, F, false) of
+        true -> maps:get(n_rs_seq, COpts, 0);
+        false -> infinity
+    end.
 
 %% Multimodal: the projector's modality caps and the whole-prompt
 %% media prefill (see erllama_nif:media_prefill/6).

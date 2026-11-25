@@ -646,6 +646,8 @@ ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         }
     }
     if (get_map_bool(env, argv[1], "vocab_only", &b)) params.vocab_only = b ? true : false;
+    /* A file's MTP layers (a draft model for nif_mtp_new). */
+    if (get_map_bool(env, argv[1], "load_mtp", &b)) params.load_mtp = b ? true : false;
 
     int enum_v;
     int sm_rc = get_map_atom_enum(
