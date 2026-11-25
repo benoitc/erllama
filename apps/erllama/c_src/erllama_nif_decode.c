@@ -908,7 +908,10 @@ ERL_NIF_TERM nif_spec_step(ErlNifEnv *env, int argc,
         return erllama_error(env, atom_released);
     }
     int32_t li = c->per_seq[seq_id].last_logits_idx;
-    if (!c->decode_ready || li < 0) {
+    /* The seq's own row, as nif_step checks: another request finishing
+     * (its seq removed) clears the context's decode_ready but leaves
+     * this row in place. */
+    if (li < 0) {
         pthread_mutex_unlock(&c->mu);
         enif_free(draft);
         return erllama_error(env, atom_no_logits);
