@@ -167,16 +167,22 @@ teacher(Ps, L, Pos, [Anchor | [_ | _] = Rest], Acc) ->
         #{pos => Pos, guesses => G, accepted => same_prefix(G, Rest), draft_us => Us} | Acc
     ]).
 verified(Ps, Leader, Anchor, Reference) ->
-    Rounds = rounds(Ps, Leader, 70, Anchor, 64, []),
+    {WallUs, Rounds} = timer:tc(fun() -> rounds(Ps, Leader, 70, Anchor, 64, []) end),
     Tokens = lists:append([maps:get(committed, R) || R <- Rounds]),
     write(draft, #{
-        rounds => Rounds, greedy_common_prefix => same_prefix(Tokens, Reference), tokens => Tokens
+        wall_us => WallUs,
+        rounds => Rounds,
+        greedy_common_prefix => same_prefix(Tokens, Reference),
+        tokens => Tokens
     }),
     Keep = 70 + length(Tokens),
     Last = lists:last(Rounds),
     % The target predicts the next known token in the last accepted row.
     Known = maps:get(next, Last),
-    transitions(Ps, Leader, Keep, Known),
+    case os:getenv("DSPARK_BATCH_ONLY") of
+        "1" -> batch_transition(Ps, Leader, Keep, Known);
+        _ -> transitions(Ps, Leader, Keep, Known)
+    end,
     ok.
 transitions(Ps, L, Pos, K) ->
     % Save both target shares and the local drafter at the committed boundary.
@@ -187,6 +193,15 @@ transitions(Ps, L, Pos, K) ->
     % Cancelling the outstanding guesses leaves the known token committed.
     ok = both(Ps, {trim, 0, Pos + 1}),
     Pos = call(L, {feed, Pos, [K]}),
+    Pos = both(Ps, {pos, 0}),
+    Cancelled = ordinary(Ps, hd(Pred), 4),
+    ok = both(Ps, {trim, 0, 0}),
+    ok = both(Ps, restore),
+    [DirectNext] = both(Ps, {decode, 0, [K], false}),
+    Direct = ordinary(Ps, DirectNext, 4),
+    write(cancel_check, #{
+        after_cancel => Cancelled, ordinary => Direct, position_after_cancel => Pos
+    }),
     ok = both(Ps, {trim, 0, 0}),
     ok = both(Ps, restore),
     ok = call(L, head_restore),
@@ -201,6 +216,8 @@ transitions(Ps, L, Pos, K) ->
     ok = both(Ps, {trim, 0, Pos + 1}),
     Pos = call(L, {feed, Pos, [K]}),
     [First | _] = RestoredPred,
+    batch_transition(Ps, L, Pos + 1, First).
+batch_transition(Ps, L, Start, First) ->
     Q = lists:foldl(
         fun(I, A) ->
             [Seed] = both(Ps, {decode, I, [4, I + 4], false}),
@@ -209,23 +226,22 @@ transitions(Ps, L, Pos, K) ->
         [First],
         lists:seq(1, 3)
     ),
-    {Q1, Pos1} = lists:foldl(
-        fun(_, {Ids, P}) ->
+    {Q1, Pos1, BatchRows} = lists:foldl(
+        fun(_, {Ids, P, Rows}) ->
             Next = both(Ps, {many, Ids}),
             [Committed | _] = Ids,
             P = call(L, {feed, P, [Committed]}),
-            {Next, P + 1}
+            {Next, P + 1, [Next | Rows]}
         end,
-        {Q, Pos + 1},
+        {Q, Start, []},
         lists:seq(1, 8)
     ),
     [ok = both(Ps, {trim, I, 0}) || I <- lists:seq(1, 3)],
     [Anchor | _] = Q1,
     Back = rounds(Ps, L, Pos1, Anchor, 8, []),
     write(transitions, #{
-        restore_guesses_match => (G =:= RestoredG),
-        restore_predictions_match => (Pred =:= RestoredPred),
-        four_ordinary_steps => 8,
+        four_ordinary_steps => length(BatchRows),
+        four_step_tokens => lists:reverse(BatchRows),
         solo_rounds_after => Back
     }).
 shell_check() ->
