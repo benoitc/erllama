@@ -638,15 +638,18 @@ mtp_step(Ctx, Sampler, Mtp, SeqId, MaxDraft) -> nif_mtp_step(Ctx, Sampler, Mtp, 
 %% `{auto, Cap}', `[]' (the next token alone, any sampler) or a list of
 %% tokens to verify (tests). The call must hold every sequence that
 %% needs a token: one it leaves out answers `{error, stale_logits}' on
-%% its next sample. Returns `{Seq, Committed, Eog, NAcc}' per item and
-%% the round's draft, verify and rollback microseconds.
+%% its next sample. Each item has its own sequence and its own sampler
+%% (badarg otherwise). Returns `{Seq, Committed, Eog, NAcc, NDrafted}'
+%% per item (NDrafted: the guesses verified for it) and the round's
+%% draft, verify and rollback microseconds.
 -spec mtp_step_batch(
     context_ref(),
     mtp_ref(),
     [{sampler_ref(), non_neg_integer(), auto | {auto, non_neg_integer()} | [token_id()]}],
     non_neg_integer()
 ) ->
-    {ok, [{non_neg_integer(), [token_id()], 0 | 1, non_neg_integer()}], map()} | {error, term()}.
+    {ok, [{non_neg_integer(), [token_id()], 0 | 1, non_neg_integer(), non_neg_integer()}], map()}
+    | {error, term()}.
 mtp_step_batch(Ctx, Mtp, Items, MaxDraft) when is_list(Items) ->
     nif_mtp_step_batch(Ctx, Mtp, Items, MaxDraft).
 

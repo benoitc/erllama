@@ -21,6 +21,7 @@
 -include_lib("stdlib/include/assert.hrl").
 
 -export([mtp_batch/1, mtp_scheduler/1, server_bench/1, cache_multiturn/1]).
+-export([mtp_batch_repeated_sampler/1]).
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([mtp_decode/1, divergence_margin/1, rollback_state_matches/1]).
 
@@ -63,7 +64,8 @@ all() ->
         mtp_batch,
         mtp_scheduler,
         server_bench,
-        cache_multiturn
+        cache_multiturn,
+        mtp_batch_repeated_sampler
     ].
 
 init_per_suite(Config) ->
@@ -369,8 +371,8 @@ mtp_batch(Config) ->
         Third = fun(Q) -> lists:nth(3, maps:get(Q, Ref)) end,
         Forced = #{1 => #{0 => [Third(0)], 1 => [Third(1) + 1]}},
         #{tokens := A, rounds := [R1, R2 | _]} = Call(mtp, [Prompts, 64, #{forced => Forced}]),
-        Acc = fun(Rd, Q) -> hd([N || {Q1, _, _, N} <- maps:get(results, Rd), Q1 =:= Q]) end,
-        Head = fun(Rd, Q) -> hd(hd([C || {Q1, C, _, _} <- maps:get(results, Rd), Q1 =:= Q])) end,
+        Acc = fun(Rd, Q) -> hd([N || {Q1, _, _, N, _} <- maps:get(results, Rd), Q1 =:= Q]) end,
+        Head = fun(Rd, Q) -> hd(hd([C || {Q1, C, _, _, _} <- maps:get(results, Rd), Q1 =:= Q])) end,
         ct:pal(
             "forced round: request 0 accepted ~b (expect 1), request 1 accepted ~b (expect 0); request 1's next token ~b, reference ~b; tokens the same as ordinary decoding: ~p",
             [
@@ -473,7 +475,7 @@ batch_row(Rep, Mode, #{tokens := Toks, wall_ms := Wall} = Run) ->
             };
         mtp ->
             Rs = maps:get(rounds, Run),
-            Committed = lists:sum([length(C) || R <- Rs, {_, C, _, _} <- maps:get(results, R)]),
+            Committed = lists:sum([length(C) || R <- Rs, {_, C, _, _, _} <- maps:get(results, R)]),
             Times = [maps:get(times, R) || R <- Rs],
             Mean = fun(K) -> mean([maps:get(K, T) || T <- Times]) / 1000 end,
             Base#{
@@ -485,7 +487,7 @@ batch_row(Rep, Mode, #{tokens := Toks, wall_ms := Wall} = Run) ->
                  || Q <- maps:keys(Toks)
                 ]),
                 accepted_per_draft =>
-                    lists:sum([A || R <- Rs, {_, _, _, A} <- maps:get(results, R)]) /
+                    lists:sum([A || R <- Rs, {_, _, _, A, _} <- maps:get(results, R)]) /
                     max(1, lists:sum([length(maps:get(drafted, R)) || R <- Rs])),
                 draft_ms => Mean(draft_us),
                 verify_ms => Mean(verify_us),
@@ -744,6 +746,40 @@ cache_multiturn(Config) ->
         ?assert(Prefix >= P1),
         ?assertMatch(#{unpack := ok}, Ck)
     end).
+
+%% One sampler given for two sequences of a batched MTP round: badarg
+%% (each item's sampler is locked once, so a repeated one would lock its
+%% mutex twice while the context is locked), and the context then serves
+%% the same round with a sampler each. On one host's GPU
+%% (ERLLAMA_TP_GLM_ONE: a GLM-5.3-Flash GGUF that fits one GB10, and the
+%% MTP head), through the NIF in the calling process.
+mtp_batch_repeated_sampler(Config) ->
+    One =
+        case os:getenv("ERLLAMA_TP_GLM_ONE") of
+            false -> exit({skip, "set ERLLAMA_TP_GLM_ONE to a GLM GGUF that fits one GPU"});
+            V -> V
+        end,
+    [Host | _] = ?config(hosts, Config),
+    {P, _} = erllama_tp_hosts:start_peer(
+        list_to_atom("erllama_tp_dup_" ++ integer_to_list(erlang:unique_integer([positive]))),
+        Host,
+        "erllama_tp_dup"
+    ),
+    try
+        ok = erllama_tp_hosts:load_module(P, erllama_tp_mtp_dup),
+        R = peer:call(
+            P,
+            erllama_tp_mtp_dup,
+            run,
+            [erllama_tp_hosts:home(P, One), erllama_tp_hosts:home(P, ?config(mtp, Config))],
+            1800000
+        ),
+        ct:pal("~p", [R]),
+        ?assertMatch(#{repeated := badarg}, R),
+        ?assertMatch(#{next := {ok, [{0, [_ | _], _, _, _}, {1, [_ | _], _, _, _}], _}}, R)
+    after
+        peer:stop(P)
+    end.
 
 %% -----------------------------------------------------------------------------
 

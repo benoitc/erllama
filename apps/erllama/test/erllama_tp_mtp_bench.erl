@@ -104,7 +104,7 @@ loop_mtp(R0, #{samplers := Sm, mtp := Mtp} = Ctx, Max, Plan, Toks, N, Rounds, T0
             {ok, Res, Times} = be(R0, mtp_step_batch, [Mtp, Items, 1]),
             Wall = (now_us() - T) / 1000,
             Toks1 = lists:foldl(
-                fun({S, Committed, E, _NAcc}, Acc) ->
+                fun({S, Committed, E, _NAcc, _NDrafted}, Acc) ->
                     maps:update_with(S, fun(L) -> L ++ marked(Committed, E) end, Acc)
                 end,
                 Toks,
@@ -121,7 +121,7 @@ loop_mtp(R0, #{samplers := Sm, mtp := Mtp} = Ctx, Max, Plan, Toks, N, Rounds, T0
             Resume =
                 case maps:get(resume, Plan, none) of
                     From when is_integer(From), N >= From, length(Res) =:= length(Active) ->
-                        lists:all(fun({_, _, _, A}) -> A >= 1 end, Res);
+                        lists:all(fun({_, _, _, A, _}) -> A >= 1 end, Res);
                     _ ->
                         false
                 end,

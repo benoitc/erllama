@@ -528,7 +528,7 @@ ERL_NIF_TERM nif_mtp_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
 
 /* =========================================================================
  * nif_mtp_step_batch(Ctx, Mtp, [{Sampler, Seq, Drafts}], MaxDraft)
- *   -> {ok, [{Seq, [Tok], Eog, NAcc}], #{draft_us, verify_us, rollback_us, rows}}
+ *   -> {ok, [{Seq, [Tok], Eog, NAcc, NDrafted}], #{draft_us, verify_us, rollback_us, rows}}
  *    | {error, _}
  *
  * One round of nif_mtp_step for several sequences at once: sample each
@@ -539,7 +539,10 @@ ERL_NIF_TERM nif_mtp_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
  *
  * Drafts: `auto' (up to MaxDraft), `{auto, Cap}' (up to Cap, at most
  * MaxDraft), or a list of tokens to verify instead (tests); `[]' or a
- * Cap of 0 decodes K alone, with any sampler. A sequence that drafts
+ * Cap of 0 decodes K alone, with any sampler. NDrafted is how many
+ * guesses were verified for the sequence (the drafter can give fewer
+ * than asked, and none after an end-of-generation K). Each item has
+ * its own sequence and its own sampler (badarg otherwise). A sequence that drafts
  * needs a greedy sampler (argmax verify); a sampler with logprobs is
  * refused (not_supported). The call holds every sequence that needs a
  * token this tick: a sequence it leaves out loses its logits row
@@ -566,18 +569,21 @@ ERL_NIF_TERM nif_mtp_step_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     int cap[ERLLAMA_MTP_MAX_SEQS];
     llama_token forced[ERLLAMA_MTP_MAX_SEQS][ERLLAMA_MTP_MAX_DRAFT];
     {
+        /* Exactly `n' items, each checked before the next; no two with the
+         * same sequence or the same sampler (each sampler is locked once
+         * below, so a repeated one would lock its mutex twice). */
         ERL_NIF_TERM head, tail = argv[2];
-        for (unsigned int i = 0; enif_get_list_cell(env, tail, &head, &tail); i++) {
+        for (unsigned int i = 0; i < n; i++) {
             int arity;
             const ERL_NIF_TERM *t;
             int seq;
-            if (!enif_get_tuple(env, head, &arity, &t) || arity != 3 ||
-                !enif_get_resource(env, t[0], SAMPLER_RT, (void **) &smp[i]) || !enif_get_int(env, t[1], &seq) ||
-                seq < 0 || seq >= ERLLAMA_N_SEQ_MAX_CAP) {
+            if (!enif_get_list_cell(env, tail, &head, &tail) || !enif_get_tuple(env, head, &arity, &t) ||
+                arity != 3 || !enif_get_resource(env, t[0], SAMPLER_RT, (void **) &smp[i]) ||
+                !enif_get_int(env, t[1], &seq) || seq < 0 || seq >= ERLLAMA_N_SEQ_MAX_CAP) {
                 return enif_make_badarg(env);
             }
             for (unsigned int j = 0; j < i; j++) {
-                if (seqs[j] == seq) {
+                if (seqs[j] == seq || smp[j] == smp[i]) {
                     return enif_make_badarg(env);
                 }
             }
@@ -605,9 +611,9 @@ ERL_NIF_TERM nif_mtp_step_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
                     return enif_make_badarg(env);
                 }
                 forced_n[i] = 0;
-                while (enif_get_list_cell(env, ft, &fh, &ft)) {
+                for (unsigned int k = 0; k < fl; k++) {
                     int v;
-                    if (!enif_get_int(env, fh, &v) || v < 0) {
+                    if (!enif_get_list_cell(env, ft, &fh, &ft) || !enif_get_int(env, fh, &v) || v < 0) {
                         return enif_make_badarg(env);
                     }
                     forced[i][forced_n[i]++] = v;
@@ -833,7 +839,8 @@ ERL_NIF_TERM nif_mtp_step_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
         }
         out = enif_make_list_cell(
             env,
-            enif_make_tuple4(env, enif_make_int(env, seqs[i]), list, enif_make_int(env, eog), enif_make_int(env, n_acc)),
+            enif_make_tuple5(env, enif_make_int(env, seqs[i]), list, enif_make_int(env, eog), enif_make_int(env, n_acc),
+                             enif_make_int(env, n_draft[i])),
             out);
     }
     const uint64_t t3 = mono_us();

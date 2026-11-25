@@ -3180,18 +3180,19 @@ mtp_batch_drafts(Req, MaxDraft) ->
 run_mtp_batch_tick(Data, Items, MaxDraft, SpecRef) ->
     case backend_call(Data, mtp_step_batch, [SpecRef, Items, MaxDraft]) of
         {ok, Results, _Times} ->
-            Drafts = maps:from_list([{Seq, D} || {_, Seq, D} <- Items]),
             Data1 = lists:foldl(
-                fun({Seq, Committed, Eog, NAcc}, D0) ->
+                fun({Seq, Committed, Eog, NAcc, NDrafted}, D0) ->
                     {Leftover, D1} = apply_spec_committed(Seq, Committed, Eog, D0),
                     D2 =
                         case Leftover of
                             0 -> D1;
                             _ -> spec_trim_overshoot(Seq, D1)
                         end,
-                    case maps:get(Seq, Drafts) of
-                        {auto, Cap} -> spec_record_feedback(Seq, Cap, NAcc, D2);
-                        _ -> D2
+                    %% What the drafter actually gave (fewer than the cap,
+                    %% or none after an end-of-generation token).
+                    case NDrafted of
+                        0 -> D2;
+                        _ -> spec_record_feedback(Seq, NDrafted, NAcc, D2)
                     end
                 end,
                 Data,
