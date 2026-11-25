@@ -421,6 +421,10 @@
     spec_accepted = 0 :: non_neg_integer(),
     %% MTP rounds this request drafted in (alone or with others).
     spec_rounds = 0 :: non_neg_integer(),
+    %% False once the backend refused this request's sampler in a
+    %% batched MTP round even without guesses (`not_supported'): the
+    %% request then keeps every later tick on the ordinary step.
+    mtp_batch = true :: boolean(),
     %% Multimodal request state. `media` holds the decoded-input
     %% list ([{image | audio, Bytes}]); `media_prompt` the rendered
     %% prompt binary (media requests carry no token list - the
@@ -3157,6 +3161,8 @@ maybe_mtp_batch_tick(_Data) ->
 
 mtp_batch_ready(#req{media_state = pending}) ->
     false;
+mtp_batch_ready(#req{mtp_batch = false}) ->
+    false;
 mtp_batch_ready(#req{prefill_cursor = undefined, sampler_ref = Ref, last_sampler_cfg = Cfg}) when
     Ref =/= undefined
 ->
@@ -3201,13 +3207,18 @@ run_mtp_batch_tick(Data, Items, MaxDraft, SpecRef) ->
                 Results
             ),
             tick_after_step(Data1, [], []);
+        {error, {Refused, Seq}} when Refused =:= not_greedy; Refused =:= not_supported ->
+            %% Refused before any sampling or decode, every row intact:
+            %% only the named request loses drafting, and this tick runs
+            %% the ordinary co-batched step instead.
+            step_tick_ops(refuse_mtp_batch(Refused, Seq, Data));
         {error, Refused} when Refused =:= not_greedy; Refused =:= not_supported ->
-            %% Refused before any decode, every row intact: the requests
-            %% go on without drafts.
-            Tab = maps:map(
-                fun(_, R) -> R#req{spec = undefined} end, Data#data.req_table
-            ),
-            tick_after_step(Data#data{req_table = Tab}, [], []);
+            %% A backend that does not name the sequence: every request
+            %% of the round goes on without drafts.
+            Seqs = [S || {_Sampler, S, _Drafts} <- Items],
+            step_tick_ops(
+                lists:foldl(fun(S, D) -> refuse_mtp_batch(Refused, S, D) end, Data, Seqs)
+            );
         {error, Reason} ->
             case is_recoverable_decode_error(Reason) orelse Reason =:= stale_logits of
                 true ->
@@ -3216,6 +3227,16 @@ run_mtp_batch_tick(Data, Items, MaxDraft, SpecRef) ->
                     fail_all_requests(Data, Reason),
                     {stop, {step_failed, Reason}, Data}
             end
+    end.
+
+%% A sampler that is not greedy can still join a round without guesses;
+%% one the backend refuses outright (logprobs) cannot join at all.
+refuse_mtp_batch(Refused, Seq, Data) ->
+    case maps:find(Seq, Data#data.req_table) of
+        {ok, R} ->
+            put_req(Data, R#req{spec = undefined, mtp_batch = Refused =:= not_greedy});
+        error ->
+            Data
     end.
 
 %% Feed committed tokens one at a time through the decode commit

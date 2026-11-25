@@ -543,8 +543,10 @@ ERL_NIF_TERM nif_mtp_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
  * guesses were verified for the sequence (the drafter can give fewer
  * than asked, and none after an end-of-generation K). Each item has
  * its own sequence and its own sampler (badarg otherwise). A sequence that drafts
- * needs a greedy sampler (argmax verify); a sampler with logprobs is
- * refused (not_supported). The call holds every sequence that needs a
+ * needs a greedy sampler (argmax verify, `{not_greedy, Seq}' otherwise);
+ * a sampler with logprobs is refused (`{not_supported, Seq}'). Both
+ * refusals come before any sampling or decode, so every row is left as
+ * it was. The call holds every sequence that needs a
  * token this tick: a sequence it leaves out loses its logits row
  * (stale_logits on its next sample).
  * ========================================================================= */
@@ -645,13 +647,15 @@ ERL_NIF_TERM nif_mtp_step_batch(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
             locked++;
             break;
         }
+        /* A refusal names its sequence: the caller turns drafting off
+         * there and keeps it for the others. */
         if (smp[locked]->n_probs > 0) {
-            err = atom_not_supported;
+            err = enif_make_tuple2(env, atom_not_supported, enif_make_int(env, seqs[locked]));
             locked++;
             break;
         }
         if (drafts && !erllama_mtp_chain_is_greedy(smp[locked]->chain)) {
-            err = enif_make_atom(env, "not_greedy");
+            err = enif_make_tuple2(env, enif_make_atom(env, "not_greedy"), enif_make_int(env, seqs[locked]));
             locked++;
             break;
         }

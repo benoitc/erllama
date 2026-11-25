@@ -42,7 +42,8 @@ this project adheres to [Semantic Versioning](https://semver.org).
   three tokens at once.
 - MTP drafting now goes on when several requests run on the model: each
   step checks every request's next token, and the guesses of those that
-  draft, together. Before, a request drafted only while it was alone.
+  draft, together. Before, a request drafted only while it was alone. A
+  request that cannot draft does not stop the others from drafting.
 
 ### Changed
 

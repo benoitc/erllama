@@ -21,7 +21,7 @@
 -include_lib("stdlib/include/assert.hrl").
 
 -export([mtp_batch/1, mtp_scheduler/1, server_bench/1, cache_multiturn/1]).
--export([mtp_batch_repeated_sampler/1]).
+-export([mtp_batch_repeated_sampler/1, mtp_batch_refusal_names_sequence/1]).
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([mtp_decode/1, divergence_margin/1, rollback_state_matches/1]).
 
@@ -65,7 +65,8 @@ all() ->
         mtp_scheduler,
         server_bench,
         cache_multiturn,
-        mtp_batch_repeated_sampler
+        mtp_batch_repeated_sampler,
+        mtp_batch_refusal_names_sequence
     ].
 
 init_per_suite(Config) ->
@@ -777,6 +778,50 @@ mtp_batch_repeated_sampler(Config) ->
         ct:pal("~p", [R]),
         ?assertMatch(#{repeated := badarg}, R),
         ?assertMatch(#{next := {ok, [{0, [_ | _], _, _, _}, {1, [_ | _], _, _, _}], _}}, R)
+    after
+        peer:stop(P)
+    end.
+
+%% A batched MTP round with mixed samplers names the sequence it refuses
+%% (a drafting sampler that is not greedy, or one with logprobs), in
+%% either position, and leaves the rows intact: the next rounds, with
+%% the other sequence joining without guesses, run and keep drafting
+%% for the greedy one. On one host's GPU (ERLLAMA_TP_GLM_ONE), through
+%% the NIF in the calling process.
+mtp_batch_refusal_names_sequence(Config) ->
+    One =
+        case os:getenv("ERLLAMA_TP_GLM_ONE") of
+            false -> exit({skip, "set ERLLAMA_TP_GLM_ONE to a GLM GGUF that fits one GPU"});
+            V -> V
+        end,
+    [Host | _] = ?config(hosts, Config),
+    {P, _} = erllama_tp_hosts:start_peer(
+        list_to_atom("erllama_tp_refusal_" ++ integer_to_list(erlang:unique_integer([positive]))),
+        Host,
+        "erllama_tp_refusal"
+    ),
+    try
+        ok = erllama_tp_hosts:load_module(P, erllama_tp_mtp_refusal),
+        R = peer:call(
+            P,
+            erllama_tp_mtp_refusal,
+            run,
+            [erllama_tp_hosts:home(P, One), erllama_tp_hosts:home(P, ?config(mtp, Config))],
+            1800000
+        ),
+        ct:pal("~p", [R]),
+        ?assertMatch(#{not_greedy_second := {error, {not_greedy, 1}}}, R),
+        ?assertMatch(#{not_greedy_first := {error, {not_greedy, 0}}}, R),
+        ?assertMatch(#{not_supported := {error, {not_supported, 1}}}, R),
+        [
+            begin
+                {ok, [{0, C0, _, _, N0}, {1, C1, _, _, 0}], _} = maps:get(K, R),
+                ?assert(N0 > 0),
+                ?assert(length(C0) >= 1),
+                ?assertEqual(1, length(C1))
+            end
+         || K <- [next, again]
+        ]
     after
         peer:stop(P)
     end.
