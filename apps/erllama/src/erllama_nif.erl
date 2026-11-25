@@ -639,7 +639,10 @@ mtp_step(Ctx, Sampler, Mtp, SeqId, MaxDraft) -> nif_mtp_step(Ctx, Sampler, Mtp, 
 %% tokens to verify (tests). The call must hold every sequence that
 %% needs a token: one it leaves out answers `{error, stale_logits}' on
 %% its next sample. Each item has its own sequence and its own sampler
-%% (badarg otherwise). Returns `{Seq, Committed, Eog, NAcc, NDrafted}'
+%% (badarg otherwise). A sequence that drafts needs a greedy sampler
+%% (`{error, {not_greedy, Seq}}'), and no item may ask for logprobs
+%% (`{error, {not_supported, Seq}}'); both refusals come before any
+%% sampling or decode. Returns `{Seq, Committed, Eog, NAcc, NDrafted}'
 %% per item (NDrafted: the guesses verified for it) and the round's
 %% draft, verify and rollback microseconds.
 -spec mtp_step_batch(

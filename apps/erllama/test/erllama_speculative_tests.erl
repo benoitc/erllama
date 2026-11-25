@@ -276,3 +276,110 @@ session_turns_keep_speculating_test() ->
         ?assert(D2 > 0),
         ?assertEqual(D2, A2)
     end).
+
+%% =============================================================================
+%% Recovery
+%% =============================================================================
+
+%% A speculative step that times out fails its caller with the bare
+%% reason, wrapped once, and the recovered model serves the next one.
+spec_step_timeout_reaches_callers_test() ->
+    with_model(#{}, fun(Id) ->
+        ok = erllama_model_stub:wedge_next_spec_step(decode_timeout),
+        {ok, Ref} = erllama:stream(Id, <<"stream me now">>, #{
+            response_tokens => 8, speculative => true
+        }),
+        ?assertEqual({error, decode_timeout}, collect_stream(Ref, 5000)),
+        ok = erllama_model_stub:wedge_next_spec_step(decode_timeout),
+        ?assertEqual(
+            {error, decode_timeout},
+            erllama:complete(Id, <<"hello world foo">>, #{
+                response_tokens => 8, speculative => true
+            })
+        ),
+        {ok, R} = erllama:complete(Id, <<"hello world foo">>, #{
+            response_tokens => 8, speculative => true
+        }),
+        ?assertEqual(8, length(maps:get(generated, R)))
+    end).
+
+%% =============================================================================
+%% MTP rounds for several requests
+%% =============================================================================
+
+mtp_opts(N) ->
+    #{response_tokens => N, speculative => #{type => mtp, n_max => 2}}.
+
+with_mtp_model(Body) ->
+    with_model(#{context_opts => #{n_seq_max => 2}, step_delay_ms => 20}, fun(Id) ->
+        ok = erllama_model_stub:reset_mtp_calls(),
+        try
+            Body(Id)
+        after
+            erllama_model_stub:reset_mtp_calls()
+        end
+    end).
+
+%% The backend refuses the neighbour's sampler in a batched round; only
+%% the neighbour loses drafting. The first request (seq 0) still drafts,
+%% and drafts alone once the neighbour (seq 1) has finished.
+mtp_refusal_not_greedy_keeps_the_other_drafting_test() ->
+    mtp_refusal_keeps_the_other_drafting(not_greedy).
+
+mtp_refusal_not_supported_keeps_the_other_drafting_test() ->
+    mtp_refusal_keeps_the_other_drafting(not_supported).
+
+mtp_refusal_keeps_the_other_drafting(Reason) ->
+    with_mtp_model(fun(Id) ->
+        ok = erllama_model_stub:refuse_mtp_seq(1, Reason),
+        {ok, A} = erllama:stream(Id, <<"the first and longer request">>, mtp_opts(40)),
+        {ok, B} = erllama:stream(Id, <<"its neighbour">>, mtp_opts(8)),
+        {OutB, _StatsB} = collect_stream(B, 10000),
+        {OutA, StatsA} = collect_stream(A, 10000),
+        ?assertEqual(8, length(OutB)),
+        ?assertEqual(40, length(OutA)),
+        ?assertEqual(length, maps:get(finish_reason, StatsA)),
+        Calls = erllama_model_stub:mtp_calls(),
+        %% Refused once: the neighbour is not asked again.
+        ?assertEqual([{refused, {Reason, 1}}], [C || {refused, _} = C <- Calls]),
+        After = tl(lists:dropwhile(fun(C) -> C =/= {refused, {Reason, 1}} end, Calls)),
+        ?assert(lists:any(fun(C) -> element(1, C) =:= lone andalso element(2, C) =:= 0 end, After)),
+        Batches = [L || {batch, L} <- After],
+        [?assertEqual(0, proplists:get_value(1, L, 0)) || L <- Batches],
+        case Reason of
+            not_greedy ->
+                %% The neighbour still joins, without guesses, while the
+                %% first request drafts in the same round.
+                ?assert(lists:any(fun(L) -> proplists:get_value(0, L, 0) > 0 end, Batches));
+            not_supported ->
+                %% The neighbour cannot join, so no round is batched.
+                ?assertEqual([], Batches)
+        end,
+        #{rounds := Rounds} = maps:get(speculative, StatsA),
+        ?assert(Rounds > 0)
+    end).
+
+%% A batched round that times out fails both requests with the bare
+%% reason, and the recovered model serves the next request.
+mtp_batch_timeout_reaches_both_callers_test() ->
+    with_mtp_model(fun(Id) ->
+        {ok, A} = erllama:stream(Id, <<"the first request">>, mtp_opts(200)),
+        {ok, B} = erllama:stream(Id, <<"the second request">>, mtp_opts(200)),
+        ok = wait_for_batch(5000),
+        ok = erllama_model_stub:wedge_next_spec_step(decode_timeout),
+        ?assertEqual({error, decode_timeout}, collect_stream(A, 5000)),
+        ?assertEqual({error, decode_timeout}, collect_stream(B, 5000)),
+        {ok, R} = erllama:complete(Id, <<"after the recovery">>, mtp_opts(6)),
+        ?assertEqual(6, length(maps:get(generated, R)))
+    end).
+
+wait_for_batch(Timeout) when Timeout =< 0 ->
+    {timeout, erllama_model_stub:mtp_calls()};
+wait_for_batch(Timeout) ->
+    case [L || {batch, L} <- erllama_model_stub:mtp_calls()] of
+        [_ | _] ->
+            ok;
+        [] ->
+            timer:sleep(10),
+            wait_for_batch(Timeout - 10)
+    end.

@@ -189,6 +189,46 @@ erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 
 The counter keys are listed on `erllama_cache:get_counters/0`.
 
+## TinyLlama on erllama and Ollama
+
+We sent the same 44-token prompt to erllama and Ollama using TinyLlama
+1.1B Chat Q4_K_M. Every reply contained 128 tokens. The figures are
+medians of six requests per server on each machine, alternating which
+server ran first. Client tokens/s covers the full request, from sending
+the prompt on loopback to reading the final stream event.
+
+| Machine | Server | Client tokens/s | First visible text | Full reply | Server-reported decode tokens/s |
+|---|---|---:|---:|---:|---:|
+| Apple M4 Pro | erllama | 223.3 | 30.3 ms | 573 ms | 225.0 |
+| Apple M4 Pro | Ollama | 214.0 | 29.0 ms | 598 ms | 224.8 |
+| NVIDIA GB10 | erllama | 259.7 | 12.3 ms | 493 ms | 262.6 |
+| NVIDIA GB10 | Ollama | 240.2 | 62.9 ms | 533 ms | 273.3 |
+
+On the **M4 Pro**, each timed request followed an unrelated prompt with
+the model already loaded. Ollama reused one token on every run. The
+first visible text arrived about 1.3 ms earlier with Ollama, and the
+full reply finished about 25 ms earlier with erllama.
+
+On the **GB10**, both servers were warmed once and then received the
+measured prompt six times. Ollama reported faster decode, while erllama
+delivered the first text about 51 ms earlier and finished about 40 ms
+earlier. Compare the servers within each machine because the prompt
+history and Ollama versions differ between machines.
+
+### Resending the same prompt with both caches warm
+
+On the M4 Pro, we enabled short-prompt checkpoints in erllama's RAM
+tier and sent the 44-token prompt once to populate both caches. On all
+six retries, both servers reused 43 tokens. Median time to first visible
+text was **6.9 ms for erllama** and **8.5 ms for Ollama**.
+
+The default cold-save minimum is 512 tokens. For this short-prompt test
+we set `min_tokens` and `cold_min_tokens` to 32, and `boundary_trim_tokens`
+and `boundary_align_tokens` to 1. That saves the first 43 tokens and leaves
+one token to process on the retry.
+
+[Exact prompt, build versions and raw measurements](https://github.com/benoitc/erllama/tree/8e54df7a45ac9cd217698162e128b097fa9bab84/bench/reports/2026-11-25-tinyllama-ollama)
+
 ## Disabling the cache
 
 For benchmarking or sanity checks, turn RAM saves off and keep the

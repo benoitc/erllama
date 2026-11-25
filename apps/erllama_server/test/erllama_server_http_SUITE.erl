@@ -45,6 +45,11 @@
     responses_chain/1,
     responses_branch/1,
     responses_stream/1,
+    responses_cancelled_and_stored/1,
+    responses_cancelled_not_stored/1,
+    responses_client_gone_and_stored/1,
+    responses_client_gone_not_stored/1,
+    responses_continue_after_a_cancelled_turn/1,
     ollama_chat_and_generate/1,
     ollama_models/1,
     ollama_pull/1,
@@ -84,6 +89,11 @@ all() ->
         responses_chain,
         responses_branch,
         responses_stream,
+        responses_cancelled_and_stored,
+        responses_cancelled_not_stored,
+        responses_client_gone_and_stored,
+        responses_client_gone_not_stored,
+        responses_continue_after_a_cancelled_turn,
         ollama_chat_and_generate,
         ollama_models,
         ollama_pull,
@@ -914,11 +924,186 @@ responses_stream(Config) ->
             <<"response.output_text.done">>,
             <<"response.content_part.done">>,
             <<"response.output_item.done">>,
-            <<"response.completed">>
+            <<"response.incomplete">>
         ],
         [E || {E, _} <- Evs]
     ),
-    ?assertEqual(lists:seq(0, length(Evs) - 1), [N || {_, #{<<"sequence_number">> := N}} <- Evs]).
+    ?assertEqual(lists:seq(0, length(Evs) - 1), [N || {_, #{<<"sequence_number">> := N}} <- Evs]),
+    %% Stopped at max_output_tokens: the terminal event and the object
+    %% it carries agree.
+    {_, #{<<"response">> := Obj}} = lists:last(Evs),
+    ?assertMatch(
+        #{
+            <<"status">> := <<"incomplete">>,
+            <<"incomplete_details">> := #{<<"reason">> := <<"max_output_tokens">>}
+        },
+        Obj
+    ).
+
+%% A streamed response cancelled after its first visible token ends as
+%% `cancelled' with the text it made. Stored, it reads back as the
+%% object the stream ended with; not stored, nothing can be read back.
+responses_cancelled_and_stored(Config) ->
+    responses_cancelled(Config, true).
+
+responses_cancelled_not_stored(Config) ->
+    responses_cancelled(Config, false).
+
+responses_cancelled(Config, Store) ->
+    {Obj, Text} = cancel_after_first_token(Config, slow_response(Store)),
+    #{<<"id">> := Id} = Obj,
+    ?assertNotEqual(<<>>, Text),
+    case Store of
+        true ->
+            {200, Got} = get(Config, <<"/v1/responses/", Id/binary>>),
+            ?assertEqual(Obj, decode(Got));
+        false ->
+            ?assertMatch({404, _}, get(Config, <<"/v1/responses/", Id/binary>>))
+    end.
+
+%% A client that goes away after the first visible token: its run is
+%% cancelled, and a stored response keeps what was made, as `cancelled',
+%% even when the run ends only after the request's handler has exited.
+responses_client_gone_and_stored(Config) ->
+    responses_client_gone(Config, true).
+
+responses_client_gone_not_stored(Config) ->
+    responses_client_gone(Config, false).
+
+responses_client_gone(Config, Store) ->
+    Body = iolist_to_binary(json:encode(slow_response(Store))),
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, erllama_server_http:port(), [binary, {active, false}]),
+    ok = gen_tcp:send(S, [
+        <<"POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: ">>,
+        integer_to_binary(byte_size(Body)),
+        <<"\r\n\r\n">>,
+        Body
+    ]),
+    Seen = first_delta(S, <<>>, erlang:monotonic_time(millisecond) + 10000),
+    {match, [Id]} = re:run(Seen, <<"\"id\":\"(resp_[0-9a-f]+)\"">>, [
+        {capture, all_but_first, binary}
+    ]),
+    %% Hold the run open (its cancel cannot land while a step waits)
+    %% until the request's handler, which the run watches, has exited.
+    [#{pid := RunPid}] =
+        [R || #{status := running, model := <<"slow">>} = R <- erllama_server_runs:list()],
+    {monitors, Watched} = process_info(RunPid, monitors),
+    ok = erllama_model_stub:hold_steps(),
+    try
+        ok = gen_tcp:close(S),
+        ok = wait(fun() ->
+            lists:any(fun({process, P}) -> not is_process_alive(P) end, Watched)
+        end),
+        ?assertMatch({ok, #{status := running}}, erllama_server_api:run(run_of(Id))),
+        ?assertMatch({404, _}, get(Config, <<"/v1/responses/", Id/binary>>))
+    after
+        erllama_model_stub:release_steps()
+    end,
+    case Store of
+        true ->
+            ok = wait(fun() -> element(1, get(Config, <<"/v1/responses/", Id/binary>>)) =:= 200 end),
+            {200, Got} = get(Config, <<"/v1/responses/", Id/binary>>),
+            #{<<"status">> := <<"cancelled">>, <<"output">> := [Msg]} = decode(Got),
+            #{<<"status">> := <<"incomplete">>, <<"content">> := [#{<<"text">> := Text}]} = Msg,
+            ?assertNotEqual(<<>>, Text);
+        false ->
+            ok = wait(fun() ->
+                [R || #{status := running} = R <- erllama_server_runs:list()] =:= []
+            end),
+            ?assertMatch({404, _}, get(Config, <<"/v1/responses/", Id/binary>>))
+    end.
+
+run_of(<<"resp_", Hex/binary>>) -> <<"run_", Hex/binary>>.
+
+%% Stream `Body', cancel its run once the first token is out, and
+%% return the response the stream ended with and the text it sent.
+cancel_after_first_token(Config, Body) ->
+    Parent = self(),
+    _ = spawn_link(fun() -> Parent ! {body, post(Config, <<"/v1/responses">>, Body)} end),
+    Run = running_run(<<"slow">>),
+    {ok, _} = erllama_server_api:attach(Run, self(), 0),
+    ok = first_token(Run),
+    ok = erllama_server_api:cancel(Run),
+    {200, Resp} =
+        receive
+            {body, B} -> B
+        after 30000 -> ct:fail(stream_did_not_end)
+        end,
+    _ = erllama_server_api:detach(Run, self()),
+    Evs = events(Resp),
+    {Last, #{<<"response">> := Obj}} = lists:last(Evs),
+    ?assertEqual(<<"response.incomplete">>, Last),
+    Text = <<<<D/binary>> || {<<"response.output_text.delta">>, #{<<"delta">> := D}} <- Evs>>,
+    #{<<"status">> := <<"cancelled">>, <<"output">> := [Msg]} = Obj,
+    ?assertMatch(
+        #{<<"status">> := <<"incomplete">>, <<"content">> := [#{<<"text">> := Text}]}, Msg
+    ),
+    {Obj, Text}.
+
+%% Turn A completes, turn B continues it and is cancelled, turn C
+%% continues B: C starts from A, without B's input or partial reply,
+%% and B still reads back as cancelled with its partial text.
+responses_continue_after_a_cancelled_turn(Config) ->
+    {200, RA} = post(Config, <<"/v1/responses">>, #{
+        <<"model">> => <<"slow">>, <<"input">> => <<"TURN_A">>, <<"max_output_tokens">> => 2
+    }),
+    #{<<"id">> := A, <<"output">> := [#{<<"content">> := [#{<<"text">> := TextA}]}]} = decode(RA),
+    {ObjB, TextB} = cancel_after_first_token(
+        Config,
+        (slow_response(true))#{<<"input">> => <<"TURN_B">>, <<"previous_response_id">> => A}
+    ),
+    #{<<"id">> := B} = ObjB,
+    ?assertNotEqual(<<>>, TextB),
+    {200, GotB} = get(Config, <<"/v1/responses/", B/binary>>),
+    ?assertEqual(ObjB, decode(GotB)),
+    {200, RC} = post(Config, <<"/v1/responses">>, #{
+        <<"model">> => <<"slow">>,
+        <<"input">> => <<"TURN_C">>,
+        <<"previous_response_id">> => B,
+        <<"max_output_tokens">> => 2
+    }),
+    #{<<"id">> := C, <<"output">> := [#{<<"content">> := [#{<<"text">> := TextC}]}]} = decode(RC),
+    {ok, #{conversation_id := Conv}} = erllama_server_api:run(run_of(C)),
+    {ok, #{messages := Msgs}} = erllama_server_api:conversation(Conv),
+    ?assertEqual([<<"TURN_A">>, <<"TURN_C">>], [M || #{role := <<"user">>, content := M} <- Msgs]),
+    ?assertEqual([TextA, TextC], [M || #{role := <<"assistant">>, content := M} <- Msgs]).
+
+slow_response(Store) ->
+    #{
+        <<"model">> => <<"slow">>,
+        <<"input">> => <<"a long answer">>,
+        <<"max_output_tokens">> => 500,
+        <<"stream">> => true,
+        <<"store">> => Store
+    }.
+
+running_run(Model) ->
+    ok = wait(fun() ->
+        [R || #{status := running, model := M} = R <- erllama_server_runs:list(), M =:= Model] =/=
+            []
+    end),
+    [#{run_id := Run} | _] =
+        [R || #{status := running, model := M} = R <- erllama_server_runs:list(), M =:= Model],
+    Run.
+
+first_token(Run) ->
+    receive
+        {erllama_server_run, Run, #{type := token}} -> ok
+    after 10000 -> ct:fail(no_first_token)
+    end.
+
+%% Read the raw stream until a text delta arrives.
+first_delta(S, Acc, Deadline) ->
+    case binary:match(Acc, <<"response.output_text.delta">>) of
+        nomatch ->
+            Left = Deadline - erlang:monotonic_time(millisecond),
+            case Left > 0 andalso gen_tcp:recv(S, 0, Left) of
+                {ok, More} -> first_delta(S, <<Acc/binary, More/binary>>, Deadline);
+                _ -> ct:fail({no_delta_in_time, Acc})
+            end;
+        _ ->
+            Acc
+    end.
 
 %% -----------------------------------------------------------------------------
 %% Ollama

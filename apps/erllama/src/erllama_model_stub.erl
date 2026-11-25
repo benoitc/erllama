@@ -71,6 +71,12 @@ paths).
     %% simulating a wedged/aborted decode so recovery can be tested
     %% without a real backend.
     wedge_next_step/1,
+    %% Test helper: the same, for the next speculative step only.
+    wedge_next_spec_step/1,
+    %% Test helpers: hold every step/2 call until released, so a test
+    %% can keep a request (and a cancel of it) from finishing.
+    hold_steps/0,
+    release_steps/0,
     %% Test helpers: read / clear the list of cfgs passed to
     %% sampler_new/2 since the last reset.
     sampler_new_cfgs/0,
@@ -93,6 +99,14 @@ paths).
     spec_step/4,
     spec_accept_calls/0,
     reset_spec_accept_calls/0,
+    %% MTP (`speculative => #{type => mtp}'): the lone round goes
+    %% through spec_step/4, the batched one through mtp_step_batch/4.
+    %% Test helpers: refuse a sequence in batched rounds, and read back
+    %% the rounds run since the last reset.
+    mtp_step_batch/4,
+    refuse_mtp_seq/2,
+    mtp_calls/0,
+    reset_mtp_calls/0,
     %% Multimodal: enabled with the `media_caps' load knob; prefill
     %% is deterministic (media_n_pos positions per item).
     media_caps/1,
@@ -315,12 +329,25 @@ step(#stub{step_delay_ms = D} = S, Ops) when D > 0 ->
     timer:sleep(D),
     step(S#stub{step_delay_ms = 0}, Ops);
 step(S, Ops) ->
+    ok = wait_while_held(),
     case take_wedge() of
         undefined ->
             Results = [stub_step_op(Op, S) || Op <- Ops],
             {ok, Results};
         Reason ->
             {error, Reason}
+    end.
+
+%% Test knob: a one-shot wedge armed by wedge_next_spec_step/1 fails
+%% the next speculative step; one armed by wedge_next_step/1 fails the
+%% next step of either kind.
+take_spec_wedge() ->
+    case persistent_term:get({?MODULE, spec_wedge}, undefined) of
+        undefined ->
+            take_wedge();
+        Reason ->
+            persistent_term:erase({?MODULE, spec_wedge}),
+            Reason
     end.
 
 %% Test knob: consume a one-shot wedge armed by wedge_next_step/1
@@ -426,8 +453,19 @@ spec_free(_S, _SpecRef) ->
 spec_step(#stub{step_delay_ms = D} = S, Sampler, SeqId, Draft) when D > 0 ->
     timer:sleep(D),
     spec_step(S#stub{step_delay_ms = 0}, Sampler, SeqId, Draft);
+spec_step(_S, Sampler, SeqId, {mtp, _SpecRef, MaxDraft}) ->
+    case take_spec_wedge() of
+        undefined ->
+            %% The drafter guesses the stub's constant token, so every
+            %% guess is accepted.
+            record_mtp_call({lone, SeqId, MaxDraft}),
+            T = stub_token(SeqId, Sampler),
+            {ok, {spec, lists:duplicate(MaxDraft + 1, T), 0, MaxDraft}};
+        Reason ->
+            {error, Reason}
+    end;
 spec_step(_S, Sampler, SeqId, Draft) ->
-    case take_wedge() of
+    case take_spec_wedge() of
         undefined ->
             T = stub_token(SeqId, Sampler),
             Matched = matched_prefix(Draft, T),
@@ -438,6 +476,66 @@ spec_step(_S, Sampler, SeqId, Draft) ->
         Reason ->
             {error, Reason}
     end.
+
+%% A batched MTP round. A sequence armed by refuse_mtp_seq/2 is refused
+%% as the NIF does, before anything runs: `not_greedy' when it drafts,
+%% `not_supported' whenever it joins.
+mtp_step_batch(#stub{step_delay_ms = D} = S, SpecRef, Items, MaxDraft) when D > 0 ->
+    timer:sleep(D),
+    mtp_step_batch(S#stub{step_delay_ms = 0}, SpecRef, Items, MaxDraft);
+mtp_step_batch(_S, _SpecRef, Items, MaxDraft) ->
+    Refused = persistent_term:get({?MODULE, mtp_refuse}, #{}),
+    Caps = [{Sampler, Seq, mtp_cap(Drafts, MaxDraft)} || {Sampler, Seq, Drafts} <- Items],
+    Refusal = [
+        {Reason, Seq}
+     || {_Sampler, Seq, Cap} <- Caps,
+        Reason <- [maps:get(Seq, Refused, none)],
+        Reason =:= not_supported orelse (Reason =:= not_greedy andalso Cap > 0)
+    ],
+    case {Refusal, take_spec_wedge()} of
+        {[First | _], _} ->
+            record_mtp_call({refused, First}),
+            {error, First};
+        {[], undefined} ->
+            record_mtp_call({batch, [{Seq, Cap} || {_, Seq, Cap} <- Caps]}),
+            Results = [
+                {Seq, lists:duplicate(Cap + 1, stub_token(Seq, Sampler)), 0, Cap, Cap}
+             || {Sampler, Seq, Cap} <- Caps
+            ],
+            {ok, Results, #{}};
+        {[], Reason} ->
+            {error, Reason}
+    end.
+
+mtp_cap(auto, MaxDraft) -> MaxDraft;
+mtp_cap({auto, Cap}, MaxDraft) -> min(Cap, MaxDraft);
+mtp_cap(Forced, _MaxDraft) when is_list(Forced) -> length(Forced).
+
+%% Test knob: refuse `Seq' in every batched MTP round from now on, with
+%% `Reason' (not_greedy | not_supported), until reset_mtp_calls/0.
+refuse_mtp_seq(Seq, Reason) when Reason =:= not_greedy; Reason =:= not_supported ->
+    persistent_term:put(
+        {?MODULE, mtp_refuse},
+        maps:put(Seq, Reason, persistent_term:get({?MODULE, mtp_refuse}, #{}))
+    ),
+    ok.
+
+record_mtp_call(Call) ->
+    persistent_term:put({?MODULE, mtp_calls}, [Call | mtp_calls_newest_first()]).
+
+mtp_calls_newest_first() ->
+    persistent_term:get({?MODULE, mtp_calls}, []).
+
+%% Test helper: the MTP rounds since the last reset, oldest first:
+%% `{lone, Seq, MaxDraft}', `{batch, [{Seq, Guesses}]}' or
+%% `{refused, {Reason, Seq}}'.
+mtp_calls() ->
+    lists:reverse(mtp_calls_newest_first()).
+
+reset_mtp_calls() ->
+    _ = persistent_term:erase({?MODULE, mtp_calls}),
+    _ = persistent_term:erase({?MODULE, mtp_refuse}),
+    ok.
 
 matched_prefix(Draft, T) ->
     lists:takewhile(fun(D) -> D =:= T end, Draft).
@@ -491,6 +589,31 @@ abort_handle(_S) ->
 %% Test knob: arm the next step/2 to return {error, Reason} once.
 wedge_next_step(Reason) ->
     persistent_term:put({?MODULE, wedge}, Reason),
+    ok.
+
+%% Test knob: hold every step/2 call (it waits inside the backend, so
+%% the model process is busy) until release_steps/0.
+hold_steps() ->
+    persistent_term:put({?MODULE, hold}, true),
+    ok.
+
+release_steps() ->
+    _ = persistent_term:erase({?MODULE, hold}),
+    ok.
+
+wait_while_held() ->
+    case persistent_term:get({?MODULE, hold}, false) of
+        true ->
+            timer:sleep(10),
+            wait_while_held();
+        false ->
+            ok
+    end.
+
+%% Test knob: arm the next speculative step (spec_step/4) to return
+%% {error, Reason} once; plain steps are left alone.
+wedge_next_spec_step(Reason) ->
+    persistent_term:put({?MODULE, spec_wedge}, Reason),
     ok.
 
 %% Test helper: cfgs passed to sampler_new/2 since the last reset.

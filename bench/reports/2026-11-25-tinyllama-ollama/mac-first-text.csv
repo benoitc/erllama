@@ -1,0 +1,13 @@
+pair,engine,case,prompt_tokens,output_tokens,headers_ms,first_event_ms,first_text_ms,server_prompt_ms,ollama_cached_tokens,client_to_first_step_ms,first_prefill_call_ms,first_decode_call_ms,adapter_to_client_ms
+1,erllama,after_unrelated,44,16,0.784,30.086,30.114,3.0,,0.965,2.772,26.125,0.163
+1,ollama,after_unrelated,44,16,28.783,28.794,28.804,27.245,1,,,,
+2,ollama,after_unrelated,44,16,30.039,30.049,30.059,28.156,1,,,,
+2,erllama,after_unrelated,44,16,1.39,30.232,30.254,2.0,,1.571,2.25,26.083,0.221
+3,erllama,after_unrelated,44,16,0.907,29.88,29.909,3.0,,1.19,2.565,25.832,0.191
+3,ollama,after_unrelated,44,16,28.571,28.582,28.592,27.113,1,,,,
+4,ollama,after_unrelated,44,16,28.441,28.452,28.46,26.811,1,,,,
+4,erllama,after_unrelated,44,16,3.171,31.017,31.04,1.0,,3.277,0.911,26.507,0.206
+5,erllama,after_unrelated,44,16,0.96,30.388,30.406,4.0,,1.159,2.924,26.05,0.186
+5,ollama,after_unrelated,44,16,30.171,30.181,30.19,27.895,1,,,,
+6,ollama,after_unrelated,44,16,31.069,31.082,31.093,29.175,1,,,,
+6,erllama,after_unrelated,44,16,0.874,30.205,30.228,3.0,,1.064,2.769,26.146,0.179

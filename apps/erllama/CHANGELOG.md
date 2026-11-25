@@ -42,7 +42,8 @@ this project adheres to [Semantic Versioning](https://semver.org).
   three tokens at once.
 - MTP drafting now goes on when several requests run on the model: each
   step checks every request's next token, and the guesses of those that
-  draft, together. Before, a request drafted only while it was alone.
+  draft, together. Before, a request drafted only while it was alone. A
+  request that cannot draft does not stop the others from drafting.
 
 ### Changed
 
@@ -57,6 +58,12 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- When a decode timed out or failed and the model recovered, the
+  requests it failed received the error wrapped twice,
+  `{error, {error, decode_timeout}}` instead of `{error, decode_timeout}`,
+  so code matching the documented reason missed it. Requests waiting
+  for a free sequence already got the right shape; now every caller
+  does, including streams and speculative requests.
 - A KV cache entry of a model split over several machines now restores
   correctly on every machine. For models that keep part of their
   attention state on every machine, such as GLM-5.3-Flash, every

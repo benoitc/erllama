@@ -10,11 +10,27 @@
 %% conversation: `previous_response_id' continues it, with its history
 %% and the KV cache warmth of the previous turn. `store: false' without
 %% a previous response is a stateless request.
+%%
+%% A cancelled run (the client went away, or the run was cancelled)
+%% ends with status `cancelled' and the output made so far. It is kept
+%% when stored like any other response; its conversation does not take
+%% the cancelled turn, so continuing it starts from the last turn that
+%% completed. When the client went away, erllama_server_responses keeps
+%% it once the run has ended, however long that takes.
 
 -export([create/1, retrieve/1, delete/1]).
 -export([request/1]).
 %% For erllama_server_openai_responses_stream.
--export([response_object/2, base_object/2, message_item/3, call_item/4, keep/2, indexed/1]).
+-export([
+    response_object/2,
+    base_object/2,
+    message_item/3,
+    call_item/4,
+    keep/2,
+    keep_gone/1,
+    item_status/1,
+    indexed/1
+]).
 
 -define(FIELDS, [
     <<"model">>,
@@ -34,6 +50,9 @@
     <<"truncation">>
 ]).
 -define(INFO_FIELDS, [<<"metadata">>, <<"user">>, <<"service_tier">>]).
+%% How often a response whose client went away checks whether its run
+%% has ended.
+-define(GONE_POLL_MS, 50).
 
 %% -----------------------------------------------------------------------------
 %% Requests
@@ -355,6 +374,7 @@ complete(#{run := Run} = Ctx) ->
             ok = keep(Ctx, Obj),
             erllama_server_http_kit:json(200, Obj);
         {gone, _} ->
+            ok = keep_gone(Ctx),
             erllama_server_http_kit:err(openai, 499, <<"client closed the request">>)
     end.
 
@@ -364,13 +384,29 @@ keep(#{store := true, id := Id, conv := Conv}, Obj) when is_binary(Conv) ->
 keep(_, _) ->
     ok.
 
+%% The client went away and its run is being cancelled: once the run
+%% has ended, keep what it made (when stored). The wait is not the
+%% request's: it runs in erllama_server_responses.
+keep_gone(#{store := true} = Ctx) ->
+    erllama_server_responses:keep_when_done(fun() -> keep_on_end(Ctx) end);
+keep_gone(_Ctx) ->
+    ok.
+
+keep_on_end(#{run := Run} = Ctx) ->
+    case erllama_server_api:result(Run) of
+        {error, running} ->
+            timer:sleep(?GONE_POLL_MS),
+            keep_on_end(Ctx);
+        {ok, #{finish_reason := _} = R} ->
+            keep(Ctx, response_object(Ctx, R));
+        _ ->
+            %% Failed, or gone after its retention.
+            ok
+    end.
+
 response_object(Ctx, R) ->
     Base = base_object(Ctx, completed),
-    Status =
-        case maps:get(finish_reason, R, stop) of
-            length -> <<"incomplete">>;
-            _ -> <<"completed">>
-        end,
+    Status = status(R),
     Incomplete =
         case Status of
             <<"incomplete">> -> #{<<"reason">> => <<"max_output_tokens">>};
@@ -407,6 +443,21 @@ base_object(#{id := Id, created := Created, echo := Echo} = Ctx, _Status) ->
         }
     ).
 
+status(R) ->
+    case maps:get(finish_reason, R, stop) of
+        length -> <<"incomplete">>;
+        cancelled -> <<"cancelled">>;
+        _ -> <<"completed">>
+    end.
+
+%% The status of the output items: those of a response that did not
+%% end normally are incomplete.
+item_status(R) ->
+    case status(R) of
+        <<"completed">> -> <<"completed">>;
+        _ -> <<"incomplete">>
+    end.
+
 output_items(#{run := Run}, R) ->
     Reasoning =
         case maps:get(reasoning, R, <<>>) of
@@ -417,9 +468,9 @@ output_items(#{run := Run}, R) ->
     Message =
         case {maps:get(content, R, <<>>), Calls} of
             {<<>>, [_ | _]} -> [];
-            {C, _} -> [message_item(Run, C, <<"completed">>)]
+            {C, _} -> [message_item(Run, C, item_status(R))]
         end,
-    Reasoning ++ Message ++ [call_item(Run, I, C, <<"completed">>) || {I, C} <- indexed(Calls)].
+    Reasoning ++ Message ++ [call_item(Run, I, C, item_status(R)) || {I, C} <- indexed(Calls)].
 
 indexed(L) -> lists:zip(lists:seq(0, length(L) - 1), L).
 

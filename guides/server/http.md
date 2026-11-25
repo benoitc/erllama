@@ -118,7 +118,7 @@ evaluated whole and do not reuse the KV cache.
 
 | Endpoint | Streaming |
 |---|---|
-| `POST /v1/responses` | SSE typed events: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`/`.done`, `response.function_call_arguments.delta`/`.done`, `response.output_item.done`, `response.completed` (or `response.failed`), each with `sequence_number` |
+| `POST /v1/responses` | SSE typed events: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`/`.done`, `response.function_call_arguments.delta`/`.done`, `response.output_item.done`, then `response.completed`, `response.incomplete` (stopped at `max_output_tokens`, or cancelled) or `response.failed`, each with `sequence_number` |
 | `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` | no |
 
 | Field | Support |
@@ -135,7 +135,24 @@ evaluated whole and do not reuse the KV cache.
 | `metadata`, `user`, `service_tier` | accepted and not used |
 | anything else (`background`, `include`, built-in tools, ...) | refused with `400` |
 
-Stored responses live in memory: a restart forgets them.
+A stream ends with `response.completed` when the answer is complete,
+and with `response.incomplete` when it is not: stopped at
+`max_output_tokens` (status `incomplete`, `incomplete_details.reason`
+`max_output_tokens`), or cancelled. OpenAI has a `cancelled` status
+but no event for it; erllama's convention is to end a cancelled stream
+with `response.incomplete` carrying status `cancelled` and the text
+made so far. The response is cancelled when the client goes away or
+with `erllama cancel`.
+
+With `store` on, `GET` reads back the object the stream ended with,
+including a cancelled one, even when the client went away before the
+run had stopped. Continuing a cancelled response with
+`previous_response_id` starts from the last turn that completed: the
+cancelled turn's input and partial reply are not added to the
+conversation. With `store: false` nothing is kept.
+
+Stored responses are written under `data_dir/responses` and are loaded
+again when the release starts.
 
 ## Anthropic Messages
 

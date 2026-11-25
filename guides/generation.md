@@ -204,7 +204,9 @@ just chose, in one batch.
 ```
 
 - Greedy requests only: the guesses are checked against the most
-  likely token. Other requests decode without drafts.
+  likely token. Other requests decode without drafts. When several
+  requests share a step, one that cannot draft stops drafting on its
+  own; the others go on drafting.
 - A recurrent or hybrid model needs `n_rs_seq` of at least `n_max`, so
   rejected guesses can be taken back.
 - The output follows the model's greedy choices, but the check runs
