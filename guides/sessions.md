@@ -21,6 +21,41 @@ erllama keeps conversation state at two levels:
 
 Sessions are the fast path; the cache is the safety net underneath.
 
+## `session_id` or `parent_key`?
+
+Both carry a conversation from one turn to the next, at different
+levels:
+
+- `session_id` names a **live sequence** pinned in the model's context
+  between turns. The next turn decodes on the cells already there: no
+  restore, only the new suffix is prefilled. The pin lasts while the
+  model runs and the sequence is not reclaimed (`end_session/2`,
+  `reset_session/2`, an engine recovery, or the pool taking back the
+  least-recently-used idle pin).
+- `parent_key` names a **saved cache row**: the `finish_key` a previous
+  `complete/3` or `prefill_only/3` returned. The next turn restores
+  that row into a free sequence, then prefills the suffix. The row
+  outlives the sequence: it stays until the cache evicts it, and on a
+  `disk` tier it survives a restart of the model.
+
+```erlang
+%% Live pin: one sequence held for the conversation.
+{ok, _} = erllama:complete(M, Turn1, #{session_id => chat_42}),
+{ok, _} = erllama:complete(M, Turn2, #{session_id => chat_42}),
+
+%% Saved row: no sequence held between turns.
+{ok, #{finish_key := K}} = erllama:complete(M, Turn1, #{}),
+{ok, _} = erllama:complete(M, Turn2, #{parent_key => K}).
+```
+
+Use `session_id` for active conversations when you have a free
+sequence for each (`context_opts.n_seq_max`). Use `parent_key` when
+conversations outnumber sequences, or when the next turn may come
+much later. `finish_key` is `undefined` when the prompt was too short
+to save (below `min_tokens`). If you track neither, a caller that
+resends the whole transcript still warm-restores through the
+longest-prefix lookup (see [caching](caching.md#when-does-a-hit-happen)).
+
 ## Start and continue a session
 
 Pass any term as `session_id`; the first request creates the pin:
@@ -129,6 +164,6 @@ timeout so it stays usable when the engine is wedged.
 
 ## See also
 
-- [Generating text](generation.md) - the request model and options
-- [Caching](caching.md) - what happens when a session is evicted
-- [Tool calls](tool-calls.md) - `chat/3` with sessions in agent loops
+- [Generating text](generation.md): the request model and options
+- [Caching](caching.md): what happens when a session is evicted
+- [Tool calls](tool-calls.md): `chat/3` with sessions in agent loops

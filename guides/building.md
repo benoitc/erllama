@@ -2,9 +2,9 @@
 
 erllama is a single OTP application with a single NIF
 (`erllama_nif.so`), in `apps/erllama/` of this repository. The first
-compile builds the vendored `c_src/llama.cpp/` (~3 minutes on a fast machine), then compiles the
-small NIF surface and a CRC table. Subsequent builds reuse the cmake
-cache and finish in seconds.
+compile builds the vendored `c_src/llama.cpp/` (about 3 minutes on a
+fast machine), then compiles the NIF sources and a CRC table.
+Subsequent builds reuse the cmake cache and finish in seconds.
 
 ## Toolchain requirements
 
@@ -42,6 +42,27 @@ CUDA is off by default. Enable with:
 ERLLAMA_OPTS=-DGGML_CUDA=ON rebar3 compile
 ```
 
+`ERLLAMA_OPTS` goes to the CMake configure step and
+`ERLLAMA_BUILDOPTS` to the llama.cpp build step, so
+`ERLLAMA_BUILDOPTS=-j4` caps the parallel jobs.
+
+### CUDA with NCCL (tensor parallelism)
+
+To split a model over several machines you need CUDA and NCCL in the
+build. Set the CUDA architecture of your GPU (121 for GB10) and point
+`NCCL_ROOT` at a directory holding NCCL's `include/` and `lib/`:
+
+```bash
+ERLLAMA_OPTS="-DGGML_CUDA=ON -DGGML_CUDA_NCCL=ON -DCMAKE_CUDA_ARCHITECTURES=121 -DNCCL_ROOT=$HOME/nccl" \
+ERLLAMA_BUILDOPTS=-j6 \
+rebar3 compile
+```
+
+`scripts/tp_hosts.sh` prepares Linux CUDA hosts this way without root
+(NCCL from the pip wheel, OTP 28.3.1, rebar3) and builds the test
+profile on each host. See [tensor parallelism](tensor-parallel.md)
+for forming the ranks and loading a split model.
+
 ## macOS (Apple Silicon and Intel)
 
 ```bash
@@ -69,7 +90,7 @@ export PATH="/usr/local/lib/erlang28/bin:/usr/local/bin:$PATH"
 
 # llama.cpp's build-info cmake script invokes `git rev-parse`. When
 # the build directory's owner differs from the user (typical inside
-# CI VMs), git refuses with "dubious ownership" - allow the path.
+# CI VMs), git refuses with "dubious ownership"; allow the path.
 git config --global --add safe.directory "$PWD"
 
 # rebar3 isn't always available as a pkg; fetch it once.
@@ -90,26 +111,34 @@ takes precedence (useful for cross-compilation or pinned headers).
 
 ## What the build produces
 
-- `priv/erllama_nif.so` - the single NIF, statically linked against
+- `priv/erllama_nif.so`: the single NIF, statically linked against
   the vendored `c_src/llama.cpp` (libllama, libggml, ggml-cpu, plus
   the platform GPU/BLAS backends) and `c_src/crc32c.c`.
-- `_build/default/lib/erllama/ebin/*.beam` - Erlang modules.
-- `_build/cmake/` (under `apps/erllama/` in this repository) - CMake build dir; cached for incremental builds.
+- `_build/default/lib/erllama/ebin/*.beam`: Erlang modules.
+- `_build/cmake/` (under `apps/erllama/` in this repository): the
+  CMake build dir, cached for incremental builds.
+
+Besides the C sources, the NIF compiles six C++ shims:
+`erllama_safe.cpp` (catches C++ exceptions before they reach
+the BEAM), `erllama_chat_nif.cpp` (chat templates and output parsing),
+`erllama_mtmd_nif.cpp` (the multimodal projector), `erllama_spec_nif.cpp`
+(ngram speculation), `erllama_mtp.cpp` (the MTP drafter) and
+`erllama_tp_nif.cpp` (tensor parallelism).
 
 ## Common build issues
 
-- **`'erl_nif.h' file not found`** - `ERTS_INCLUDE_DIR` is wrong.
+- **`'erl_nif.h' file not found`**: `ERTS_INCLUDE_DIR` is wrong.
   `FindErlang.cmake` should resolve it automatically; if it fails,
   set the env var explicitly:
   `ERTS_INCLUDE_DIR=$(erl -noshell -eval 'io:format("~s",[filename:join([code:root_dir(),"erts-"++erlang:system_info(version),"include"])]),halt().') rebar3 compile`.
-- **`R_X86_64_TPOFF32 against hidden symbol gomp_tls_data`** - your
+- **`R_X86_64_TPOFF32 against hidden symbol gomp_tls_data`**: your
   `libgomp.a` is non-PIC. erllama's CMakeLists already sets
   `GGML_OPENMP OFF` to avoid this. If you re-enabled OpenMP, build
   a PIC `libgomp` or leave it off.
-- **`PCRE2_10.47 not defined`** when running git on FreeBSD - refresh
+- **`PCRE2_10.47 not defined`** when running git on FreeBSD: refresh
   `pcre2` first: `pkg install -y pcre2`. The cached VM image lags
   the latest repo.
-- **macOS metal init slow on first model load** - the lazy
+- **macOS metal init slow on first model load**: the lazy
   `llama_backend_init` runs on the first `erllama:load_model/1` call
   and discovers Metal devices. eunit cases that load a model need
   a generator timeout >5 s; see
@@ -124,8 +153,8 @@ rebar3 compile
 rebar3 xref
 rebar3 dialyzer
 rebar3 lint
-rebar3 eunit       # 162 tests, 0 failures
-rebar3 ct          # 7 stub-backend cases pass; 6 real-model cases skip
+rebar3 eunit
+rebar3 ct          # real-model and hardware suites skip without their env vars
 ```
 
 End-to-end against a real GGUF:

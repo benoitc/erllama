@@ -84,6 +84,45 @@ The script checks the retained files against the patched tarball.
 Update the tag in this page and
 add a CHANGELOG line, then commit with a message naming the new tag.
 
+### Check the C++ shims
+
+Every file in `c_src/*.cpp` builds against llama.cpp's C++ headers,
+not only its C API, so a bump can change them without touching
+`llama.h`. Read the upstream diff of the headers each one includes
+(upstream paths, under `c_src/llama.cpp/`):
+
+| Shim | What it wraps |
+|---|---|
+| `c_src/erllama_safe.cpp` | the `noexcept` wrappers around every `llama_*` / `ggml_*` call that can throw |
+| `c_src/erllama_chat_nif.cpp` | `common_chat_*`, the autoparser (`common/chat.h`) |
+| `c_src/erllama_spec_nif.cpp` | ngram speculation (`common/speculative.h`) |
+| `c_src/erllama_mtp.cpp` | the MTP drafter (`common_speculative`, a draft context) |
+| `c_src/erllama_mtmd_nif.cpp` | libmtmd (`tools/mtmd/`) |
+| `c_src/erllama_tp_nif.cpp` | ggml's internal backend interfaces (`ggml/src/ggml-backend-impl.h`) and the split backend (`ggml/src/ggml-backend-meta.cpp`) |
+
+A changed signature fails the build; a changed behaviour shows only in
+the real-model suites (see
+[internals/hardware-suites.md](../../internals/hardware-suites.md)).
+
+### Check tensor parallelism on every bump
+
+The tensor-parallel devices rely on ggml internals that change between
+pins. On the CUDA hosts, build with NCCL and run at least
+`erllama_tp_nccl_SUITE`, then `erllama_tp_failure_SUITE` and
+`erllama_tp_checkpoint_SUITE` (see "When you bump llama.cpp" in
+[internals/tensor-parallel-design.md](../../internals/tensor-parallel-design.md#when-you-bump-llamacpp)):
+
+```sh
+scripts/tp_hosts.sh sync  hostA hostB
+scripts/tp_hosts.sh build hostA hostB
+ERLLAMA_TP_HOSTS=hostA,hostB rebar3 ct --dir apps/erllama/test \
+    --suite erllama_tp_nccl_SUITE,erllama_tp_failure_SUITE,erllama_tp_checkpoint_SUITE
+```
+
+For hybrid-model work (GLM-5.3-Flash), also run the GLM suites, and
+check whether the local `meta-*` patches still apply and are still
+needed.
+
 ## Build knobs
 
 `do_cmake.sh` passes `ERLLAMA_OPTS` to the CMake configure step and
@@ -91,6 +130,8 @@ add a CHANGELOG line, then commit with a message naming the new tag.
 
 ```sh
 ERLLAMA_OPTS="-DGGML_CUDA=ON"           # enable CUDA on Linux x86-64
+ERLLAMA_OPTS="-DGGML_CUDA=ON -DGGML_CUDA_NCCL=ON -DNCCL_ROOT=$HOME/nccl"
+                                        # CUDA with NCCL, for tensor parallelism
 ERLLAMA_OPTS="-DGGML_METAL=OFF"         # disable Metal on Darwin
 ERLLAMA_OPTS="-DGGML_BLAS=OFF"          # disable BLAS
 ERLLAMA_OPTS="-DCMAKE_BUILD_TYPE=Debug" # debug build

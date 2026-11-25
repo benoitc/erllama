@@ -8,42 +8,40 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
-- Experimental: a node's GPU can join a group of ranks on other hosts
-  and sum buffers with them on the GPUs' own network path
-  (`erllama_tp`), and a model can be split over such a group with
-  llama.cpp's own tensor split, each machine holding and computing its
-  share (`tp_rank` load option), and served through the usual
-  `complete`, `stream` and `cancel` calls from a machine that holds no
-  part of it (`erllama_model_tp` backend). If one machine is lost while
-  a request streams, the request ends with a single error, the serving
+- Experimental: a model can be split over several machines, each
+  holding and computing its share with llama.cpp's own tensor split.
+  Each machine's GPU joins a group of ranks that sum buffers on the
+  GPUs' own network path; a model loaded with the `tp_rank` option is
+  split over the group and served through the usual `complete`,
+  `stream` and `cancel` calls from a machine that holds no part of it
+  (the `erllama_model_tp` backend). If one machine is lost while a
+  request streams, the request ends with a single error, the serving
   node keeps running, and a group formed again serves the next request.
   A cancel never interrupts a step halfway through. A split model's KV
   cache entry holds every machine's share, saved at the same point, so
   a group formed again resumes from it; a save missing a share is not
   kept. This needs a CUDA build with NCCL. The machines can be joined
-  by RDMA or by ordinary Ethernet (TCP); the tensor-parallel page shows
-  how to choose TCP and the network interface on each machine.
-
+  by RDMA or by ordinary Ethernet (TCP); the tensor-parallel guide
+  shows how to choose TCP and the network interface on each machine.
 - `media_add_special`, a request option for streams with media: set it
   to `false` when the prompt comes from a chat template, so the BOS
   token is not added a second time. `chat/3` already did this; streamed
   multimodal chat can now do the same.
-
 - Experimental: speculative decoding with a model's MTP head
   (`speculative => #{type => mtp}`, with the head's GGUF as
-  `draft_model`). The head guesses the next two tokens and the model
-  checks them in one step, so a step can produce up to three tokens. It
-  works on a model split over several machines, including a hybrid one
-  such as GLM-5.3-Flash when every machine keeps recurrent-state
-  snapshots (`n_rs_seq => 2`). Greedy requests only. On GLM-5.3-Flash
-  Q4_K split over two DGX Spark machines, one stream went from 19.5 to
-  26.2 tokens/s. The text can differ from decoding without drafts where
-  the two most likely tokens are almost tied, because the model checks
-  three tokens at once.
-- MTP drafting now goes on when several requests run on the model: each
-  step checks every request's next token, and the guesses of those that
-  draft, together. Before, a request drafted only while it was alone. A
-  request that cannot draft does not stop the others from drafting.
+  `draft_model`). The head guesses up to `n_max` next tokens (default
+  2, at most 16) and the model checks them in one step, so a step can
+  produce up to `n_max + 1` tokens. Drafting goes on when several
+  requests run on the model: each step checks every request's next
+  token, and the guesses of those that draft, together. A request that
+  cannot draft does not stop the others from drafting. It works on a
+  model split over several machines, including a hybrid one such as
+  GLM-5.3-Flash when every machine keeps recurrent-state snapshots
+  (`n_rs_seq => 2`). Greedy requests only. On GLM-5.3-Flash Q4_K split
+  over two DGX Spark machines, one stream went from 19.5 to 26.2
+  tokens/s. The text can differ from decoding without drafts where the
+  two most likely tokens are almost tied, because the model checks
+  several tokens at once.
 
 ### Changed
 
@@ -80,28 +78,21 @@ this project adheres to [Semantic Versioning](https://semver.org).
   always opens a thinking block, such as GLM-5.3-Flash. Such a model
   used to think anyway, and its whole reply came back as reasoning
   with empty content.
-
-- A hybrid model such as GLM-5.3-Flash split over several machines can
-  now keep recurrent-state snapshots (`n_rs_seq`), so its last tokens
-  can be taken back. Every machine used to stop at the first decode
-  when they were on. This is a local fix to the vendored llama.cpp
-  until upstream carries it; split loads still keep no snapshot unless
-  asked.
-
+- A hybrid model (one mixing attention and recurrent layers, such as
+  GLM-5.3-Flash) split over several machines now opens the same kind
+  of context on every machine, and can keep recurrent-state snapshots
+  when you ask for them with `n_rs_seq`, so its last tokens can be
+  taken back. The machines after the first used to miss that state, so
+  the first removal of a token failed on them, and with snapshots on,
+  every machine stopped at the first decode. Split loads still keep no
+  snapshot unless asked; without one, a cache hit on a whole prompt is
+  served from scratch. This is a local fix to the vendored llama.cpp
+  until upstream carries it.
 - Hybrid models such as GLM-5.3-Flash rebuilt their decode graph for
   every token when the KV cache was unified (one cache shared by all
   sequences), which cost about 10 ms a token on GB10 hosts. They now
   reuse it between tokens as other models do. This is a local fix to
   the vendored llama.cpp until upstream carries it.
-
-- A model split over several machines now opens the same kind of
-  context on every machine. The machines that follow the first one
-  missed the extra state erllama keeps for hybrid models (those mixing
-  attention and recurrent layers, such as GLM-5.3-Flash), so the first
-  removal of a token would fail on them. Split hybrid models now keep
-  no such state at all, since llama.cpp cannot split it: a cache hit
-  on a whole prompt is then served from scratch.
-
 - A malformed request to a loaded model, such as a chat message list
   the template renderer rejects or an invalid token id, crashed the
   model process, so every request on that model failed with it. The
@@ -728,7 +719,7 @@ agentic tool-continue loops).
 - `on_full => block | error` admission option on `complete/3`,
   `prefill_only/3`, `infer/4` (default `block`). `error` fails fast
   with `{error, seq_capacity}` instead of queueing when no seq is
-  free — pair with `available_seqs` / `n_seq_max` from `model_info/1`.
+  free: pair with `available_seqs` / `n_seq_max` from `model_info/1`.
 - `generated => [token_id()]` in the `erllama_done` Stats map: the
   exact generated token ids in order, so a caller can build a
   byte-exact suffix for `continue/3` without re-tokenising
@@ -844,7 +835,7 @@ Documentation-only patch on top of 0.5.0.
 - README rewritten for sharper top-of-funnel: tighter "Why" list,
   cleaner Quick taste, Common patterns block replacing the old
   long example.
-- Architecture diagram corrected — `erllama_cache_ramfile_srv`
+- Architecture diagram corrected: `erllama_cache_ramfile_srv`
   and `erllama_cache_disk_srv` are operator-started standalone
   servers, not children of `erllama_cache_sup`. Added
   `erllama_registry` and `erllama_inflight` which were missing.
@@ -879,7 +870,7 @@ and sticky per-session seq_id pinning.
 - `erllama:prefill_only/3` accepting `Opts` with `parent_key`.
   When passed a prior turn's `finish_key`, the call warm-restores
   from that row and prefills only the new suffix before firing the
-  finish save — useful for chaining cache-warming calls across
+  finish save, useful for chaining cache-warming calls across
   turns (#40).
 - `session_id => term()` on `infer/4` Params and
   `complete/3` / `prefill_only/3` Opts. Pins the underlying seq_id
@@ -1011,7 +1002,7 @@ the llama.cpp multi-GPU / flash-attention / KV-quant params.
   - `generated :: [token_id()]`
   - `context_tokens :: [token_id()]` (prompt ++ generated)
   - `committed_tokens :: non_neg_integer()` (`length(context_tokens)`)
-  - `finish_key :: cache_key() | undefined` — token-exact key for the
+  - `finish_key :: cache_key() | undefined`: token-exact key for the
     full context, suitable as `parent_key` on the next turn;
     `undefined` if the finish save was suppressed
   - `cache_hit_kind :: exact | partial | cold`

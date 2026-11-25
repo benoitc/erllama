@@ -33,7 +33,7 @@ repository).
   %% --------------- Cache flow tunables ---------------------------
   {evict_save_timeout_ms,  30000},
   {session_resume_wait_ms,   500},
-  {fingerprint_mode,         safe},   %% safe | gguf_chunked | fast_unsafe
+  {fingerprint_mode, gguf_chunked},   %% gguf_chunked | safe | fast_unsafe
   %% {writer_max_concurrent,   9},   %% default: 2 * schedulers + 1
 
   %% --------------- Chat -------------------------------------------
@@ -43,7 +43,7 @@ repository).
   %% --------------- Observability ----------------------------------
   {middleware, []},                   %% see guides/middleware.md
 
-  %% --------------- Memory-pressure scheduler ---------------------
+  %% --------------- Cache eviction scheduler ----------------------
   {scheduler, #{
     enabled         => false,
     pressure_source => noop,          %% noop | system | nvidia_smi | {module, M}
@@ -153,7 +153,8 @@ Global middleware chain applied to every API call; see the
 
 ### `scheduler`
 
-See the [caching guide](caching.md#memory-pressure-driven-eviction).
+Configures the cache eviction scheduler (`erllama_scheduler`), which
+evicts cache rows under memory pressure. See the [caching guide](caching.md#memory-pressure-driven-eviction).
 `model_evictor` must name a loadable module exporting `evict_one/0`
 (the `erllama_model_evictor` behaviour).
 
@@ -169,7 +170,7 @@ Passed to `erllama:load_model/1,2`:
   context_opts      => #{
     n_ctx           => 4096,
     n_batch         => 512,
-    n_seq_max       => 1,        %% > 1 enables the multi-tenant scheduler
+    n_seq_max       => 1,        %% > 1 lets the request scheduler batch requests
     flash_attn      => auto,     %% auto | boolean() | enabled | disabled
     type_k          => f16,      %% KV type for keys: auto | f16 | f32 | bf16
                                  %% | q4_0 | q5_0 | q5_1 | q8_0 | f8_e4m3
@@ -204,7 +205,7 @@ Passed to `erllama:load_model/1,2`:
 
 Per-tick prefill slice cap. Default `max(64, n_batch div 4)`; pass
 `infinity` to disable. Lives in the `policy` map for parity with
-the save-policy gates but does not gate saving - it caps how many
+the save-policy gates but does not gate saving: it caps how many
 tokens a single prefill row contributes to one `step_tick`, so a
 long prompt is sliced across multiple ticks and concurrent decoders
 keep making progress between chunks.
@@ -212,9 +213,9 @@ keep making progress between chunks.
 ### `n_seq_max`
 
 Maximum concurrent sequences. Belongs under `context_opts`, not the
-`policy` map - it is a context shape, not a save-policy gate.
-Default `1` (single-tenant). Set higher to opt into multi-tenant
-co-batched scheduling.
+`policy` map: it is a context shape, not a save-policy gate.
+Default `1` (one request at a time). Set higher to let the request
+scheduler co-batch several requests in one decode.
 
 When `n_seq_max` is too low for the concurrent-session count, an
 admission with no free seq blocks by default. Pass
@@ -230,7 +231,7 @@ context's ggml abort callback and returns `{error, decode_timeout}`,
 so a wedged decode can never block the model process indefinitely.
 The engine recovers in place (recreates the context, model stays
 loaded) rather than cold-reloading. Recovery drops only the live
-in-context KV cells and sticky-session pins - the tiered cache
+in-context KV cells and sticky-session pins; the tiered cache
 (RAM/disk rows) persists, so a subsequent request still reuses
 cached prefixes through the normal warm-restore lookup rather than
 starting fully cold. The same callback honours `erllama:cancel/1`,
@@ -288,9 +289,13 @@ set).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `n_match` | 24 | Token window hashed for the ngram lookup. Smaller windows draft more but mispredict more. |
-| `n_max` | 64 | Cap on drafted tokens per verify tick (also bounded by `n_batch` and the remaining `response_tokens`). |
-| `n_min` | 48 | Drafts shorter than this are discarded rather than verified. |
+| `n_match` | 24 | Ngram only. Token window hashed for the lookup. Smaller windows draft more but mispredict more. |
+| `n_max` | 64 (ngram), 2 (MTP) | Cap on drafted tokens per verify tick (also bounded by `n_batch` and the remaining `response_tokens`). MTP accepts at most 16. |
+| `n_min` | 48 | Ngram only. Drafts shorter than this are discarded rather than verified. |
+
+The MTP map takes only `type` and `n_max`; any other key, or an
+`n_max` above 16, fails the request with
+`{error, {invalid_option, speculative, _}}`.
 
 The speculator is one shared table per model, sized 16 MiB,
 created on the first speculative request and reused while requests
@@ -299,12 +304,8 @@ carry the same config.
 Speculation is silently skipped, with the request decoding
 normally, when:
 
-- other requests are active on the same model (it resumes when the
-  request is alone again). MTP drafting goes on with other requests:
-  every request's next token, and the guesses of those that draft, are
-  verified together, in one decode a tick, while every active request
-  can join it (none is still reading its prompt, none asks for
-  `logprobs`);
+- the request drafts with ngram and other requests are active on the
+  same model (it resumes when the request is alone again);
 - the model family is recurrent or hybrid (their memories refuse
   the partial KV rollback a draft miss needs), unless the request
   drafts with MTP and the context keeps `n_rs_seq >= n_max`
@@ -314,6 +315,27 @@ normally, when:
 - the request sets `thinking => enabled` or `logprobs`;
 - the backend does not support it (the stub does; a llama model
   with thinking markers configured does not).
+
+### MTP rounds with several requests
+
+MTP drafting goes on while other requests are active: one decode a
+tick verifies every request's next token together with the guesses of
+those that draft. A tick runs this way only when all of these hold;
+otherwise it runs the ordinary co-batched step, with no drafts, for
+every request:
+
+- between 2 and 16 requests are active on the model;
+- every active request is decoding: none is still reading its prompt,
+  none has media still to prefill, none asks for `logprobs`;
+- at least one request drafts.
+
+The draft of each request shrinks to
+`min(n_max, n_batch div N - 1)` tokens, where `N` is the number of
+active requests, so the shared decode fits in one batch; with no room
+for one guess, the tick runs the ordinary step. A request that cannot
+draft (not greedy) joins with no guess and the others keep drafting.
+
+### Speculation stats
 
 Requests that enabled the option report
 `speculative => #{drafted => N, accepted => N, rounds => N}` on the

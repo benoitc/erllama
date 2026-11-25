@@ -43,9 +43,10 @@ your OTP application          CLI   HTTP clients   Erlang nodes
 | See the server at work: several clients, a slow tool, a restart | [the walkthrough](guides/server/demo.md) |
 | Call the server from Erlang | [examples/service_client](examples/service_client) |
 | Serve `wasi:nn` components of erlang_wasm from your models | [apps/erllama_wasi_nn](apps/erllama_wasi_nn/README.md) |
-| Read the usage guides | [guides/](guides/) |
-| Understand the cache, NIF and request design | [internals/](internals/) |
-| Contribute | [AGENTS.md](AGENTS.md) |
+| Read the library guides | [loading a model](guides/loading.md), [generating text](guides/generation.md), [sessions](guides/sessions.md), [caching](guides/caching.md), [configuration](guides/configuration.md), [tensor parallelism](guides/tensor-parallel.md), [troubleshooting](guides/troubleshooting.md) |
+| Read the server guides | [CLI](guides/server/rpc.md), [models](guides/server/models.md), [HTTP APIs](guides/server/http.md), [conversations](guides/server/conversations.md), [agent sessions](guides/server/agent.md), [MCP](guides/server/mcp.md), [operations](guides/server/operations.md) |
+| Understand how the code fits together | [internals/overview.md](internals/overview.md), then the design records it links |
+| Contribute | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | See what is planned | [ROADMAP.md](ROADMAP.md) |
 
 ## Layout
@@ -56,15 +57,17 @@ apps/erllama_server/   the server release and the `erllama` CLI
 apps/erllama_wasi_nn/  a wasi:nn backend for erlang_wasm components
 config/, rel/          release configuration and the CLI launcher
 scripts/               checks, e.g. erllama built standalone from its Hex package
-guides/, internals/    documentation, published with the library
+guides/, internals/    documentation: the library's HexDocs carry guides/ and
+                       internals/; the server's docs carry guides/server/,
+                       the erllama_server_api reference and the server design
 bench/, examples/      benchmarks and standalone example projects
 rebar.config           shared tooling for both apps
 ```
 
 ## Build and test
 
-Run every command from the repository root. You need Erlang/OTP 28,
-rebar3 3.25+, CMake and a C/C++ toolchain.
+Run every command from the repository root. You need Erlang/OTP 28 (28.3
+is tested), rebar3 3.25+, CMake and a C/C++ toolchain.
 
 ```bash
 rebar3 compile    # builds the vendored llama.cpp and the NIF on first run
@@ -72,7 +75,8 @@ rebar3 eunit
 rebar3 ct
 ```
 
-The full set of checks is in [AGENTS.md](AGENTS.md).
+The full set of checks, the toolchain and the test layout are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

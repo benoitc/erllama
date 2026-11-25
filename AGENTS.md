@@ -1,12 +1,15 @@
 # Agents
 
-Instructions for AI coding agents working on this project.
+Instructions for AI coding agents working on this project. Human
+contributors start with [CONTRIBUTING.md](CONTRIBUTING.md); the mental
+model of the code is in [internals/overview.md](internals/overview.md).
 
 ## Project Overview
 
 erllama is a native Erlang/OTP wrapper around llama.cpp providing
 OpenAI-compatible inference with full supervision and a tiered KV
-cache. Requires Erlang/OTP 28 and rebar3 3.25+.
+cache. Requires Erlang/OTP 28 (28.3 is the tested toolchain; a newer
+OTP can break the `warnings_as_errors` build) and rebar3 3.25+.
 
 A rebar3 umbrella. Run every rebar3 command from the repository root.
 
@@ -27,7 +30,9 @@ apps/erllama_wasi_nn/  wasi:nn backend for erlang_wasm (one module, no
 config/                release sys.config and vm.args.src
 rel/erllama            CLI launcher copied into the release's bin/
 scripts/               check_library_package.sh: erllama standalone from Hex
-guides/, internals/    documentation, published with the library
+guides/, internals/    documentation: the library's HexDocs carry guides/
+                       and internals/; guides/server/ and
+                       internals/server-design.md go with erllama_server
 rebar.config           shared tooling: plugins, profiles, fmt, dialyzer,
                        the release and the CLI escript
 ```
@@ -35,11 +40,14 @@ rebar.config           shared tooling: plugins, profiles, fmt, dialyzer,
 The KV cache is logically a subsystem (its own supervisor, modules
 prefixed `erllama_cache_*`) but lives in the same OTP application as
 the rest of erllama. There is one NIF (`erllama_nif`) that holds the
-entire native surface (cache pipeline + future llama.cpp wrappers).
+entire native surface: the cache pipeline, the llama.cpp model,
+context, sampler and decode wrappers, multimodal, speculative decoding
+and MTP, and tensor parallelism.
 
 Authoritative behaviour is encoded in the test suites under `test/`
 (EUnit, PropEr, and Common Test) and the module docstrings. The
-README has the public-API tables and configuration reference.
+public-API tables are in `apps/erllama/README.md`, the configuration
+reference in `guides/configuration.md`.
 
 ## Required Checks
 
@@ -157,7 +165,10 @@ LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-q4_k_m.gguf rebar3 ct \
 ```
 
 Without the env var the suite skips so default `rebar3 ct` runs stay
-green on CI without model files.
+green on CI without model files. The other opt-in suites (tensor
+parallelism, MTP, vision, model families) and their env vars and
+hosts are listed in
+[internals/hardware-suites.md](internals/hardware-suites.md).
 
 ## Linting Notes
 
@@ -177,10 +188,10 @@ The atom naming regex allows `_SUITE` suffix for CT suites:
   process per table.
 - NIFs run on dirty schedulers (CPU or IO as appropriate), except a
   few cheap or latency-critical ones (`kv_format`, the native log
-  receiver, `request_abort`). The cache path does no file I/O in a
-  NIF: framing and validation live in Erlang code that calls a small
-  set of pure-data NIFs (`kv_pack`, `kv_unpack`, `crc32c`). Model and
-  projector loads do read files natively.
+  receiver, `request_abort`, `tp_bootstrap_reply`). The cache path
+  does no file I/O in a NIF: framing and validation live in Erlang code
+  that calls a small set of pure-data NIFs (`kv_pack`, `kv_unpack`,
+  `crc32c`). Model and projector loads do read files natively.
 - Configuration validation runs at supervisor `init/1`; misconfig is
   a hard `start_link` error, not a runtime warning.
 

@@ -131,17 +131,44 @@ behind a few thresholds, all overridable per-model.
 | `boundary_trim_tokens` | 32 | Drop the last N tokens before saving. Mid-token, mid-sentence boundaries make poor resume points; trim to a safe alignment. |
 | `boundary_align_tokens` | 2048 | Round the cold-save point down to a multiple of this, so cold saves of similar prompts land on the same boundary. |
 | `session_resume_wait_ms` | 500 | When a `parent_key` is supplied and the cache sees an in-flight finish save, wait up to this long for it to publish before falling through to a fresh prefill. |
-| `prefill_chunk_size` | `max(64, n_batch div 4)` | Per-tick cap on how many tokens a single prefill row contributes. Not a save gate - lives in the same `policy` map but caps the scheduler's per-tick slice so a long prompt never monopolises the batch. `infinity` to disable. |
+| `prefill_chunk_size` | `max(64, n_batch div 4)` | Per-tick cap on how many tokens a single prefill row contributes. Not a save gate: it lives in the same `policy` map but caps the request scheduler's per-tick slice so a long prompt never monopolises the batch. `infinity` to disable. |
 
 Bigger `boundary_align_tokens` = fewer probes per longest-prefix
 walk but coarser hit alignment. 2048 is the default; 256 makes
 hits more likely on shorter prompts at the cost of more probes.
 
+## Checkpoint ladder
+
+A cold save normally writes one row, near the end of the prompt. When
+later prompts share only the head of an earlier one (an agent client
+that re-renders or compacts its history), no row matches. The ladder
+adds `cold` checkpoints at regular points below that row, so the
+longest-prefix lookup can hit the shared head. It is off by default;
+you turn it on per model in the `policy` map:
+
+```erlang
+{ok, M} = erllama:load_model(<<"agent">>, #{
+    model_path => Path,
+    policy => #{max_ladder_rows => 3, ladder_interval => 8192}
+}).
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `max_ladder_rows` | 0 | Maximum number of extra cold checkpoints per cold prefill. `0` turns the ladder off. |
+| `ladder_interval` | 16384 | Spacing in tokens between checkpoints, rounded down to a multiple of `boundary_align_tokens`. |
+
+Checkpoints fall at multiples of the spacing, at or above
+`cold_min_tokens` and below the usual cold-save point. Each one is a
+full save, so it costs a pack and a write. These keys have no
+application environment default; set them in `policy`.
+
 ## Memory-pressure-driven eviction
 
-`erllama_scheduler` is a polling gen_server that watches a pluggable
-pressure source and evicts cache slabs when pressure crosses a
-watermark. Off by default. Enable in `sys.config`:
+The cache eviction scheduler (`erllama_scheduler`) is a polling
+gen_server that watches a pluggable pressure source and evicts cache
+slabs when pressure crosses a watermark. Off by default. Enable it in
+`sys.config`:
 
 ```erlang
 {erllama, [
@@ -158,15 +185,35 @@ watermark. Off by default. Enable in `sys.config`:
 
 Sources shipped:
 
-- `noop` - always reports zero pressure.
-- `system` - OTP `memsup`. Linux, macOS, BSD, Windows.
-- `nvidia_smi` - sums VRAM across all visible NVIDIA GPUs.
-- `{module, M}` - calls `M:sample/0`. Implement
+- `noop`: always reports zero pressure.
+- `system`: OTP `memsup`. Linux, macOS, BSD, Windows.
+- `nvidia_smi`: sums VRAM across all visible NVIDIA GPUs.
+- `{module, M}`: calls `M:sample/0`. Implement
   `-behaviour(erllama_pressure)` to write your own.
 
 When the source reports `Used / Total >= high_watermark`, the
-scheduler asks the cache to evict enough bytes to drop the ratio
-below `low_watermark`, scoped to the configured tiers.
+cache eviction scheduler asks the cache to evict enough bytes to drop
+the ratio below `low_watermark`, scoped to the configured tiers. It
+evicts the lowest-frecency rows first; pinned rows and the live key go
+last, only when nothing else frees enough.
+
+## Evict a model's live context
+
+`erllama:evict/1` saves the live context of every in-flight request on
+a model, with save reason `evict`, and returns. The requests keep
+running and nothing is released: no sequence is freed and no cache row
+is dropped. Use it when you want a checkpoint of work in progress, for
+example before you expect memory pressure or a restart.
+
+```erlang
+ok = erllama:evict(<<"chat">>).
+```
+
+With no request in flight it does nothing. The call waits at most
+`evict_save_timeout_ms` (default 30 s) for the model process and
+returns `{error, timeout}` past that, or `{error, not_loaded}` for an
+unknown model. The saves follow the usual tier and writer-pool rules,
+so a save can still be dropped when every writer slot is busy.
 
 ## Inspecting the cache
 
@@ -179,7 +226,7 @@ erllama_cache:info().
 %% #{tiers => [...], entries => 42,
 %%   bytes => #{ram => 12582912, ram_file => 0, disk => 805306368}}
 
-%% Synchronous full eviction pass: returns {evicted, N}.
+%% Node-wide eviction pass: returns {evicted, N}.
 erllama_cache:gc().
 
 %% Free at least N bytes, least used rows first: returns {evicted, N, BytesFreed}.
@@ -188,6 +235,14 @@ erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 ```
 
 The counter keys are listed on `erllama_cache:get_counters/0`.
+
+`gc/0` is node-wide: it drops every row of every model that no request
+is holding, on every tier, except pinned rows (`agent_prefix`
+checkpoints) and the live key. The live key is one value for the whole
+node: the key of the most recent finish save, from any model. It
+protects that one row only, so the previous turn of another
+conversation is not kept. Use `gc/0` in tests and benchmarks; under
+load, prefer `evict_bytes/1,2`, which frees only what you ask for.
 
 ## TinyLlama on erllama and Ollama
 
@@ -245,8 +300,8 @@ out of the load config to keep the whole node cold.
 
 ## See also
 
-- [Loading a model](loading.md) - option-by-option walkthrough.
-- [Configuration reference](configuration.md) - every knob,
+- [Loading a model](loading.md): option-by-option walkthrough.
+- [Configuration reference](configuration.md): every knob,
   with defaults.
 - Internals: [cache design](../internals/cache-design.md) and
   [publish protocol](../internals/publish-protocol.md) for the

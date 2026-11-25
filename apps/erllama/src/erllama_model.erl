@@ -815,9 +815,8 @@ status(Model) ->
 -doc """
 Fire an `evict` save of the live context of every in-flight request
 and return; the requests keep running and nothing is released, so a
-later admission can resume from the saved row. The cache eviction
-scheduler (`erllama_scheduler`) calls it under memory pressure. No-op
-when the model is idle with no live context.
+later admission can resume from the saved row. Reached through
+`erllama:evict/1`. No-op when the model is idle with no live context.
 """.
 -spec evict(model()) -> ok | {error, not_loaded | timeout}.
 evict(Model) ->

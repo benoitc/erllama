@@ -148,10 +148,17 @@ Thinking tokens do not land in `reply` or in the cache keys.
 
 ## Speculative decoding
 
-Speed up generation without changing its output. The `speculative`
-option enables draft-model-free ngram speculation: a per-model hash
-table over previously seen tokens drafts likely continuations, one
-batched decode verifies the whole draft against the model, and the
+Speculative decoding drafts several tokens ahead and has the model
+check them in one batched decode, so a tick can commit more than one
+token. You turn it on per request with the `speculative` option; the
+output does not change, only the latency. Two drafters are built in:
+an ngram table (`speculative => true`) and the model's own MTP head
+(`speculative => #{type => mtp}`).
+
+### Ngram drafting
+
+A per-model hash table over previously seen tokens drafts likely
+continuations, one batched decode verifies the whole draft, and the
 accepted prefix commits in a single tick. Rejected tokens are rolled
 back, so the output is byte-identical to non-speculative decoding,
 including seeded sampling at any temperature.
@@ -179,8 +186,8 @@ speculative => #{n_match => 24, n_max => 64, n_min => 48}
 
 `n_match` is the window hashed for lookup, `n_max` caps the draft
 length, and drafts shorter than `n_min` are discarded (defaults are
-llama.cpp's). See [configuration](configuration.md#speculation) for
-when the option is silently ignored.
+llama.cpp's). Ngram drafting runs only while the request is alone on
+the model; it resumes when the other requests finish.
 
 ### Drafting with an MTP head (experimental)
 
@@ -203,31 +210,60 @@ just chose, in one batch.
 }).
 ```
 
+`n_max` defaults to 2 and accepts at most 16; the map takes no other
+key. A request without a loaded `draft_model` decodes without drafts.
+
 - Greedy requests only: the guesses are checked against the most
-  likely token. Other requests decode without drafts. When several
-  requests share a step, one that cannot draft stops drafting on its
-  own; the others go on drafting.
-- A recurrent or hybrid model needs `n_rs_seq` of at least `n_max`, so
-  rejected guesses can be taken back.
+  likely token, so a request with `temperature` above 0 or a
+  `grammar` decodes without drafts. When several requests share a
+  step, one that cannot draft stops drafting on its own; the others
+  go on drafting.
+- A recurrent or hybrid model needs `context_opts.n_rs_seq` of at
+  least `n_max`, so rejected guesses can be taken back.
 - The output follows the model's greedy choices, but the check runs
   several tokens in one batch, whose arithmetic differs slightly from a
   one-token step: where the two best tokens are almost tied, the text
   can differ from decoding without drafts.
-- It also works on a model split over several machines (see the
-  tensor-parallel page): the head runs on the first rank's GPU.
+- It also works on a model split over several machines (see
+  [tensor parallelism](tensor-parallel.md)): the head runs on the first
+  rank's GPU.
 
-For a two-model setup, the manual building blocks remain:
+### When a request does not draft
+
+The `speculative` option never fails a request: when a condition is
+not met, the request decodes normally. For both drafters:
+
+- a request with `thinking => enabled` does not draft;
+- a request with `logprobs` set does not draft;
+- a llama model loaded with thinking markers configured refuses
+  speculation for every request;
+- a recurrent or hybrid model drafts only with MTP and enough
+  `n_rs_seq` snapshots.
+
+[Configuration](configuration.md#speculation) lists the full set,
+including the limits of MTP rounds that hold several requests. Check
+the `speculative => #{drafted, accepted, rounds}` stats on the result
+to see whether drafts are landing.
+
+### Drafting and verifying yourself
+
+`erllama:draft_tokens/3` and `erllama:verify/4` are the building
+blocks for drafters the `speculative` option does not cover: a small
+draft model checked by a large one, or a custom drafter of your own.
+Most callers do not need them.
 
 ```erlang
 {ok, Draft} = erllama:draft_tokens(SmallModel, PrefixTokens, #{max => 8}),
 {ok, #{accepted := N, next := Next}} = erllama:verify(BigModel, PrefixTokens, Draft, 8).
 ```
 
-`verify/4` runs one batched forward pass over the candidates,
-accepts the longest prefix the verifier agrees with, and returns its
-own next token (`eos` when the verifier would stop). The verifier's
-KV state is restored before returning, so you can loop:
-append the accepted tokens plus `Next`, draft again.
+`draft_tokens/3` runs an ordinary stream on the draft model and
+collects up to `max` token ids. `verify/4` runs one batched forward
+pass over the first `K` candidates, accepts the longest prefix the
+verifier agrees with, and returns its own next token (`eos` when the
+verifier would stop). The verifier must be idle (otherwise
+`{error, busy}`) and its KV state is restored before returning, so you
+can loop: append the accepted tokens plus `Next`, draft again.
 
 ## Notes
 

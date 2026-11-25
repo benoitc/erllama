@@ -69,6 +69,22 @@ Prompt = <<"<|im_start|>User: <__media__>Describe this.<end_of_utterance>\nAssis
 #{items := 1, n_tokens := _, n_pos := _} = maps:get(media, Stats).
 ```
 
+By default the model's BOS token is added when the prompt is
+evaluated. A prompt rendered by a chat template (for example the
+`prompt` from `erllama:chat_apply/3`) already starts with it, so pass
+`media_add_special => false` to avoid a second one:
+
+```erlang
+{ok, #{prompt := P}} = erllama:chat_apply(M, Messages, #{}),
+{ok, Ref} = erllama:stream(M, P, #{
+    media => [#{type => image, data => Jpg}],
+    media_add_special => false
+}).
+```
+
+`chat/3` sets it for you. The option only matters on a request with
+`media`.
+
 A marker-count mismatch fails the request with
 `{error, {media_failed, _}}`; the model recovers for the next
 request. Stats report `media => #{items, n_tokens, n_pos}`
@@ -105,7 +121,7 @@ Qwen2-VL).
 
 ## See also
 
-- [Loading a model](loading.md) - `mmproj_path`, `mmproj_opts`
-- [Tool calls](tool-calls.md) - chat message shapes
-- [Generating text](generation.md) - streaming, options, stats
-- [Testing](testing.md) - the vision suite's environment variables
+- [Loading a model](loading.md): `mmproj_path`, `mmproj_opts`
+- [Tool calls](tool-calls.md): chat message shapes
+- [Generating text](generation.md): streaming, options, stats
+- [Testing](testing.md): the vision suite's environment variables

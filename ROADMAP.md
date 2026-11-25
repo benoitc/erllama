@@ -1,215 +1,119 @@
 # Roadmap
 
-What erllama does not do yet, with rough scope and rationale for each
-item. Issues / PRs welcome.
+What erllama does not do yet, with rough scope and the reason for each
+item. It is a backlog, with no fixed milestone; what each release
+shipped is in the CHANGELOG of each app. Issues and pull requests are
+welcome.
 
-## Recently shipped: engine robustness
+## Tensor parallelism
 
-The server hardening brief (cold-admit decode wedges and
-agentic tool-continue loops under real 30B/Metal load) is fully
-shipped. For reference so these are not re-filed:
+- **More than two hosts.** A split model is verified on two hosts;
+  larger groups are experimental and untested. Four-host testing is
+  the next step.
+- **Metal.** Tensor parallelism needs a CUDA build with NCCL.
 
-- **Bounded, interruptible, self-recovering decode** (0.8.0). Per-step
-  wall-clock budget via a ggml abort callback
-  (`context_opts.decode_budget_ms`, default 30000) returning
-  `{error, decode_timeout}`; `erllama_nif:request_abort/1` for
-  mid-decode interruption (`{error, decode_aborted}`, wired into
-  `cancel/1`); in-place recovery via the backend `reset_context/1`
-  (model stays loaded). Recovery drops only live KV + sticky pins; the
-  persistent tiered cache survives.
-- **`reset_session/2`** (0.7.0). Forcibly drop a wedged session's live
-  KV and in-flight req, reachable when the hot path is blocked.
-- **Non-blocking admission** (0.8.0). `on_full => error` returns
-  `{error, seq_capacity}` instead of queueing; `model_info/1` exposes
-  `available_seqs` / `n_seq_max` (0.7.0).
-- **Grammar honoured through tool-call syntax** (0.8.0). A binary
-  `grammar` disables the greedy-on-syntax swap, so
-  `tool_choice=required` / `response_format` hold end to end on
-  `infer/4` and `continue/3`.
-- **Byte-exact continuation aids** (0.8.0). `generated` token ids in
-  the `erllama_done` Stats map, and `continue/3` `expect_committed`
-  verification (`{error, {transcript_mismatch, _}}`).
-- **Structured NIF errors** (0.7.0/0.8.0). `nif_decode_one` and
-  `nif_step` surface `{error, {decode_failed, Rc}}`.
+## Speculative decoding
 
-## Sister project: erllama_cluster (in development)
+- **Ngram drafting under concurrency.** Ngram drafting runs only while
+  its request is the only one on the model; with others it falls back
+  to ordinary steps. MTP drafting already runs for several requests in
+  one step.
+- **More draft sources.** llama.cpp's ngram-map and ngram-cache
+  drafters.
+- **Drafting with logprobs or thinking.** A request asking for
+  logprobs, or with thinking on, decodes without drafts.
+- **Verifier context isolation.** `verify/4` leaves the context ready
+  to decode after it runs, whatever its state before. A caller that
+  needs the exact earlier state has to reset its sampler itself.
+  Restoring it waits for a caller that needs it.
 
-A separate OTP application that coordinates a fleet of erllama nodes
-into one inference cluster. Each node still runs erllama as a
-standalone library; the cluster layer sits on top and decides which
-node serves which request.
+## Multimodal
 
-Three v1 strategies:
+Remaining after vision and audio input: caching the KV of requests
+with media (they bypass the cache today), sessions and sticky
+sequences with media, media prefill batched with other requests,
+video and webp (needs an ffmpeg subprocess), and mtmd's experimental
+text to speech.
 
-- **Request distribution** with cache-affinity routing (follow-up
-  requests prefer the node that warmed the KV cache for the prefix).
-- **Speculative decoding across nodes** — small draft on one node,
-  large verifier on another.
-- **Pipeline parallelism** — models too large for one node split by
-  layer ranges, hidden states passed as Erlang binaries.
+## Transcription API (whisper.cpp)
 
-Transport is QUIC via [erlang_quic](https://github.com/benoitc/erlang_quic)
-(pure Erlang, no C NIF in the protocol path). Repository:
-<https://github.com/benoitc/erllama>.
+Apart from the audio input above, which feeds audio to multimodal
+models: a speech recognition surface for plain Whisper GGUFs with
+timestamps and segments. whisper.cpp is its own runtime with its own
+context shape; likely a sister application sharing the cache.
 
-### Pipeline parallelism: blocked on upstream llama.cpp
+## Non-GGUF model loading
 
-The cluster's pipeline-parallelism strategy needs three new
-NIFs (`forward_partial/3`, `forward_continue/3`,
-`forward_final/3`) that run a configurable subrange of model
-layers and pass hidden states between nodes. llama.cpp's public
-API does not expose layer-range execution today: `llama_decode`
-always runs the full model, and `llama_model_n_layer/1` only
-exposes the count. Implementing the NIFs requires patching
-llama.cpp itself, which the cluster brief
-(`AGENTS_TASKS.md`) puts out of scope.
+ONNX, safetensors, PyTorch checkpoints. llama.cpp does not load them,
+so the path is a conversion step when the server fetches a model, or a
+second backend on another runtime.
 
-The cluster already gates pipeline mode on
-`erlang:function_exported(erllama, forward_partial, 3)` and
-falls back to the other strategies (request distribution and
-speculative decoding) when the export is missing, so this is a
-graceful degradation rather than a blocker for the cluster's
-v1 release.
+## Bit-exact multi-turn resume
 
-If the NIFs become critical, the right next step is a separate
-upstream-llama.cpp investigation: identify the minimum patch to
-`llama_decode` (likely a `layer_start` / `layer_end` field on a
-new `llama_decode_params` struct) and either upstream it or
-maintain a fork.
+A warm restore decodes the last cached token again to get its logits,
+which can change a near-tied sample. `continue/3` avoids that cost for
+a pinned session, but the sampler and its random state are still
+rebuilt per request. Saving them with the KV at a turn boundary would
+make a multi-turn reply identical to the unbroken stream. The same
+goes for sampler state such as the repetition penalty's window.
 
-### Verifier context isolation (item 6 design note)
+## Pipeline parallelism
 
-The current `verify/4` implementation snapshots the caller's
-KV length, runs the verifier forward pass, and restores via
-`kv_seq_rm` plus a re-prefill of the last prefix token. The
-`decode_ready` flag is left in the "ready" state after verify
-regardless of its pre-call value, on the assumption that any
-caller of `verify/4` will follow up with a `decode_one`
-imminently. Callers that need bit-identical pre-call state
-beyond the sampling distribution (e.g. pre-call `decode_ready`
-preserved as `false`) should clear the sampler explicitly
-after verify. A v2 path that snapshots and restores
-`decode_ready` is straightforward but waits for a concrete
-caller need.
+Splitting a model by layer ranges across nodes, hidden states passed
+between them. llama.cpp's public API does not run a range of layers
+(`llama_decode` always runs the whole model), so this needs a patch to
+llama.cpp, upstreamed or carried locally.
 
-## Backlog (no fixed milestone)
+## Cache
 
-### Speculative decoding
+- **Semantic or approximate matching.** The cache is exact by design:
+  a hit is a SHA-256 match on the rendered prompt. A semantic candidate
+  proposer is deferred to a later major version.
+- **KV state compression.** KV state is bulky (about 1 GB for 30k
+  tokens on a 70B model). Generic lz4 or zstd helps a little;
+  TurboQuant is unproven for this. Both wait for benchmark data.
+- **Sharing across nodes.** The cache is node-local; sharing it through
+  a disk tier on a shared filesystem or a small announce protocol is
+  open.
+- **Tool-id maps in KV files.** Not planned: storing an HTTP-layer tool
+  map inside cache files would tie the cache's stable format to it.
+  Revisit only if keeping them apart costs measurable I/O.
 
-Draft-model-free ngram speculation shipped as the per-request
-`speculative` option (llama.cpp `common_speculative` NGRAM_MOD;
-solo-request verify ticks via `nif_spec_step`). Remaining:
-co-batched speculation under concurrency, the ngram-map-k4v /
-ngram-cache draft sources, logprobs alongside speculation, and the
-two-model variant (needs a draft-model registry; the KV cache layer
-is largely orthogonal since verifications run on the target
-context).
+## Observability
 
-### Multimodal (vision + audio input) - shipped
+- **Telemetry events.** Counters are plain atomics. A `telemetry`
+  event surface would let you wire Prometheus, OpenTelemetry or statsd
+  without forking the metrics module.
+- **Per-GPU memory pressure.** The NVIDIA pressure source sums all
+  GPUs. A multi-GPU host wants pressure and eviction per device;
+  `list_devices/0` gives the per-device probe to build it on.
 
-Shipped via libmtmd (`tools/mtmd` vendored, `mmproj_path` load
-option, image/audio chat content parts, `media` request option).
-Remaining follow-ups: media KV caching (digest-embedded markers +
-mtmd chunk save/load), sessions and sticky seqs with media,
-co-batched media prefill, video/webp (needs the ffmpeg subprocess
-path), and mtmd's experimental TTS.
+## Prompts and tokens
 
-### Transcription API (whisper.cpp)
+- **Incremental chat-template render.** `continue/3` takes only the
+  new turn's tokens, but you still render the whole conversation to
+  get them. A delta render that takes the prior token count and the
+  new messages would skip the full template pass on every turn.
+- **Streaming tokenize for very large prompts.** `tokenize/2` and the
+  chat-template renderers allocate the whole output at once (up to
+  about 256 MB at the 64 MiB text cap). A chunked variant would let
+  prefill start earlier and cap native allocations.
 
-Distinct from the mtmd audio INPUT shipped above (which feeds audio
-to multimodal LLMs): a dedicated ASR surface for plain Whisper
-GGUFs with timestamps and segments. `whisper.cpp` is its own
-runtime with its own context shape; likely a sister application
-(`erllama_whisper`) sharing the cache subsystem.
+## Remote devices
 
-### Non-GGUF model loading
+The ggml RPC backend is removed from the vendored llama.cpp and
+`GGML_RPC` is forced off. Distribution happens at the Erlang level
+instead (tensor parallelism, the server).
 
-ONNX, safetensors, raw PyTorch checkpoints. llama.cpp doesn't load
-these natively, so the path is either a converter step at
-`fetch`-time (the server handles fetch) or a second
-backend that targets a different runtime.
+## Code structure
 
-### Stateful streaming with bit-exact KV resume
+Refactors deferred until the documented boundaries are clean:
 
-Today's warm restore re-prefills the last KV cell to regenerate
-logits, which can shift a near-tied sample. `erllama:continue/3`
-(0.6.0) extends a pinned sticky session with a caller-asserted
-token tail and avoids the warm-restore primer cost entirely for
-multi-turn workloads, but it's still not bit-exact: the sampler
-and RNG state are rebuilt per request. A turn-boundary save that
-persists the sampler+RNG state alongside the KV cells would make
-multi-turn replies bit-identical to the unbroken stream.
-
-### Persistent sampler chain state across turns
-
-If a chain carries internal state (e.g., `repetition_penalty`'s
-sliding window), the current design rebuilds it per request.
-Persisting it through the cache so a multi-turn resume picks up the
-exact same sampler internal state is a 0.2 nice-to-have.
-
-### Telemetry / OTel hooks
-
-Counters today are bare atomics. A telemetry-style event surface
-(`telemetry:execute([erllama, complete, start], ...)`) would let
-operators wire Prometheus, OTel, statsd without forking the metrics
-module.
-
-### RPC / remote devices
-
-Not available: the ggml RPC backend is pruned from the vendored
-llama.cpp tree (apps/erllama/scripts/vendor_llama.sh) and GGML_RPC is forced OFF
-in apps/erllama/c_src/CMakeLists.txt. Re-vendoring it would enable
-`--rpc`-style remote devices; distribution work is planned at the
-Erlang level instead (see erllama_cluster).
-
-### Memory-pressure NVIDIA-multi-GPU
-
-`erllama_pressure_nvidia_smi` reads `nvidia-smi` once and sums; a
-real multi-GPU deployment wants per-GPU pressure with per-context
-eviction. The single-source pressure model in 0.1 collapses to "all
-GPUs together". `erllama:list_devices/0` now provides the per-device
-free/total probe to build it on.
-
-### TurboQuant / KV state compression
-
-KV state is bulky (~1 GB for 30k tokens on a 70B model). Generic
-lz4/zstd helps a little; TurboQuant is unproven for this. We have no
-benchmark data we trust enough to ship a default; both stay
-deferred.
-
-### KTM-inside-KV-files persistence
-
-ds4 packs its tool-id → bytes map ("KTM") as appended sections
-inside the disk KV cache files. Tempting because the lifetime
-matches the KV row, but couples erllama's stable cache binary
-format to an evolving HTTP-layer concept. Keep the two stores
-separate; revisit only if running them side-by-side produces
-measurable I/O amplification.
-
-### Cluster / distributed inference
-
-A model loaded on node A served from node B. The cache subsystem is
-node-local; cross-node cache sharing (via the disk tier on a shared
-filesystem, or a small announce protocol) is a 0.3+ topic.
-
-### Incremental chat-template render
-
-`erllama:continue/3` (0.6.0) lets callers pass only the new turn's
-tokens, but they still have to render the full conversation through
-`apply_chat_template/2` and slice off the prior tokens — wasteful
-when the history is large. A companion `apply_chat_template_delta/3`
-that takes the prior token count plus the new messages and emits
-just the tail bytes would let HTTP layers skip the full Jinja pass
-on every turn. The primitive is well-defined; the work is mostly
-plumbing through the existing chat-template detector.
-
-### Streaming tokenize for very large prompts
-
-`erllama:tokenize/2` and `apply_chat_template/2` allocate the full
-output buffer up front (worst case ~256 MB at the new 64 MiB text
-cap). A streaming variant that yields tokens in chunks would let
-the prefill scheduler start work before tokenization completes and
-cap peak NIF allocations to a fixed chunk size. The C++ tokenize
-already builds an internal vector incrementally, so the path is
-exposing it through a cursor-based NIF rather than the one-shot
-copy.
+- one shared per-sequence MTP round in C, used by the single and the
+  batched round, so a fix to verification or rollback is made once;
+- `erllama_nif_decode.c` split by pipeline (step, ngram step, media
+  prefill, embeddings, argmax forward), as `erllama_nif_mtp.c` already
+  is;
+- extractions from `erllama_model`: the prompt-cache lookup chain, the
+  stop-sequence buffer, the sequence pool and sessions, batch building,
+  and MTP batching.

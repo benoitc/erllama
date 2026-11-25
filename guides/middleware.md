@@ -1,7 +1,8 @@
 # Middleware
 
-erllama wraps every public API call in a middleware chain, the same
-way hackney wraps `hackney:request/1..5`. A middleware is a plain fun
+erllama runs its main API calls (loading, generation, chat,
+tokenization, embeddings) through a middleware chain, the same way
+hackney wraps `hackney:request/1..5`. A middleware is a plain fun
 `fun(Request, Next) -> Response` that can observe, rewrite,
 short-circuit or wrap a call. There is no behaviour, no registry and
 no dependency: metrics, logging, tracing and caching are recipes you
@@ -13,6 +14,25 @@ erllama is doing, or to change it, without touching your call sites.
 -type next() :: fun((request()) -> term()).
 -type middleware() :: fun((request(), next()) -> term()).
 ```
+
+## Which calls go through the chain
+
+| Intercepted (`op`) | Not intercepted |
+|---|---|
+| `load_model`, `unload` | `cancel/1` |
+| `complete`, `stream`, `prefill_only`, `continue` | `end_session/2`, `reset_session/2` |
+| `draft_tokens/3` (seen as `stream`) | `evict/1`, `shutdown/1` |
+| `fork_session` | `render_chat_template/2` |
+| `tokenize`, `detokenize`, `vocab_info` | `load_adapter/2`, `unload_adapter/2`, `set_adapter_scale/3`, `list_adapters/1` |
+| `chat`, `chat_apply`, `chat_parse` | `verify/4`, `cached_prefix_len/2` |
+| `embed`, `embed_batch` | `collect/2` and the status and observability getters (`model_info/1`, `status/1`, `phase/1`, `pending_len/1`, `last_cache_hit/1`, `requests/0`, `request_info/1`, `counters/0`, ...) |
+
+A call in the right-hand column never reaches a middleware. Do not
+build access control on middleware alone: a caller who can reach
+`erllama` can cancel, end sessions, evict, change adapters or verify
+without passing through your chain. Gate those calls in your own code.
+`erllama_middleware_tests` (`facade_ops_all_wrapped_test`,
+`facade_ops_not_wrapped_test`) checks both columns.
 
 ## Chain order
 
@@ -37,8 +57,8 @@ erllama:complete(Model, Prompt, #{middleware => [Log]}).
 Per-call chains are accepted by every function that takes an option
 map: `complete/3`, `prefill_only/3`, `stream/3`, `continue/3`,
 `chat/3`, `chat_apply/3`. The other wrapped calls (`load_model`,
-`unload`, `tokenize`, `detokenize`, `embed`, `embed_batch`,
-`chat_parse`) only see the global chain.
+`unload`, `fork_session`, `tokenize`, `detokenize`, `vocab_info`,
+`embed`, `embed_batch`, `chat_parse`) only see the global chain.
 
 ## What a middleware sees
 
@@ -54,8 +74,10 @@ map: `complete/3`, `prefill_only/3`, `stream/3`, `continue/3`,
 | `chat_apply` | `#{messages := [map()], opts := map()}` |
 | `chat_parse` | `#{params := term(), input := binary(), partial := boolean()}` |
 | `embed`, `embed_batch` | `#{input := term()}` |
+| `fork_session` | `#{src := term(), new := term()}` |
 | `tokenize` | `#{text := binary(), opts := map()}` |
-| `detokenize` | `#{tokens := [token_id()]}` |
+| `detokenize` | `#{tokens := [token_id()]}`, plus `opts` from `detokenize/3` |
+| `vocab_info` | `#{}` |
 
 `opts` is the validated option map without the `middleware` key. The
 response is whatever the function returns.
