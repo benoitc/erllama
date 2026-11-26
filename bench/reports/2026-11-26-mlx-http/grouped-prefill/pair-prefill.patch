@@ -1,0 +1,75 @@
+--- a/apps/erllama/priv/mlx/runner.py
++++ b/apps/erllama/priv/mlx/runner.py
+@@ -90,6 +90,44 @@
+         seq.tokens.extend(tokens)
+         seq.pending = True
+
++    def prefill_rows(self, requests):
++        fresh = [(slot, ids) for slot, ids in requests if not self.slot(slot).tokens and len(ids) > 2]
++        grouped = set()
++        fresh.sort(key=lambda row: len(row[1]))
++        for start in range(0, len(fresh) - 1, 2):
++            pair = fresh[start:start + 2]
++            lengths = [len(ids) - 1 for _, ids in pair]
++            if lengths[1] <= 2 * lengths[0]:
++                self.prefill_fresh(pair, lengths, lengths[1])
++                grouped.update(slot for slot, _ in pair)
++        for slot, ids in requests:
++            if slot not in grouped:
++                self.prefill(self.slot(slot), ids)
++
++    def prefill_fresh(self, rows, lengths, width):
++        layers = self.make_cache(self.model)
++        ids = self.mx.array([tokens[:-1] + [0] * (width - n) for (_, tokens), n in zip(rows, lengths)])
++        # Causal attention cannot see right padding from a valid position.
++        # Recurrent layers must stop updating each row at its last real token.
++        if min(lengths) < width:
++            for layer, weights in zip(layers, self.model.layers):
++                if weights.is_linear:
++                    layer.prepare(lengths=lengths)
++        chunk = max(1, 512 // len(rows))
++        for start in range(0, width, chunk):
++            self.model(ids[:, start:start + chunk], cache=layers)
++            self.mx.eval([layer.state for layer in layers])
++        for i, ((slot, tokens), length) in enumerate(zip(rows, lengths)):
++            seq = self.slot(slot)
++            for j, (layer, weights) in enumerate(zip(layers, self.model.layers)):
++                if weights.is_linear:
++                    seq.layers[j] = layer.extract(i)
++                else:
++                    # Keep the allocated page so the first suffix can append in place.
++                    seq.layers[j].state = layer.keys[i:i + 1], layer.values[i:i + 1], length
++            seq.tokens.extend(tokens)
++            seq.pending = True
++
+     def split_batch(self):
+         if self.batch_slots:
+             for i, slot in enumerate(self.batch_slots):
+@@ -112,11 +150,14 @@
+         if len({slot for slot, _, _ in ops}) != len(ops):
+             raise ValueError("duplicate slot")
+         decode = []
++        prefills = []
+         results = {}
+         for slot, op, ids in ops:
+             seq = self.slot(slot)
+             if op == "prefill" and ids and min(ids) >= 0 and max(ids) < len(self.tokenizer):
+                 count = len(ids)
++                prefills.append((slot, ids))
++                results[slot] = None
+             elif op == "decode" and seq.pending:
+                 count = 1
+                 decode.append(slot)
+@@ -127,10 +168,8 @@
+         with self.mx.stream(self.stream):
+             if decode != self.batch_slots:
+                 self.split_batch()
+-            for slot, op, ids in ops:
+-                if op == "prefill":
+-                    self.prefill(self.slot(slot), ids)
+-                    results[slot] = None
++            if prefills:
++                self.prefill_rows(prefills)
+             if decode:
+                 rows = [self.slot(slot) for slot in decode]
+                 layers = self.decode_layers(decode)

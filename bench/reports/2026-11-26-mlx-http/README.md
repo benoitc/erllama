@@ -24,6 +24,8 @@ on retry arrived in 113 ms. The earlier erllama llama.cpp run with the
 UD-Q4_K_M GGUF measured 9.07 and 9.64 tokens/s respectively. These runs took
 place in different measurement windows. [Original measurements](https://github.com/erllama/erllama/tree/ddc11057a2f2e1f4dfcb0e6d0df0fb162ac1e353/bench/reports/2026-11-26-mac-qwen-27b)
 
+The [grouped prefill follow-up](grouped-prefill/README.md) repeats the four-client workload with six variants and reports where the first-token time went.
+
 ## Reproduction
 
 Use the [Qwen checkpoint](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-4bit/tree/22d8d538154e0e5b6f8dcb1fcc74a60a0798104c)
