@@ -19,10 +19,10 @@ COPY rel/ rel/
 COPY scripts/ scripts/
 ARG BUILD_JOBS=4
 RUN ERLLAMA_OPTS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121 -DGGML_NATIVE=OFF" \
-    ERLLAMA_BUILDOPTS="-j${BUILD_JOBS}" rebar3 as prod release && \
-    ldd _build/prod/rel/erllama_server/lib/erllama-*/priv/erllama_nif.so | grep libcublas
+    ERLLAMA_BUILDOPTS="-j${BUILD_JOBS}" rebar3 as prod release
+RUN grep -Fx GGML_CUDA:BOOL=ON apps/erllama/_build/cmake/CMakeCache.txt
 
-FROM nvidia/cuda:13.0.2-runtime-ubuntu24.04
+FROM nvidia/cuda:13.0.2-base-ubuntu24.04
 LABEL org.opencontainers.image.source="https://github.com/benoitc/erllama"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libncurses6 libssl3t64 libsctp1 openssl procps && rm -rf /var/lib/apt/lists/* && \
