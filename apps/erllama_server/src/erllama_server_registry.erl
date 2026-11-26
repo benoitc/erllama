@@ -187,20 +187,20 @@ reply_change({error, _} = E, St) ->
 
 local_entry(Path0, Opts) ->
     Path = unicode:characters_to_binary(filename:absname(Path0)),
-    case erllama_server_gguf:read(Path) of
-        {ok, #{kv := _}} ->
+    case local_format(Path, load_opts(Opts)) of
+        {ok, Load, Size} ->
             Name = normalize(maps:get(name, Opts, filename:basename(Path, <<".gguf">>))),
             MmProj = maps:get(mmproj, Opts, undefined),
-            case check_mmproj(MmProj) of
+            case check_projector(Load, MmProj) of
                 ok ->
                     {ok, #{
                         name => Name,
                         source => #{kind => local, ref => Path},
                         path => Path,
                         sha256 => undefined,
-                        size => filelib:file_size(Path),
+                        size => Size,
                         mmproj => abs_or_undefined(MmProj),
-                        load => load_opts(Opts),
+                        load => Load,
                         defaults => #{},
                         keep_alive => maps:get(keep_alive, Opts, undefined),
                         created_at => now_ms()
@@ -208,11 +208,42 @@ local_entry(Path0, Opts) ->
                 {error, _} = E ->
                     E
             end;
-        {error, enoent} ->
-            {error, {enoent, Path}};
-        {error, Reason} ->
-            {error, {not_a_gguf, Path, Reason}}
+        Error ->
+            Error
     end.
+
+local_format(Path, Load) ->
+    case filelib:is_dir(Path) orelse maps:get(backend, Load, undefined) =:= erllama_model_mlx of
+        true ->
+            Files = filelib:wildcard(filename:join(binary_to_list(Path), "*.safetensors")),
+            Required = ["config.json", "tokenizer.json", "tokenizer_config.json"],
+            case
+                Files =/= [] andalso
+                    lists:all(
+                        fun(F) ->
+                            filelib:is_regular(filename:join(Path, F))
+                        end,
+                        Required
+                    )
+            of
+                true ->
+                    {ok, Load#{backend => erllama_model_mlx},
+                        lists:sum([filelib:file_size(F) || F <- Files])};
+                false ->
+                    {error, {invalid_mlx_checkpoint, Path}}
+            end;
+        false ->
+            case erllama_server_gguf:read(Path) of
+                {ok, _} -> {ok, Load, filelib:file_size(Path)};
+                {error, enoent} -> {error, {enoent, Path}};
+                {error, Reason} -> {error, {not_a_gguf, Path, Reason}}
+            end
+    end.
+
+check_projector(#{backend := erllama_model_mlx}, P) when P =/= undefined ->
+    {error, {mlx_unsupported_option, mmproj}};
+check_projector(_, P) ->
+    check_mmproj(P).
 
 check_mmproj(undefined) ->
     ok;
@@ -249,11 +280,16 @@ find(Name0, #state{entries = E, aliases = A, default = D}) ->
 %% the entry itself.
 view(#{path := Path} = Entry, Default) ->
     Status =
-        case filelib:is_regular(Path) of
+        case entry_present(Entry, Path) of
             true -> ok;
             false -> missing
         end,
     Entry#{status => Status, default => maps:get(name, Entry) =:= Default}.
+
+entry_present(#{load := #{backend := erllama_model_mlx}}, Path) ->
+    filelib:is_regular(filename:join(Path, "config.json"));
+entry_present(_, Path) ->
+    filelib:is_regular(Path).
 
 delete_unused_blobs(Entry, Remaining) ->
     Blobs = unicode:characters_to_binary(filename:absname(blobs_dir())),
@@ -293,6 +329,8 @@ load_opts(Opts) ->
         fun
             (backend, B) when B =:= erllama_model_stub; B =:= <<"erllama_model_stub">> ->
                 {true, erllama_model_stub};
+            (backend, B) when B =:= erllama_model_mlx; B =:= <<"erllama_model_mlx">> ->
+                {true, erllama_model_mlx};
             (backend, _) ->
                 false;
             (parallel, P) ->

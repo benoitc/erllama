@@ -48,6 +48,31 @@ print(reply.choices[0].message.content)
 The model is a registry name ([Managing models](models.md)), loaded on
 demand, or omitted for the default model.
 
+## Serving MLX on a Mac
+
+Install the [optional MLX runtime](../building.md#optional-mlx-lm-backend-on-apple-silicon)
+and export `ERLLAMA_MLX_PYTHON` in the server's environment. Point a registry
+entry at the local checkpoint directory in `sys.config`. The registry keeps
+the backend and slot count under the same model name after restart.
+
+```erlang
+{erllama_server, [
+    {http, #{ip => {127,0,0,1}, port => 8080}},
+    {models, [#{name => <<"qwen">>, path => "/models/Qwen3.8-27B-MLX-4bit",
+                backend => erllama_model_mlx, n_ctx => 4096, parallel => 4}]}
+]}
+```
+
+```sh
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Explain OTP supervision."}],"temperature":0,"reasoning_effort":"none","max_tokens":64,"stream":true}'
+```
+
+Set `stream` to `false` for a single JSON response. Closing a stream cancels
+its request and frees its slot. Cache reuse follows the configured minimum
+prompt length and checkpoint policy.
+
 ## Security and limits
 
 | Setting | Default | Meaning |
