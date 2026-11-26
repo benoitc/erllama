@@ -72,6 +72,14 @@ When you do not want to write the receive loop, fold the stream:
 Cancel an in-flight stream with `erllama:cancel(Ref)`; you still
 receive `{done, Stats}` with `finish_reason => cancelled`.
 
+On the local llama.cpp backend, set `early_stream_token => true` when loading
+the model to sample the first token as soon as the last prompt slice is ready.
+The next tick feeds that token into KV. A request cancelled between those
+ticks can report one generated token beyond its committed count and returns
+no finish key. Ordinary text streams can use this option. Speculative and
+media requests, configured thinking markers and split models use the normal
+decode path. The default is `false`.
+
 ## Sampling options
 
 With no sampling options the decode is greedy and deterministic. Set

@@ -252,7 +252,7 @@ detokenize(Model, Tokens) when is_binary(Model), is_list(Tokens) ->
 -doc """
 Register a GGUF file on the release machine. `Opts`: `name`, `mmproj`,
 `n_ctx`, `n_gpu_layers`, `parallel` (requests served at once, default
-`default_parallel`), `kv_unified`, `chat_template`, `keep_alive`.
+`default_parallel`), `kv_unified`, `early_stream_token`, `chat_template`, `keep_alive`.
 """.
 -spec register_model(binary() | string(), map()) -> {ok, map()} | {error, term()}.
 register_model(Path, Opts) when is_map(Opts) ->

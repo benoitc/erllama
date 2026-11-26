@@ -61,6 +61,9 @@
     native_logs_reach_logger/1,
     logit_bias_suppresses_token/1,
     ignore_eos_reaches_target/1,
+    early_stream_mixed_batch/1,
+    early_stream_checkpoints/1,
+    early_stream_cancel/1,
     logprobs_stream_events/1,
     vocab_info_reports_specials/1,
     detokenize_specials/1,
@@ -134,6 +137,9 @@ all() ->
         native_logs_reach_logger,
         logit_bias_suppresses_token,
         ignore_eos_reaches_target,
+        early_stream_mixed_batch,
+        early_stream_checkpoints,
+        early_stream_cancel,
         logprobs_stream_events,
         vocab_info_reports_specials,
         detokenize_specials,
@@ -190,7 +196,18 @@ init_per_testcase(TC, Config) ->
     DiskSrv = list_to_atom("real_disk_" ++ atom_to_list(TC)),
     {ok, _} = erllama_cache_disk_srv:start_link(DiskSrv, Dir),
     Model = iolist_to_binary(["real_model_", atom_to_binary(TC)]),
-    {ok, _} = erllama_model:start_link(Model, model_config(Path, DiskSrv)),
+    Base = model_config(Path, DiskSrv),
+    Cfg =
+        case TC of
+            early_stream_checkpoints ->
+                Base#{
+                    early_stream_token => false,
+                    policy => (maps:get(policy, Base))#{prefill_chunk_size => 2}
+                };
+            _ ->
+                Base
+        end,
+    {ok, _} = erllama_model:start_link(Model, Cfg),
     erllama_cache_counters:reset(),
     [{disk_srv, DiskSrv}, {model, Model}, {dir, Dir} | Config].
 
@@ -807,6 +824,161 @@ ignore_eos_reaches_target(Config) ->
     ),
     ?assertEqual(6, maps:get(completion_tokens, Stats)),
     ok.
+
+early_stream_mixed_batch(Config) ->
+    Model = ?config(model, Config),
+    {ok, Prompt} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    ModelRef = element(2, erllama_model:get_backend_state(Model)),
+    {ok, Ctx} = erllama_nif:new_context(ModelRef, #{n_ctx => 512, n_seq_max => 2, n_batch => 64}),
+    try
+        Before = mixed_first_tokens(Ctx, Prompt, false),
+        ok = erllama_nif:kv_seq_rm(Ctx, 0, 0, -1),
+        ok = erllama_nif:kv_seq_rm(Ctx, 1, 0, -1),
+        ?assertEqual(Before, mixed_first_tokens(Ctx, Prompt, true))
+    after
+        erllama_nif:free_context(Ctx)
+    end.
+
+mixed_first_tokens(Ctx, Prompt, Early) ->
+    Params = #{temperature => 0.8, seed => 42, logprobs => 2},
+    {ok, A} = erllama_nif:sampler_new(Ctx, Params),
+    {ok, B} = erllama_nif:sampler_new(Ctx, Params),
+    try
+        {ok, [{0, prefilled}]} = erllama_nif:step(Ctx, [{0, {prefill, [42]}}]),
+        Finish =
+            case Early of
+                true -> {prefill, Prompt, B};
+                false -> {prefill, Prompt}
+            end,
+        {ok, [{0, A1}, {1, Peek}]} = erllama_nif:step(Ctx, [{0, {decode, A}}, {1, Finish}]),
+        ?assertEqual(length(Prompt) - 1, erllama_nif:kv_seq_pos_max(Ctx, 1)),
+        Next =
+            case Peek of
+                prefilled -> {decode, B};
+                {token, T, _, _} -> {prefill, [T]}
+            end,
+        {ok, [{0, A2}, {1, Commit}]} = erllama_nif:step(Ctx, [{0, {decode, A}}, {1, Next}]),
+        ?assertEqual(length(Prompt), erllama_nif:kv_seq_pos_max(Ctx, 1)),
+        B1 =
+            case Early of
+                true -> Peek;
+                false -> Commit
+            end,
+        {ok, More} = erllama_nif:step(Ctx, [{0, {decode, A}}, {1, {decode, B}}]),
+        {A1, A2, B1, More}
+    after
+        erllama_nif:sampler_free(A),
+        erllama_nif:sampler_free(B)
+    end.
+
+early_stream_checkpoints(Config) ->
+    with_early_stream_model(Config, fun(Early) ->
+        Control = ?config(model, Config),
+        {ok, Prompt} = erllama:tokenize(Control, ?SHORT_PROMPT),
+        Opts = #{temperature => 0.8, seed => 42, logprobs => 3, response_tokens => 1},
+        {ok, Ladder} = erllama:tokenize(Control, ?LONG_PROMPT),
+        Seeded = Opts#{response_tokens => 8},
+        assert_same_stream(
+            stream_collect(Control, Ladder, Seeded), stream_collect(Early, Ladder, Seeded)
+        ),
+        Ref = stream_collect(Control, Prompt, Opts),
+        First = stream_collect(Early, Prompt, Opts),
+        assert_same_stream(Ref, First),
+        [T] = maps:get(generated, First),
+        Full = Prompt ++ [T],
+        ?assertEqual(length(Full), maps:get(committed_tokens, First)),
+        Key = maps:get(finish_key, First),
+        ?assertNotEqual(undefined, Key),
+        %% The snapshot includes the sampled token. Run its exact-hit primer,
+        %% then restore that same snapshot with a suffix, and compare to cold.
+        More = Opts#{temperature => 0.0, response_tokens => 4},
+        lists:foreach(
+            fun({Kind, Tokens}) ->
+                Warm = stream_collect(Early, Tokens, More#{parent_key => Key}),
+                ?assertEqual(Kind, maps:get(cache_hit_kind, Warm)),
+                Cold = stream_collect(Control, Tokens, More),
+                ?assertEqual(maps:get(generated, Cold), maps:get(generated, Warm)),
+                ?assertEqual(
+                    length(Tokens) + length(maps:get(generated, Warm)),
+                    maps:get(committed_tokens, Warm)
+                )
+            end,
+            [{exact, Full}, {partial, Full ++ [lists:last(Prompt)]}]
+        ),
+        Stop = maps:get(reply, Ref),
+        ?assert(byte_size(Stop) > 0),
+        Stopped = stream_collect(Early, Prompt, Opts#{
+            response_tokens => 4, stop_sequences => [Stop]
+        }),
+        ?assertMatch(
+            #{reply := <<>>, stop_sequence := Stop, finish_reason := stop, generated := [T]},
+            Stopped
+        )
+    end).
+
+early_stream_cancel(Config) ->
+    with_early_stream_model(Config, fun(Model) ->
+        Pid = erllama_registry:whereis_name(Model),
+        Owner = self(),
+        %% Hold the first tick before it enters the NIF so cancel is queued
+        %% ahead of the ingestion tick. No sleeps or races with GPU timing.
+        Hook = fun
+            (armed, {in, {cast, tick}, running}, _) ->
+                Owner ! ready_to_cancel,
+                receive
+                    resume_prefill -> done
+                after 5000 -> error(prefill_timeout)
+                end;
+            (St, _, _) ->
+                St
+        end,
+        ok = sys:install(Pid, {Hook, armed}),
+        {ok, Ref} = erllama:stream(Model, [42], #{response_tokens => 8, temperature => 0.0}),
+        receive
+            ready_to_cancel -> ok
+        after 5000 -> ct:fail(no_prefill_tick)
+        end,
+        ok = erllama:cancel(Ref),
+        Pid ! resume_prefill,
+        {ok, Cancel} = erllama:collect(Ref, 60000),
+        ?assertMatch(
+            #{
+                finish_reason := cancelled,
+                generated := [_],
+                committed_tokens := 1,
+                finish_key := undefined
+            },
+            Cancel
+        ),
+        ok = sys:remove(Pid, Hook),
+        ?assertMatch(
+            #{generated := [_], committed_tokens := 2},
+            stream_collect(Model, [42], #{response_tokens => 1})
+        )
+    end).
+
+assert_same_stream(Expected, Actual) ->
+    Keys = [generated, reply, logprobs, committed_tokens, finish_reason],
+    ?assertEqual(maps:with(Keys, Expected), maps:with(Keys, Actual)).
+
+stream_collect(Model, Tokens, Opts) ->
+    {ok, Ref} = erllama:stream(Model, Tokens, Opts),
+    {ok, Result} = erllama:collect(Ref, 60000),
+    Result.
+
+with_early_stream_model(Config, Fun) ->
+    Base = model_config(?config(model_path, Config), ?config(disk_srv, Config)),
+    Cfg = Base#{
+        early_stream_token => true,
+        fingerprint => crypto:hash(sha256, <<"early">>),
+        policy => (maps:get(policy, Base))#{min_tokens => 1, prefill_chunk_size => 2}
+    },
+    {ok, M} = erllama:load_model(<<"early-stream">>, Cfg),
+    try
+        Fun(M)
+    after
+        erllama:unload(M)
+    end.
 
 %% Greedy + logprobs: one event per token, top sorted descending,
 %% every logprob =< 0, and the sampled token IS the top-1 with the

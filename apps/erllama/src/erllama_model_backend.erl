@@ -411,6 +411,7 @@ the model any more.
 -type sampler_ref() :: term().
 -type step_op() ::
     {prefill, [erllama:token_id()]}
+    | {prefill, [erllama:token_id()], sampler_ref()}
     | {decode, sampler_ref()}.
 -type step_result() ::
     prefilled

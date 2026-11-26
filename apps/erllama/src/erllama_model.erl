@@ -319,6 +319,7 @@
     generation_started_at :: integer() | undefined,
     %% Per-request sampler chain handle. `undefined` for prefill_only.
     sampler_ref :: term() | undefined,
+    pending_first :: {non_neg_integer(), 0 | 1} | undefined,
     last_sampler_cfg = undefined :: map() | undefined,
     %% Tokens to prefill AFTER the next cold save fires. Cold-save
     %% policy splits the prompt into a trimmed prefix (which lands
@@ -470,6 +471,7 @@
     %% Inference backend: erllama_model_stub | erllama_model_llama.
     backend :: module(),
     backend_state :: term(),
+    early_stream = false :: boolean(),
     %% Captured at init for list_models metadata.
     loaded_at_monotonic :: integer(),
     %% Best-effort VRAM footprint of the loaded model, in bytes.
@@ -1136,6 +1138,11 @@ build_init_data(ModelId, Config, Backend, BState) ->
         policy = resolve_policy(Config, NBatch),
         backend = Backend,
         backend_state = BState,
+        early_stream =
+            Backend =:= erllama_model_llama andalso
+                maps:get(early_stream_token, Config, false) andalso
+                not maps:is_key(thinking_markers, Config) andalso
+                not maps:is_key(tp_rank, maps:get(model_opts, Config, #{})),
         chat_template = maps:get(chat_template, Config, undefined),
         adapters = [],
         effective_fp = Fp,
@@ -2716,7 +2723,7 @@ step_tick_ops(Data1) ->
             %% Drive the finishers and return.
             tick_after_step(Data1, FinishersFirst, []);
         {OpList, FinishersFirst} ->
-            case backend_call(Data1, step, [OpList]) of
+            case backend_call(Data1, step, [stream_step_ops(OpList, Data1)]) of
                 {ok, Results} ->
                     Pairs = pair_ops_with_results(OpList, Results),
                     Data2 = apply_step_results(Pairs, Data1),
@@ -2738,6 +2745,27 @@ step_tick_ops(Data1) ->
                     end
             end
     end.
+
+stream_step_ops(Ops, #data{early_stream = false}) ->
+    Ops;
+stream_step_ops(Ops, #data{req_table = Tab}) ->
+    [{Seq, stream_step_op(Op, maps:get(Seq, Tab))} || {Seq, Op} <- Ops].
+
+stream_step_op({decode, _}, #req{pending_first = {Tok, _}}) ->
+    {prefill, [Tok]};
+stream_step_op({prefill, Slice}, #req{
+    prefill_cursor = Slice,
+    cold_save_segments = Segs,
+    mode = streaming,
+    spec = undefined,
+    media = undefined,
+    thinking = disabled,
+    generated = [],
+    sampler_ref = Ref
+}) when Segs =:= undefined; Segs =:= []; Segs =:= [{cold, []}]; Segs =:= [{agent_prefix, []}] ->
+    {prefill, Slice, Ref};
+stream_step_op(Op, _) ->
+    Op.
 
 %% =============================================================================
 %% Multimodal requests
@@ -3185,6 +3213,8 @@ maybe_mtp_batch_tick(#data{spec = {#{type := mtp, n_max := NMax}, SpecRef}} = Da
 maybe_mtp_batch_tick(_Data) ->
     no.
 
+mtp_batch_ready(#req{pending_first = {_, _}}) ->
+    false;
 mtp_batch_ready(#req{media_state = pending}) ->
     false;
 mtp_batch_ready(#req{mtp_batch = false}) ->
@@ -3485,7 +3515,7 @@ prefill_slice_cap(N, Remaining, ChunkSize) when is_integer(ChunkSize), ChunkSize
 %% length the slicer kept; decode results append the sampled token.
 apply_step_results([], Data) ->
     Data;
-apply_step_results([{{SeqId, {prefill, Slice}}, prefilled} | T], Data) ->
+apply_step_results([{{SeqId, {prefill, Slice}}, Result} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     SentLen = length(Slice),
     Cursor0 =
@@ -3518,7 +3548,13 @@ apply_step_results([{{SeqId, {prefill, Slice}}, prefilled} | T], Data) ->
             undefined -> maybe_fire_cold_save(Req1#req{last_save_at = 0}, Data);
             _ -> Req1
         end,
-    apply_step_results(T, put_req(Data, Req2));
+    Req3 = prefill_result(Result, Req2, Data),
+    apply_step_results(T, put_req(Data, Req3));
+apply_step_results([{{SeqId, {decode, _}}, prefilled} | T], Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    {Tok, EogFlag} = Req#req.pending_first,
+    Req1 = Req#req{context_tokens = Req#req.context_tokens ++ [Tok], pending_first = undefined},
+    apply_step_results(T, put_req(Data, after_token_commit(Req1, EogFlag, Data)));
 apply_step_results([{{SeqId, {decode, S}}, {token, Tok, EogFlag, {SampledLp, Top}}} | T], Data) ->
     %% Logprobs variant: peel the payload off, deliver it (event for
     %% streaming callers, accumulator for standard mode), then re-run
@@ -3534,21 +3570,7 @@ apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     Req1 = req_append_token(Req, Tok),
     Req2 = req_stream_emit(Req1, Tok, Data),
-    %% Mark terminal if eog, response_target reached, or a stop
-    %% sequence fired. matched_stop is set inside req_stream_emit
-    %% on a hit; check it here so the request is marked finishing
-    %% at the same point the existing EOG/length paths are.
-    GenLen = length(Req2#req.generated),
-    Done =
-        EogFlag =:= 1 orelse
-            GenLen >= Req2#req.response_target orelse
-            Req2#req.matched_stop =/= undefined,
-    Req3 =
-        case Done of
-            true -> Req2#req{finishing = true};
-            false -> maybe_fire_continued_for_req(Req2, Data)
-        end,
-    apply_step_results(T, put_req(Data, Req3));
+    apply_step_results(T, put_req(Data, after_token_commit(Req2, EogFlag, Data)));
 apply_step_results([{{SeqId, {decode, S}}, {thinking_token, Tok}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     case Req#req.thinking_capped of
@@ -3573,6 +3595,25 @@ apply_step_results([{{SeqId, {decode, _}}, thinking_end} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     Req1 = req_thinking_end(Req, Data),
     apply_step_results(T, put_req(Data, Req1)).
+
+prefill_result(prefilled, Req, _Data) ->
+    Req;
+prefill_result({token, Tok, Eog, {Lp, Top}}, Req, Data) ->
+    Req1 = req_logprobs(Req, #{token_id => Tok, logprob => Lp, top => Top}),
+    prefill_result({token, Tok, Eog}, Req1, Data);
+prefill_result({token, Tok, Eog}, Req, Data) ->
+    %% The stream can expose this token now. Only its ingestion on the next
+    %% tick may advance context_tokens or publish a checkpoint that includes it.
+    req_stream_emit(Req#req{generated = [Tok], pending_first = {Tok, Eog}}, Tok, Data).
+
+after_token_commit(Req, Eog, Data) ->
+    case
+        Eog =:= 1 orelse length(Req#req.generated) >= Req#req.response_target orelse
+            Req#req.matched_stop =/= undefined
+    of
+        true -> Req#req{finishing = true};
+        false -> maybe_fire_continued_for_req(Req, Data)
+    end.
 
 %% Deliver a per-token logprobs map: streaming callers get it as an
 %% `{erllama, Ref, {logprobs, Map}}` event; standard-mode requests
@@ -4584,6 +4625,8 @@ fire_save_for_tokens(Reason, Tokens, Req, Data) ->
 
 %% Returns `{ok, Key}` if a finish save fired. Returns `skipped` if
 %% the policy suppressed it (live token count below `min_tokens`).
+fire_finish_save_for_req(_LiveTokens, #req{pending_first = {_, _}}, _Data) ->
+    skipped;
 fire_finish_save_for_req(_LiveTokens, #req{media = Media}, _Data) when Media =/= undefined ->
     %% Media requests bypass the cache entirely.
     skipped;
