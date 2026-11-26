@@ -272,6 +272,14 @@ handle_event(info, {agent_gen, Gen, {error, Reason}}, generating, #d{gen = Gen} 
     ok = erllama_server_failures:record(turn_failed, D#d.id, Reason),
     end_turn({error, Reason}, D#d{gen = undefined}, []);
 %% --- tools ----------------------------------------------------------------------
+handle_event(info, {shell_output, Worker, Index, Bytes, Omitted}, tools, #d{calls = Calls} = D) ->
+    case lists:keyfind(Index, #call.index, Calls) of
+        #call{worker = {Worker, _}, name = <<"shell">>, id = Id} ->
+            {keep_state,
+                emit(tool_output, #{call_id => Id, output => Bytes, omitted => Omitted}, D)};
+        _ ->
+            keep_state_and_data
+    end;
 handle_event(info, {tool_done, Worker, Index, Result}, tools, D) ->
     tool_finished(Worker, Index, Result, D);
 handle_event(_Type, _Msg, _State, _D) ->
@@ -486,7 +494,11 @@ start_call(
     %% Linked as well as monitored: a session that dies, even killed,
     %% takes its running tools (and their commands) with it.
     Worker = spawn_opt(
-        fun() -> Self ! {tool_done, self(), I, erllama_server_tools:execute(Name, Args, Ctx)} end,
+        fun() ->
+            Progress = fun(Bytes, Omitted) -> Self ! {shell_output, self(), I, Bytes, Omitted} end,
+            Result = erllama_server_tools:execute(Name, Args, Ctx#{progress => Progress}),
+            Self ! {tool_done, self(), I, Result}
+        end,
         [link, monitor]
     ),
     {

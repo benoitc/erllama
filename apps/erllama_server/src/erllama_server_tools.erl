@@ -190,7 +190,9 @@ shell(Ws, #{<<"command">> := Cmd} = Args, Ctx) when is_binary(Cmd), Cmd =/= <<>>
             {ok, <<"started background job ", Id/binary, "; use shell_status to read its output">>,
                 {job, Id, Job}};
         _ ->
-            Result = erllama_server_tool_shell:run(Ws, Cmd, Timeout),
+            Result = erllama_server_tool_shell:run(
+                Ws, Cmd, Timeout, maps:get(progress, Ctx, undefined)
+            ),
             Text = erllama_server_tool_shell:format(Result),
             case maps:get(exit, Result) of
                 0 ->

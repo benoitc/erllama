@@ -298,14 +298,10 @@ event(_Node, _Id, #{type := T}) when T =:= turn_started; T =:= round ->
 event(_Node, _Id, #{type := tool_started, data := #{name := N, arguments := A}}) ->
     ok = erllama_server_cli_term:status(N),
     say(io_lib:format("~n[tool] ~ts ~ts~n", [N, args_text(A)]));
+event(_Node, _Id, #{type := tool_output, data := Data}) ->
+    show_shell_output(Data);
 event(_Node, _Id, #{type := tool_result, data := #{ok := Ok, output := Out}}) ->
-    Mark =
-        case Ok of
-            true -> "ok";
-            false -> "error"
-        end,
-    ok = erllama_server_cli_term:status("thinking"),
-    say(io_lib:format("[~s] ~ts~n", [Mark, first_line(Out)]));
+    show_tool_result(Ok, Out);
 event(Node, Id, #{type := approval_request, data := Req}) ->
     ok = erllama_server_cli_term:status(undefined),
     ask_approval(Node, Id, Req);
@@ -317,6 +313,22 @@ event(_Node, _Id, #{type := turn_done, data := #{reason := R}}) ->
     say(io_lib:format("~n[turn ended: ~0p]~n", [R]));
 event(_Node, _Id, E) ->
     erllama_server_cli:print_event(E).
+
+show_shell_output(Data) ->
+    Text = erllama_server_tool_shell:display_output(Data),
+    Safe = re:replace(Text, <<"[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f]">>, <<>>, [
+        global, unicode, {return, binary}
+    ]),
+    say(Safe).
+
+show_tool_result(Ok, Out) ->
+    Mark =
+        case Ok of
+            true -> "ok";
+            false -> "error"
+        end,
+    ok = erllama_server_cli_term:status("thinking"),
+    say(io_lib:format("[~s] ~ts~n", [Mark, first_line(Out)])).
 
 ask_approval(Node, Id, #{call_id := C, name := N, arguments := A}) ->
     Answer = erllama_server_cli_term:prompt(

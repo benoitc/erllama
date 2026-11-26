@@ -98,6 +98,11 @@ A tool call the restart cut is marked unresolved and never run again.
 | `shell_status` | output so far of a background job | no |
 | `shell_kill` | stops a background job | yes |
 
+Foreground shell commands send stdout and stderr to the session together while they run.
+Output is grouped over 100 ms. If more than 16 KiB arrives in one group, the session
+shows the latest 16 KiB and reports how many bytes it skipped. The model receives the
+usual final result. For a background command, use `shell_status` with the job id.
+
 - Paths resolve inside the workspace. `..` and symbolic links that
   lead outside are refused.
 - `list_dir` and `search` never follow a symbolic link to a directory
