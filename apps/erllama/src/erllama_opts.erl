@@ -31,6 +31,7 @@
     model_id,
     progress_to,
     %% erllama_model_stub only (test backend)
+    stub_reply,
     step_delay_ms,
     thinking_capable,
     fail_seq_rm_last,
@@ -312,6 +313,7 @@ base_load_checks() ->
 %% Stub-backend test knobs.
 backend_load_checks() ->
     [
+        {stub_reply, fun is_binary/1},
         {step_delay_ms, fun non_neg_int/1},
         {thinking_capable, fun is_boolean/1},
         {fail_seq_rm_last, fun is_boolean/1},

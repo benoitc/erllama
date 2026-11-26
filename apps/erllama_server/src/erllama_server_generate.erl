@@ -10,7 +10,7 @@
 %%
 %% Chat goes through llama.cpp's template engine (`erllama:chat_apply'),
 %% which also yields the output parser and the sampler constraints for
-%% tools and JSON schemas. A backend without it (the stub) falls back
+%% tools and JSON schemas. A backend without a configured parser falls back
 %% to the legacy template renderer and an unparsed reply.
 
 -export([start/4, finish/4, option_keys/0, check_opts/1, message/1, reply_message/1, constrain/3]).

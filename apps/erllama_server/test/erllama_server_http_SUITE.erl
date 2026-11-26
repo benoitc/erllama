@@ -56,6 +56,10 @@
     ollama_chat_and_generate/1,
     ollama_models/1,
     ollama_pull/1,
+    parsed_chat/1,
+    parsed_responses/1,
+    parsed_anthropic/1,
+    parsed_ollama/1,
     real_model_anthropic_tools/1,
     real_model_responses_tools/1
 ]).
@@ -103,6 +107,10 @@ all() ->
         ollama_chat_and_generate,
         ollama_models,
         ollama_pull,
+        parsed_chat,
+        parsed_responses,
+        parsed_anthropic,
+        parsed_ollama,
         real_model_anthropic_tools,
         real_model_responses_tools
     ].
@@ -666,6 +674,187 @@ weather_tool() ->
             }
         }
     }.
+
+parsed_model() ->
+    Template = <<
+        "{% if tools %}<|im_start|>system\nTools: {{ tools | tojson }}\n"
+        "Use <tool_call> with <function=name> and <parameter=key>. "
+        "Wrap reasoning in <think> and </think>.<|im_end|>\n{% endif %}"
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+        "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+    >>,
+    Reply = <<
+        "<think>Check forecast</think>Checking.<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+    >>,
+    {ok, Model} = erllama:load_model(<<"parsed">>, #{
+        backend => erllama_model_stub, chat_template => Template, stub_reply => Reply
+    }),
+    Model.
+
+parsed_chat(Config) ->
+    Req = chat(<<"Weather?">>, #{
+        <<"model">> => parsed_model(), <<"max_tokens">> => 200, <<"tools">> => [weather_tool()]
+    }),
+    Path = <<"/v1/chat/completions">>,
+    {200, Body} = post(Config, Path, Req),
+    #{
+        <<"choices">> := [
+            #{
+                <<"finish_reason">> := <<"tool_calls">>,
+                <<"message">> :=
+                    #{
+                        <<"reasoning_content">> := <<"Check forecast">>,
+                        <<"content">> := <<"Checking.">>,
+                        <<"tool_calls">> := [
+                            #{
+                                <<"function">> := #{
+                                    <<"name">> := <<"get_weather">>, <<"arguments">> := Args
+                                }
+                            }
+                        ]
+                    }
+            }
+        ]
+    } = decode(Body),
+    ?assertEqual(#{<<"city">> => <<"Paris">>}, decode(Args)),
+    {200, Stream} = post(Config, Path, Req#{<<"stream">> => true}),
+    Choices = [C || #{<<"choices">> := [C]} <- chunks(Stream)],
+    Deltas = [D || #{<<"delta">> := D} <- Choices],
+    ?assertEqual(<<"Checking.">>, join_field(<<"content">>, Deltas)),
+    ?assertEqual(<<"Check forecast">>, join_field(<<"reasoning_content">>, Deltas)),
+    Fns = [
+        F
+     || #{<<"tool_calls">> := Cs} <- Deltas, #{<<"index">> := 0, <<"function">> := F} <- Cs
+    ],
+    ?assertEqual([<<"get_weather">>], [N || #{<<"name">> := N} <- Fns]),
+    ?assertEqual(#{<<"city">> => <<"Paris">>}, decode(join_field(<<"arguments">>, Fns))),
+    ?assertMatch(#{<<"finish_reason">> := <<"tool_calls">>}, lists:last(Choices)).
+
+join_field(K, Maps) ->
+    iolist_to_binary([B || #{K := B} <- Maps, is_binary(B)]).
+
+parsed_anthropic(Config) ->
+    #{<<"function">> := #{<<"parameters">> := Schema}} = weather_tool(),
+    Req = anthropic(#{
+        <<"model">> => parsed_model(),
+        <<"max_tokens">> => 200,
+        <<"tools">> => [#{<<"name">> => <<"get_weather">>, <<"input_schema">> => Schema}]
+    }),
+    Path = <<"/v1/messages">>,
+    {200, Body} = post(Config, Path, Req),
+    ?assertMatch(
+        #{
+            <<"stop_reason">> := <<"tool_use">>,
+            <<"content">> := [
+                #{<<"type">> := <<"thinking">>, <<"thinking">> := <<"Check forecast">>},
+                #{<<"type">> := <<"text">>, <<"text">> := <<"Checking.">>},
+                #{
+                    <<"type">> := <<"tool_use">>,
+                    <<"name">> := <<"get_weather">>,
+                    <<"input">> := #{<<"city">> := <<"Paris">>}
+                }
+            ]
+        },
+        decode(Body)
+    ),
+    {200, Stream} = post(Config, Path, Req#{<<"stream">> => true}),
+    Events = events(Stream),
+    Names = [
+        Name
+     || {<<"content_block_start">>, #{<<"content_block">> := #{<<"name">> := Name}}} <- Events
+    ],
+    ?assertEqual([<<"get_weather">>], Names),
+    D = [Delta || {<<"content_block_delta">>, #{<<"delta">> := Delta}} <- Events],
+    ?assertEqual(<<"Check forecast">>, join_field(<<"thinking">>, D)),
+    ?assertEqual(<<"Checking.">>, join_field(<<"text">>, D)),
+    ?assertEqual(#{<<"city">> => <<"Paris">>}, decode(join_field(<<"partial_json">>, D))).
+
+parsed_responses(Config) ->
+    #{<<"function">> := F} = weather_tool(),
+    Req = #{
+        <<"model">> => parsed_model(),
+        <<"input">> => <<"Weather?">>,
+        <<"max_output_tokens">> => 200,
+        <<"tools">> => [F#{<<"type">> => <<"function">>}]
+    },
+    Path = <<"/v1/responses">>,
+    {200, Body} = post(Config, Path, Req),
+    check_parsed_response(decode(Body)),
+    {200, Stream} = post(Config, Path, Req#{<<"stream">> => true}),
+    Events = events(Stream),
+    ?assertEqual(
+        <<"Checking.">>,
+        join_field(<<"delta">>, [D || {<<"response.output_text.delta">>, D} <- Events])
+    ),
+    Args = join_field(<<"delta">>, [
+        D
+     || {<<"response.function_call_arguments.delta">>, D} <- Events
+    ]),
+    ?assertEqual(#{<<"city">> => <<"Paris">>}, decode(Args)),
+    {<<"response.completed">>, #{<<"response">> := Final}} = lists:last(Events),
+    check_parsed_response(Final).
+
+check_parsed_response(#{
+    <<"output">> := [
+        #{<<"type">> := <<"reasoning">>, <<"summary">> := [#{<<"text">> := <<"Check forecast">>}]},
+        #{<<"type">> := <<"message">>, <<"content">> := [#{<<"text">> := <<"Checking.">>}]},
+        #{
+            <<"type">> := <<"function_call">>,
+            <<"name">> := <<"get_weather">>,
+            <<"arguments">> := Args
+        }
+    ]
+}) ->
+    ?assertEqual(#{<<"city">> => <<"Paris">>}, decode(Args)).
+
+parsed_ollama(Config) ->
+    Req = #{
+        <<"model">> => parsed_model(),
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"Weather?">>}],
+        <<"stream">> => false,
+        <<"options">> => #{<<"num_predict">> => 200},
+        <<"tools">> => [weather_tool()]
+    },
+    Path = <<"/api/chat">>,
+    {200, Body} = post(Config, Path, Req),
+    ?assertMatch(
+        #{
+            <<"done">> := true,
+            <<"message">> := #{
+                <<"content">> := <<"Checking.">>,
+                <<"thinking">> := <<"Check forecast">>,
+                <<"tool_calls">> := [
+                    #{
+                        <<"function">> := #{
+                            <<"name">> := <<"get_weather">>,
+                            <<"arguments">> := #{<<"city">> := <<"Paris">>}
+                        }
+                    }
+                ]
+            }
+        },
+        decode(Body)
+    ),
+    {200, Stream} = post(Config, Path, Req#{<<"stream">> => true}),
+    Frames = ndjson(Stream),
+    Msgs = [M || #{<<"message">> := M} <- Frames],
+    ?assertEqual(<<"Checking.">>, join_field(<<"content">>, Msgs)),
+    ?assertEqual(<<"Check forecast">>, join_field(<<"thinking">>, Msgs)),
+    ?assertMatch(
+        [
+            [
+                #{
+                    <<"function">> := #{
+                        <<"name">> := <<"get_weather">>,
+                        <<"arguments">> := #{<<"city">> := <<"Paris">>}
+                    }
+                }
+            ]
+        ],
+        [Cs || #{<<"tool_calls">> := Cs} <- Msgs]
+    ),
+    ?assertMatch(#{<<"done">> := true}, lists:last(Frames)).
 
 %% A tool-capable model (Qwen2.5, Llama 3.1, ...): the call comes back
 %% as tool_calls, streamed as announced calls plus their arguments, and

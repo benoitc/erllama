@@ -467,6 +467,7 @@ Config map for `load_model/1,2`.
     thinking_markers => #{start := binary(), 'end' := binary()},
     chat_template => binary(),
     %% erllama_model_stub only
+    stub_reply => binary(),
     step_delay_ms => non_neg_integer(),
     thinking_capable => boolean()
 }.

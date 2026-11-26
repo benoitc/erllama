@@ -28,6 +28,20 @@ stub_step_decode_is_deterministic_per_seq_and_sampler_test() ->
         erllama_model_stub:step(S, [{0, {decode, Sampler0}}]),
     ?assertEqual(T1, T2).
 
+stub_scripted_reply_per_request_test() ->
+    Reply = <<"a", 16#E9/utf8>>,
+    {ok, S} = erllama_model_stub:init(#{stub_reply => Reply}),
+    [First, Last] = erllama_model_stub:tokenize(S, Reply),
+    ?assertEqual(Reply, erllama_model_stub:detokenize(S, [First, Last])),
+    {ok, A} = erllama_model_stub:sampler_new(S, #{}),
+    {ok, B} = erllama_model_stub:sampler_new(S, #{}),
+    {ok, [{0, {token, First, 0}}]} = erllama_model_stub:step(S, [{0, {decode, A}}]),
+    {ok, [{0, {token, Last, 1}}, {1, {token, First, 0}}]} =
+        erllama_model_stub:step(S, [{0, {decode, A}}, {1, {decode, B}}]),
+    {ok, [{1, {token, Last, 1}}]} = erllama_model_stub:step(S, [{1, {decode, B}}]),
+    ok = erllama_model_stub:sampler_free(A),
+    ok = erllama_model_stub:sampler_free(B).
+
 stub_step_decode_differs_across_seqs_test() ->
     {ok, S} = erllama_model_stub:init(#{}),
     {ok, Sampler} = erllama_model_stub:sampler_new(S, #{}),
