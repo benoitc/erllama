@@ -6,7 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-26
+
 ### Added
+
+- Local llama.cpp text streams can deliver the first sampled token immediately
+  after prefill. Set `early_stream_token => true` when loading the model.
+  The next decode step commits the token to KV. On an M4 Pro with
+  Qwen2.5-1.5B, median time to first visible text fell from 44.8 to 42.9 ms
+  for one stream. The option defaults to `false`.
 
 - Automatic cache fingerprints for numbered GGUF models now cover every
   shard. Existing checkpoints for these models will warm up again.
@@ -441,21 +449,21 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
-- `erllama_chat:set_observer/1' / `clear_observer/0' hook.
+- `erllama_chat:set_observer/1` / `clear_observer/0` hook.
   Lets a separate module (typically the server's metrics module)
   observe wall-time of every chat-NIF call (apply / parse) without the runtime taking a compile-time
   dependency on the metrics module. Registered via persistent_term;
   unset = no-op. Drives the new
-  `erllama_chat_*_duration_seconds' Prometheus histograms
+  `erllama_chat_*_duration_seconds` Prometheus histograms
   on the server side.
-- `erllama_app:start/2' enables
-  `erlang:system_flag(scheduler_wall_time, true)' at boot so callers
+- `erllama_app:start/2` enables
+  `erlang:system_flag(scheduler_wall_time, true)` at boot so callers
   (the server's metrics module among them) can read per-scheduler
   busy ratios for the autoparser dirty-pool monitoring.
 
 ### Changed
 
-- `chat_apply/2' runs upstream's `common_chat_templates_apply' once per
+- `chat_apply/2` runs upstream's `common_chat_templates_apply` once per
   request (prompt + parser). The per-tools params cache and the
   render-only NIF are gone; only the per-model templates ref is
   cached.
@@ -472,21 +480,21 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Removed (BREAKING)
 
-- Streaming API: `{erllama_token, _, {tool_call_delta, _}}'
-  and `erllama_tool_call_end' messages, plus the matching
+- Streaming API: `{erllama_token, _, {tool_call_delta, _}}`
+  and `erllama_tool_call_end` messages, plus the matching
   step result variants. The engine no longer classifies tool-call
-  bytes mid-stream. Callers using `erllama:infer/4'
-  directly buffer tokens and call `erllama:chat_parse/3'
+  bytes mid-stream. Callers using `erllama:infer/4`
+  directly buffer tokens and call `erllama:chat_parse/3`
   at done for structured extraction. HTTP wire format on the
   server is unchanged.
-- Backend `tool_call_end_is_eos/1' callback.
+- Backend `tool_call_end_is_eos/1` callback.
 
 ### Changed
 
-- `erllama:chat_apply/3' becomes `chat_apply/2' (drops the
+- `erllama:chat_apply/3' becomes `chat_apply/2` (drops the
   `ToolsHash' parameter). `erllama_chat_cache' shrinks to
   caching only the heavy `common_chat_templates_init' ref per model;
-  each request invokes `common_chat_templates_apply' fresh because
+  each request invokes `common_chat_templates_apply` fresh because
   the synthesized parser is sensitive to `tool_choice' and
   `parallel_tool_calls' (now folded into the NIF Inputs map).
 
@@ -558,7 +566,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
   byte-string-end families (Mistral `</s>`, Qwen `</tool_call>`,
   DeepSeek `<｜tool▁call▁end｜>`, Llama 3.1 `<|eom_id|>`) are
   byte-exact unchanged; the new path is opt-in via the sentinel
-  binary `<<"$eos">>` on the `end' key. Backend behaviour gains
+  binary `<<"$eos">>` on the `end` key. Backend behaviour gains
   one optional `tool_call_end_is_eos/1` callback (the scheduler
   defaults to `false` for backends that have not been updated).
   Targets the IBM Granite-3.x and Microsoft Phi-4-mini families
@@ -1497,7 +1505,10 @@ Initial public release.
 
 Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
-[Unreleased]: https://github.com/benoitc/erllama/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/benoitc/erllama/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/benoitc/erllama/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/benoitc/erllama/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/benoitc/erllama/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/benoitc/erllama/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/benoitc/erllama/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/benoitc/erllama/compare/v0.8.0...v0.9.0
