@@ -444,6 +444,9 @@ Config map for `load_model/1,2`.
 - `mmproj_path`, `mmproj_opts`: multimodal projector GGUF for
   vision / audio input (see the multimodal guide).
 - `policy`: cache policy overrides (`min_tokens`, `cold_min_tokens`, ...).
+- `early_stream_token`: opt in to sampling the first token at the end of
+  text prefill on the local llama.cpp backend. Applies to ordinary streams.
+  The next tick commits the token to KV before any checkpoint includes it.
 - `thinking_markers`: `#{start := binary(), 'end' := binary()}`.
 - `chat_template`: Jinja source that replaces the template stored in
   the GGUF for `chat/3` and `chat_apply/3` (for files that ship a broken
@@ -464,6 +467,7 @@ Config map for `load_model/1,2`.
     tier => ram | ram_file | disk,
     tier_srv => atom(),
     policy => map(),
+    early_stream_token => boolean(),
     thinking_markers => #{start := binary(), 'end' := binary()},
     chat_template => binary(),
     %% erllama_model_stub only

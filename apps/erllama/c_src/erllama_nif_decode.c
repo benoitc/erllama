@@ -15,7 +15,7 @@
 /* =========================================================================
  * nif_step: multi-sequence batched decode
  *
- *   nif_step(CtxRef, [{SeqId, {prefill, [Token]} | {decode, SamplerRef}}])
+ *   nif_step(CtxRef, [{SeqId, {prefill, Tokens} | {prefill, Tokens, SamplerRef} | {decode, SamplerRef}}])
  *     -> {ok, [{SeqId, prefilled | {token, Token, Eog :: 0 | 1}}]}
  *      | {error, atom()}
  *
@@ -27,11 +27,9 @@
  * token that lands in KV by the time the call returns. That
  * preserves the cache invariant (every committed token is in KV).
  *
- * Prefill rows do not sample: their last token gets logits=true in
- * the batch so the NEXT tick can sample for that seq. The first
- * output token for a freshly admitted seq is produced one tick
- * after its prefill — hidden in production by co-batching with
- * in-flight decoders.
+ * A final prefill carrying a sampler also samples its new logits row.
+ * Only the prompt is in KV. The scheduler later ingests the sampled
+ * token as a one-token prefill without advancing the sampler again.
  * ========================================================================= */
 
 typedef struct {
@@ -39,9 +37,9 @@ typedef struct {
     int is_prefill;                /* 1 prefill, 0 decode */
     llama_token *prefill_tokens;   /* prefill only; enif_alloc'd */
     int32_t prefill_n;             /* prefill only */
-    erllama_sampler_t *sampler;    /* decode only */
-    llama_token sampled;           /* decode only, set during pre-sample */
-    int eog;                       /* decode only */
+    erllama_sampler_t *sampler;    /* decode or final prefill */
+    llama_token sampled;
+    int eog;
     /* Optional per-token logprobs (sampler->n_probs > 0): the
      * sampled token's logprob plus the top-lp_count ids/logprobs,
      * both enif_alloc'd during pre-sample. lp_count 0 = none. */
@@ -158,6 +156,50 @@ int erllama_ctx_decode(ErlNifEnv *env, erllama_context_t *c, struct llama_batch 
     return 0;
 }
 
+static ERL_NIF_TERM sample_step_row(erllama_context_t *c, erllama_step_op_t *op,
+                                    int32_t li, const struct llama_vocab *vocab) {
+    pthread_mutex_lock(&op->sampler->mu);
+    if (!op->sampler->chain) {
+        pthread_mutex_unlock(&op->sampler->mu);
+        return atom_released;
+    }
+    int n_probs = op->sampler->n_probs;
+    llama_token tok = erllama_safe_sampler_sample(
+        op->sampler->chain, c->ctx, li
+    );
+    pthread_mutex_unlock(&op->sampler->mu);
+    if (tok < 0) {
+        return atom_exception;
+    }
+    op->sampled = tok;
+    op->eog = vocab ? erllama_safe_vocab_is_eog(vocab, tok) : 0;
+    /* Optional logprobs: the raw logits row `li` is untouched by
+     * sampling (the chain works on a candidates copy), so the
+     * full-vocab log-softmax here reports the model's own
+     * distribution, OpenAI-style. Failure downgrades to "no
+     * logprobs for this token" rather than failing the tick. */
+    if (n_probs > 0 && vocab) {
+        int32_t nv = erllama_safe_vocab_n_tokens(vocab);
+        llama_token *ids = enif_alloc(sizeof(llama_token) * (size_t) n_probs);
+        float *vals = enif_alloc(sizeof(float) * (size_t) n_probs);
+        if (ids && vals) {
+            int32_t got = erllama_safe_top_logprobs(
+                c->ctx, li, nv, n_probs, tok,
+                ids, vals, &op->sampled_lp);
+            if (got > 0) {
+                op->lp_count = got;
+                op->lp_ids = ids;
+                op->lp_vals = vals;
+                ids = NULL;
+                vals = NULL;
+            }
+        }
+        if (ids) enif_free(ids);
+        if (vals) enif_free(vals);
+    }
+    return 0;
+}
+
 ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
     erllama_context_t *c;
@@ -178,7 +220,7 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     }
     memset(ops, 0, sizeof(erllama_step_op_t) * n_ops);
 
-    /* Parse `[{SeqId, {Tag, Arg}}, ...]` into the working array. Any
+    /* Parse the sequence operations into the working array. Any
      * malformed entry rejects the whole call with badarg. */
     ERL_NIF_TERM head;
     ERL_NIF_TERM tail = argv[1];
@@ -200,7 +242,7 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
 
         const ERL_NIF_TERM *inner;
         int inner_arity;
-        if (!enif_get_tuple(env, outer[1], &inner_arity, &inner) || inner_arity != 2) {
+        if (!enif_get_tuple(env, outer[1], &inner_arity, &inner) || (inner_arity != 2 && inner_arity != 3)) {
             free_step_ops(ops, parsed);
             return enif_make_badarg(env);
         }
@@ -218,23 +260,18 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
                 free_step_ops(ops, parsed + 1);
                 return enif_make_badarg(env);
             }
-        } else if (strcmp(tag, "decode") == 0) {
-            ops[parsed].is_prefill = 0;
+        } else if (strcmp(tag, "decode") != 0 || inner_arity != 2) {
+            free_step_ops(ops, parsed);
+            return enif_make_badarg(env);
+        }
+        if (!ops[parsed].is_prefill || inner_arity == 3) {
             erllama_sampler_t *samp;
-            if (!enif_get_resource(env, inner[1], SAMPLER_RT, (void **) &samp)) {
-                free_step_ops(ops, parsed);
-                return enif_make_badarg(env);
-            }
-            /* Sampler must be bound to this context — its internal
-             * chain was built against `c->ctx` at sampler_new time. */
-            if (samp->ctx_res != c) {
-                free_step_ops(ops, parsed);
+            if (!enif_get_resource(env, inner[inner_arity - 1], SAMPLER_RT, (void **) &samp) ||
+                samp->ctx_res != c) {
+                free_step_ops(ops, parsed + 1);
                 return enif_make_badarg(env);
             }
             ops[parsed].sampler = samp;
-        } else {
-            free_step_ops(ops, parsed);
-            return enif_make_badarg(env);
         }
         parsed++;
     }
@@ -263,48 +300,11 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
             free_step_ops(ops, n_ops);
             return erllama_error(env, li == ERLLAMA_LOGITS_STALE ? atom_stale_logits : atom_no_logits);
         }
-        pthread_mutex_lock(&ops[i].sampler->mu);
-        if (!ops[i].sampler->chain) {
-            pthread_mutex_unlock(&ops[i].sampler->mu);
+        ERL_NIF_TERM err = sample_step_row(c, &ops[i], li, vocab);
+        if (err) {
             pthread_mutex_unlock(&c->mu);
             free_step_ops(ops, n_ops);
-            return erllama_error(env, atom_released);
-        }
-        int n_probs = ops[i].sampler->n_probs;
-        llama_token tok = erllama_safe_sampler_sample(
-            ops[i].sampler->chain, c->ctx, li
-        );
-        pthread_mutex_unlock(&ops[i].sampler->mu);
-        if (tok < 0) {
-            pthread_mutex_unlock(&c->mu);
-            free_step_ops(ops, n_ops);
-            return erllama_error(env, atom_exception);
-        }
-        ops[i].sampled = tok;
-        ops[i].eog = vocab ? erllama_safe_vocab_is_eog(vocab, tok) : 0;
-        /* Optional logprobs: the raw logits row `li` is untouched by
-         * sampling (the chain works on a candidates copy), so the
-         * full-vocab log-softmax here reports the model's own
-         * distribution, OpenAI-style. Failure downgrades to "no
-         * logprobs for this token" rather than failing the tick. */
-        if (n_probs > 0 && vocab) {
-            int32_t nv = erllama_safe_vocab_n_tokens(vocab);
-            llama_token *ids = enif_alloc(sizeof(llama_token) * (size_t) n_probs);
-            float *vals = enif_alloc(sizeof(float) * (size_t) n_probs);
-            if (ids && vals) {
-                int32_t got = erllama_safe_top_logprobs(
-                    c->ctx, li, nv, n_probs, tok,
-                    ids, vals, &ops[i].sampled_lp);
-                if (got > 0) {
-                    ops[i].lp_count = got;
-                    ops[i].lp_ids = ids;
-                    ops[i].lp_vals = vals;
-                    ids = NULL;
-                    vals = NULL;
-                }
-            }
-            if (ids) enif_free(ids);
-            if (vals) enif_free(vals);
+            return erllama_error(env, err);
         }
     }
 
@@ -390,12 +390,16 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
         return erllama_error(env, why);
     }
 
-    /* Update per-seq state from the just-decoded batch. */
+    /* All rows are in KV even if sampling one of the new rows fails. */
+    ERL_NIF_TERM sample_error = 0;
     for (unsigned int i = 0; i < n_ops; i++) {
         int seq_id = ops[i].seq_id;
         int slice_n = ops[i].is_prefill ? ops[i].prefill_n : 1;
         c->per_seq[seq_id].next_pos += slice_n;
         c->per_seq[seq_id].last_logits_idx = last_logits_idx_new[i];
+        if (!sample_error && ops[i].is_prefill && ops[i].sampler) {
+            sample_error = sample_step_row(c, &ops[i], last_logits_idx_new[i], vocab);
+        }
     }
     c->decode_ready = 1;
 
@@ -403,8 +407,13 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     enif_free(last_logits_idx_new);
     pthread_mutex_unlock(&c->mu);
 
-    /* Build result list. Prefill rows -> `{seq_id, prefilled}`;
-     * decode rows -> `{seq_id, {token, Token, EogFlag}}`, or with
+    if (sample_error) {
+        free_step_ops(ops, n_ops);
+        return erllama_error(env, sample_error);
+    }
+
+    /* Build result list. Plain prefill rows -> `{seq_id, prefilled}`;
+     * sampled rows -> `{seq_id, {token, Token, EogFlag}}`, or with
      * logprobs requested `{seq_id, {token, Token, EogFlag,
      * {SampledLp, [{Id, Lp}, ...]}}}`. */
     ERL_NIF_TERM atom_prefilled = enif_make_atom(env, "prefilled");
@@ -416,7 +425,7 @@ ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     }
     for (unsigned int i = 0; i < n_ops; i++) {
         ERL_NIF_TERM payload;
-        if (ops[i].is_prefill) {
+        if (!ops[i].sampler) {
             payload = atom_prefilled;
         } else if (ops[i].lp_count > 0) {
             ERL_NIF_TERM top = enif_make_list(env, 0);

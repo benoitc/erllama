@@ -37,7 +37,14 @@
 %% How to load the model. `backend' and `step_delay_ms' exist for tests:
 %% they load the model on erllama's stub backend instead of llama.cpp.
 -define(LOAD_KEYS, [
-    n_ctx, n_gpu_layers, parallel, kv_unified, chat_template, backend, step_delay_ms
+    n_ctx,
+    n_gpu_layers,
+    parallel,
+    kv_unified,
+    early_stream_token,
+    chat_template,
+    backend,
+    step_delay_ms
 ]).
 
 -record(state, {
@@ -374,7 +381,7 @@ load_opts(Opts) ->
                 false;
             (parallel, P) ->
                 is_integer(P) andalso P >= 1 andalso P =< 64;
-            (kv_unified, U) ->
+            (K, U) when K =:= kv_unified; K =:= early_stream_token ->
                 is_boolean(U);
             (_, _) ->
                 true

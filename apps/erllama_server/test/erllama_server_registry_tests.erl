@@ -119,7 +119,9 @@ restart() ->
 register_resolve_and_persist_test() ->
     with_registry(fun(Dir) ->
         Path = gguf_file(Dir, "Tiny.gguf"),
-        {ok, #{name := <<"tiny:latest">>, status := ok}} = ?R:register_local(Path, #{n_ctx => 1024}),
+        {ok, #{name := <<"tiny:latest">>, status := ok}} = ?R:register_local(Path, #{
+            n_ctx => 1024, early_stream_token => true
+        }),
         ?assertMatch({ok, #{name := <<"tiny:latest">>}}, ?R:resolve(<<"tiny">>)),
         ?assertMatch({ok, #{name := <<"tiny:latest">>}}, ?R:resolve(<<"TINY:latest">>)),
         ok = ?R:alias(<<"t">>, <<"tiny">>),
@@ -127,7 +129,8 @@ register_resolve_and_persist_test() ->
         ok = ?R:set_default(<<"tiny:two">>),
         restart(),
         ?assertMatch(
-            {ok, #{name := <<"tiny:latest">>, load := #{n_ctx := 1024}}}, ?R:resolve(<<"t">>)
+            {ok, #{name := <<"tiny:latest">>, load := #{n_ctx := 1024, early_stream_token := true}}},
+            ?R:resolve(<<"t">>)
         ),
         ?assertMatch({ok, #{name := <<"tiny:two">>, default := true}}, ?R:resolve(undefined)),
         ?assertEqual([<<"tiny:latest">>, <<"tiny:two">>], [N || #{name := N} <- ?R:list()])

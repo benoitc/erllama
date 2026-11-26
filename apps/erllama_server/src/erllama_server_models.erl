@@ -333,10 +333,7 @@ with_extras(Base, Entry, Load) ->
             #{mmproj := MM} when is_binary(MM) -> Base#{mmproj_path => MM};
             _ -> Base
         end,
-    case Load of
-        #{chat_template := T} -> WithProj#{chat_template => T};
-        _ -> WithProj
-    end.
+    maps:merge(WithProj, maps:with([chat_template, early_stream_token], Load)).
 
 %% The entry's `n_ctx', else `default_n_ctx' capped at what the model
 %% was trained for.

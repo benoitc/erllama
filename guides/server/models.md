@@ -139,6 +139,11 @@ qwen:latest  generating  ctx 8192  q4_k_m  2 of 4 sequences busy  in use by 2
   rows saved under the old layout are no longer used: the first turns
   after the change start cold.
 
+To try early first-token sampling for a local GGUF, register the path with
+`erllama load /path/to/model.gguf --early-stream-token`, or set
+`early_stream_token => true` in its registry options. This applies to
+ordinary text streams. [Behaviour and cache semantics](../generation.md#streaming)
+
 ## Memory pressure
 
 The release turns on erllama's scheduler: when memory runs short it

@@ -268,7 +268,10 @@ prefill rows decode their slice without sampling and leave logits
 on the last slice token for the NEXT tick to sample from. Decode
 rows sample from the previous tick's logits BEFORE the new batch
 is built, so the token returned to the caller is the same token
-that lands in KV by the time the call returns.
+that lands in KV by the time the call returns. A final
+`{prefill, Tokens, SamplerRef}` samples the new logits and returns
+the token without ingesting it. Ingest it once on the next tick using
+`{prefill, [Token]}` before saving any checkpoint that includes it.
 
 Each `SeqId` must be `0 <= SeqId < 256` (compile-time cap on the
 context's `per_seq[]` array; lift in the NIF if it becomes binding).
@@ -304,7 +307,14 @@ log-softmax logprob plus the top-N ids/logprobs, descending.
 """.
 -spec step(
     context_ref(),
-    [{non_neg_integer(), {prefill, [token_id()]} | {decode, sampler_ref()}}]
+    [
+        {
+            non_neg_integer(),
+            {prefill, [token_id()]}
+            | {prefill, [token_id()], sampler_ref()}
+            | {decode, sampler_ref()}
+        }
+    ]
 ) ->
     {ok, [
         {

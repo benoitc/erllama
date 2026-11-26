@@ -16,6 +16,7 @@ Two harnesses live here:
 | --- | --- |
 | Qwen2.5-1.5B on M4 Pro, GLM-5.3-Flash and DeepSeek V4 Flash on two GB10s | [Prompt processing and generation at four context lengths](reports/2026-11-25-context-speed/README.md) |
 | Qwen3.8-27B on M4 Pro | [TensorFold and erllama on new prompts and immediate retries](reports/2026-11-26-mac-qwen-27b/README.md) |
+| Qwen2.5-1.5B on M4 Pro | [Time to first visible text with early sampling](reports/2026-11-26-first-token/README.md) |
 | TinyLlama on M4 Pro | [Time to pack a checkpoint and token delay on a second stream](reports/2026-11-26-checkpoint-pause/README.md) |
 | TinyLlama on M4 Pro and GB10 | [erllama and Ollama serving the same prompt, including time to first text and cache retries](reports/2026-11-25-tinyllama-ollama/README.md) |
 | DeepSeek V4 Flash on one and two GB10s | [Scaling with the original weights and the custom Q5_K GGUF trial](reports/2026-11-25-context-speed/shared-expert/q5/README.md) |
