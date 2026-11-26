@@ -15,13 +15,17 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$ROOT"
 
-rebar3 hex build --app erllama --unpack >/dev/null
-PKG=$(ls -d "$ROOT"/_build/default/lib/erllama/hex/erllama-* | head -n 1)
-VSN=${PKG##*/erllama-}
-echo "package: $PKG"
-
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/erllama-consumer.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
+rebar3 hex build --app erllama --unpack --output "$WORK/packages"
+APP_SRC=$(find "$WORK/packages" -path '*/src/erllama.app.src' -type f)
+test -f "$APP_SRC"
+PKG=${APP_SRC%/src/erllama.app.src}
+VSN=${PKG##*/erllama-}
+test -s "$PKG-docs/index.html"
+test -s "$PKG-docs/erllama.html"
+echo "package and HexDocs: erllama $VSN"
+
 mkdir -p "$WORK/_checkouts" "$WORK/src" "$WORK/test"
 cp -R "$PKG" "$WORK/_checkouts/erllama"
 
