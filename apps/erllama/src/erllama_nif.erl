@@ -719,7 +719,7 @@ media_prefill(Ctx, Mtmd, Prompt, Media, SeqId, Opts) when
 %% use (overriding the GGUF's default) or the atom `undefined' to use
 %% the model's own template. Returned ref is the input to
 %% `chat_templates_apply/2'.
--spec chat_templates_init(model_ref(), binary() | undefined) ->
+-spec chat_templates_init(model_ref() | {binary(), binary()}, binary() | undefined) ->
     {ok, chat_templates_ref()} | {error, term()}.
 chat_templates_init(Model, TemplateOverride) ->
     nif_chat_templates_init(Model, TemplateOverride).

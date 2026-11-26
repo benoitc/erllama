@@ -133,6 +133,23 @@ register_resolve_and_persist_test() ->
         ?assertEqual([<<"tiny:latest">>, <<"tiny:two">>], [N || #{name := N} <- ?R:list()])
     end).
 
+mlx_directory_persists_test() ->
+    with_registry(fun(Dir) ->
+        Path = filename:join(Dir, "qwen"),
+        ok = file:make_dir(Path),
+        ?assertMatch({error, {invalid_mlx_checkpoint, _}}, ?R:register_local(Path, #{})),
+        [
+            ok = file:write_file(filename:join(Path, F), <<"{}">>)
+         || F <- ["tokenizer_config.json", "config.json", "tokenizer.json", "model.safetensors"]
+        ],
+        {ok, _} = ?R:register_local(Path, #{parallel => 4}),
+        restart(),
+        ?assertMatch(
+            {ok, #{status := ok, size := 2, load := #{backend := erllama_model_mlx, parallel := 4}}},
+            ?R:resolve(<<"qwen">>)
+        )
+    end).
+
 unknown_and_default_test() ->
     with_registry(fun(_Dir) ->
         ?assertEqual({error, {unknown_model, <<"nope">>}}, ?R:resolve(<<"nope">>)),

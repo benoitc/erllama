@@ -294,6 +294,9 @@ the model any more.
 %% `{error, chat_not_supported}`.
 -callback get_model_ref(state()) -> term().
 
+%% A backend that loads a standalone Jinja template can use the common chat parser.
+-callback chat_templates(state()) -> {ok, erllama_chat:templates_ref()} | {error, term()}.
+
 %% Multimodal (libmtmd) support. media_caps/1 reports the loaded
 %% projector's modalities (`undefined` when the model has none);
 %% media_prefill/4 evaluates a whole rendered prompt (text plus one
@@ -359,6 +362,7 @@ the model any more.
     spec_step/4,
     spec_rollback/1,
     mtp_step_batch/4,
+    chat_templates/1,
     get_model_ref/1,
     media_caps/1,
     media_prefill/4,

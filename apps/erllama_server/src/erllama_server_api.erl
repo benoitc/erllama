@@ -189,10 +189,14 @@ model(Id) when is_binary(Id) ->
 model_entries() ->
     {ok, erllama_server_registry:list()}.
 
--doc "One model: its registry entry, the GGUF metadata and its load state.".
+-doc "One model: its registry entry, format metadata and load state.".
 -spec show(binary()) -> {ok, map()} | {error, term()}.
 show(Name) ->
     case erllama_server_registry:resolve(Name) of
+        {ok, #{name := Id, load := #{backend := erllama_model_mlx}} = Entry} ->
+            {ok, Entry#{
+                metadata => #{format => mlx}, loaded => erllama:whereis(Id) =/= {error, not_loaded}
+            }};
         {ok, #{name := Id, path := Path} = Entry} ->
             Meta =
                 case erllama_server_gguf:read(Path) of
@@ -259,7 +263,7 @@ load(Name, Opts) when is_map(Opts) ->
     erllama_server_models:load(Name, maps:get(keep_alive, Opts, undefined)).
 
 -doc """
-Register a local GGUF file (when `Path` is one and not yet registered)
+Register a local GGUF file or MLX checkpoint directory
 and load it. `Opts` as for `register_model/2`.
 """.
 -spec load_model(binary() | string(), map()) -> {ok, binary()} | {error, term()}.

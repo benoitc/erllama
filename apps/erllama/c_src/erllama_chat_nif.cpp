@@ -144,11 +144,20 @@ extern "C" ERL_NIF_TERM nif_chat_templates_init(
     }
 
     erllama_model_t *m = nullptr;
-    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
-        return mk_error(env, "invalid_model");
-    }
-    if (m->model == nullptr) {
-        return mk_error(env, "model_released");
+    int arity = 0;
+    const ERL_NIF_TERM *tokens = nullptr;
+    std::string bos, eos;
+    if (enif_get_tuple(env, argv[0], &arity, &tokens) && arity == 2) {
+        if (!term_to_string(env, tokens[0], bos) || !term_to_string(env, tokens[1], eos)) {
+            return enif_make_badarg(env);
+        }
+    } else {
+        if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+            return mk_error(env, "invalid_model");
+        }
+        if (m->model == nullptr) {
+            return mk_error(env, "model_released");
+        }
     }
 
     std::string override_template;
@@ -159,12 +168,14 @@ extern "C" ERL_NIF_TERM nif_chat_templates_init(
         }
     }
 
+    if (!m && override_template.empty()) {
+        return mk_error(env, "missing_template");
+    }
     try {
         common_chat_templates_ptr ptr = common_chat_templates_init(
-            m->model,
+            m ? m->model : nullptr,
             have_override ? override_template : std::string(),
-            /* bos_token_override = */ std::string(),
-            /* eos_token_override = */ std::string());
+            bos, eos);
         if (!ptr) {
             return mk_error(env, "templates_init_failed");
         }

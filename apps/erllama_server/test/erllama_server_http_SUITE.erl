@@ -15,6 +15,7 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2, end_per_testcase/2]).
 -export([
+    mlx_chat_stream/1,
     lists_models/1,
     chat_completion/1,
     chat_completion_stream/1,
@@ -61,6 +62,7 @@
 
 all() ->
     [
+        mlx_chat_stream,
         lists_models,
         chat_completion,
         chat_completion_stream,
@@ -808,6 +810,77 @@ image_needs_a_projector(Config) ->
     {400, Body} = post(Config, <<"/v1/chat/completions">>, image_chat(<<"blind">>)),
     #{<<"error">> := #{<<"message">> := Msg}} = decode(Body),
     ?assertNotEqual(nomatch, binary:match(Msg, <<"no multimodal projector">>)).
+
+mlx_chat_stream(Config) ->
+    case os:getenv("ERLLAMA_MLX_TEST_MODEL") of
+        false ->
+            {skip, "set ERLLAMA_MLX_TEST_MODEL on Apple Silicon"};
+        Path ->
+            {ok, Id} = erllama_server_api:load_model(Path, #{
+                name => <<"mlx_qwen">>, n_ctx => 2048, parallel => 4
+            }),
+            try
+                {200, Models} = get(Config, <<"/v1/models">>),
+                ?assertNotEqual(nomatch, binary:match(Models, Id)),
+                Opts = #{
+                    <<"model">> => Id,
+                    <<"temperature">> => 0,
+                    <<"max_tokens">> => 16,
+                    <<"reasoning_effort">> => <<"none">>
+                },
+                Prompt = <<"Name the capital of France in a sentence.">>,
+                Endpoint = <<"/v1/chat/completions">>,
+                {200, Whole} = post(Config, Endpoint, chat(Prompt, Opts)),
+                #{<<"choices">> := [#{<<"message">> := #{<<"content">> := Text}}]} = decode(Whole),
+                ?assert(byte_size(Text) > 0),
+                {200, Stream} = post(Config, Endpoint, chat(Prompt, Opts#{<<"stream">> => true})),
+                ?assertEqual(<<"[DONE]">>, lists:last(sse(Stream))),
+                Deltas = [D || #{<<"choices">> := [#{<<"delta">> := D}]} <- chunks(Stream)],
+                ?assertEqual(
+                    Text, iolist_to_binary([maps:get(<<"content">>, D, <<>>) || D <- Deltas])
+                ),
+                ?assertEqual(
+                    <<>>,
+                    iolist_to_binary([maps:get(<<"reasoning_content">>, D, <<>>) || D <- Deltas])
+                ),
+                mlx_concurrent(Config, Endpoint, Opts, Id)
+            after
+                erllama_server_api:unload(Id)
+            end
+    end.
+
+mlx_concurrent(Config, Endpoint, Opts, Id) ->
+    Parent = self(),
+    Refs = [
+        begin
+            Ref = make_ref(),
+            spawn_link(fun() ->
+                Request = chat(
+                    <<"Count in full sentences from ", (integer_to_binary(N))/binary, " to 500.">>,
+                    Opts#{<<"max_tokens">> => 48}
+                ),
+                Parent ! {Ref, post(Config, Endpoint, Request)}
+            end),
+            Ref
+        end
+     || N <- lists:seq(1, 4)
+    ],
+    ok = wait(fun() ->
+        {ok, Info} = erllama:model_info(Id),
+        maps:get(available_seqs, Info) =:= 0
+    end),
+    [
+        begin
+            receive
+                {Ref, {200, Body}} ->
+                    #{<<"choices">> := [#{<<"message">> := #{<<"content">> := C}}]} = decode(Body),
+                    ?assert(byte_size(C) > 0)
+            after 30000 -> ct:fail(mlx_request_timeout)
+            end
+        end
+     || Ref <- Refs
+    ],
+    {ok, #{available_seqs := 4}} = erllama:model_info(Id).
 
 real_model_image_chat(Config) ->
     case {os:getenv("LLAMA_TEST_VISION_MODEL"), os:getenv("LLAMA_TEST_MMPROJ")} of

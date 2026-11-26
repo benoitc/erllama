@@ -313,6 +313,12 @@ load_config(#{path := Path} = Entry) ->
     },
     with_extras(Base, Entry, Load).
 
+with_extras(Base, _Entry, #{backend := erllama_model_mlx} = Load) ->
+    Context = maps:remove(kv_unified, maps:get(context_opts, Base)),
+    maps:merge(
+        Base#{backend => erllama_model_mlx, context_opts => Context},
+        maps:with([chat_template], Load)
+    );
 with_extras(Base, _Entry, #{backend := erllama_model_stub} = Load) ->
     %% Tests: the same entry on erllama's stub backend, with the same
     %% sequences.
@@ -336,6 +342,8 @@ with_extras(Base, Entry, Load) ->
 %% was trained for.
 n_ctx(_Entry, #{n_ctx := N}) ->
     N;
+n_ctx(_, #{backend := erllama_model_mlx}) ->
+    erllama_server_config:get(default_n_ctx);
 n_ctx(#{path := Path}, _) ->
     Default = erllama_server_config:get(default_n_ctx),
     case erllama_server_gguf:read(Path) of

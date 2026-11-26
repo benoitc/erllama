@@ -192,8 +192,29 @@ export ERLLAMA_MLX_PYTHON="$HOME/.venvs/erllama-mlx/bin/python"
 ok = erllama:unload(M).
 ```
 
-This milestone supports one live sequence, greedy text decoding and the model's
-EOS IDs. Live attention and recurrent state are kept for the request. Persistent
-checkpoints, the chat/server interface and batched sequences are later milestones.
-To run the optional reference test, set `ERLLAMA_MLX_TEST_MODEL` to the pinned
-checkpoint directory and run `rebar3 ct --dir apps/erllama/test --suite erllama_mlx_SUITE`.
+Set `context_opts => #{n_seq_max => 4}` for four active sequences. Prefill runs
+per sequence. Ready decode rows share one MLX forward pass per scheduler tick.
+The checkpoint holds each layer's attention or recurrent state and the last
+token needed to resume. The normal erllama cache policy selects which prefixes
+to save. Model files are hashed at load so a changed checkpoint gets a fresh
+cache namespace. Packing and restoring use a temporary safetensors file in a
+private directory on the Mac and the configured erllama RAM or disk tier.
+
+See [Serving MLX over HTTP](server/http.md#serving-mlx-on-a-mac) for a streaming example.
+The current backend supports greedy text generation. The following checks define the next milestones.
+
+| Feature | Acceptance check |
+| --- | --- |
+| Concurrent prefill | Use the four-client HTTP workload to compare grouped or interleaved prefill with the current per-sequence prefill. Measure time to first visible text and verify cache resume after cancellation. |
+| Temperature, top-p and seed | Match direct MLX-LM with a fixed seed. Cancelling another stream must preserve the surviving request's sampler state. |
+| Long-context serving | Measure first visible text, throughput and peak memory at one and four clients as prefix length grows. Measure the cost of changing batch membership. |
+| Additional model families and embeddings | Check each family's tokenizer, cache layout and output against its MLX reference before enabling it through HTTP. |
+| Vision and speculative decoding | Add a model-specific reference for image inputs or a drafter, then exercise cancellation and warm resume through the server. |
+
+Set `ERLLAMA_MLX_TEST_MODEL` to the pinned checkpoint directory to run the
+hardware cases from the repository root.
+
+```sh
+rebar3 ct --dir apps/erllama/test --suite erllama_mlx_SUITE
+rebar3 ct --dir apps/erllama_server/test --suite erllama_server_http_SUITE --case mlx_chat_stream
+```

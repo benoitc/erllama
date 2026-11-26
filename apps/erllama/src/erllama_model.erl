@@ -2379,8 +2379,10 @@ handle_common(
     _State,
     info,
     {'DOWN', _, port, Port, Reason},
-    #data{backend = erllama_model_mlx, backend_state = Port} = Data
+    #data{backend = erllama_model_mlx, backend_state = #{port := Port}} = Data
 ) ->
+    ok = fail_all_requests(Data, mlx_runner_down),
+    ok = fail_pending_admits(Data, mlx_runner_down),
     {stop, {mlx_runner_down, Reason}, Data};
 handle_common(_State, _EventType, _EventContent, Data) ->
     {keep_state, Data}.
@@ -2569,26 +2571,23 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
 %% `parallel_tool_calls' and message content into the synthesised
 %% `common_chat_params', so the returned params_ref is valid for this
 %% request's `chat_parse/3' only. The model resource is reached via
-%% the backend module's `get_model_ref/1' getter; backends without
-%% that callback (the stub) return `{error, chat_not_supported}'.
-do_chat_apply(
-    #data{backend = Mod, backend_state = S, model_id = ModelId, chat_template = Tmpl},
-    Inputs
-) ->
+%% the backend's model reference or its standalone chat template.
+do_chat_apply(Data, Inputs) ->
+    case backend_chat_templates(Data) of
+        {ok, Templates} -> erllama_chat:apply(Templates, Inputs);
+        Error -> Error
+    end.
+
+backend_chat_templates(#data{
+    backend = Mod, backend_state = S, model_id = ModelId, chat_template = Tmpl
+}) ->
     case erlang:function_exported(Mod, get_model_ref, 1) of
-        false ->
-            {error, chat_not_supported};
         true ->
-            ModelRef = Mod:get_model_ref(S),
-            case
-                erllama_chat_cache:get_or_init(
-                    ModelId, self(), ModelRef, Tmpl
-                )
-            of
-                {ok, Templates} ->
-                    erllama_chat:apply(Templates, Inputs);
-                Err ->
-                    Err
+            erllama_chat_cache:get_or_init(ModelId, self(), Mod:get_model_ref(S), Tmpl);
+        false ->
+            case erlang:function_exported(Mod, chat_templates, 1) of
+                true -> Mod:chat_templates(S);
+                false -> {error, chat_not_supported}
             end
     end.
 
@@ -2734,6 +2733,7 @@ step_tick_ops(Data1) ->
                             %% to a single row. Stop: the model is a
                             %% temporary child, so it needs a fresh load.
                             fail_all_requests(Data1, Reason),
+                            fail_pending_admits(Data1, Reason),
                             {stop, {step_failed, Reason}, Data1}
                     end
             end
@@ -4340,7 +4340,7 @@ flush_pending_text(_Req) ->
 %% failures falls through to the byte-prefix scan, and only a
 %% byte-prefix miss returns cold.
 lookup_or_resume(PromptTokens, ParentKey, Req, Data) ->
-    PromptBytes = backend_call(Data, detokenize, [PromptTokens]),
+    PromptBytes = cache_text(Data, PromptTokens),
     Key = make_key_bytes(PromptBytes, Req, Data),
     case pin_and_load(Key, Req#req.seq_id, Data) of
         {ok, ContextTokens} ->
@@ -4398,7 +4398,7 @@ resume_at_prefix(Key, MatchBytes, PromptTokens, PromptBytes, Req, Data) ->
 maybe_repin_prefix(Key, MatchBytes, Req, Data) ->
     case Req#req.prefix_checkpoint_len of
         N when is_integer(N), N > 0 ->
-            HeadBytes = backend_call(Data, detokenize, [lists:sublist(Req#req.prompt_tokens, N)]),
+            HeadBytes = cache_text(Data, lists:sublist(Req#req.prompt_tokens, N)),
             case byte_size(HeadBytes) =:= MatchBytes of
                 true ->
                     Ns = erllama_cache_key:namespace(
@@ -4460,7 +4460,7 @@ split_tokens_at_byte(_Tokens, _TargetBytes, _Data, _Lo, _Hi) ->
 prefix_byte_size(_Tokens, 0, _Data) ->
     0;
 prefix_byte_size(Tokens, K, Data) ->
-    byte_size(backend_call(Data, detokenize, [lists:sublist(Tokens, K)])).
+    byte_size(cache_text(Data, lists:sublist(Tokens, K))).
 
 %% Session fast path: the previous turn threaded its finish key as
 %% ParentKey. If that checkpoint is cached and its rendered bytes are
@@ -4487,7 +4487,7 @@ try_session_resume(PromptTokens, PromptBytes, ParentKey, Req, Data) ->
     end.
 
 resume_session_or_fallthrough(PromptTokens, PromptBytes, ParentTokens, Req, Data) ->
-    ParentBytes = backend_call(Data, detokenize, [ParentTokens]),
+    ParentBytes = cache_text(Data, ParentTokens),
     PLen = byte_size(ParentBytes),
     case PromptBytes of
         <<ParentBytes:PLen/binary, _/binary>> ->
@@ -4675,14 +4675,19 @@ build_meta_for(SaveReason, Tokens, Req, Data) ->
         %% The rendered prompt bytes are the cache-key source (v2) and
         %% are stored in the KVC prompt section. The token list stays
         %% in the TLV for KV resume.
-        prompt_text => backend_call(Data, detokenize, [Tokens])
+        prompt_text => cache_text(Data, Tokens)
     }.
 
 %% Cache key over the rendered prompt BYTES. The token list is
 %% detokenised first so the same logical prompt still hits when it
 %% retokenises across turns.
 make_key(Tokens, Req, Data) ->
-    make_key_bytes(backend_call(Data, detokenize, [Tokens]), Req, Data).
+    make_key_bytes(cache_text(Data, Tokens), Req, Data).
+
+cache_text(#data{backend = erllama_model_mlx, backend_state = State}, Tokens) ->
+    erllama_model_mlx:detokenize(State, Tokens, #{unparse_special => true});
+cache_text(Data, Tokens) ->
+    backend_call(Data, detokenize, [Tokens]).
 
 make_key_bytes(Bytes, Req, Data) ->
     erllama_cache_key:make(#{
