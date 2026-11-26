@@ -87,6 +87,7 @@
         "src",
         "include",
         "scripts",
+        "priv/mlx",
         "c_src/CMakeLists.txt",
         "c_src/CMake",
         "c_src/*.c",

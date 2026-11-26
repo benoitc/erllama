@@ -259,8 +259,13 @@ check_backend(#{backend := B}) ->
 
 check_model_path(#{backend := erllama_model_stub} = C) ->
     {ok, C};
-check_model_path(#{model_path := Path} = C) ->
-    case is_path(Path) andalso filelib:is_regular(Path) of
+check_model_path(#{model_path := Path, backend := Backend} = C) ->
+    Valid =
+        case Backend of
+            erllama_model_mlx -> fun filelib:is_dir/1;
+            _ -> fun filelib:is_regular/1
+        end,
+    case is_path(Path) andalso Valid(Path) of
         true -> {ok, C};
         false -> {error, {invalid_config, model_path, Path}}
     end;

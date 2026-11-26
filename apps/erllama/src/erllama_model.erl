@@ -2375,6 +2375,13 @@ handle_common(_State, {call, From}, cache_key_meta, Data) ->
         ctx_params_hash => Data#data.ctx_params_hash
     },
     reply(From, Meta, Data);
+handle_common(
+    _State,
+    info,
+    {'DOWN', _, port, Port, Reason},
+    #data{backend = erllama_model_mlx, backend_state = Port} = Data
+) ->
+    {stop, {mlx_runner_down, Reason}, Data};
 handle_common(_State, _EventType, _EventContent, Data) ->
     {keep_state, Data}.
 

@@ -420,8 +420,9 @@ as `{erllama, Ref, Event}`.
 Config map for `load_model/1,2`.
 
 - `model_path` (required unless `backend` is `erllama_model_stub`):
-  path to a GGUF file.
-- `backend`: `erllama_model_llama` (default) or `erllama_model_stub`.
+  path to a GGUF file, or a local checkpoint directory for MLX.
+- `backend`: `erllama_model_llama` (default), `erllama_model_tp`,
+  `erllama_model_mlx` (experimental) or `erllama_model_stub`.
 - `model_id`: explicit id (`load_model/1` only).
 - `model_opts`: `n_gpu_layers`, `main_gpu`, `load_mode` (`auto | none |
   mmap | mlock | mmap_mlock | direct_io`; `use_mmap` / `use_mlock`

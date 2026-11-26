@@ -6,11 +6,12 @@
 Behaviour describing the operations the `erllama_model` gen_statem
 needs from a backing inference engine.
 
-Three backends ship with erllama:
+Four backends ship with erllama:
 
 - `erllama_model_llama`: llama.cpp through the NIF.
 - `erllama_model_tp`: a model split over a group of ranks on other
   hosts (see the tensor-parallel guide).
+- `erllama_model_mlx`: greedy Qwen text decoding through an optional MLX-LM helper on Apple Silicon.
 - `erllama_model_stub`: deterministic stubs, for tests that have no
   GGUF on disk.
 
