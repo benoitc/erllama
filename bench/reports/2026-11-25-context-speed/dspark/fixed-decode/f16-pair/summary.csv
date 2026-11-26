@@ -1,0 +1,10 @@
+shape,method,trials,wall_median_us,kernel_median_us
+attn-1024,stock,48,71.216,67.216
+attn-1024,stock_stacked,48,69.792,65.472
+attn-1024,ds4_pair,48,72.552,71.984
+attn-512,stock,48,39.543,35.712
+attn-512,stock_stacked,48,38.04,33.536
+attn-512,ds4_pair,48,40.983,36.64
+indexer-256,stock,48,23.808,18.944
+indexer-256,stock_stacked,48,22.296,17.344
+indexer-256,ds4_pair,48,25.992,21.264

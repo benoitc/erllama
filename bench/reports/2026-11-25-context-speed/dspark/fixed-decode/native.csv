@@ -1,0 +1,6 @@
+rank,engine,native_function,calls,ms_per_token
+0,erllama,llama_decode,32,39.547626
+0,erllama,logits_sum,32,2.752663
+0,erllama,sampler,32,0.120151
+1,erllama,llama_decode,32,38.672416
+1,erllama,logits_sum,32,2.750775
