@@ -34,6 +34,11 @@ memory stalls or checkpoint serialization. macOS reported memory pressure
 during the single PromptProcessingBatch run. The results cover short cold
 prompts on this Mac. [Per-run timings](runs.csv) · [Per-request timings](requests.csv)
 
+After the timed series, a fresh-server check of the replay command with the
+pairwise patch returned first text in 2.66 s at 36.57 total tokens/s. All
+four prompts were cold. Including this third pairwise run gives medians of
+2.98 s to first text and 32.92 total tokens/s.
+
 ## Correctness
 
 With the pairwise patch, one HTTP client disconnected after visible text
