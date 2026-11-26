@@ -117,6 +117,13 @@ init([]) ->
 
 handle_call({register_local, Path, Opts}, _From, St) ->
     reply_change(local_entry(Path, Opts), St);
+handle_call({add, #{shard_digests := [_, _ | _] = Digests, name := Name} = Entry}, _From, St) ->
+    Result =
+        case erllama_server_shards:link_set(Digests) of
+            {ok, Path, Sha} -> {ok, Entry#{path => Path, sha256 => Sha, name := normalize(Name)}};
+            {error, _} = E -> E
+        end,
+    reply_change(Result, St);
 handle_call({add, Entry}, _From, St) ->
     reply_change({ok, Entry#{name := normalize(maps:get(name, Entry))}}, St);
 handle_call({resolve, Name}, _From, St) ->
@@ -150,8 +157,13 @@ handle_call({remove, Name}, _From, St) ->
                     D -> D
                 end,
             St1 = St#state{entries = Entries, aliases = Aliases, default = Default},
-            ok = delete_unused_blobs(Entry, Entries),
-            {reply, save(St1), St1};
+            case save(St1) of
+                ok ->
+                    ok = delete_unused_blobs(Entry, Entries),
+                    {reply, ok, St1};
+                {error, _} = E ->
+                    {reply, E, St}
+            end;
         {error, _} = E ->
             {reply, E, St}
     end;
@@ -179,8 +191,14 @@ handle_info(_Msg, St) ->
 reply_change({ok, #{name := Name} = Entry}, St) ->
     St1 = St#state{entries = (St#state.entries)#{Name => Entry}},
     case save(St1) of
-        ok -> {reply, {ok, view(Entry, St1#state.default)}, St1};
-        {error, _} = E -> {reply, E, St}
+        ok ->
+            case maps:find(Name, St#state.entries) of
+                {ok, Old} -> delete_unused_blobs(Old, St1#state.entries);
+                error -> ok
+            end,
+            {reply, {ok, view(Entry, St1#state.default)}, St1};
+        {error, _} = E ->
+            {reply, E, St}
     end;
 reply_change({error, _} = E, St) ->
     {reply, E, St}.
@@ -188,15 +206,20 @@ reply_change({error, _} = E, St) ->
 local_entry(Path0, Opts) ->
     Path = unicode:characters_to_binary(filename:absname(Path0)),
     case local_format(Path, load_opts(Opts)) of
-        {ok, Load, Size} ->
-            Name = normalize(maps:get(name, Opts, filename:basename(Path, <<".gguf">>))),
+        {ok, First, Load, Size} ->
+            Base =
+                case erllama_gguf_shards:parts(First) of
+                    {Prefix, _, _} -> filename:basename(Prefix);
+                    single -> filename:basename(First, <<".gguf">>)
+                end,
+            Name = normalize(maps:get(name, Opts, Base)),
             MmProj = maps:get(mmproj, Opts, undefined),
             case check_projector(Load, MmProj) of
                 ok ->
                     {ok, #{
                         name => Name,
                         source => #{kind => local, ref => Path},
-                        path => Path,
+                        path => First,
                         sha256 => undefined,
                         size => Size,
                         mmproj => abs_or_undefined(MmProj),
@@ -227,18 +250,22 @@ local_format(Path, Load) ->
                     )
             of
                 true ->
-                    {ok, Load#{backend => erllama_model_mlx},
+                    {ok, Path, Load#{backend => erllama_model_mlx},
                         lists:sum([filelib:file_size(F) || F <- Files])};
                 false ->
                     {error, {invalid_mlx_checkpoint, Path}}
             end;
         false ->
-            case erllama_server_gguf:read(Path) of
-                {ok, _} -> {ok, Load, filelib:file_size(Path)};
-                {error, enoent} -> {error, {enoent, Path}};
-                {error, Reason} -> {error, {not_a_gguf, Path, Reason}}
-            end
+            local_gguf(erllama_gguf_shards:paths(Path), Load)
     end.
+
+local_gguf({ok, [First | _] = Paths}, Load) ->
+    case erllama_server_shards:inspect(Paths) of
+        {ok, Size} -> {ok, First, Load, Size};
+        {error, _} = E -> E
+    end;
+local_gguf({error, _} = E, _) ->
+    E.
 
 check_projector(#{backend := erllama_model_mlx}, P) when P =/= undefined ->
     {error, {mlx_unsupported_option, mmproj}};
@@ -289,18 +316,30 @@ view(#{path := Path} = Entry, Default) ->
 entry_present(#{load := #{backend := erllama_model_mlx}}, Path) ->
     filelib:is_regular(filename:join(Path, "config.json"));
 entry_present(_, Path) ->
-    filelib:is_regular(Path).
+    lists:all(fun filelib:is_regular/1, model_paths(Path)).
 
+model_paths(Path) ->
+    case erllama_gguf_shards:paths(Path) of
+        {ok, Paths} -> Paths;
+        {error, _} -> [Path]
+    end.
+
+entry_files(Entry) ->
+    model_paths(maps:get(path, Entry)) ++ [maps:get(mmproj, Entry, undefined)] ++
+        [erllama_server_shards:blob(H) || H <- maps:get(shard_digests, Entry, [])].
+
+delete_unused_blobs(#{source := #{kind := local}}, _) ->
+    ok;
 delete_unused_blobs(Entry, Remaining) ->
     Blobs = unicode:characters_to_binary(filename:absname(blobs_dir())),
     Used = lists:usort(
-        lists:append([[maps:get(path, R), maps:get(mmproj, R, undefined)] || _ := R <- Remaining])
+        lists:append([entry_files(R) || _ := R <- Remaining])
     ),
     _ = [
         file:delete(P)
-     || P <- [maps:get(path, Entry), maps:get(mmproj, Entry, undefined)],
+     || P <- entry_files(Entry),
         is_binary(P),
-        string:prefix(P, Blobs) =/= nomatch,
+        filename:dirname(P) =:= Blobs,
         not lists:member(P, Used)
     ],
     ok.
@@ -401,7 +440,7 @@ null_or(undefined) -> null;
 null_or(V) -> V.
 
 encode_entry(E) ->
-    #{
+    (maps:with([shard_digests], E))#{
         <<"name">> => maps:get(name, E),
         <<"source">> => #{
             <<"kind">> => maps:get(kind, maps:get(source, E)),
@@ -426,7 +465,7 @@ decode(#{<<"version">> := ?VERSION, <<"models">> := Models} = Doc) ->
 decode_entry(
     #{<<"name">> := N, <<"path">> := P, <<"source">> := #{<<"kind">> := K, <<"ref">> := R}} = M
 ) ->
-    #{
+    (atom_keys(M, [shard_digests]))#{
         name => N,
         source => #{kind => source_kind(K), ref => R},
         path => P,

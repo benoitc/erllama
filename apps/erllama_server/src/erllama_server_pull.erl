@@ -57,6 +57,7 @@
     todo = [] :: [erllama_server_source:file()],
     fetched = [] :: [{model | projector, binary(), binary(), non_neg_integer()}],
     dl :: #dl{} | undefined,
+    part_lock :: term(),
     %% A blob already on disk being checked before it is reused.
     verify :: {reference(), erllama_server_source:file(), binary()} | undefined,
     result :: map() | undefined
@@ -128,6 +129,8 @@ handle_info({livery_response, Ref, Msg}, #state{dl = #dl{ref = Ref}, status = ru
     {noreply, transfer(Msg, St)};
 handle_info({verified, Ref, Result}, #state{verify = {Ref, _, _}, status = running} = St) ->
     {noreply, verified(Result, St)};
+handle_info(next_file, #state{status = running} = St) ->
+    {noreply, next_file(St)};
 handle_info({retry, Ref}, #state{dl = #dl{ref = {retry, Ref}} = Dl, status = running} = St) ->
     {noreply, request(Dl, St)};
 handle_info({ack, Sub, Seq}, #state{events = Ev} = St) when is_integer(Seq) ->
@@ -148,7 +151,25 @@ handle_info(_Msg, St) ->
 
 next_file(#state{todo = []} = St) ->
     register_model(St);
-next_file(#state{todo = [#{sha256 := Sha, size := Size} = File | Rest]} = St) ->
+next_file(#state{todo = [File | _]} = St) ->
+    %% Retries resume a shared .part file. Give it one writer at a time,
+    %% including while a finished blob is being verified.
+    Lock = {{?MODULE, part_path(File, St)}, self()},
+    case global:set_lock(Lock, [node()], 0) of
+        true ->
+            fetch_file(St#state{part_lock = Lock});
+        false ->
+            erlang:send_after(100, self(), next_file),
+            St
+    end.
+
+unlock(#state{part_lock = undefined} = St) ->
+    St;
+unlock(#state{part_lock = Lock} = St) ->
+    global:del_lock(Lock, [node()]),
+    St#state{part_lock = undefined}.
+
+fetch_file(#state{todo = [#{sha256 := Sha, size := Size} = File | Rest]} = St) ->
     Final = blob_path(Sha, St),
     case Sha =/= undefined andalso Size =/= undefined andalso filelib:file_size(Final) =:= Size of
         true ->
@@ -166,7 +187,9 @@ verified(Result, #state{verify = {_, #{sha256 := Sha, size := Size} = File, Fina
     St = St0#state{verify = undefined},
     case Result of
         {ok, Sha} ->
-            next_file(St#state{fetched = [{role(File), Final, Sha, Size} | St#state.fetched]});
+            next_file(
+                unlock(St#state{fetched = [{role(File), Final, Sha, Size} | St#state.fetched]})
+            );
         _ ->
             _ = file:delete(Final),
             start_file(File, St)
@@ -325,9 +348,11 @@ finish_file(#state{dl = #dl{fd = Fd, hash = H, offset = Size, part = Part, file 
         true ->
             Final = blob_path(Sha, St),
             ok = file:rename(Part, Final),
-            next_file(St#state{
-                dl = undefined, fetched = [{role(File), Final, Sha, Size} | St#state.fetched]
-            });
+            next_file(
+                unlock(St#state{
+                    dl = undefined, fetched = [{role(File), Final, Sha, Size} | St#state.fetched]
+                })
+            );
         false ->
             _ = file:delete(Part),
             fail(
@@ -366,7 +391,7 @@ stop_download(#state{dl = #dl{ref = Ref, fd = Fd}} = St) ->
 register_model(
     #state{name = Name, fetched = Fetched, source = Source, defaults = D, opts = Opts} = St
 ) ->
-    [{model, Path, Sha, Size}] = [F || {model, _, _, _} = F <- Fetched],
+    Parts = [{P, H, Bytes} || {model, P, H, Bytes} <- lists:reverse(Fetched)],
     MmProj =
         case [P || {projector, P, _, _} <- Fetched] of
             [P | _] -> P;
@@ -375,18 +400,30 @@ register_model(
     Entry = #{
         name => Name,
         source => #{kind => maps:get(kind, Source), ref => maps:get(ref, Source)},
-        path => unicode:characters_to_binary(Path),
-        sha256 => Sha,
-        size => Size,
         mmproj => bin_or_undefined(MmProj),
         load => maps:with([n_ctx, n_gpu_layers], Opts),
         defaults => D,
         keep_alive => maps:get(keep_alive, Opts, undefined),
         created_at => erlang:system_time(millisecond)
     },
-    case erllama_server_registry:add(Entry) of
+    case register_parts(Parts, Entry) of
         {ok, Registered} -> terminal(done, #{model => Registered}, St);
         {error, Reason} -> fail({registry, Reason}, St)
+    end.
+
+register_parts([{Path, Sha, Size}], Entry) ->
+    erllama_server_registry:add(Entry#{
+        path => unicode:characters_to_binary(Path), sha256 => Sha, size => Size
+    });
+register_parts(Parts, Entry) ->
+    Paths = [P || {P, _, _} <- Parts],
+    case erllama_server_shards:inspect(Paths) of
+        {ok, Size} ->
+            erllama_server_registry:add(Entry#{
+                size => Size, shard_digests => [H || {_, H, _} <- Parts]
+            });
+        {error, _} = E ->
+            E
     end.
 
 bin_or_undefined(undefined) -> undefined;
@@ -398,7 +435,7 @@ fail(Reason, St) ->
     terminal(error, #{error => Reason}, St).
 
 terminal(Type, Data, #state{id = Id} = St) ->
-    St1 = emit(Type, Data, St),
+    St1 = emit(Type, Data, unlock(St)),
     ok = erllama_server_runs:set_status(Id, Type),
     _ = erlang:send_after(erllama_server_config:get(run_retention_ms), self(), expire),
     St1#state{
@@ -415,7 +452,7 @@ role(#{role := R}) -> R.
 blob_path(undefined, _St) ->
     undefined;
 blob_path(Sha, _St) ->
-    filename:join(erllama_server_registry:blobs_dir(), <<"sha256-", Sha/binary, ".gguf">>).
+    erllama_server_shards:blob(Sha).
 
 %% A file of unknown digest is staged under the job's name until its
 %% digest is known.

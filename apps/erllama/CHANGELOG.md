@@ -8,6 +8,9 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Automatic cache fingerprints for numbered GGUF models now cover every
+  shard. Existing checkpoints for these models will warm up again.
+
 - Experimental MLX-LM backend for greedy Qwen text completions on Apple
   Silicon. Load a local checkpoint directory with `backend => erllama_model_mlx`.
   [Setup and hardware test](../../guides/building.md#optional-mlx-lm-backend-on-apple-silicon)

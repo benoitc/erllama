@@ -16,6 +16,7 @@
 -export([
     hf_repo_with_projector/1,
     hf_single_file/1,
+    split_set/1,
     hf_unknown_quant/1,
     ollama_model_with_params/1,
     https_with_checksum/1,
@@ -34,6 +35,7 @@ all() ->
     [
         hf_repo_with_projector,
         hf_single_file,
+        split_set,
         hf_unknown_quant,
         ollama_model_with_params,
         https_with_checksum,
@@ -161,6 +163,63 @@ hf_single_file(_Config) ->
     {#{type := done, data := #{model := M}}, _} = pull(<<"hf://acme/tiny/tiny-model.Q8_0.gguf">>),
     ?assertEqual(<<"hf.co/acme/tiny:tiny-model.q8_0">>, maps:get(name, M)),
     ?assertEqual(undefined, maps:get(mmproj, M)).
+
+split_set(Config) ->
+    A = <<"tiny.Q4_K_M-00001-of-00002.gguf">>,
+    B = <<"tiny.Q4_K_M-00002-of-00002.gguf">>,
+    Reg = erllama_server_fake_registry,
+    One = shard_bytes(0),
+    Two = shard_bytes(1),
+    ets:insert(Reg, [{{blob, first}, One}, {{blob, second}, Two}]),
+    ok = Reg:set(paged, true),
+    ok = Reg:set(files, [{B, second}]),
+    {#{type := error, data := #{error := {missing_shard, A}}}, _} = pull(<<"hf://acme/tiny">>),
+    ok = Reg:set(files, [{B, second}, {A, first}]),
+    ets:insert(Reg, {{blob, second}, One}),
+    {#{type := error}, _} = pull(<<"hf://acme/tiny">>),
+    [] = erllama_server_registry:list(),
+    ets:insert(Reg, {{blob, second}, Two}),
+    ets:match_delete(Reg, {{interrupted, '_'}, '_'}),
+    ok = Reg:set(interrupt_after, 16),
+    ok = Reg:set(interrupt_how, drop),
+    {ok, #{job_id := J1}} = erllama_server_api:pull(<<"hf://acme/tiny">>, #{}),
+    {ok, #{job_id := J2}} = erllama_server_api:pull(<<"hf://acme/tiny/", B/binary>>, #{
+        name => <<"copy">>
+    }),
+    {#{type := done, data := #{model := Entry}}, _} = follow(J1),
+    #{path := Path, size := Size, name := Name, status := ok} = Entry,
+    ?assertEqual(byte_size(One) + byte_size(Two), Size),
+    {ok, [Path, Other]} = erllama_gguf_shards:paths(Path),
+    ?assertEqual({ok, Two}, file:read_file(Other)),
+    {#{type := done, data := #{model := #{path := Path}}}, _} = follow(J2),
+    ?assert(lists:any(fun(#{range := R}) -> R =:= <<"bytes=16-">> end, Reg:seen())),
+    ok = application:stop(erllama_server),
+    {ok, _} = application:ensure_all_started(erllama_server),
+    ok = erllama_server_registry:remove(Name),
+    ?assertMatch({ok, #{status := ok}}, erllama_server_registry:resolve(<<"copy">>)),
+    ok = erllama_server_registry:remove(<<"copy">>),
+    ?assertNot(filelib:is_file(Path)),
+    ?assertNot(filelib:is_file(Other)),
+    Dir = ?config(data_dir, Config),
+    P1 = filename:join(Dir, A),
+    P2 = filename:join(Dir, B),
+    ok = file:write_file(P2, Two),
+    ?assertMatch({error, {missing_shard, _}}, erllama_server_registry:register_local(P2, #{})),
+    ok = file:write_file(P1, One),
+    {ok, #{path := P1, name := Local, size := Size}} = erllama_server_registry:register_local(
+        P2, #{}
+    ),
+    {ok, Fp} = erllama_fingerprint:derive(P1, safe),
+    ok = file:write_file(P2, <<Two/binary, 0>>),
+    ?assertNotEqual({ok, Fp}, erllama_fingerprint:derive(P1, safe)),
+    ok = file:delete(P2),
+    ?assertMatch({ok, #{status := missing}}, erllama_server_registry:resolve(Local)),
+    ok = erllama_server_registry:remove(Local),
+    ?assert(filelib:is_file(P1)).
+
+shard_bytes(Index) ->
+    <<"GGUF", 3:32/little, 0:64/little, 2:64/little, 8:64/little, "split.no", 2:32/little,
+        Index:16/little, 11:64/little, "split.count", 2:32/little, 2:16/little>>.
 
 hf_unknown_quant(_Config) ->
     {#{type := error, data := #{error := {quant_not_found, <<"q2_k">>, Available}}}, _} =

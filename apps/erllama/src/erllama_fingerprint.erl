@@ -34,7 +34,29 @@
 -define(READ_CHUNK, 8 * 1024 * 1024).
 
 -spec derive(file:filename_all(), mode()) -> {ok, <<_:256>>} | {error, term()}.
-derive(Path, fast_unsafe) ->
+derive(Path, Mode) ->
+    case erllama_gguf_shards:paths(Path) of
+        {ok, [Only]} ->
+            derive_file(Only, Mode);
+        {ok, Paths} ->
+            derive_shards(
+                Paths,
+                Mode,
+                crypto:hash_update(crypto:hash_init(sha256), <<"erllama:gguf-shards:v1">>)
+            );
+        {error, _} = E ->
+            E
+    end.
+
+derive_shards([], _Mode, Hash) ->
+    {ok, crypto:hash_final(Hash)};
+derive_shards([Path | Rest], Mode, Hash) ->
+    case derive_file(Path, Mode) of
+        {ok, Digest} -> derive_shards(Rest, Mode, crypto:hash_update(Hash, Digest));
+        {error, Reason} -> {error, {shard, Path, Reason}}
+    end.
+
+derive_file(Path, fast_unsafe) ->
     case file:read_file_info(Path, [{time, posix}]) of
         {ok, #file_info{size = Size, mtime = MTime}} ->
             Abs = unicode:characters_to_binary(filename:absname(Path)),
@@ -45,7 +67,7 @@ derive(Path, fast_unsafe) ->
         {error, _} = E ->
             E
     end;
-derive(Path, gguf_chunked) ->
+derive_file(Path, gguf_chunked) ->
     with_file(Path, fun(Fd, Size) ->
         Ctx0 = crypto:hash_update(crypto:hash_init(sha256), [
             <<"erllama:gguf_chunked">>, <<Size:64>>
@@ -57,7 +79,7 @@ derive(Path, gguf_chunked) ->
             {error, _} = E -> E
         end
     end);
-derive(Path, safe) ->
+derive_file(Path, safe) ->
     with_file(Path, fun(Fd, Size) ->
         hash_range(Fd, 0, Size, crypto:hash_init(sha256))
     end).
