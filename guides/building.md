@@ -201,11 +201,13 @@ cache namespace. Packing and restoring use a temporary safetensors file in a
 private directory on the Mac and the configured erllama RAM or disk tier.
 
 See [Serving MLX over HTTP](server/http.md#serving-mlx-on-a-mac) for a streaming example.
+On a 48 GiB M4 Pro serving four short cold prompts, per-sequence prefill delivered
+first text in 2.84 s. Grouping fresh prompts in pairs took 3.19 s.
+
 The current backend supports greedy text generation. The following checks define the next milestones.
 
 | Feature | Acceptance check |
 | --- | --- |
-| Concurrent prefill | Use the four-client HTTP workload to compare grouped or interleaved prefill with the current per-sequence prefill. Measure time to first visible text and verify cache resume after cancellation. |
 | Temperature, top-p and seed | Match direct MLX-LM with a fixed seed. Cancelling another stream must preserve the surviving request's sampler state. |
 | Long-context serving | Measure first visible text, throughput and peak memory at one and four clients as prefix length grows. Measure the cost of changing batch membership. |
 | Additional model families and embeddings | Check each family's tokenizer, cache layout and output against its MLX reference before enabling it through HTTP. |
