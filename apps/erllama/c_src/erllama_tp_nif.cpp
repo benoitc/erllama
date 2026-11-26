@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <mutex>
 
 #include "ggml.h"
@@ -196,6 +197,23 @@ bool bootstrap_cb(void *user_data, const void *send_buf, void *recv_buf, size_t 
 /* Rank                                                              */
 /* ---------------------------------------------------------------- */
 
+struct tensor_scope {
+    ggml_context *ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ~tensor_scope() {
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+        }
+        if (ctx) {
+            ggml_free(ctx);
+        }
+    }
+};
+
+struct logits_staging : tensor_scope {
+    ggml_tensor *tensor = nullptr;
+};
+
 struct tp_group;
 
 struct tp_rank {
@@ -204,6 +222,8 @@ struct tp_rank {
     void *comm = nullptr;
     ggml_backend_comm_free_t comm_free = nullptr;
     ggml_backend_comm_allreduce_tensor_t allreduce = nullptr;
+    ggml_backend_comm_allreduce_tensor_t allreduce_f32 = nullptr;
+    std::unique_ptr<logits_staging> logits;
     int rank = 0;
     int world = 0;
     /* The devices a model is loaded on (created on first use). */
@@ -215,6 +235,7 @@ struct tp_rank {
 void group_free(tp_group *g);
 
 void rank_release(tp_rank *r) {
+    r->logits.reset();
     if (r->group) {
         group_free(r->group);
         r->group = nullptr;
@@ -586,20 +607,6 @@ bool get_rank(ErlNifEnv *env, ERL_NIF_TERM t, tp_rank **out) {
     return enif_get_resource(env, t, TP_RANK_RT, (void **) out);
 }
 
-/* Upload `data' into a 1-D or 2-D F32 tensor on the rank's backend. */
-struct tensor_scope {
-    ggml_context *ctx = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
-    ~tensor_scope() {
-        if (buf) {
-            ggml_backend_buffer_free(buf);
-        }
-        if (ctx) {
-            ggml_free(ctx);
-        }
-    }
-};
-
 ggml_context *small_ctx(size_t n_tensors) {
     struct ggml_init_params p = {
         ggml_tensor_overhead() * n_tensors + ggml_graph_overhead(),
@@ -607,6 +614,37 @@ ggml_context *small_ctx(size_t n_tensors) {
         true,
     };
     return ggml_init(p);
+}
+
+bool reduce_logits_f32(tp_rank *r, float *data, size_t n) {
+    if (!r->logits || n > (size_t) r->logits->tensor->ne[0]) {
+        auto next = std::make_unique<logits_staging>();
+        next->ctx = small_ctx(1);
+        if (!next->ctx) {
+            return false;
+        }
+        next->tensor = ggml_new_tensor_1d(next->ctx, GGML_TYPE_F32, (int64_t) n);
+        next->buf = ggml_backend_alloc_ctx_tensors(next->ctx, r->backend);
+        if (!next->buf) {
+            return false;
+        }
+        r->logits = std::move(next);
+    }
+    // A smaller batch uses the prefix of the high-water allocation.
+    ggml_tensor view = *r->logits->tensor;
+    view.ne[0] = (int64_t) n;
+    for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+        view.nb[dim] = n * sizeof(float);
+    }
+    view.flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_backend_tensor_set(&view, data, 0, n * sizeof(float));
+    ggml_tensor *local[] = {&view};
+    if (!r->allreduce_f32(r->comm, local)) {
+        return false;
+    }
+    ggml_backend_synchronize(r->backend);
+    ggml_backend_tensor_get(&view, data, 0, n * sizeof(float));
+    return true;
 }
 
 /* All-reduce `t' in place (sum over ranks) and read it back. */
@@ -737,6 +775,8 @@ extern "C" ERL_NIF_TERM nif_tp_open(ErlNifEnv *env, int, const ERL_NIF_TERM argv
         r->comm = comm;
         r->comm_free = comm_free;
         r->allreduce = allreduce;
+        r->allreduce_f32 = (ggml_backend_comm_allreduce_tensor_t)
+            reg_proc(dev, "ggml_backend_comm_allreduce_tensor_f32");
         r->rank = rank;
         r->world = world;
         ERL_NIF_TERM t = enif_make_resource(env, r);
@@ -978,35 +1018,57 @@ extern "C" void erllama_tp_model_released(void *keep) {
     enif_release_resource(r);
 }
 
-/* Sum `n' floats on the host over every rank, exactly: in chunks below
- * the backend's FP32 threshold (larger buffers are reduced in BF16).
- * Every rank must call it with the same `n'. 0 on success. */
-extern "C" int erllama_tp_reduce_host(void *keep, float *data, size_t n) {
+static int reduce_logits_chunked(tp_rank *r, float *data, size_t n) {
     constexpr size_t CHUNK = 32000;
-    auto *r = static_cast<tp_rank *>(keep);
-    pthread_mutex_lock(&r->mu);
     int rc = 0;
-    try {
-        tensor_scope s;
-        /* The chunk tensor, and one view per chunk. */
-        s.ctx = small_ctx(2 + n / CHUNK);
-        ggml_tensor *t = ggml_new_tensor_1d(s.ctx, GGML_TYPE_F32, (int64_t) CHUNK);
-        s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, r->backend);
-        if (!s.buf || !r->comm) {
+    tensor_scope s;
+    /* The chunk tensor, and one view per chunk. */
+    s.ctx = small_ctx(2 + n / CHUNK);
+    ggml_tensor *t = ggml_new_tensor_1d(s.ctx, GGML_TYPE_F32, (int64_t) CHUNK);
+    s.buf = ggml_backend_alloc_ctx_tensors(s.ctx, r->backend);
+    if (!s.buf) {
+        rc = -1;
+    }
+    for (size_t off = 0; rc == 0 && off < n; off += CHUNK) {
+        size_t len = std::min(CHUNK, n - off);
+        ggml_tensor *v = ggml_view_1d(s.ctx, t, (int64_t) len, 0);
+        v->buffer = t->buffer;
+        v->data = t->data;
+        ggml_backend_tensor_set(v, data + off, 0, len * sizeof(float));
+        std::vector<float> out;
+        if (!reduce_into(r, v, out)) {
             rc = -1;
+            break;
         }
-        for (size_t off = 0; rc == 0 && off < n; off += CHUNK) {
-            size_t len = std::min(CHUNK, n - off);
-            ggml_tensor *v = ggml_view_1d(s.ctx, t, (int64_t) len, 0);
-            v->buffer = t->buffer;
-            v->data = t->data;
-            ggml_backend_tensor_set(v, data + off, 0, len * sizeof(float));
-            std::vector<float> out;
-            if (!reduce_into(r, v, out)) {
-                rc = -1;
-                break;
+        memcpy(data + off, out.data(), len * sizeof(float));
+    }
+    return rc;
+}
+
+/* All ranks supply the same number of FP32 output scores. */
+extern "C" int erllama_tp_reduce_host(void *keep, float *data, size_t n) {
+    auto *r = static_cast<tp_rank *>(keep);
+    if (n == 0) {
+        return 0;
+    }
+    if (n > INT64_MAX / sizeof(float)) {
+        return -1;
+    }
+    pthread_mutex_lock(&r->mu);
+    int rc = -1;
+    try {
+        if (r->comm && r->allreduce_f32) {
+            // Bound persistent staging when prefill requests logits for many rows.
+            constexpr size_t max_elements = (size_t{4} * 1024 * 1024) / sizeof(float);
+            rc = 0;
+            for (size_t off = 0; off < n; off += max_elements) {
+                if (!reduce_logits_f32(r, data + off, std::min(n - off, max_elements))) {
+                    rc = -1;
+                    break;
+                }
             }
-            memcpy(data + off, out.data(), len * sizeof(float));
+        } else if (r->comm) {
+            rc = reduce_logits_chunked(r, data, n);
         }
     } catch (...) {
         rc = -1;

@@ -1,0 +1,5 @@
+source,anchor_position,guess_1,guess_2,target_1,target_2
+reference,70,442,85,344,260
+reference,71,260,5553,260,5553
+split,70,442,85,344,260
+split,71,260,5553,260,5553

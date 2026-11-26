@@ -1327,7 +1327,7 @@ struct ggml_backend_cuda_comm_context {
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32.
 static bool ggml_backend_cuda_comm_allreduce_nccl(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, bool force_f32 = false) {
     const int64_t ne = ggml_nelements(tensors[0]);
     // FIXME the input of llm_graph_context::build_in_out_ids can produce a tensor with 0 elements if n_outputs == 0
     // This then causes a crash in this function
@@ -1346,7 +1346,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
     // For small tensors, simply reduce them as FP32.
     // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_ranks <= 2 && ne < 32768) || (n_ranks == 3 && ne < 131072) || (n_ranks >= 4 && ne < 262144)) {
+    if (force_f32 || (n_ranks <= 2 && ne < 32768) || (n_ranks == 3 && ne < 131072) || (n_ranks >= 4 && ne < 262144)) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -1660,6 +1660,13 @@ static void * ggml_backend_cuda_comm_init_rank(ggml_backend_t backend, int rank,
     return ret;
 }
 #endif // GGML_USE_NCCL
+
+#ifdef GGML_USE_NCCL
+static bool ggml_backend_cuda_comm_allreduce_tensor_f32(void * comm, struct ggml_tensor ** tensors) {
+    auto * ctx = static_cast<ggml_backend_cuda_comm_context *>(comm);
+    return ctx && !ctx->comms.empty() && ggml_backend_cuda_comm_allreduce_nccl(ctx, tensors, true);
+}
+#endif
 
 // Top-level dispatch -- calls the function pointer chosen by comm_init.
 // Returns false to let the meta-backend's butterfly run.
@@ -6860,6 +6867,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
 #ifdef GGML_USE_NCCL
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_f32") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_tensor_f32;
+    }
     if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
         return (void *)ggml_backend_cuda_comm_init_rank;
     }

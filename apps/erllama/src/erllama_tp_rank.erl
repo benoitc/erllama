@@ -184,6 +184,7 @@ describe(Path, {MOpts, COpts}, World) ->
         model_opts => MOpts,
         context_opts => COpts,
         world => World,
+        logits_protocol => 2,
         kv_format => erllama_nif:kv_format()
     }.
 
