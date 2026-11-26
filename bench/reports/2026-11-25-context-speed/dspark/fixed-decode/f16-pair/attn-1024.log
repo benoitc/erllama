@@ -1,0 +1,11 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 124544 MiB):
+  Device 0: NVIDIA GB10, compute capability 12.1, VMM: yes, VRAM: 124544 MiB
+check rows=1024 trial=-3 mode=0 relative_L2=0.00051446316 max_condition_scaled=4.0945289e-05 differing_stock=0/2048
+check rows=1024 trial=-3 mode=1 relative_L2=0.00051446316 max_condition_scaled=4.0945289e-05 differing_stock=0/2048
+check rows=1024 trial=-3 mode=2 relative_L2=1.6897922e-07 max_condition_scaled=1.7584612e-08 differing_stock=2048/2048
+check rows=1024 trial=-2 mode=0 relative_L2=0.00048497535 max_condition_scaled=3.8324022e-05 differing_stock=0/2048
+check rows=1024 trial=-2 mode=1 relative_L2=0.00048497535 max_condition_scaled=3.8324022e-05 differing_stock=0/2048
+check rows=1024 trial=-2 mode=2 relative_L2=1.5864685e-07 max_condition_scaled=1.6968193e-08 differing_stock=2048/2048
+check rows=1024 trial=-1 mode=0 relative_L2=0.00050095458 max_condition_scaled=4.6874373e-05 differing_stock=0/2048
+check rows=1024 trial=-1 mode=1 relative_L2=0.00050095458 max_condition_scaled=4.6874373e-05 differing_stock=0/2048
+check rows=1024 trial=-1 mode=2 relative_L2=1.615908e-07 max_condition_scaled=1.8948245e-08 differing_stock=2048/2048

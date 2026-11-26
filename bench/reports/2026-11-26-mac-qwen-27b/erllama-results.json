@@ -1,0 +1,128 @@
+[
+  {
+    "engine": "erllama",
+    "case": 1,
+    "phase": "first",
+    "prompt": "Navigation at sea changed with the arrival of instruments for measuring time, angles and distance. Write a detailed chronological explanation for a student. Include examples from at least four periods and explain how a navigator checked a position for errors.",
+    "ttft_ms": 784.5959588885307,
+    "wall_s": 11.756475583883002,
+    "tokens": 128,
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 56,
+      "total_tokens": 184
+    },
+    "finish": "length",
+    "output": "Hello! Welcome to the fascinating world of maritime navigation. For centuries, sailors relied on the stars, the wind, and their own intuition. However, the history of navigation is really the history of **instruments**. As we developed better tools to measure **time**, **angles**, and **distance**, our ability to pinpoint our location on the vast, featureless ocean improved dramatically.\n\nBelow is a chronological explanation of how this evolved, broken into four key periods, followed by an explanation of how navigators checked their work for errors.\n\n---\n\n### Period 1: The Age of Dead Reckoning (Pre-150",
+    "visible_chunks": 128,
+    "reasoning_bytes": 0,
+    "last_text_s": 11.643473125062883,
+    "e2e_tps": 10.887616708486657,
+    "visible_decode_tps_est": 11.695500193667156
+  },
+  {
+    "engine": "erllama",
+    "case": 1,
+    "phase": "retry",
+    "prompt": "Navigation at sea changed with the arrival of instruments for measuring time, angles and distance. Write a detailed chronological explanation for a student. Include examples from at least four periods and explain how a navigator checked a position for errors.",
+    "ttft_ms": 123.52912500500679,
+    "wall_s": 11.5358237081673,
+    "tokens": 128,
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 56,
+      "total_tokens": 184
+    },
+    "finish": "length",
+    "output": "Hello! Welcome to the fascinating world of maritime navigation. For centuries, sailors relied on the stars, the wind, and their own intuition. However, the history of navigation is really the history of **instruments**. As we developed better tools to measure **time**, **angles**, and **distance**, our ability to pinpoint our location on the vast, featureless ocean improved dramatically.\n\nBelow is a chronological explanation of how this evolved, broken into four key periods, followed by an explanation of how navigators checked their work for errors.\n\n---\n\n### Period 1: The Age of Dead Reckoning (Pre-150",
+    "visible_chunks": 128,
+    "reasoning_bytes": 0,
+    "last_text_s": 11.399400916183367,
+    "e2e_tps": 11.095869981904864,
+    "visible_decode_tps_est": 11.262987230784054
+  },
+  {
+    "engine": "erllama",
+    "case": 2,
+    "phase": "first",
+    "prompt": "Erlang applications often supervise workers that exchange messages. Write a detailed technical guide for a developer implementing a bounded queue. Explain admission, back pressure, worker recovery and how to test concurrent requests. Include an example.",
+    "ttft_ms": 765.3334580827504,
+    "wall_s": 13.305369165958837,
+    "tokens": 128,
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 55,
+      "total_tokens": 183
+    },
+    "finish": "length",
+    "output": "# Implementing a Bounded Queue in Erlang: A Technical Guide\n\n## Overview\n\nIn Erlang/OTP systems, bounded queues are essential for controlling resource usage, preventing memory exhaustion, and providing back pressure to upstream producers. This guide covers the design and implementation of a robust bounded queue with admission control, back pressure mechanisms, worker recovery, and concurrent testing strategies.\n\n---\n\n## 1. Core Concepts\n\n### 1.1 Bounded Queue Definition\n\nA bounded queue has a fixed maximum capacity. When the queue is full, new items cannot be admitted until space becomes available. This contrasts with unbounded queues, which can",
+    "visible_chunks": 128,
+    "reasoning_bytes": 0,
+    "last_text_s": 12.994295125128701,
+    "e2e_tps": 9.620176516971961,
+    "visible_decode_tps_est": 10.385182606486847
+  },
+  {
+    "engine": "erllama",
+    "case": 2,
+    "phase": "retry",
+    "prompt": "Erlang applications often supervise workers that exchange messages. Write a detailed technical guide for a developer implementing a bounded queue. Explain admission, back pressure, worker recovery and how to test concurrent requests. Include an example.",
+    "ttft_ms": 436.1786658409983,
+    "wall_s": 13.248708707978949,
+    "tokens": 128,
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 55,
+      "total_tokens": 183
+    },
+    "finish": "length",
+    "output": "# Implementing a Bounded Queue in Erlang: A Technical Guide\n\n## Overview\n\nIn Erlang/OTP systems, bounded queues are essential for controlling resource usage, preventing memory exhaustion, and providing back pressure to upstream producers. This guide covers the design and implementation of a robust bounded queue with admission control, back pressure mechanisms, worker recovery, and concurrent testing strategies.\n\n---\n\n## 1. Core Concepts\n\n### 1.1 Bounded Queue Definition\n\nA bounded queue has a fixed maximum capacity. When the queue is full, new items cannot be admitted until space becomes available. This contrasts with unbounded queues, which can",
+    "visible_chunks": 128,
+    "reasoning_bytes": 0,
+    "last_text_s": 12.9307231658604,
+    "e2e_tps": 9.661318912001803,
+    "visible_decode_tps_est": 10.164436166504734
+  },
+  {
+    "engine": "erllama",
+    "case": 3,
+    "phase": "first",
+    "prompt": "Bridge designers must account for wind, changing loads and temperature. Explain the engineering of a long suspension bridge in five detailed paragraphs. Give a concrete example of each design trade-off and describe how engineers check their assumptions.",
+    "ttft_ms": 1278.6818749736995,
+    "wall_s": 14.692870707949623,
+    "tokens": 128,
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 54,
+      "total_tokens": 182
+    },
+    "finish": "length",
+    "output": "The primary structural challenge in designing a long suspension bridge is managing the immense tensile forces generated by the main cables, which must support the entire weight of the deck and live loads. Engineers must balance the cable\u2019s diameter against its weight; a thicker cable provides higher tensile strength but adds significant dead load, creating a recursive design problem. For example, in the design of the Akashi Kaikyo Bridge, engineers selected high-strength steel wires with a yield strength exceeding 1,600 MPa to minimize the cable\u2019s self-weight while maintaining safety margins. To check these assumptions, engineers perform finite element analysis (FEA)",
+    "visible_chunks": 128,
+    "reasoning_bytes": 0,
+    "last_text_s": 14.244409832870588,
+    "e2e_tps": 8.711708048362883,
+    "visible_decode_tps_est": 9.795053576043106
+  },
+  {
+    "engine": "erllama",
+    "case": 3,
+    "phase": "retry",
+    "prompt": "Bridge designers must account for wind, changing loads and temperature. Explain the engineering of a long suspension bridge in five detailed paragraphs. Give a concrete example of each design trade-off and describe how engineers check their assumptions.",
+    "ttft_ms": 404.68058409169316,
+    "wall_s": 13.500114375026897,
+    "tokens": 128,
+    "usage": {
+      "completion_tokens": 128,
+      "prompt_tokens": 54,
+      "total_tokens": 182
+    },
+    "finish": "length",
+    "output": "The primary structural challenge in designing a long suspension bridge is managing the immense tensile forces generated by the main cables, which must support the entire weight of the deck and live loads. Engineers must balance the cable\u2019s diameter against its weight; a thicker cable provides higher tensile strength but adds significant dead load, creating a recursive design problem. For example, in the design of the Akashi Kaikyo Bridge, engineers selected high-strength steel wires with a yield strength exceeding 1,600 MPa to minimize the cable\u2019s self-weight while maintaining safety margins. To check these assumptions, engineers perform finite element analysis (FEA)",
+    "visible_chunks": 128,
+    "reasoning_bytes": 0,
+    "last_text_s": 12.826644875109196,
+    "e2e_tps": 9.481401152925045,
+    "visible_decode_tps_est": 10.223825880085284
+  }
+]
