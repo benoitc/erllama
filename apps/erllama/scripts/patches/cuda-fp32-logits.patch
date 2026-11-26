@@ -1,0 +1,29 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fed14dd..92893b5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1329,3 +1329,3 @@ struct ggml_backend_cuda_comm_context {
+ static bool ggml_backend_cuda_comm_allreduce_nccl(
+-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
++        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, bool force_f32 = false) {
+     const int64_t ne = ggml_nelements(tensors[0]);
+@@ -1348,3 +1348,3 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+     // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
+-    if ((n_ranks <= 2 && ne < 32768) || (n_ranks == 3 && ne < 131072) || (n_ranks >= 4 && ne < 262144)) {
++    if (force_f32 || (n_ranks <= 2 && ne < 32768) || (n_ranks == 3 && ne < 131072) || (n_ranks >= 4 && ne < 262144)) {
+         for (size_t i = 0; i < n_backends; ++i) {
+@@ -1664,1 +1664,8 @@ static void * ggml_backend_cuda_comm_init_rank(ggml_backend_t backend, int rank,
++#ifdef GGML_USE_NCCL
++static bool ggml_backend_cuda_comm_allreduce_tensor_f32(void * comm, struct ggml_tensor ** tensors) {
++    auto * ctx = static_cast<ggml_backend_cuda_comm_context *>(comm);
++    return ctx && !ctx->comms.empty() && ggml_backend_cuda_comm_allreduce_nccl(ctx, tensors, true);
++}
++#endif
++
+ // Top-level dispatch -- calls the function pointer chosen by comm_init.
+@@ -6862,2 +6869,5 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+ #ifdef GGML_USE_NCCL
++    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_f32") == 0) {
++        return (void *)ggml_backend_cuda_comm_allreduce_tensor_f32;
++    }
+     if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
