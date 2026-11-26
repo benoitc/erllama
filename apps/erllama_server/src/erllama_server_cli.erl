@@ -47,6 +47,10 @@
     "  mcp [tools | resources SERVER | read SERVER URI | prompts SERVER\n",
     "      | prompt SERVER NAME [KEY=VALUE ...]]\n",
     "                                the MCP servers agent sessions use\n",
+    "  acp [--model MODEL] [--workspace PATH] [--yes | --read-only]\n",
+    "                                run as an ACP agent on standard input/output,\n",
+    "                                for agent clients (Zed, OpenCode, ...); the\n",
+    "                                client's working directory is the workspace\n",
     "  conversations                 list the conversations (kept across restarts)\n",
     "  conversation show|export|fork|compact|rm|attach ID [--format json|md]\n",
     "                                read, export, copy, shorten or delete a\n",
@@ -70,8 +74,15 @@ main(Args) ->
     _ = erllama_server_cli_term:start(),
     {Code, Output} = run(Args),
     ok = erllama_server_cli_term:finish(),
-    ok = erllama_server_cli_term:safe_put(standard_io, Output),
+    %% A command with no output (acp' spoke through its own writer and
+    %% the client may have gone away) must not touch standard output.
+    safe_put(Output),
     halt(Code).
+
+%% Write a command's output, but not when there is none: the device
+%% may already be closed, and an io request on it never returns.
+safe_put([]) -> ok;
+safe_put(Output) -> ok = erllama_server_cli_term:safe_put(standard_io, Output).
 
 %% Diagnostics go to standard error: standard output is the command's
 %% result, and may be a pipe its reader closes.
@@ -161,6 +172,16 @@ command("agent-stop") ->
     {[], fun erllama_server_cli_agent:stop/4};
 command("mcp") ->
     {[], fun erllama_server_cli_mcp:mcp/4};
+command("acp") ->
+    {
+        [
+            {"--model", model, string},
+            {"--workspace", workspace, string},
+            {"--yes", yes, flag},
+            {"--read-only", read_only, flag}
+        ],
+        fun erllama_server_cli_acp:acp/4
+    };
 command("conversations") ->
     {[], fun erllama_server_cli_conv:list/4};
 command("conversation") ->

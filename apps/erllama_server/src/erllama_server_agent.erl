@@ -38,7 +38,7 @@
 
 -behaviour(gen_statem).
 
--export([start_link/1, send/2, approve/3, interrupt/1, stop/1, compact/1]).
+-export([start_link/1, send/2, approve/3, interrupt/1, stop/1, compact/1, set_model/2, set_policy/2]).
 -export([callback_mode/0, init/1, handle_event/4, terminate/3]).
 
 %% How a session generates (erllama_server_agent_gen; tests script it):
@@ -126,6 +126,15 @@ compact(Pid) -> erllama_server_job:call(Pid, compact, 300000).
 %% End the session (its conversation stays).
 -spec stop(pid()) -> ok | {error, term()}.
 stop(Pid) -> erllama_server_job:call(Pid, stop, 10000).
+
+%% Switch the model; the next generation round uses it.
+-spec set_model(pid(), binary()) -> ok | {error, term()}.
+set_model(Pid, Model) -> erllama_server_job:call(Pid, {set_model, Model}, 5000).
+
+%% Switch the policy mode (`default', `yes' or `read_only'); consulted
+%% per tool call, so switching mid-session is safe.
+-spec set_policy(pid(), default | yes | read_only) -> ok | {error, term()}.
+set_policy(Pid, Policy) -> erllama_server_job:call(Pid, {set_policy, Policy}, 5000).
 
 %% -----------------------------------------------------------------------------
 
@@ -227,6 +236,28 @@ handle_event({call, From}, {approve, CallId, Decision}, approving, D) ->
     approve_call(CallId, Decision, From, D);
 handle_event({call, From}, {approve, _, _}, _State, _D) ->
     {keep_state_and_data, [{reply, From, {error, nothing_to_approve}}]};
+handle_event({call, From}, {set_model, Model}, _State, #d{} = D) ->
+    case erllama_server_models:resolve(Model) of
+        {ok, Target} ->
+            M =
+                case Target of
+                    {registry, #{name := N}} -> N;
+                    {loaded, N} -> N
+                end,
+            {keep_state, D#d{model = M}, [{reply, From, ok}]};
+        {error, _} = E ->
+            {keep_state, D, [{reply, From, E}]}
+    end;
+handle_event({call, From}, {set_policy, Policy}, _State, #d{policy = P} = D) ->
+    case Policy of
+        M when M =:= default; M =:= yes; M =:= read_only ->
+            %% MCP tools granted `always' keep their grant.
+            Always = maps:filter(fun(_, V) -> V =:= always end, P),
+            D1 = D#d{policy = maps:merge(mode_policies(Policy), Always), mode = Policy},
+            {keep_state, D1, [{reply, From, ok}]};
+        _ ->
+            {keep_state, D, [{reply, From, {error, invalid_policy}}]}
+    end;
 %% --- compaction ---------------------------------------------------------------
 handle_event(info, {compacting, C}, compacting, #d{compactor = C} = D) ->
     {keep_state, emit(compacting, #{}, D)};
@@ -547,6 +578,18 @@ close_turn(Reason, #d{turn = Turn, model = M} = D) ->
 reason({error, R}) -> #{error => R};
 reason({budget, What}) -> #{budget => What};
 reason(R) -> R.
+
+%% The policy map of a mode (`yes' auto-approves every native tool,
+%% `read_only' denies the writing ones).
+mode_policies(yes) ->
+    maps:from_list([{N, auto} || N <- erllama_server_tools:names()]);
+mode_policies(read_only) ->
+    maps:from_list([
+        {N, deny}
+     || N <- erllama_server_tools:names(), erllama_server_tools:class(N) =:= write
+    ]);
+mode_policies(_) ->
+    #{}.
 
 %% Stop what the turn is doing. Unfinished tool calls get an
 %% "interrupted" result, so the transcript stays well formed.

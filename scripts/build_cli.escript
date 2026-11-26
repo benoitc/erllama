@@ -19,7 +19,10 @@ main([BuildDir]) ->
     Files =/= [] orelse fail("no compiled erllama_server in ~ts", [Ebin]),
     Out = filename:join([BuildDir, "bin", "erllama"]),
     ok = filelib:ensure_dir(Out),
-    ok = escript:create(Out, [shebang, {emu_args, "-escript main erllama_server_cli"}, {archive, Files, []}]),
+    %% `-noinput' as well as `-noshell': the VM must not let prim_tty
+    %% own fd 0, or the ACP agent's {fd, 0, 1} port can never read it
+    %% (the steal is logged, then the reader silently starves).
+    ok = escript:create(Out, [shebang, {emu_args, "-noshell -noinput -escript main erllama_server_cli"}, {archive, Files, []}]),
     {ok, #file_info{mode = Mode}} = file:read_file_info(Out),
     ok = file:change_mode(Out, Mode bor 8#111),
     io:format("built ~ts (~b files)~n", [Out, length(Files)]);

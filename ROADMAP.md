@@ -105,6 +105,20 @@ The ggml RPC backend is removed from the vendored llama.cpp and
 `GGML_RPC` is forced off. Distribution happens at the Erlang level
 instead (tensor parallelism, the server).
 
+## Agent client protocol
+
+`erllama acp` (see [guides/server/acp.md](guides/server/acp.md)) serves
+the Agent Client Protocol already. Deferred from its v1:
+
+- client-initiated commands the protocol lets an agent advertise but
+  the server tools already cover (e.g. terminal sessions owned by the
+   client);
+- MCP servers mounted by the client per session (`session/new`'s
+  `mcpServers`); workspaces beyond one directory
+  (`additionalDirectories`);
+- serving on a remote host (workspace paths resolve on the release's
+  machine, so client and server share a filesystem today).
+
 ## Code structure
 
 Refactors deferred until the documented boundaries are clean:
