@@ -167,4 +167,10 @@ recently used model that no request holds. Configure it under
   - `max_active_pulls` (default 4);
   - `pull_idle_timeout_ms` (default 60000: a transfer that sends nothing
     for that long is resumed).
-- Split GGUF files (`-00001-of-00003`) are not supported yet.
+- For a split GGUF, register any numbered part in the directory containing
+  the complete set, or pull its Hugging Face quant or a numbered part URL.
+  erllama checks each part and registers one model using the first shard.
+  With a plain HTTP URL, the parts must be siblings with the same query
+  parameters. An explicit URL checksum applies to the named part. Hugging
+  Face downloads check each published digest. Retrying reuses verified blobs.
+  The model size and cache fingerprint cover the whole set.

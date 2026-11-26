@@ -95,24 +95,14 @@ ollama(Ref, Ns, Name, Tag) ->
 %% generation defaults the source declares.
 -spec plan(source(), livery_client:client(), map()) ->
     {ok, #{name := binary(), files := [file()], defaults := map()}} | {error, term()}.
-plan(#{kind := https, url := Url} = S, _Client, Opts) ->
-    Name = maps:get(name, Opts, filename:basename(uri_path(Url), <<".gguf">>)),
-    Sha = maps:get(sha256, Opts, undefined),
-    _ = S,
-    {ok, #{
-        name => Name,
-        files => [
-            #{role => model, url => Url, sha256 => lower(Sha), size => undefined, auth => false}
-        ],
-        defaults => #{}
-    }};
+plan(#{kind := https, url := Url}, _Client, Opts) ->
+    url_plan(Url, Opts);
 plan(#{kind := hf, repo := Repo} = S, Client, Opts) ->
     Base = erllama_server_config:get(hf_base_url),
     Rev = maps:get(revision, Opts, <<"main">>),
     TreeUrl = <<Base/binary, "/api/models/", Repo/binary, "/tree/", Rev/binary, "?recursive=true">>,
-    case get_json(Client, TreeUrl, hf_headers()) of
-        {ok, Tree} when is_list(Tree) -> hf_plan(S, gguf_files(Tree), Base, Rev);
-        {ok, _} -> {error, {unexpected_response, TreeUrl}};
+    case tree_files(Client, TreeUrl, [], #{}) of
+        {ok, Files} -> hf_plan(S, Files, Base, Rev);
         {error, _} = E -> E
     end;
 plan(#{kind := ollama, namespace := Ns, name := Name, tag := Tag}, Client, _Opts) ->
@@ -125,6 +115,62 @@ plan(#{kind := ollama, namespace := Ns, name := Name, tag := Tag}, Client, _Opts
         {error, _} = E -> E
     end.
 
+url_plan(Url, Opts) ->
+    Uri = uri_string:parse(Url),
+    Path = maps:get(path, Uri, <<>>),
+    case erllama_gguf_shards:paths(Path) of
+        {ok, Paths} ->
+            Name = maps:get(name, Opts, model_basename(Path)),
+            Files = [
+                #{
+                    role => model,
+                    url => uri_string:recompose(Uri#{path => P}),
+                    sha256 =>
+                        case P =:= Path of
+                            true -> lower(maps:get(sha256, Opts, undefined));
+                            false -> undefined
+                        end,
+                    size => undefined,
+                    auth => false
+                }
+             || P <- Paths
+            ],
+            {ok, #{name => Name, files => Files, defaults => #{}}};
+        {error, _} = E ->
+            E
+    end.
+
+tree_files(_C, Url, _, Seen) when is_map_key(Url, Seen) ->
+    {error, {repeated_page, Url}};
+tree_files(C, Url, Acc, Seen) ->
+    case json_page(C, Url, hf_headers()) of
+        {ok, Tree, Resp} when is_list(Tree) ->
+            Pages = [gguf_files(Tree) | Acc],
+            Link = livery_client:header(<<"link">>, Resp),
+            case next_page(Link) of
+                none ->
+                    {ok, lists:append(lists:reverse(Pages))};
+                Next ->
+                    To = resolve(Url, Next),
+                    case origin(Url) =:= origin(To) of
+                        true -> tree_files(C, To, Pages, Seen#{Url => true});
+                        false -> {error, {invalid_page_origin, To}}
+                    end
+            end;
+        {ok, _, _} ->
+            {error, {unexpected_response, Url}};
+        {error, _} = E ->
+            E
+    end.
+
+next_page(undefined) ->
+    none;
+next_page(Link) ->
+    case re:run(Link, <<"<([^>]+)>;[ ]*rel=\"next\"">>, [{capture, [1], binary}]) of
+        {match, [Next]} -> Next;
+        nomatch -> none
+    end.
+
 gguf_files(Tree) ->
     [
         F
@@ -135,10 +181,10 @@ gguf_files(Tree) ->
 hf_plan(#{repo := Repo} = S, Files, Base, Rev) ->
     {Models, Projectors} = lists:partition(fun(#{<<"path">> := P}) -> not is_mmproj(P) end, Files),
     case pick_model(S, Models) of
-        {ok, #{<<"path">> := Path} = Model} ->
+        {ok, [#{<<"path">> := Path} | _] = Parts} ->
             Tag =
                 case S of
-                    #{file := _} -> string:lowercase(filename:basename(Path, <<".gguf">>));
+                    #{file := _} -> string:lowercase(model_basename(Path));
                     _ -> quant_of(Path)
                 end,
             Proj = [
@@ -147,34 +193,62 @@ hf_plan(#{repo := Repo} = S, Files, Base, Rev) ->
             ],
             {ok, #{
                 name => <<"hf.co/", (string:lowercase(Repo))/binary, ":", Tag/binary>>,
-                files => [hf_file(model, Model, Repo, Base, Rev) | Proj],
+                files => [hf_file(model, M, Repo, Base, Rev) || M <- Parts] ++ Proj,
                 defaults => #{}
             }};
         {error, _} = E ->
             E
     end.
 
-pick_model(#{file := File}, Models) ->
-    case [M || #{<<"path">> := P} = M <- Models, P =:= File] of
-        [M | _] -> {ok, M};
-        [] -> {error, {not_in_repository, File}}
+pick_model(Source, Models) ->
+    ByPath = maps:from_list([{maps:get(<<"path">>, M), M} || M <- Models]),
+    case select_path(Source, ByPath) of
+        {ok, Path} ->
+            case erllama_gguf_shards:paths(Path) of
+                {ok, Paths} -> collect_parts(Paths, ByPath, []);
+                {error, _} = E -> E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+collect_parts([], _, Acc) ->
+    {ok, lists:reverse(Acc)};
+collect_parts([Path | Rest], ByPath, Acc) ->
+    case maps:find(Path, ByPath) of
+        {ok, Part} -> collect_parts(Rest, ByPath, [Part | Acc]);
+        error -> {error, {missing_shard, Path}}
+    end.
+
+select_path(#{file := Path}, ByPath) ->
+    case maps:is_key(Path, ByPath) of
+        true -> {ok, Path};
+        false -> {error, {not_in_repository, Path}}
     end;
-pick_model(#{quant := Quant}, Models) ->
+select_path(#{quant := Quant}, ByPath) ->
     Want =
         case Quant of
             undefined -> ?DEFAULT_QUANT;
             Q -> Q
         end,
-    %% Split GGUFs (`-00001-of-00003') are not supported yet.
-    Single = [M || #{<<"path">> := P} = M <- Models, binary:match(P, <<"-of-0">>) =:= nomatch],
-    case {[M || #{<<"path">> := P} = M <- Single, quant_of(P) =:= Want], Quant, Single} of
-        {[M | _], _, _} ->
-            {ok, M};
-        {[], undefined, [Only]} ->
-            %% No quantisation asked for and only one file: take it.
-            {ok, Only};
-        {[], _, _} ->
-            {error, {quant_not_found, Want, [quant_of(P) || #{<<"path">> := P} <- Single]}}
+    %% One representative per set, including incomplete sets so planning can name the absent shard.
+    Models = lists:ukeysort(1, [{model_prefix(P), P} || P <- lists:sort(maps:keys(ByPath))]),
+    case {[P || {_, P} <- Models, quant_of(P) =:= Want], Quant, Models} of
+        {[P | _], _, _} -> {ok, P};
+        {[], undefined, [{_, Only}]} -> {ok, Only};
+        _ -> {error, {quant_not_found, Want, [quant_of(P) || {_, P} <- Models]}}
+    end.
+
+model_prefix(Path) ->
+    case erllama_gguf_shards:parts(Path) of
+        single -> Path;
+        {Prefix, _, N} -> {Prefix, N}
+    end.
+
+model_basename(Path) ->
+    case model_prefix(Path) of
+        {Prefix, _} -> filename:basename(Prefix);
+        P -> filename:basename(P, <<".gguf">>)
     end.
 
 %% The projector matching the model's quantisation, else F16, else any.
@@ -216,7 +290,7 @@ is_mmproj(Path) ->
 %% `TinyLlama-1.1B-Chat.Q4_K_M.gguf' -> `q4_k_m': the last `.' or `-'
 %% separated word of the file name that looks like a quantisation.
 quant_of(Path) ->
-    Base = string:lowercase(filename:basename(Path, <<".gguf">>)),
+    Base = string:lowercase(model_basename(Path)),
     Words = re:split(Base, <<"[.-]">>, [{return, binary}]),
     case [W || W <- Words, is_quant(W)] of
         [] -> Base;
@@ -303,25 +377,40 @@ token() ->
     end.
 
 get_json(Client, Url, Headers) ->
+    case json_page(Client, Url, Headers) of
+        {ok, Value, _} -> {ok, Value};
+        {error, _} = E -> E
+    end.
+
+json_page(Client, Url, Headers) ->
     case livery_client:request(Client, get, Url, #{headers => Headers, timeout => 30000}) of
         {ok, Resp} ->
             case {livery_client:status(Resp), livery_client:body(Resp)} of
                 {200, {full, Body}} ->
                     try
-                        {ok, json:decode(Body)}
+                        {ok, json:decode(Body), Resp}
                     catch
                         error:_ -> {error, {invalid_json, Url}}
                     end;
                 {Status, _} when Status >= 300, Status < 400 ->
                     case livery_client:header(<<"location">>, Resp) of
-                        undefined -> {error, {http_status, Status, Url}};
-                        Loc -> get_json(Client, resolve(Url, Loc), Headers)
+                        undefined ->
+                            {error, {http_status, Status, Url}};
+                        Loc ->
+                            json_redirect(Client, Url, Loc, Headers)
                     end;
                 {Status, _} ->
                     {error, {http_status, Status, Url}}
             end;
         {error, Reason} ->
             {error, {http, Reason, Url}}
+    end.
+
+json_redirect(Client, Url, Loc, Headers) ->
+    To = resolve(Url, Loc),
+    case origin(Url) =:= origin(To) of
+        true -> json_page(Client, To, Headers);
+        false -> json_page(Client, To, [])
     end.
 
 %% Scheme, host and port of a URL: a redirect to another origin drops
@@ -341,12 +430,6 @@ default_port(_) -> 80.
 
 resolve(Base, Location) ->
     unicode:characters_to_binary(uri_string:resolve(Location, Base)).
-
-uri_path(Url) ->
-    case uri_string:parse(Url) of
-        #{path := P} -> P;
-        _ -> Url
-    end.
 
 lower(undefined) -> undefined;
 lower(B) -> string:lowercase(unicode:characters_to_binary(B)).

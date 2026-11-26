@@ -8,6 +8,9 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Model pulls and local registration accept numbered GGUF shards as one
+  model. The registry verifies the complete set before serving it.
+
 - An embedding request (OpenAI `/v1/embeddings`, Ollama `/api/embed`)
   now counts against `max_active_runs`, like a generation: when every
   slot is in use it answers 429 instead of running on top of them.

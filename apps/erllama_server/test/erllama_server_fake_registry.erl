@@ -121,6 +121,9 @@ cdn_router() ->
     livery_router:compile([{<<"GET">>, <<"/cdn/*file">>, {?MODULE, cdn}}]).
 
 files() ->
+    opt(files, default_files()).
+
+default_files() ->
     [
         {<<"tiny-model.Q4_K_M.gguf">>, model},
         {<<"tiny-model.Q8_0.gguf">>, model},
@@ -145,6 +148,20 @@ tree(Req) ->
                     }
                  || {Path, Kind} <- files()
                 ] ++ [#{<<"type">> => <<"file">>, <<"path">> => <<"README.md">>, <<"size">> => 10}],
+            tree_page(Req, Entries)
+    end.
+
+tree_page(Req, [First | Rest] = Entries) ->
+    case {opt(paged, false), livery_req:query(Req)} of
+        {true, <<"page=2">>} ->
+            livery_resp:json(200, json:encode(Rest));
+        {true, _} ->
+            livery_resp:json(
+                200,
+                [{<<"link">>, <<"<", (livery_req:path(Req))/binary, "?page=2>; rel=\"next\"">>}],
+                json:encode([First])
+            );
+        _ ->
             livery_resp:json(200, json:encode(Entries))
     end.
 
