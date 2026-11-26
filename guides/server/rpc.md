@@ -217,6 +217,7 @@ An agent session (see [Agent sessions](agent.md)):
 | `token`, `thinking`, `tool_call` | the round's reply, as for a run |
 | `approval_request` | a call waits for `agent_approve/3`: `call_id`, `name`, `arguments` |
 | `tool_started` | a call runs: `call_id`, `name`, `arguments` |
+| `tool_output` | live foreground shell output: `call_id`, UTF-8 `output`, and `omitted` (bytes skipped before this chunk) |
 | `tool_result` | a call finished: `call_id`, `name`, `ok`, a preview of the `output` |
 | `turn_done` | the turn ended: `rounds`, `tokens` and its `reason` |
 | `done` | terminal: the session stopped |

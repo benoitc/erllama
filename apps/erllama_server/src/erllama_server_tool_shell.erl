@@ -11,11 +11,12 @@
 %% and is linked to its owner: when the owner goes (an interrupted tool
 %% worker, a stopped session), the group is killed.
 %%
-%% `run/3' runs a command to its end; `start/3' starts a background job
+%% `run/4' runs a command to its end; `start/4' starts a background job
 %% that `status/1' and `kill/1' address.
 
--export([run/3, start/4, status/1, kill/1, stop_jobs/1, stop_run/1, format/1]).
--export([init/4]).
+-export([
+    run/3, run/4, start/4, status/1, kill/1, stop_jobs/1, stop_run/1, format/1, display_output/1
+]).
 
 -define(HEAD, 16384).
 -define(TAIL, 16384).
@@ -27,14 +28,29 @@
     truncated := non_neg_integer(),
     ms := non_neg_integer()
 }.
--export_type([result/0]).
+-export_type([result/0, progress/0]).
 
 %% Run `Cmd' in `Dir' and wait for it (at most `TimeoutMs').
+-type progress() :: fun((binary(), non_neg_integer()) -> term()) | undefined.
 -spec run(binary(), binary(), pos_integer()) -> result().
 run(Dir, Cmd, TimeoutMs) ->
-    {Pid, Mon} = spawn_monitor(?MODULE, init, [self(), Dir, Cmd, TimeoutMs]),
-    link(Pid),
+    run(Dir, Cmd, TimeoutMs, undefined).
+
+-spec run(binary(), binary(), pos_integer(), progress()) -> result().
+run(Dir, Cmd, TimeoutMs, Progress) ->
+    Owner = self(),
+    {Pid, Mon} = spawn_opt(fun() -> init(Owner, Dir, Cmd, TimeoutMs, Progress =/= undefined) end, [
+        link, monitor
+    ]),
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs + 3 * ?GRACE_MS,
+    await_job(Pid, Mon, Deadline, Progress).
+
+await_job(Pid, Mon, Deadline, Progress) ->
+    Left = max(0, Deadline - erlang:monotonic_time(millisecond)),
     receive
+        {shell_output, Pid, Bytes, Omitted} when is_function(Progress, 2) ->
+            Progress(Bytes, Omitted),
+            await_job(Pid, Mon, Deadline, Progress);
         {shell_done, Pid, Result} ->
             erlang:demonitor(Mon, [flush]),
             unlink(Pid),
@@ -47,7 +63,7 @@ run(Dir, Cmd, TimeoutMs) ->
             Result;
         {'DOWN', Mon, process, Pid, Reason} ->
             died(Reason)
-    after TimeoutMs + 3 * ?GRACE_MS ->
+    after Left ->
         %% The job enforces the timeout; this only guards against a job
         %% that stopped answering.
         exit(Pid, kill),
@@ -57,7 +73,7 @@ run(Dir, Cmd, TimeoutMs) ->
 stopped({done, R}) -> R;
 stopped({error, gone}) -> died(gone).
 
-%% Stop the command a `run/3' in process `Runner' is waiting for, and
+%% Stop the command a `run/4' in process `Runner' is waiting for, and
 %% wait (bounded) until its process group has been dealt with.
 -spec stop_run(pid()) -> ok.
 stop_run(Runner) ->
@@ -85,7 +101,7 @@ died(Reason) ->
 start(Owner, Dir, Cmd, TimeoutMs) ->
     spawn(fun() ->
         link(Owner),
-        init(Owner, Dir, Cmd, TimeoutMs)
+        init(Owner, Dir, Cmd, TimeoutMs, false)
     end).
 
 -spec status(pid()) -> {running, result()} | {done, result()} | {error, gone}.
@@ -161,6 +177,8 @@ format(#{exit := Exit, output := Out, truncated := T, ms := Ms}) ->
 
 -record(job, {
     owner :: pid(),
+    progress = off :: off | ready | {binary(), non_neg_integer()},
+    partial = <<>> :: binary(),
     port :: port(),
     pgid :: string(),
     head = <<>> :: binary(),
@@ -172,8 +190,7 @@ format(#{exit := Exit, output := Out, truncated := T, ms := Ms}) ->
     exit_as :: timeout | killed | undefined
 }).
 
--spec init(pid(), binary(), binary(), pos_integer()) -> no_return().
-init(Owner, Dir, Cmd, TimeoutMs) ->
+init(Owner, Dir, Cmd, TimeoutMs, Live) ->
     process_flag(trap_exit, true),
     %% The command is passed as a positional parameter, never spliced
     %% into the script.
@@ -192,6 +209,11 @@ init(Owner, Dir, Cmd, TimeoutMs) ->
     _ = erlang:send_after(TimeoutMs, self(), timeout),
     loop(#job{
         owner = Owner,
+        progress =
+            case Live of
+                true -> ready;
+                false -> off
+            end,
         port = Port,
         pgid = integer_to_list(OsPid),
         started = erlang:monotonic_time(millisecond)
@@ -206,7 +228,9 @@ loop(#job{port = Port, owner = Owner} = J) ->
         end,
     receive
         {Port, {data, Data}} ->
-            loop(keep(Data, J));
+            loop(keep(Data, buffer_output(Data, J)));
+        flush_output ->
+            loop(flush_output(J, false));
         {Port, {exit_status, Status}} ->
             finish(Status, J);
         timeout when J#job.result =:= undefined ->
@@ -250,6 +274,53 @@ stop(Why, J) ->
     stop_group(J),
     J#job{exit_as = Why}.
 
+%% Batch noisy commands into one bounded preview per 100 ms. Keeping the most
+%% recent bytes lets a subscriber see later progress even during an output flood.
+buffer_output(_Data, #job{progress = off} = J) ->
+    J;
+buffer_output(Data, #job{progress = ready} = J) ->
+    erlang:send_after(100, self(), flush_output),
+    buffer_output(Data, J#job{progress = {<<>>, 0}});
+buffer_output(Data, #job{progress = {Prev, Omitted}} = J) ->
+    J#job{progress = append_tail(Data, Prev, Omitted)}.
+
+flush_output(#job{progress = {Bytes, Omitted}, partial = Partial} = J, Final) ->
+    {Input, Skipped} =
+        case Omitted of
+            0 -> {<<Partial/binary, Bytes/binary>>, 0};
+            _ -> {Bytes, Omitted + byte_size(Partial)}
+        end,
+    {Text, Rest} = output_text(Input, Final, []),
+    send_output(Text, Skipped, J),
+    J#job{progress = ready, partial = Rest};
+flush_output(#job{partial = Partial} = J, true) when Partial =/= <<>> ->
+    send_output(<<16#FFFD/utf8>>, 0, J),
+    J#job{partial = <<>>};
+flush_output(J, _) ->
+    J.
+
+send_output(<<>>, 0, _) ->
+    ok;
+send_output(Text, Omitted, #job{owner = Owner}) ->
+    Owner ! {shell_output, self(), Text, Omitted},
+    ok.
+
+output_text(Bytes, Final, Acc) ->
+    case unicode:characters_to_binary(Bytes) of
+        Text when is_binary(Text) -> {iolist_to_binary(lists:reverse([Text | Acc])), <<>>};
+        {incomplete, Text, _} when Final ->
+            {iolist_to_binary(lists:reverse([<<16#FFFD/utf8>>, Text | Acc])), <<>>};
+        {incomplete, Text, Rest} ->
+            {iolist_to_binary(lists:reverse([Text | Acc])), binary:copy(Rest)};
+        {error, Text, <<_, Rest/binary>>} ->
+            output_text(Rest, Final, [<<16#FFFD/utf8>>, Text | Acc])
+    end.
+
+display_output(#{output := Text, omitted := 0}) ->
+    Text;
+display_output(#{output := Text, omitted := N}) ->
+    iolist_to_binary([<<"[">>, integer_to_binary(N), <<" bytes omitted]\n">>, Text]).
+
 keep(<<>>, J) ->
     J;
 keep(Data, #job{head = H} = J) when byte_size(H) < ?HEAD ->
@@ -266,10 +337,14 @@ keep(Data, J) ->
 keep_tail(<<>>, J) ->
     J;
 keep_tail(Data, #job{tail = T, dropped = D} = J) ->
-    New = <<T/binary, Data/binary>>,
-    case byte_size(New) - ?TAIL of
-        Over when Over > 0 -> J#job{tail = binary:part(New, Over, ?TAIL), dropped = D + Over};
-        _ -> J#job{tail = New}
+    {Tail, Dropped} = append_tail(Data, T, D),
+    J#job{tail = Tail, dropped = Dropped}.
+
+append_tail(Data, Prev, Dropped) ->
+    Combined = <<Prev/binary, Data/binary>>,
+    case byte_size(Combined) - ?TAIL of
+        Over when Over > 0 -> {binary:copy(binary:part(Combined, Over, ?TAIL)), Dropped + Over};
+        _ -> {Combined, Dropped}
     end.
 
 snapshot(Exit, #job{head = H, tail = T, dropped = D, started = S}) ->
@@ -280,7 +355,8 @@ snapshot(Exit, #job{head = H, tail = T, dropped = D, started = S}) ->
         ms => erlang:monotonic_time(millisecond) - S
     }.
 
-finish(Status, #job{owner = Owner, waiting = W, exit_as = As} = J) ->
+finish(Status, #job{owner = Owner, waiting = W, exit_as = As} = J0) ->
+    J = flush_output(J0, true),
     Exit =
         case As of
             undefined -> Status;

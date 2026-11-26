@@ -21,6 +21,7 @@
     unknown_tool_and_outside_path/1,
     round_budget/1,
     queued_input_runs_next/1,
+    live_shell_output/1,
     interrupt_kills_the_shell/1,
     background_job/1,
     stop_frees_the_conversation/1,
@@ -40,6 +41,7 @@ all() ->
         unknown_tool_and_outside_path,
         round_budget,
         queued_input_runs_next,
+        live_shell_output,
         interrupt_kills_the_shell,
         background_job,
         stop_frees_the_conversation,
@@ -328,6 +330,40 @@ queued_input_runs_next(Config) ->
      || #{role := <<"user">>, content := C} <- conv_messages(Conv)
     ]),
     _ = Ws.
+
+live_shell_output(Config) ->
+    %% Releasing the command requires seeing its first output while it is still running.
+    Cmd =
+        <<"printf 'ready\\303'; while [ ! -f release ]; do sleep 0.1; done; printf '\\251done' >&2">>,
+    Script = [
+        #{calls => [{<<"c1">>, <<"shell">>, #{<<"command">> => Cmd}}]},
+        #{text => <<"finished">>}
+    ],
+    {Id, _} = start(Config, Script, #{policy => yes}),
+    {ok, _} = erllama_server_api:attach(Id, self(), 0),
+    ok = erllama_server_api:agent_send(Id, <<"run">>),
+    receive
+        {erllama_server_run, Id, #{
+            type := tool_output, data := #{call_id := <<"c1">>, output := <<"ready">>, omitted := 0}
+        }} ->
+            ok
+    after 5000 ->
+        ct:fail(no_live_output)
+    end,
+    ok = erllama_server_api:detach(Id, self()),
+    flush(Id),
+    ok = file:write_file(filename:join(?config(ws, Config), <<"release">>), <<>>),
+    Events = collect_turn(Id),
+    ?assertEqual([tool_started, tool_output, tool_output, tool_result], [
+        T
+     || #{type := T, data := #{call_id := <<"c1">>}} <- Events,
+        lists:member(T, [tool_started, tool_output, tool_result])
+    ]),
+    ?assertEqual([<<"ready">>, <<16#e9/utf8, "done">>], [
+        Bytes
+     || #{type := tool_output, data := #{output := Bytes}} <- Events
+    ]),
+    ?assertEqual([{<<"shell">>, <<"exit 0\nready", 16#e9/utf8, "done">>}], last_tool_results(Id)).
 
 interrupt_kills_the_shell(Config) ->
     Marker = integer_to_binary(erlang:unique_integer([positive])),

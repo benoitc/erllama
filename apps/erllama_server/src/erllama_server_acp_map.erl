@@ -223,6 +223,15 @@ event_updates(#{type := tool_started, data := #{call_id := Id, name := Name, arg
             <<"locations">> => locations(Args)
         })
     ];
+event_updates(#{type := tool_output, data := #{call_id := Id} = Data}) ->
+    Content = text_content(erllama_server_tool_shell:display_output(Data)),
+    [
+        update(<<"tool_call_update">>, #{
+            <<"toolCallId">> => Id,
+            <<"status">> => <<"in_progress">>,
+            <<"content">> => [#{<<"type">> => <<"content">>, <<"content">> => Content}]
+        })
+    ];
 event_updates(#{type := tool_result, data := #{call_id := Id, ok := Ok, output := Out}}) ->
     [
         update(<<"tool_call_update">>, #{

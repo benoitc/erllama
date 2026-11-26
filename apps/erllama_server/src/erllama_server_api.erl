@@ -27,7 +27,8 @@ as `{erllama_server_run, JobId, Event}`. An event is
 - an agent session emits `started` once, then, per turn, `turn_started`, then for each
   generation round `round`, the round's `token`, `thinking` and
   `tool_call` events, `approval_request` for a call that needs one,
-  `tool_started` and `tool_result` for each call, and `turn_done`; it
+  `tool_started` and `tool_result` for each call, `tool_output` while a foreground shell
+  command runs, and `turn_done`; it
   also emits `compacting` and `compacted`;
 - a download emits `started` and `progress`.
 

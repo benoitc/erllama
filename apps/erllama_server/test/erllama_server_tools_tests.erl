@@ -145,6 +145,48 @@ write_and_edit_test() ->
         )
     end).
 
+shell_output_counts_omitted_bytes_test() ->
+    with_ws(fun(Ws) ->
+        Bytes = binary:copy(<<"abcd">>, 32768),
+        write(Ws, "flood", Bytes),
+        Ref = make_ref(),
+        Progress = fun(Text, Omitted) -> self() ! {Ref, Text, Omitted} end,
+        #{exit := 0, truncated := Truncated} =
+            erllama_server_tool_shell:run(Ws, <<"cat flood">>, 5000, Progress),
+        ?assertEqual(byte_size(Bytes) - 32768, Truncated),
+        ?assertEqual(<<>>, check_chunks(Ref, Bytes))
+    end).
+
+check_chunks(Ref, Remaining) ->
+    receive
+        {Ref, Chunk, Omitted} ->
+            Size = byte_size(Chunk),
+            ?assert(Size =< 16384),
+            <<_:Omitted/binary, Chunk:Size/binary, Rest/binary>> = Remaining,
+            check_chunks(Ref, Rest)
+    after 0 ->
+        Remaining
+    end.
+
+shell_output_invalid_utf8_test() ->
+    with_ws(fun(Ws) ->
+        Bytes = <<$a, 255, 195>>,
+        write(Ws, "binary", Bytes),
+        Ref = make_ref(),
+        Progress = fun(Text, 0) -> self() ! {Ref, Text} end,
+        #{exit := 0, output := Bytes} =
+            erllama_server_tool_shell:run(Ws, <<"cat binary">>, 5000, Progress),
+        Chunks = collect_text(Ref),
+        ?assertEqual(<<$a, 16#fffd/utf8, 16#fffd/utf8>>, iolist_to_binary(Chunks))
+    end).
+
+collect_text(Ref) ->
+    receive
+        {Ref, Text} -> [Text | collect_text(Ref)]
+    after 0 ->
+        []
+    end.
+
 tool_catalog_test() ->
     Names = erllama_server_tools:names(),
     ?assertEqual(lists:usort(Names), lists:sort(Names)),

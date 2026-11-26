@@ -217,6 +217,17 @@ event_updates_test() ->
     ?assertEqual(<<"c1">>, maps:get(<<"toolCallId">>, Tool)),
     ?assertEqual(<<"edit">>, maps:get(<<"kind">>, Tool)),
     ?assertEqual([#{<<"path">> => <<"a.txt">>}], maps:get(<<"locations">>, Tool)),
+    [Progress] = U(#{
+        type => tool_output, data => #{call_id => <<"c1">>, output => <<"ready">>, omitted => 0}
+    }),
+    ?assertMatch(
+        #{
+            <<"toolCallId">> := <<"c1">>,
+            <<"status">> := <<"in_progress">>,
+            <<"content">> := [#{<<"content">> := #{<<"text">> := <<"ready">>}}]
+        },
+        Progress
+    ),
     [Upd] = U(#{
         type => tool_result, data => #{call_id => <<"c1">>, ok => false, output => <<"boom">>}
     }),
