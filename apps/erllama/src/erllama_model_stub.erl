@@ -14,7 +14,7 @@ tiers) in unit tests:
 {ok, #{reply := Reply}} = erllama:complete(M, <<"hello world">>, #{response_tokens => 4}).
 ```
 
-Tokenisation hashes whitespace-delimited words (`erlang:phash2/1`),
+By default, tokenisation hashes whitespace-delimited words (`erlang:phash2/1`),
 generation derives the next token from the context hash, so the same
 prompt always yields the same tokens; `kv_pack`/`kv_unpack` serialise
 the token list, so cache saves and restores work end to end. Chat
@@ -23,7 +23,9 @@ without those features (`{error, not_supported}` /
 `{error, chat_not_supported}`).
 
 Load-config keys specific to this backend: `step_delay_ms` (hold each
-decode step that long, to make queueing observable), `thinking_capable`
+decode step that long, to make queueing observable), `stub_reply` (emit a fixed
+UTF-8 reply, one character per token), `chat_template` (a standalone Jinja
+template for the native chat parser), `thinking_capable`
 (emit thinking events), and the failure knobs `fail_seq_rm_last` /
 `fail_kv_unpack` (emulate a recurrent-model backend whose partial
 KV removals / state restores fail, driving the engine's cold-fallback
@@ -52,6 +54,7 @@ paths).
     sampler_new/2,
     sampler_free/1,
     apply_chat_template/2,
+    chat_templates/1,
     embed/2,
     set_grammar/2,
     configure_sampler/2,
@@ -121,6 +124,8 @@ paths).
 %% preserved across clear_sampler/1 so end-of-request cleanup doesn't
 %% wipe out the value tests want to read.
 -record(stub, {
+    templates :: erllama_chat:templates_ref() | undefined,
+    reply :: tuple() | undefined,
     sampler = #{} :: map(),
     last_sampler = #{} :: map(),
     cleared = false :: boolean(),
@@ -166,27 +171,46 @@ paths).
 }).
 
 init(Config) ->
-    {ok, #stub{
-        thinking_capable = bool_opt(thinking_capable, Config),
-        step_delay_ms = step_delay_opt(step_delay_ms, Config),
-        fail_seq_rm_last = bool_opt(fail_seq_rm_last, Config),
-        fail_kv_unpack = bool_opt(fail_kv_unpack, Config),
-        fail_seq_cp = bool_opt(fail_seq_cp, Config),
-        spec_draft = spec_draft_opt(Config),
-        spec_draft_len = spec_draft_len_opt(Config),
-        media_caps = media_caps_opt(Config),
-        media_n_pos = media_n_pos_opt(Config),
-        fail_media_prefill = bool_opt(fail_media_prefill, Config)
-    }}.
-
-media_caps_opt(Config) ->
-    case maps:get(media_caps, Config, undefined) of
-        M when is_map(M) -> M;
-        _ -> undefined
+    maybe
+        {ok, Templates} ?= init_templates(Config),
+        {ok, Reply} ?= init_reply(Config),
+        {ok, #stub{
+            templates = Templates,
+            reply = Reply,
+            thinking_capable = bool_opt(thinking_capable, Config),
+            step_delay_ms = step_delay_opt(step_delay_ms, Config),
+            fail_seq_rm_last = bool_opt(fail_seq_rm_last, Config),
+            fail_kv_unpack = bool_opt(fail_kv_unpack, Config),
+            fail_seq_cp = bool_opt(fail_seq_cp, Config),
+            spec_draft = spec_draft_opt(Config),
+            spec_draft_len = positive_opt(spec_draft_len, Config),
+            media_caps = media_caps_opt(Config),
+            media_n_pos = positive_opt(media_n_pos, Config),
+            fail_media_prefill = bool_opt(fail_media_prefill, Config)
+        }}
     end.
 
-media_n_pos_opt(Config) ->
-    case maps:get(media_n_pos, Config, 4) of
+init_templates(#{chat_template := Source}) ->
+    erllama_nif:chat_templates_init({<<>>, <<>>}, Source);
+init_templates(_) ->
+    {ok, undefined}.
+
+init_reply(#{stub_reply := Reply}) ->
+    case unicode:characters_to_list(Reply) of
+        [_ | _] = Chars -> {ok, list_to_tuple(Chars)};
+        _ -> {error, {invalid_config, stub_reply, Reply}}
+    end;
+init_reply(_) ->
+    {ok, undefined}.
+
+chat_templates(#stub{templates = undefined}) -> {error, chat_not_supported};
+chat_templates(#stub{templates = T}) -> {ok, T}.
+
+media_caps_opt(#{media_caps := Caps}) when is_map(Caps) -> Caps;
+media_caps_opt(_) -> undefined.
+
+positive_opt(Key, Config) ->
+    case maps:get(Key, Config, 4) of
         N when is_integer(N), N > 0 -> N;
         _ -> 4
     end.
@@ -198,15 +222,9 @@ spec_draft_opt(Config) ->
         _ -> perfect
     end.
 
-spec_draft_len_opt(Config) ->
-    case maps:get(spec_draft_len, Config, 4) of
-        N when is_integer(N), N > 0 -> N;
-        _ -> 4
-    end.
-
 bool_opt(Key, Config) ->
-    case maps:get(Key, Config, false) of
-        true -> true;
+    case Config of
+        #{Key := true} -> true;
         _ -> false
     end.
 
@@ -222,6 +240,8 @@ terminate(_S) ->
 %% The stub's tokeniser is a pure function of the text.
 shared_state(S) -> S.
 
+tokenize(#stub{reply = R}, Text) when is_tuple(R) ->
+    unicode:characters_to_list(Text);
 tokenize(_S, Text) when is_binary(Text) ->
     [
         erlang:phash2(W) rem (1 bsl 32)
@@ -229,6 +249,8 @@ tokenize(_S, Text) when is_binary(Text) ->
         W =/= <<>>
     ].
 
+detokenize(#stub{reply = R}, Tokens) when is_tuple(R) ->
+    unicode:characters_to_binary(Tokens);
 detokenize(_S, Tokens) ->
     list_to_binary(
         lists:join(<<" ">>, [integer_to_binary(T) || T <- Tokens])
@@ -363,6 +385,14 @@ take_wedge() ->
 
 stub_step_op({SeqId, {prefill, _Tokens}}, _S) ->
     {SeqId, prefilled};
+stub_step_op({SeqId, {decode, Cursor}}, #stub{reply = R}) when is_tuple(R) ->
+    I = atomics:add_get(Cursor, 1, 1),
+    Eog =
+        case I >= tuple_size(R) of
+            true -> 1;
+            false -> 0
+        end,
+    {SeqId, {token, element(min(I, tuple_size(R)), R), Eog}};
 stub_step_op({SeqId, {decode, Sampler}}, #stub{thinking_capable = false}) ->
     decode_token(SeqId, Sampler);
 stub_step_op({SeqId, {decode, Sampler}}, #stub{thinking_capable = true}) ->
@@ -624,16 +654,17 @@ reset_sampler_new_cfgs() ->
     persistent_term:put({?MODULE, sampler_new_cfgs}, []),
     ok.
 
-%% Sampler refs are opaque references. Free drops the per-sampler
-%% per-sampler stub phase (a no-op when neither thinking_capable nor
-%% tool_call_capable is set).
-sampler_new(_S, Cfg) ->
+sampler_new(#stub{reply = Reply}, Cfg) ->
     %% Record the cfg so tests can assert which sampler chains the
     %% request scheduler built (e.g. the grammar-less greedy `#{temperature
     %% => 0.0}` chain vs a request chain carrying a grammar).
     Prev = persistent_term:get({?MODULE, sampler_new_cfgs}, []),
     persistent_term:put({?MODULE, sampler_new_cfgs}, Prev ++ [Cfg]),
-    Ref = make_ref(),
+    Ref =
+        case Reply of
+            undefined -> make_ref();
+            _ -> atomics:new(1, [])
+        end,
     case maps:get(logprobs, Cfg, 0) of
         N when is_integer(N), N > 0 ->
             persistent_term:put({?MODULE, sampler_logprobs, Ref}, N);
