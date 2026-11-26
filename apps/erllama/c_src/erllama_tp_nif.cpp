@@ -1059,7 +1059,7 @@ extern "C" int erllama_tp_reduce_host(void *keep, float *data, size_t n) {
     try {
         if (r->comm && r->allreduce_f32) {
             // Bound persistent staging when prefill requests logits for many rows.
-            constexpr size_t max_elements = (4 * 1024 * 1024) / sizeof(float);
+            constexpr size_t max_elements = (size_t{4} * 1024 * 1024) / sizeof(float);
             rc = 0;
             for (size_t off = 0; off < n; off += max_elements) {
                 if (!reduce_logits_f32(r, data + off, std::min(n - off, max_elements))) {
