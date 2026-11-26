@@ -16,6 +16,16 @@ load_defaults_backend_to_llama_test() ->
     {ok, C} = ?M:load_config(#{model_path => Path}),
     ?assertEqual(erllama_model_llama, maps:get(backend, C)).
 
+load_mlx_uses_directory_test() ->
+    Path = existing_file(),
+    Dir = filename:dirname(Path),
+    ?assertMatch({ok, _}, ?M:load_config(#{backend => erllama_model_mlx, model_path => Dir})),
+    ?assertEqual(
+        {error, {invalid_config, model_path, Path}},
+        ?M:load_config(#{backend => erllama_model_mlx, model_path => Path})
+    ),
+    ?assertEqual({error, {invalid_config, model_path, Dir}}, ?M:load_config(#{model_path => Dir})).
+
 load_requires_model_path_for_llama_test() ->
     ?assertEqual({error, {missing_config, model_path}}, ?M:load_config(#{})).
 

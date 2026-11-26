@@ -8,6 +8,10 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Experimental MLX-LM backend for greedy Qwen text completions on Apple
+  Silicon. Load a local checkpoint directory with `backend => erllama_model_mlx`.
+  [Setup and hardware test](../../guides/building.md#optional-mlx-lm-backend-on-apple-silicon)
+
 - Experimental: a model can be split over several machines, each
   holding and computing its share with llama.cpp's own tensor split.
   Each machine's GPU joins a group of ranks that sum buffers on the

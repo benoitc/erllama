@@ -170,3 +170,30 @@ green on machines without a model file.
 ## Bumping the vendored llama.cpp
 
 See [UPDATE_LLAMA.md](../apps/erllama/UPDATE_LLAMA.md).
+
+## Optional MLX-LM backend on Apple Silicon
+
+The experimental backend loads a local Qwen3.5-family MLX text checkpoint.
+The tested model is [Qwen3.8-27B, MLX four-bit](https://huggingface.co/TensorFold/Qwen3.8-27B-MLX-4bit/tree/22d8d538154e0e5b6f8dcb1fcc74a60a0798104c).
+A Python helper holds the model on the GPU. Install the optional dependencies
+in a virtual environment on the Mac (tested with arm64 Python 3.13).
+
+```sh
+python3.13 -m venv "$HOME/.venvs/erllama-mlx"
+export ERLLAMA_MLX_PYTHON="$HOME/.venvs/erllama-mlx/bin/python"
+"$ERLLAMA_MLX_PYTHON" -m pip install -r apps/erllama/priv/mlx/requirements.txt
+```
+
+```erlang
+{ok, M} = erllama:load_model(#{backend => erllama_model_mlx,
+                               model_path => "/models/Qwen3.8-27B-MLX-4bit"}).
+{ok, #{reply := Text}} = erllama:complete(M, <<"Explain Erlang supervision.">>,
+                                         #{temperature => 0.0, response_tokens => 32}).
+ok = erllama:unload(M).
+```
+
+This milestone supports one live sequence, greedy text decoding and the model's
+EOS IDs. Live attention and recurrent state are kept for the request. Persistent
+checkpoints, the chat/server interface and batched sequences are later milestones.
+To run the optional reference test, set `ERLLAMA_MLX_TEST_MODEL` to the pinned
+checkpoint directory and run `rebar3 ct --dir apps/erllama/test --suite erllama_mlx_SUITE`.
