@@ -1,0 +1,5 @@
+format,batch,graph_duration_us,kernel_node_count
+IQ2_XXS,1,81.44,
+IQ2_XXS,512,6175.968,
+Q4_K,1,160.0,
+Q4_K,512,9272.384,

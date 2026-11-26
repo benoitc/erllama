@@ -1,0 +1,4 @@
+{
+  "prose": "Write a practical field guide for a volunteer taking water-level measurements at a river gauge. Cover preparation, safe observation from the bank, recording uncertainty, and handing the log to the next shift. Include worked examples and a checklist. Write at least 500 words.",
+  "code": "Implement a small bounded job queue in Erlang/OTP using gen_server. Show the complete module, specs, the queue-full case, cancellation of waiting jobs, worker monitoring, and EUnit examples. Explain what happens when a worker exits. Give complete code and explanations in at least 500 words."
+}

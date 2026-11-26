@@ -1,0 +1,7 @@
+mode,prompt,input_tokens,output_tokens,first_ms,total_ms,output_tokens_per_second
+erllama,prose,61,250,286.827,11173.448,22.374
+erllama,code,70,250,312.535,11168.646,22.384
+ds4,prose,61,250,384.603,8861.928,28.211
+ds4,code,70,250,412.594,8863.331,28.206
+dspark,prose,61,250,430.787,8009.14,31.214
+dspark,code,70,250,468.918,5186.808,48.199

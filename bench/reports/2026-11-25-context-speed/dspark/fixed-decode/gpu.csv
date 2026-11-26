@@ -1,0 +1,27 @@
+rank,engine,kernel_calls_per_token,gpu_busy_ms_per_token,gpu_span_ms_per_token,sum_or_union,operation,ms_per_token
+0,erllama,4429.0,40.5359,43.1198,sum,Attention score and output kernels,0.696
+0,erllama,4429.0,40.5359,43.1198,sum,F16 weight matvec,6.3467
+0,erllama,4429.0,40.5359,43.1198,sum,GPU copies and fills,0.2943
+0,erllama,4429.0,40.5359,43.1198,sum,IQ2/Q2 routed projections,5.5805
+0,erllama,4429.0,40.5359,43.1198,sum,NCCL,5.2483
+0,erllama,4429.0,40.5359,43.1198,sum,Other kernels,6.5809
+0,erllama,4429.0,40.5359,43.1198,sum,Q8 weight matvec,18.245
+0,ds4,1648.5,28.8388,34.5021,sum,Attention score and output kernels,0.7147
+0,ds4,1648.5,28.8388,34.5021,sum,F16 weight matvec,3.3047
+0,ds4,1648.5,28.8388,34.5021,sum,GPU copies and fills,0.0076
+0,ds4,1648.5,28.8388,34.5021,sum,IQ2/Q2 routed projections,5.326
+0,ds4,1648.5,28.8388,34.5021,sum,Other kernels,3.1011
+0,ds4,1648.5,28.8388,34.5021,sum,Q8 weight matvec,16.3848
+1,erllama,4429.0,39.6776,43.1042,sum,Attention score and output kernels,0.711
+1,erllama,4429.0,39.6776,43.1042,sum,F16 weight matvec,6.418
+1,erllama,4429.0,39.6776,43.1042,sum,GPU copies and fills,0.3015
+1,erllama,4429.0,39.6776,43.1042,sum,IQ2/Q2 routed projections,5.6313
+1,erllama,4429.0,39.6776,43.1042,sum,NCCL,4.0817
+1,erllama,4429.0,39.6776,43.1042,sum,Other kernels,6.6876
+1,erllama,4429.0,39.6776,43.1042,sum,Q8 weight matvec,18.3477
+1,ds4,1648.5,28.2475,34.4883,sum,Attention score and output kernels,0.711
+1,ds4,1648.5,28.2475,34.4883,sum,F16 weight matvec,3.2893
+1,ds4,1648.5,28.2475,34.4883,sum,GPU copies and fills,0.0068
+1,ds4,1648.5,28.2475,34.4883,sum,IQ2/Q2 routed projections,5.1391
+1,ds4,1648.5,28.2475,34.4883,sum,Other kernels,3.081
+1,ds4,1648.5,28.2475,34.4883,sum,Q8 weight matvec,16.0203
