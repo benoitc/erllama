@@ -15,6 +15,7 @@ Two harnesses live here:
 | Model and hardware | What we measured |
 | --- | --- |
 | Qwen2.5-1.5B on M4 Pro, GLM-5.3-Flash and DeepSeek V4 Flash on two GB10s | [Prompt processing and generation at four context lengths](reports/2026-11-25-context-speed/README.md) |
+| Qwen3.8-27B on M4 Pro | [TensorFold and erllama on new prompts and immediate retries](reports/2026-11-26-mac-qwen-27b/README.md) |
 | TinyLlama on M4 Pro and GB10 | [erllama and Ollama serving the same prompt, including time to first text and cache retries](reports/2026-11-25-tinyllama-ollama/README.md) |
 | DeepSeek V4 Flash on one and two GB10s | [Scaling with the original weights and the custom Q5_K GGUF trial](reports/2026-11-25-context-speed/shared-expert/q5/README.md) |
 | DeepSeek V4 Flash on two GB10s | [Same-prompt comparison with ds4](reports/2026-11-25-context-speed/dspark/README.md) and [erllama's live DSpark decode benchmark](https://github.com/benoitc/erllama/blob/c6d7cbd39c76542efb80dad4411fc65d92cfb2d2/bench/reports/2026-11-25-deepseek-dspark/README.md) |
