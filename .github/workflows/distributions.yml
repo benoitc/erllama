@@ -6,6 +6,10 @@ on:
         description: Existing GitHub release tag
         required: true
         type: string
+      gx10_from_release:
+        description: Publish the GX10 image already attached and tested on hardware
+        type: boolean
+        default: false
   release:
     types: [published]
   pull_request:
@@ -129,18 +133,20 @@ jobs:
         with:
           ref: ${{ needs.target.outputs.tag }}
           path: source
-      - name: Build ARM64 CUDA image for GB10
+      - name: Set versioned image name
         env:
           VERSION: ${{ needs.target.outputs.version }}
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY}:${VERSION}-gx10" >> "$GITHUB_ENV"
+      - name: Build ARM64 CUDA image for GB10
+        if: inputs.gx10_from_release != true
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
           cp -R packaging-tools/packaging source/
           cd source
-          image="ghcr.io/${GITHUB_REPOSITORY}:${VERSION}-gx10"
           docker build --build-arg BUILD_JOBS=2 -f packaging/gx10/Dockerfile -t "$image" .
           docker run --rm "$image" erllama --version
-          echo "image=$image" >> "$GITHUB_ENV"
       - name: Attach a Docker-loadable image to the release
+        if: inputs.gx10_from_release != true
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.target.outputs.tag }}
@@ -149,6 +155,17 @@ jobs:
           docker save "$image" | gzip > "$file"
           sha256sum "$file" > "$file.sha256"
           gh release upload "$TAG" "$file" "$file.sha256" --repo "$GITHUB_REPOSITORY"
+      - name: Load the hardware-tested release image
+        if: inputs.gx10_from_release == true
+        env:
+          TAG: ${{ needs.target.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          file="erllama-${TAG#v}-gx10.docker.tar.gz"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "$file" -p "$file.sha256"
+          sha256sum -c "$file.sha256"
+          docker load -i "$file"
+          docker image inspect "$image" >/dev/null
       - name: Push versioned image
         env:
           GH_TOKEN: ${{ github.token }}

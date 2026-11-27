@@ -27,7 +27,11 @@ LABEL org.opencontainers.image.source="https://github.com/benoitc/erllama"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libncurses6 libssl3t64 libsctp1 openssl procps && rm -rf /var/lib/apt/lists/* && \
     useradd --create-home --uid 10001 erllama && mkdir /data && chown erllama:erllama /data
+COPY --from=build /usr/lib/aarch64-linux-gnu/libnccl.so.2* /usr/lib/aarch64-linux-gnu/
 COPY --from=build --chown=erllama:erllama /src/_build/prod/rel/erllama_server /opt/erllama
+RUN ldd /opt/erllama/lib/erllama-*/priv/erllama_nif.so > /tmp/nif-libs && \
+    awk '/not found/ && $1 != "libcuda.so.1" { print; missing=1 } END { exit missing }' /tmp/nif-libs && \
+    rm /tmp/nif-libs
 COPY --chmod=755 packaging/gx10/entrypoint.sh /usr/local/bin/erllama-entrypoint
 ENV HOME=/home/erllama ERLLAMA_DATA_DIR=/data PATH="/opt/erllama/bin:${PATH}"
 USER erllama
