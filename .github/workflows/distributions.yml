@@ -1,0 +1,174 @@
+name: Binary distributions
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub release tag
+        required: true
+        type: string
+      gx10_from_release:
+        description: Publish the GX10 image already attached and tested on hardware
+        type: boolean
+        default: false
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - '.github/workflows/distributions.yml'
+      - 'scripts/dist/**'
+      - 'packaging/gx10/**'
+
+permissions:
+  contents: read
+
+jobs:
+  target:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: release
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          if [ -z "$TAG" ]; then TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*'); fi
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git rev-parse --verify "refs/tags/$TAG^{commit}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  archives:
+    needs: target
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: macos-15, image: macos15, platform: macos-arm64}
+          - {runner: ubuntu-24.04, image: ubuntu24, platform: linux-amd64}
+          - {runner: ubuntu-24.04-arm, image: ubuntu24, platform: linux-arm64}
+          - {runner: ubuntu-24.04, platform: freebsd-amd64}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with: {path: packaging-tools}
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.target.outputs.tag }}
+          path: source
+      - uses: erlef/setup-beam@v1
+        if: matrix.platform != 'freebsd-amd64'
+        env:
+          ImageOS: ${{ matrix.image }}
+        with:
+          otp-version: '28.3'
+          rebar3-version: '3.25.0'
+      - name: Build archive and test offline installation
+        if: matrix.platform != 'freebsd-amd64'
+        working-directory: source
+        env:
+          VERSION: ${{ needs.target.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: ../packaging-tools/scripts/dist/build-archive.sh "$VERSION" "$PLATFORM" "$GITHUB_WORKSPACE/dist"
+      - name: Build and install in FreeBSD 14.4
+        if: matrix.platform == 'freebsd-amd64'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.4'
+          usesh: true
+          prepare: |
+            pkg install -y pcre2
+            pkg install -y erlang-runtime28 cmake bash gmake git curl
+          run: |
+            set -eu
+            PATH="/usr/local/lib/erlang28/bin:/usr/local/bin:$PATH"
+            export PATH
+            fetch -o /usr/local/bin/rebar3 https://github.com/erlang/rebar3/releases/download/3.25.0/rebar3
+            chmod +x /usr/local/bin/rebar3
+            root=$PWD
+            cd source
+            git config --global --add safe.directory "$PWD"
+            ../packaging-tools/scripts/dist/build-archive.sh '${{ needs.target.outputs.version }}' freebsd-amd64 "$root/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-archives:
+    if: github.event_name != 'pull_request'
+    needs: [target, archives]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with: {path: dist, merge-multiple: true}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.target.outputs.tag }}
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          sed "s/__RELEASE_VERSION__/${TAG#v}/" ../scripts/dist/install.sh > install.sh
+          gh release upload "$TAG" *.tar.gz SHA256SUMS install.sh
+
+  gx10:
+    if: github.event_name != 'pull_request'
+    needs: target
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with: {path: packaging-tools}
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.target.outputs.tag }}
+          path: source
+      - name: Set versioned image name
+        env:
+          VERSION: ${{ needs.target.outputs.version }}
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY}:${VERSION}-gx10" >> "$GITHUB_ENV"
+      - name: Build ARM64 CUDA image for GB10
+        if: inputs.gx10_from_release != true
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          cp -R packaging-tools/packaging source/
+          cd source
+          docker build --build-arg BUILD_JOBS=2 -f packaging/gx10/Dockerfile -t "$image" .
+          docker run --rm "$image" erllama --version
+      - name: Attach a Docker-loadable image to the release
+        if: inputs.gx10_from_release != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.target.outputs.tag }}
+        run: |
+          file="erllama-${TAG#v}-gx10.docker.tar.gz"
+          docker save "$image" | gzip > "$file"
+          sha256sum "$file" > "$file.sha256"
+          gh release upload "$TAG" "$file" "$file.sha256" --repo "$GITHUB_REPOSITORY"
+      - name: Load the hardware-tested release image
+        if: inputs.gx10_from_release == true
+        env:
+          TAG: ${{ needs.target.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          file="erllama-${TAG#v}-gx10.docker.tar.gz"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "$file" -p "$file.sha256"
+          sha256sum -c "$file.sha256"
+          docker load -i "$file"
+          docker image inspect "$image" >/dev/null
+      - name: Push versioned image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$image"

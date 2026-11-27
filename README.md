@@ -39,6 +39,7 @@ your OTP application          CLI   HTTP clients   Erlang nodes
 | You want to | Go to |
 |---|---|
 | Use erllama as a dependency (Hex package `erllama`) | [apps/erllama](apps/erllama/README.md), [examples/embedded_app](examples/embedded_app) |
+| Install the server and CLI from a release, or run on a GX10 | [Installation](guides/server/install.md) |
 | Run the server release | [apps/erllama_server](apps/erllama_server/README.md) |
 | See the server at work: several clients, a slow tool, a restart | [the walkthrough](guides/server/demo.md) |
 | Drive server agents from editors (Zed, OpenCode...) over ACP | [ACP: `erllama acp`](guides/server/acp.md) |
