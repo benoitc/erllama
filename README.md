@@ -13,7 +13,13 @@ of two ways:
 
 Both use the same engine: a model serves several requests at once in
 one batch, and an exact, tiered KV cache restores prefixes it has
-already computed. You start here to find the part you need.
+already computed.
+
+## Get started
+
+- [Install the CLI and server and run your first prompt](guides/server/install.md) on macOS, Linux or FreeBSD.
+- [Run the GX10 / DGX Spark Docker image](guides/server/install.md#gx10--dgx-spark).
+- [Add erllama to an Erlang/OTP application](apps/erllama/README.md#install).
 
 ## How it fits together
 
@@ -39,7 +45,6 @@ your OTP application          CLI   HTTP clients   Erlang nodes
 | You want to | Go to |
 |---|---|
 | Use erllama as a dependency (Hex package `erllama`) | [apps/erllama](apps/erllama/README.md), [examples/embedded_app](examples/embedded_app) |
-| Install the server and CLI from a release, or run on a GX10 | [Installation](guides/server/install.md) |
 | Run the server release | [apps/erllama_server](apps/erllama_server/README.md) |
 | See the server at work: several clients, a slow tool, a restart | [the walkthrough](guides/server/demo.md) |
 | Drive server agents from editors (Zed, OpenCode...) over ACP | [ACP: `erllama acp`](guides/server/acp.md) |
