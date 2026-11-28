@@ -29,7 +29,7 @@ install_erllama() {
         *) echo "Unsupported platform: $(uname -sm)" >&2; return 1 ;;
     esac
     file=erllama-$version-$platform.tar.gz
-    url=https://github.com/erllama/erllama/releases/download/v$version
+    url=https://github.com/benoitc/erllama/releases/download/v$version
     mkdir -p "$prefix/lib/erllama" "$prefix/bin"
     root=$(cd "$prefix/lib/erllama" && pwd -P)
     dest=$root/$version

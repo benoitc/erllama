@@ -1512,8 +1512,8 @@ Initial public release.
 
 Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
-[Unreleased]: https://github.com/erllama/erllama/compare/v0.14.0...HEAD
-[0.14.0]: https://github.com/erllama/erllama/compare/v0.13.0...v0.14.0
+[Unreleased]: https://github.com/benoitc/erllama/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/benoitc/erllama/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/benoitc/erllama/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/benoitc/erllama/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/benoitc/erllama/compare/v0.10.1...v0.11.0
