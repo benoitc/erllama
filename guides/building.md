@@ -200,7 +200,7 @@ to save. Model files are hashed at load so a changed checkpoint gets a fresh
 cache namespace. Packing and restoring use a temporary safetensors file in a
 private directory on the Mac and the configured erllama RAM or disk tier.
 
-See [Serving MLX over HTTP](https://github.com/benoitc/erllama/blob/v0.13.0/guides/server/http.md#serving-mlx-on-a-mac) for a streaming example.
+See [Serving MLX over HTTP](https://github.com/erllama/erllama/blob/v0.14.0/guides/server/http.md#serving-mlx-on-a-mac) for a streaming example.
 On a 48 GiB M4 Pro serving four short cold prompts, per-sequence prefill delivered
 first text in 2.84 s. Grouping fresh prompts in pairs took 3.19 s.
 

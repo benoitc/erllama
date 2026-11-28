@@ -553,7 +553,7 @@ connect_spec(#{transport := http, url := Url} = S) ->
 
 common(Base, _S) ->
     Base#{
-        client_info => #{name => <<"erllama_server">>, version => <<"0.1.0">>},
+        client_info => #{name => <<"erllama_server">>, version => <<"0.2.0">>},
         request_timeout => erllama_server_config:get(mcp_timeout_ms)
     }.
 

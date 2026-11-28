@@ -775,7 +775,7 @@ agent_set_model(Id, Model) ->
             E
     end.
 
--doc "Switch the session's policy mode: `default', `yes' or `read_only'.".
+-doc "Switch the session's policy mode: `default`, `yes` or `read_only`.".
 -spec agent_set_policy(binary(), default | yes | read_only) -> ok | {error, term()}.
 agent_set_policy(Id, Policy) when Policy =:= default; Policy =:= yes; Policy =:= read_only ->
     with_agent(Id, fun(Pid) -> erllama_server_agent:set_policy(Pid, Policy) end);

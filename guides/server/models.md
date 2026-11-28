@@ -169,7 +169,7 @@ qwen:latest  generating  ctx 8192  q4_k_m  2 of 4 sequences busy  in use by 2
 To try early first-token sampling for a local GGUF, register the path with
 `erllama load /path/to/model.gguf --early-stream-token`, or set
 `early_stream_token => true` in its registry options. This applies to
-ordinary text streams. [Behaviour and cache semantics](../generation.md#streaming)
+ordinary text streams. [Behaviour and cache semantics](https://hexdocs.pm/erllama/0.14.0/generation.html#streaming)
 
 ## Memory pressure
 

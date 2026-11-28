@@ -50,7 +50,7 @@ demand, or omitted for the default model.
 
 ## Serving MLX on a Mac
 
-Install the [optional MLX runtime](../building.md#optional-mlx-lm-backend-on-apple-silicon)
+Install the [optional MLX runtime](https://hexdocs.pm/erllama/0.14.0/building.html#optional-mlx-lm-backend-on-apple-silicon)
 and export `ERLLAMA_MLX_PYTHON` in the server's environment. Point a registry
 entry at the local checkpoint directory in `sys.config`. The registry keeps
 the backend and slot count under the same model name after restart.

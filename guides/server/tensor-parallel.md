@@ -237,7 +237,7 @@ used one private interface, a shorter prompt and the HTTP serving path.
 The archived log shows all eight NCCL channels used that interface.
 The release benchmark did not time the in-graph sums or include a matched RoCE leg, so the
 22.73 ms difference per token also includes other split-serving costs.
-[Transport comparison and reduction timings](../../apps/erllama/doc/features.md#tensor-parallelism-over-plain-tcp-2026-11-23)
+[Transport comparison and reduction timings](https://github.com/erllama/erllama/blob/v0.14.0/apps/erllama/doc/features.md#tensor-parallelism-over-plain-tcp-2026-11-23)
 
 Both GB10s also completed a separate 2,048-value FP32 sum with
 `NCCL_NET=IB` on `rocep1s0f0`. Both logged `Using network IB` and
@@ -281,7 +281,7 @@ Both ranks logged the selected NCCL transport.
 
 RoCE decoded 3.83 times as fast as sockets in this run. RoCE was measured
 first. The earlier single-GPU result of 261.6 tokens/s came from a separate
-window. [Individual runs and Fleet outcomes](../../bench/results/2026-11-28-gb10-fleet-roce-socket.json)
+window. [Individual runs and Fleet outcomes](https://github.com/erllama/erllama/blob/v0.14.0/bench/results/2026-11-28-gb10-fleet-roce-socket.json)
 
 ### Fleet adapter handoff
 

@@ -53,7 +53,7 @@ cp -R "$R" "$WORK/rel"
 R="$WORK/rel"
 NODE_NAME=erllama_acp_e2e
 # vm.args is regenerated from vm.args.src on every boot, so rename both.
-for F in "$R/releases/0.1.0/vm.args" "$R/releases/0.1.0/vm.args.src"; do
+for F in "$R"/releases/*/vm.args "$R"/releases/*/vm.args.src; do
     [ -f "$F" ] && sed -i '' "s/-name erllama_server@/-name ${NODE_NAME}@/" "$F"
 done
 export ERLLAMA_NODE="${NODE_NAME}@127.0.0.1"
