@@ -258,6 +258,31 @@ The TinyLlama GGUF SHA-256 was
 `9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0`
 on both hosts.
 
+### Fleet acceptance and matched transport comparison
+
+Two Fleet agents ran erllama `0f69622` on the same GB10 pair. In epoch 10
+the gateway served chat through the lead. After rank 1 received SIGKILL,
+Fleet removed the replica from its ready catalog and the next gateway
+request returned HTTP 502. A new activation (epoch 31) served the same
+chat again. Fleet released its slots at the end. The follower readiness
+report includes the model revision in barrellm `d5b508c`.
+
+The timing client ran on the lead host and used the erllama streaming
+endpoint directly. Both transports used one private 200 Gb/s interface,
+the same release and GGUF, one active sequence, and the 38-token prompt
+from the qualification above. Each leg had one warm-up and three
+64-token streams. The cache counters recorded zero hits throughout.
+Both ranks logged the selected NCCL transport.
+
+| Two GB10s, one private link | First visible text, median | Decode tokens/s, median (range) |
+|---|---:|---:|
+| RoCE (`NET/IB`) | 25.9 ms | 135.4 (129.6–144.9) |
+| TCP (`NET/Socket`) | 76.6 ms | 35.3 (28.1–41.4) |
+
+RoCE decoded 3.83 times as fast as sockets in this run. RoCE was measured
+first. The earlier single-GPU result of 261.6 tokens/s came from a separate
+window. [Individual runs and Fleet outcomes](../../bench/results/2026-11-28-gb10-fleet-roce-socket.json)
+
 ### Fleet adapter handoff
 
 1. Write one serving `sys.config` with `erllama_server.models` containing
