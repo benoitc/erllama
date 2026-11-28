@@ -156,7 +156,7 @@ models() ->
     Loaded = maps:from_list([{maps:get(id, I), I} || I <- erllama:list_models()]),
     Registered = [
         maps:merge(
-            maps:with([name, source, size, sha256, status, default, keep_alive], E),
+            maps:with([name, source, size, sha256, status, default, keep_alive, group, reason], E),
             #{
                 registered => true,
                 loaded => is_map_key(Name, Loaded),
@@ -253,6 +253,9 @@ detokenize(Model, Tokens) when is_binary(Model), is_list(Tokens) ->
 Register a GGUF file on the release machine. `Opts`: `name`, `mmproj`,
 `n_ctx`, `n_gpu_layers`, `parallel` (requests served at once, default
 `default_parallel`), `kv_unified`, `early_stream_token`, `chat_template`, `keep_alive`.
+To serve on configured ranks, pass a `group` map with `group_id`, `generation`,
+`world`, the local `coordinator` name and the `followers` node names in rank order.
+A grouped model uses the ranks' context settings and stays loaded by default.
 """.
 -spec register_model(binary() | string(), map()) -> {ok, map()} | {error, term()}.
 register_model(Path, Opts) when is_map(Opts) ->
@@ -772,7 +775,7 @@ agent_set_model(Id, Model) ->
             E
     end.
 
--doc "Switch the session's policy mode: `default', `yes' or `read_only'.".
+-doc "Switch the session's policy mode: `default`, `yes` or `read_only`.".
 -spec agent_set_policy(binary(), default | yes | read_only) -> ok | {error, term()}.
 agent_set_policy(Id, Policy) when Policy =:= default; Policy =:= yes; Policy =:= read_only ->
     with_agent(Id, fun(Pid) -> erllama_server_agent:set_policy(Pid, Policy) end);

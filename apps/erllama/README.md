@@ -76,7 +76,7 @@ Add it to `rebar.config`:
 
 ```erlang
 {deps, [
-    {erllama, "~> 0.13"}
+    {erllama, "~> 0.14"}
 ]}.
 ```
 

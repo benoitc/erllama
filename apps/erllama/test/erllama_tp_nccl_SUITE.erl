@@ -77,7 +77,6 @@ init_per_suite(Config) ->
              || {R, H} <- lists:enumerate(0, Hosts)
             ],
             [{_, P0, _} | _] = Peers,
-            ok = erllama_tp_hosts:load_module(P0, erllama_tp_coordinator),
             %% The node serving the split model: erllama, no GPU work.
             {S, _} = erllama_tp_hosts:start_peer(erllama_tps, hd(Hosts), Cookie),
             ok = erllama_tp_hosts:load_module(S, erllama_tp_stream),

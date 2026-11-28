@@ -16,7 +16,7 @@ $R/bin/erllama status
 
 ```text
 release   erllama_server@127.0.0.1
-versions  erllama_server 0.1.0, erllama 0.13.0, api 1
+versions  erllama_server 0.2.0, erllama 0.14.0, api 2
 memory    36401 of 49152 MiB used (system)
 models
   demo:latest  running  ctx 8192  2 of 4 sequences busy

@@ -1,0 +1,213 @@
+{
+  "date": "2026-11-28",
+  "erllama": "0f696225d7c05804ab967936f5eb5e5795ca9121",
+  "barrellm": "d5b508cc2b71c5a806f548be1bb796e48abd98a8",
+  "nif_sha256": "c958befa43a3261f930e830ea3865ff5d82955fdf283728bae4f64c280d7be5a",
+  "model_sha256": "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0",
+  "hosts": [
+    "gx10-fa8e",
+    "gx10-e25e"
+  ],
+  "interface": "enp1s0f0np0",
+  "hca": "rocep1s0f0",
+  "n_ctx": 2048,
+  "parallel": 1,
+  "model": "TinyLlama 1.1B Chat Q4",
+  "prompt": "Write a detailed numbered list of ways to grow vegetables in a small garden. Explain every item.",
+  "temperature": 0,
+  "measurement": "One warm-up, then three HTTP streams per transport through the serving erllama endpoint on rank 0’s host. Gateway chat was checked separately. RoCE was measured first.",
+  "activations": [
+    {
+      "group": {
+        "reason": null,
+        "state": "ready",
+        "world": 2,
+        "model": "tiny:latest",
+        "n_seq_max": 1,
+        "generation": 10,
+        "group_id": "fleet-10",
+        "ranks": [
+          {
+            "reason": null,
+            "state": "ready",
+            "rank": 0
+          },
+          {
+            "reason": null,
+            "state": "ready",
+            "rank": 1
+          }
+        ]
+      },
+      "before": {
+        "bytes_disk": 0,
+        "bytes_ram": 0,
+        "hits_longest_prefix": 0,
+        "evictions": 0,
+        "saves_finish": 0,
+        "saves_continued": 0,
+        "saves_cold": 0,
+        "misses": 1,
+        "hits_resume": 0,
+        "hits_exact": 0
+      },
+      "after": {
+        "bytes_disk": 0,
+        "bytes_ram": 0,
+        "hits_longest_prefix": 0,
+        "evictions": 0,
+        "saves_finish": 0,
+        "saves_continued": 0,
+        "saves_cold": 0,
+        "misses": 5,
+        "hits_resume": 0,
+        "hits_exact": 0
+      },
+      "runs": [
+        {
+          "tokens": 64,
+          "prompt_tokens": 38,
+          "ttft_ms": 30.75,
+          "end_to_end_tps": 137.49,
+          "decode_tps": 144.91
+        },
+        {
+          "tokens": 64,
+          "prompt_tokens": 38,
+          "ttft_ms": 23.52,
+          "end_to_end_tps": 130.95,
+          "decode_tps": 135.42
+        },
+        {
+          "tokens": 64,
+          "prompt_tokens": 38,
+          "ttft_ms": 25.92,
+          "end_to_end_tps": 125.01,
+          "decode_tps": 129.62
+        }
+      ],
+      "gateway": {
+        "epoch": 10,
+        "capacity": 1,
+        "content": "Two colors are:\n\n1. Blue and green."
+      },
+      "transport": "IB",
+      "nccl": [
+        "gx10-fa8e:3916144:3916248 [0] NCCL INFO Using network IB",
+        "gx10-e25e:3994990:3995041 [0] NCCL INFO Using network IB"
+      ],
+      "workloads": [
+        [
+          "open-webui"
+        ],
+        []
+      ],
+      "median": {
+        "decode_tps": 135.42,
+        "ttft_ms": 25.92,
+        "end_to_end_tps": 130.95
+      }
+    },
+    {
+      "group": {
+        "reason": null,
+        "state": "ready",
+        "world": 2,
+        "model": "tiny:latest",
+        "n_seq_max": 1,
+        "generation": 31,
+        "group_id": "fleet-31",
+        "ranks": [
+          {
+            "reason": null,
+            "state": "ready",
+            "rank": 0
+          },
+          {
+            "reason": null,
+            "state": "ready",
+            "rank": 1
+          }
+        ]
+      },
+      "before": {
+        "bytes_disk": 0,
+        "bytes_ram": 0,
+        "hits_longest_prefix": 0,
+        "evictions": 0,
+        "saves_finish": 0,
+        "saves_continued": 0,
+        "saves_cold": 0,
+        "misses": 1,
+        "hits_resume": 0,
+        "hits_exact": 0
+      },
+      "after": {
+        "bytes_disk": 0,
+        "bytes_ram": 0,
+        "hits_longest_prefix": 0,
+        "evictions": 0,
+        "saves_finish": 0,
+        "saves_continued": 0,
+        "saves_cold": 0,
+        "misses": 5,
+        "hits_resume": 0,
+        "hits_exact": 0
+      },
+      "runs": [
+        {
+          "tokens": 64,
+          "prompt_tokens": 38,
+          "ttft_ms": 51.94,
+          "end_to_end_tps": 40.68,
+          "decode_tps": 41.42
+        },
+        {
+          "tokens": 64,
+          "prompt_tokens": 38,
+          "ttft_ms": 76.64,
+          "end_to_end_tps": 34.42,
+          "decode_tps": 35.34
+        },
+        {
+          "tokens": 64,
+          "prompt_tokens": 38,
+          "ttft_ms": 77.44,
+          "end_to_end_tps": 27.57,
+          "decode_tps": 28.08
+        }
+      ],
+      "gateway": {
+        "epoch": 31,
+        "capacity": 1,
+        "content": "Two colors are:\n\n1. Blue and green."
+      },
+      "transport": "Socket",
+      "nccl": [
+        "gx10-fa8e:3916365:3916484 [0] NCCL INFO Using network Socket",
+        "gx10-e25e:3995111:3995165 [0] NCCL INFO Using network Socket"
+      ],
+      "workloads": [
+        [
+          "open-webui"
+        ],
+        []
+      ],
+      "median": {
+        "decode_tps": 35.34,
+        "ttft_ms": 76.64,
+        "end_to_end_tps": 34.42
+      }
+    }
+  ],
+  "failure": {
+    "rank": 1,
+    "generation": 10,
+    "signal": "SIGKILL",
+    "pid": 3994990,
+    "ready_catalog_entries_after_loss": 0,
+    "gateway_http_after_loss": 502
+  },
+  "new_epoch_served": true,
+  "slots_released": true
+}

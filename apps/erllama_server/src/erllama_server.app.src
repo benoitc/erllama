@@ -3,7 +3,7 @@
 %%
 {application, erllama_server, [
     {description, "erllama server release: models, conversations, agent runs and APIs"},
-    {vsn, "0.1.0"},
+    {vsn, "0.2.0"},
     {registered, [
         erllama_server_sup,
         erllama_server_failures,

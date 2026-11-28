@@ -3,17 +3,18 @@
 %%
 %% The bootstrap exchange of a tensor-parallel group, without a GPU:
 %% the native callback a communicator's init calls, the agent that
-%% serves it and the test coordinator, through
+%% serves it and the group coordinator, through
 %% erllama_tp:bootstrap_selftest/5 (the same bridge erllama_tp:open/5
-%% uses). Every rank is a process of this VM. The GPU side is
+%% uses). The peer case runs ranks on separate local nodes. The GPU side is
 %% erllama_tp_nccl_SUITE (opt-in, on CUDA hosts).
 -module(erllama_tp_bootstrap_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
--export([all/0]).
+-export([all/0, cpu_rank/2]).
 -export([
+    watched_peer_loss/1,
     ranks_gather_in_rank_order/1,
     missing_rank_fails_within_the_deadline/1,
     silent_coordinator_hits_the_native_deadline/1,
@@ -25,6 +26,7 @@
 
 all() ->
     [
+        watched_peer_loss,
         ranks_gather_in_rank_order,
         missing_rank_fails_within_the_deadline,
         silent_coordinator_hits_the_native_deadline,
@@ -33,6 +35,57 @@ all() ->
         duplicate_rank_is_refused,
         no_communicator_in_this_build
     ].
+
+watched_peer_loss(_Config) ->
+    with_peer(fun(Serving) ->
+        with_peer(fun(P0) ->
+            with_peer(fun(P1) -> exercise_loss(Serving, P0, P1) end)
+        end)
+    end).
+
+exercise_loss(Serving, P0, P1) ->
+    {ok, C} = peer:call(Serving, erllama_tp_coordinator, start, [2, 5000]),
+    Results = erllama_tp_hosts:parallel([
+        fun() ->
+            ok = erllama_tp_hosts:load_module(Peer, ?MODULE),
+            peer:call(Peer, proc_lib, start, [?MODULE, cpu_rank, [C, Rank]], 10000)
+        end
+     || {Rank, Peer} <- lists:enumerate(0, [P0, P1])
+    ]),
+    Expected = {ok, [<<0, 1>>, <<0, 1>>]},
+    [{R0, Expected}, {R1, Expected}] = Results,
+    ok = peer:call(Serving, erllama_tp_coordinator, watch, [C, [R0, R1]]),
+    ?assertEqual(undefined, peer:call(Serving, erllama_tp_coordinator, lost, [C])),
+    Ref = monitor(process, P1),
+    true = peer:call(P0, erlang, exit, [R0, kill]),
+    receive
+        {'DOWN', Ref, process, P1, _} -> ok
+    after 10000 -> ct:fail(surviving_rank_node_still_up)
+    end,
+    ?assertEqual({R0, killed}, peer:call(Serving, erllama_tp_coordinator, lost, [C])),
+    ok = peer:call(Serving, erllama_tp_coordinator, stop, [C]).
+
+cpu_rank(Coord, Rank) ->
+    Join = erllama_tp_coordinator:join_fun(Coord, Rank),
+    Result = erllama_tp:bootstrap_selftest(2, <<Rank>>, 2, Join, 6000),
+    proc_lib:init_ack({self(), Result}),
+    receive
+        stop -> ok
+    end.
+
+with_peer(Fun) ->
+    {ok, Peer, _} = peer:start(#{
+        name => peer:random_name("tp"),
+        host => "127.0.0.1",
+        longnames => true,
+        connection => standard_io,
+        args => ["+S", "2", "-pa", filename:join(code:lib_dir(erllama), "ebin")]
+    }),
+    try
+        Fun(Peer)
+    after
+        catch peer:stop(Peer)
+    end.
 
 %% Three ranks, four rounds: every rank gets every rank's record, in
 %% rank order, each round.
@@ -52,6 +105,8 @@ missing_rank_fails_within_the_deadline(_Config) ->
     end),
     ?assertEqual({error, join_timeout}, Result),
     ?assert(Ms < 2000, Ms),
+    Late = erllama_tp_coordinator:join_fun(C, 1),
+    ?assertEqual({error, join_timeout}, Late(1, <<"y">>)),
     erllama_tp_coordinator:stop(C).
 
 %% A coordinator that never answers: the native wait ends at the

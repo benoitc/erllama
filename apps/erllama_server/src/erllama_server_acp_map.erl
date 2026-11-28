@@ -71,7 +71,7 @@ initialize_result() ->
 version() ->
     case application:get_key(erllama_server, vsn) of
         {ok, V} -> list_to_binary(V);
-        _ -> <<"0.1.0">>
+        _ -> <<"0.2.0">>
     end.
 
 %% ---------------------------------------------------------------------------

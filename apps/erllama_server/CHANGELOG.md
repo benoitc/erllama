@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-28
+
+### Added
+
+- The release includes a mutual TLS distribution profile for groups across hosts.
+- HTTP status API 2 reports grouped models, rank readiness and loss reasons. Prometheus exposes group state and lost slots.
+- Start serving and rank roles from the same release with separate config files.
+- Register a tensor-parallel group to serve a model by name and see when a rank is lost.
+- Tested with two GB10 hosts on RoCE and TCP. Fleet served chat, withdrew the
+  replica after follower loss, and served again with a new generation. See the
+  [two-host guide](../../guides/server/tensor-parallel.md#fleet-acceptance-and-matched-transport-comparison).
+
 ### Changed
 
 - Model pulls and local registration accept numbered GGUF shards as one

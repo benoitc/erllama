@@ -27,7 +27,20 @@ init([]) ->
         sup_child(erllama_model_sup),
         worker_child(erllama_scheduler)
     ],
-    {ok, {SupFlags, Children}}.
+    Rank =
+        case application:get_env(erllama, tp_rank) of
+            undefined ->
+                [];
+            {ok, Config} ->
+                [
+                    #{
+                        id => erllama_tp_rank_role,
+                        start => {erllama_tp_rank_role, start_link, [Config]},
+                        restart => temporary
+                    }
+                ]
+        end,
+    {ok, {SupFlags, Children ++ Rank}}.
 
 sup_child(Mod) ->
     #{

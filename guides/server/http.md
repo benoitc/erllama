@@ -50,7 +50,7 @@ demand, or omitted for the default model.
 
 ## Serving MLX on a Mac
 
-Install the [optional MLX runtime](../building.md#optional-mlx-lm-backend-on-apple-silicon)
+Install the [optional MLX runtime](https://hexdocs.pm/erllama/0.14.0/building.html#optional-mlx-lm-backend-on-apple-silicon)
 and export `ERLLAMA_MLX_PYTHON` in the server's environment. Point a registry
 entry at the local checkpoint directory in `sys.config`. The registry keeps
 the backend and slot count under the same model name after restart.
@@ -243,7 +243,13 @@ you the kind:
 - `404`: an unknown model;
 - `413`: the body is too large;
 - `429`: the server is at capacity;
-- `500`: anything else.
+- `503`: a new inference request cannot use its rank group. Read
+  `error.code` (OpenAI and Anthropic) or `code` (Ollama).
+  `tp_rank_lost` means the generation lost a rank. Start a new generation.
+  `incompatible_ranks` means the ranks disagree on the model, options,
+  group size or build. Check the rank numbers in `/status` before restarting.
+  `group_unavailable` covers other group failures, such as a timed-out join;
+- `500`: other server failures.
 
 An error during a stream arrives as a final event in the protocol's
 own shape:
@@ -261,6 +267,35 @@ own shape:
 | Endpoint | Answers |
 |---|---|
 | `GET /health` | `200` while the release runs |
-| `GET /ready` | `200` when the engine, the registry and the model manager are up, `503` and the failed checks otherwise |
-| `GET /metrics` | Prometheus text: HTTP request metrics, erllama's cache counters, loaded models, active and waiting runs, downloads, failures by kind |
-| `GET /status` | what runs, waits and failed, as JSON (the same as `erllama status`; see [Operating the release](operations.md)) |
+| `GET /ready` | `200` when the engine, registry, model manager and all grouped models are ready, `503` and the failed checks otherwise |
+| `GET /metrics` | Prometheus text: HTTP request metrics, erllama's cache counters, loaded models, active and waiting runs, downloads, failures by kind and rank group gauges |
+| `GET /rank` | on a rank node, its local identity, state and reason |
+| `GET /status` | HTTP API version, ordinary server status and rank groups as JSON |
+
+The serving node reports `api: 2` in `/status`. You can read the same
+model, run, cache and failure fields as in API 1. The CLI uses its existing
+RPC version. The new `groups` array has one entry per grouped model and is
+empty on a standalone server.
+
+| Group field | Meaning |
+|---|---|
+| `model` | Registered model name, including its tag. |
+| `group_id`, `generation` | Group name and generation number. Use both to identify a run. |
+| `world` | Number of configured ranks. |
+| `state` | `forming` while waiting for ranks or model load, `ready` once all shares and the serving model are loaded, `lost` when this generation has failed. |
+| `reason` | `null` until loss, then an object with a `code`. A rank exit can include its `rank` and exit `detail`. An identity mismatch includes the list of disagreeing `ranks`, relative to rank 0. |
+| `ranks` | One entry per slot, in order from zero, with `rank`, `state` and `reason`. A rank becomes ready after loading its share. All slots become lost when the generation fails. |
+| `n_seq_max` | Number of sequence slots in the model context, or `null` until rank 0 reports its capacity. |
+
+On a grouped server, `/ready` includes the same `groups` array. When any
+group is forming or lost, the response is HTTP 503 and `failed` includes
+`group`. On a rank node, `/rank` returns `group_id`, `generation`, `world`,
+`rank`, `state` and `reason`. Its `/ready` includes this object under
+`rank`. It returns 503 with `rank` in `failed` until ready and after loss.
+You can still read `/rank` after the local role reports a loss.
+
+Scrape `erllama_server_tp_group_state` with labels `model`, `group_id`,
+`generation` and `state`. Only the current state's sample is 1.
+`erllama_server_tp_lost_ranks` uses the first three labels and counts slots
+in the lost state. If one host fails and the group shuts down, that count
+includes every slot that can no longer serve.

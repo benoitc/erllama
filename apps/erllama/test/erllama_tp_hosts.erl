@@ -175,7 +175,7 @@ with_serving([Host0 | _], Fun) ->
     Cookie = cookie(),
     {S, _} = start_peer(name("erllama_tps"), Host0, Cookie),
     put(cookie, Cookie),
-    [ok = ?MODULE:load_module(S, M) || M <- [erllama_tp_coordinator, erllama_tp_stream]],
+    ok = ?MODULE:load_module(S, erllama_tp_stream),
     try
         Fun(S)
     after

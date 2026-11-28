@@ -21,7 +21,17 @@
 -behaviour(gen_server).
 -behaviour(erllama_model_evictor).
 
--export([start_link/0, resolve/1, acquire/3, release/2, load/2, unload/1, ps/0, evict_one/0]).
+-export([
+    start_link/0,
+    resolve/1,
+    acquire/3,
+    release/2,
+    load/2,
+    unload/1,
+    ps/0,
+    group_loaded/2,
+    evict_one/0
+]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(LOAD_TIMEOUT, infinity).
@@ -38,7 +48,7 @@
 -record(state, {
     models = #{} :: #{binary() => #model{}},
     %% A load in progress: the loader's monitor, and who waits for it.
-    loading = #{} :: #{binary() => {reference(), [{gen_server:from(), pid(), term()}]}},
+    loading = #{} :: #{binary() => {reference(), map(), [{gen_server:from(), pid(), term()}]}},
     %% An unload in progress, and the acquisitions waiting for it to
     %% finish: they then load the model again.
     unloading = #{} :: #{
@@ -57,8 +67,19 @@ start_link() ->
     {ok, {registry, map()} | {loaded, binary()}} | {error, term()}.
 resolve(Name) ->
     case erllama_server_registry:resolve(Name) of
+        {ok, #{status := lost, reason := Reason}} ->
+            {error, Reason};
         {ok, #{status := missing, name := N}} ->
             {error, {model_file_missing, N}};
+        {ok, #{group := G} = Entry} ->
+            case erllama_server_group:snapshot(G) of
+                {ok, _, {incompatible_ranks, _} = Why} -> {error, Why};
+                {ok, _, {tp_rank_lost, R, Why}} -> {error, {tp_rank_lost, {R, Why}}};
+                {ok, _, {tp_rank_lost, _} = Why} -> {error, Why};
+                {ok, _, Why} when Why =/= undefined -> {error, {group_unavailable, Why}};
+                {error, wrong_generation} -> {error, {group_unavailable, wrong_generation}};
+                _ -> {ok, {registry, Entry}}
+            end;
         {ok, Entry} ->
             {ok, {registry, Entry}};
         {error, _} = E when is_binary(Name) ->
@@ -135,6 +156,10 @@ ps() ->
      || Info <- erllama:list_models()
     ].
 
+-spec group_loaded(binary(), map()) -> boolean().
+group_loaded(Id, Group) ->
+    gen_server:call(?MODULE, {group_loaded, Id, Group}).
+
 %% Requests queued for a free sequence (read without the model process).
 waiting(Id) ->
     case erllama:pending_len(Id) of
@@ -172,6 +197,11 @@ handle_call(
     case {Ms, L} of
         {#{Id := M}, _} ->
             case erllama:whereis(Id) of
+                {ok, _} when
+                    map_get(group, Entry) =/= map_get(group, M#model.entry);
+                    is_map_key(group, Entry) =/= is_map_key(group, M#model.entry)
+                ->
+                    {reply, {error, model_busy}, St};
                 {ok, _} ->
                     {reply, {ok, Id}, St#state{models = Ms#{Id := hold(Holder, KA, M)}}};
                 {error, not_loaded} ->
@@ -180,13 +210,27 @@ handle_call(
                         models = maps:remove(Id, Ms)
                     })
             end;
-        {_, #{Id := {Mon, Waiters}}} ->
-            {noreply, St#state{loading = L#{Id := {Mon, [{From, Holder, KA} | Waiters]}}}};
+        {_, #{Id := {_, Other, _}}} when
+            map_get(group, Entry) =/= map_get(group, Other);
+            is_map_key(group, Entry) =/= is_map_key(group, Other)
+        ->
+            {reply, {error, model_busy}, St};
+        {_, #{Id := {Mon, Other, Waiters}}} ->
+            {noreply, St#state{loading = L#{Id := {Mon, Other, [{From, Holder, KA} | Waiters]}}}};
         _ ->
             Self = self(),
             {_, Mon} = spawn_monitor(fun() -> Self ! {load_result, Id, load_model(Entry)} end),
-            {noreply, St#state{loading = L#{Id => {Mon, [{From, Holder, KA}]}}}}
+            {noreply, St#state{loading = L#{Id => {Mon, Entry, [{From, Holder, KA}]}}}}
     end;
+handle_call({group_loaded, Id, Group}, _, #state{models = Ms, unloading = U} = St) ->
+    Loaded =
+        case Ms of
+            #{Id := #model{entry = #{group := Group}}} when not is_map_key(Id, U) ->
+                erllama:whereis(Id) =/= {error, not_loaded};
+            _ ->
+                false
+        end,
+    {reply, Loaded, St};
 handle_call(managed, _From, #state{models = Ms} = St) ->
     {reply, maps:map(fun(_, M) -> describe(M) end, Ms), St};
 handle_call({unload, Id}, From, #state{unloading = U} = St) when is_map_key(Id, U) ->
@@ -228,12 +272,12 @@ handle_cast(_Msg, St) ->
     {noreply, St}.
 
 handle_info({load_result, Id, Result}, #state{loading = L} = St) when is_map_key(Id, L) ->
-    {Mon, _} = maps:get(Id, L),
+    {Mon, _, _} = maps:get(Id, L),
     erlang:demonitor(Mon, [flush]),
     {noreply, loaded(Id, {loaded, Id, Result}, St)};
 handle_info({'DOWN', Mon, process, _, Reason}, #state{loading = L} = St) ->
     %% A loader that died before reporting crashed in the load.
-    case [Id || Id := {M, _} <- L, M =:= Mon] of
+    case [Id || Id := {M, _, _} <- L, M =:= Mon] of
         [Id] -> {noreply, loaded(Id, Reason, St)};
         [] -> {noreply, holder_down(Mon, St)}
     end;
@@ -254,7 +298,7 @@ handle_info(_Msg, St) ->
 
 %% The loader exited with the load's outcome; answer everyone waiting.
 loaded(Id, {loaded, Id, Result}, #state{loading = L, models = Ms} = St) ->
-    {{_, Waiters}, L1} = maps:take(Id, L),
+    {{_, _, Waiters}, L1} = maps:take(Id, L),
     case Result of
         {ok, Id, Entry} ->
             Now = erlang:monotonic_time(millisecond),
@@ -277,15 +321,19 @@ loaded(Id, {loaded, Id, Result}, #state{loading = L, models = Ms} = St) ->
             [gen_server:reply(From, E) || {From, _, _} <- Waiters],
             St#state{loading = L1}
     end;
-loaded(Id, Crash, #state{loading = L} = St) ->
-    {{_, Waiters}, L1} = maps:take(Id, L),
-    [gen_server:reply(From, {error, {load_failed, Crash}}) || {From, _, _} <- Waiters],
-    St#state{loading = L1}.
+loaded(Id, Crash, St) ->
+    loaded(Id, {loaded, Id, {error, {load_failed, Crash}}}, St).
 
 load_model(#{name := Id} = Entry) ->
-    case erllama:load_model(Id, load_config(Entry)) of
+    case load_config(Entry) of
+        {ok, Config} -> load_model(Id, Entry, Config);
+        Error -> Error
+    end.
+
+load_model(Id, Entry, Config) ->
+    case erllama:load_model(Id, Config) of
         {ok, Id} -> {ok, Id, Entry};
-        {error, already_loaded} -> {ok, Id, Entry};
+        {error, already_loaded} when not is_map_key(group, Entry) -> {ok, Id, Entry};
         {error, _} = E -> E
     end.
 
@@ -298,6 +346,13 @@ load_model(#{name := Id} = Entry) ->
 %% sequences share one KV pool of `n_ctx' cells and each may use up to
 %% `n_ctx' (as llama-server with automatic slots); without it each
 %% sequence gets `n_ctx / parallel'.
+load_config(#{group := _, load := #{backend := _}}) ->
+    {error, {incompatible_ranks, [0]}};
+load_config(#{group := _, path := Path} = Entry) ->
+    %% Rank descriptors carry the effective context. A group still forming
+    %% can be polled without reading a GGUF tokenizer on each attempt.
+    Base = with_extras(#{model_path => Path}, Entry, maps:get(load, Entry, #{})),
+    erllama_server_group:attach(Entry, Base);
 load_config(#{path := Path} = Entry) ->
     Load = maps:get(load, Entry, #{}),
     NCtx = n_ctx(Entry, Load),
@@ -311,7 +366,7 @@ load_config(#{path := Path} = Entry) ->
         },
         context_size => NCtx
     },
-    with_extras(Base, Entry, Load).
+    {ok, with_extras(Base, Entry, Load)}.
 
 with_extras(Base, _Entry, #{backend := erllama_model_mlx} = Load) ->
     Context = maps:remove(kv_unified, maps:get(context_opts, Base)),
@@ -355,6 +410,7 @@ n_ctx(#{path := Path}, _) ->
 
 default_keep_alive(Entry) ->
     case maps:get(keep_alive, Entry, undefined) of
+        undefined when is_map_key(group, Entry) -> infinity;
         undefined -> erllama_server_config:get(keep_alive_ms);
         KA -> KA
     end.

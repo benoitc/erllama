@@ -145,6 +145,10 @@ control commands (`ping`, `stop`, `eval`), not the node's.
 By default the release listens on the loopback interface only
 (`-kernel inet_dist_use_interface {127,0,0,1}` in `config/vm.args.src`).
 To reach it from another machine, use TLS distribution on both sides.
+For a tensor-parallel group, you can copy the release's `etc/tp-dist.conf`
+beside the CLI host's certificate, private key and cluster CA, and point
+`ERLLAMA_DIST_OPTFILE` there. Use the service account's cookie file.
+See [Put the follower on a second host](tensor-parallel.md#put-the-follower-on-a-second-host).
 
 1. Write an `ssl_dist.conf` for each side, with certificates both sides
    trust:

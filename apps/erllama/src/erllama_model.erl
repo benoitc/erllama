@@ -455,6 +455,7 @@
 }).
 
 -record(data, {
+    rank_monitors = #{} :: map(),
     model_id :: binary(),
     tier_srv :: atom(),
     tier :: ram | disk | ram_file,
@@ -1110,6 +1111,12 @@ init([ModelId, Config0]) ->
             {stop, Reason}
     end.
 
+monitor_ranks(#{backend := erllama_model_tp, tp_worker := W} = Config) ->
+    Pids = [W | [P || {P, _} <- maps:get(tp_followers, Config, [])]],
+    maps:from_list([{monitor(process, P, [{tag, tp_rank_down}]), P} || P <- Pids]);
+monitor_ranks(_) ->
+    #{}.
+
 build_init_data(ModelId, Config, Backend, BState) ->
     CtxOpts = maps:get(context_opts, Config, #{}),
     NSeqMax = maps:get(n_seq_max, CtxOpts, 1),
@@ -1121,6 +1128,7 @@ build_init_data(ModelId, Config, Backend, BState) ->
     Fp = maps:get(fingerprint, Config, maps:get(fingerprint, Meta, default_fingerprint())),
     {QuantType, QuantBits} = configured_quant(Config, Meta),
     #data{
+        rank_monitors = monitor_ranks(Config),
         model_id = ModelId,
         tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
         tier = maps:get(tier, Config, ram),
@@ -2391,6 +2399,15 @@ handle_common(
     ok = fail_all_requests(Data, mlx_runner_down),
     ok = fail_pending_admits(Data, mlx_runner_down),
     {stop, {mlx_runner_down, Reason}, Data};
+handle_common(
+    _, info, {tp_rank_down, Ref, process, P, Why}, #data{rank_monitors = Refs} = Data
+) when
+    map_get(Ref, Refs) =:= P
+->
+    Reason = {tp_rank_lost, Why},
+    ok = fail_all_requests(Data, Reason),
+    ok = fail_pending_admits(Data, Reason),
+    {stop, Reason, Data};
 handle_common(_State, _EventType, _EventContent, Data) ->
     {keep_state, Data}.
 

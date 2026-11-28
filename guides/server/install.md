@@ -13,7 +13,7 @@ The native archives run on these platforms:
 ## Install from GitHub
 
 ```sh
-curl -fsSL https://github.com/benoitc/erllama/releases/download/v0.13.0/install.sh | sh
+curl -fsSL https://github.com/benoitc/erllama/releases/download/v0.14.0/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 erllama_server foreground
 ```
@@ -33,7 +33,7 @@ after the pipe for a different installation directory. Existing model data stays
 ## Install from local files
 
 Download `install.sh`, `SHA256SUMS` and the matching `.tar.gz` from the
-[same release](https://github.com/benoitc/erllama/releases/tag/v0.13.0) to one directory, then run:
+[same release](https://github.com/benoitc/erllama/releases/tag/v0.14.0) to one directory, then run:
 
 ```sh
 sh ./install.sh --from .
@@ -47,15 +47,15 @@ Run it on Linux with Docker and the NVIDIA Container Toolkit:
 ```sh
 docker run -d --name erllama --gpus all --network host \
   -v erllama-data:/data -v /path/to/models:/models:ro \
-  ghcr.io/benoitc/erllama:0.13.0-gx10
+  ghcr.io/benoitc/erllama:0.14.0-gx10
 docker exec erllama erllama load /models/model.gguf --name demo --gpu-layers 99
 docker exec erllama erllama run demo "Say hello."
 curl http://127.0.0.1:8080/ready
 ```
 
-For an offline GX10, download `erllama-0.13.0-gx10.docker.tar.gz` and its
-`.sha256` file from the release. Run `sha256sum -c erllama-0.13.0-gx10.docker.tar.gz.sha256`
-and `docker load -i erllama-0.13.0-gx10.docker.tar.gz`, then use the same run command.
+For an offline GX10, download `erllama-0.14.0-gx10.docker.tar.gz` and its
+`.sha256` file from the release. Run `sha256sum -c erllama-0.14.0-gx10.docker.tar.gz.sha256`
+and `docker load -i erllama-0.14.0-gx10.docker.tar.gz`, then use the same run command.
 
 Host networking keeps the default HTTP listener on the host loopback interface.
 Use `-e ERLLAMA_HTTP_PORT=8081` if port 8080 is occupied. The default Erlang node name

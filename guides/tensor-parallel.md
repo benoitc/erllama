@@ -52,21 +52,19 @@ On each host, check that the build can join a group:
 
 ## 2. Start a coordinator
 
-Ranks join through a coordinator that answers
-`gen_server:call(Coord, {exchange, Rank, Round, Bytes})` with
-`{ok, AllBytes}`: every rank's bytes for that round, concatenated in
-rank order. erllama does not ship one yet. The test coordinator
-`apps/erllama/test/erllama_tp_coordinator.erl` does this, fails a round
-that is not complete in time, and watches the ranks once they are up.
-On the serving node:
+Start `erllama_tp_coordinator` on the serving node. Give it the number
+of ranks and the time in milliseconds to wait from the first arrival
+in each bootstrap round.
 
 ```erlang
 World = 2,
 {ok, Coord} = erllama_tp_coordinator:start(World, 60000).
 ```
 
-Use one coordinator per group generation. After any failure you start
-a new one and form the group again.
+Each rank receives every rank's bytes in rank order. If a rank misses
+the deadline, waiting and late joins receive `{error, join_timeout}`.
+Stop the failed coordinator with `erllama_tp_coordinator:stop(Coord)`
+and start a fresh one for the next generation.
 
 ## 3. Form the ranks
 
@@ -95,8 +93,59 @@ ok = erllama_tp_coordinator:watch(Coord, [Rank0, Rank1]).
 
 `gpu` (default 0) picks the host's device. The rank process is not
 linked to its caller: it lives until `erllama_tp_rank:stop/1` or until
-its node goes. When a watched rank goes, the test coordinator kills the
-others (a rank left in a collective with a lost peer never returns).
+its node goes. After a normal exit the coordinator stops the other
+ranks. After an abnormal exit it terminates the remaining rank nodes
+to release blocked collectives. Read `erllama_tp_coordinator:lost(Coord)`
+for the first lost rank's `{Pid, Reason}`.
+
+### Start a rank from application configuration
+
+Use this mode when each rank has its own OTP application and you want
+to check its state locally. Start a named coordinator on the serving
+node first. Give each group its own registered name:
+
+```erlang
+{ok, Coord} = erllama_tp_coordinator:start(
+    glm_group, {<<"glm">>, 1}, 2, 60000).
+```
+
+On each dedicated rank node, place this in `sys.config`. Set `rank` to
+0 on the first node and 1 on the second. Both nodes need the same erllama
+version, native library build, absolute model path, model file and options.
+
+```erlang
+[{erllama, [
+    {tp_rank, #{group_id => <<"glm">>, generation => 1,
+                rank => 0, world => 2, gpu => 0,
+                coordinator => {glm_group, 'serve@hostA'},
+                model_path => "/models/glm.gguf",
+                model_opts => #{n_gpu_layers => 99},
+                context_opts => #{n_ctx => 4096, n_seq_max => 4},
+                timeout => 60000}}
+]}].
+```
+
+Start the node with that configuration and start the `erllama` application.
+The rank joins and loads its share in the background, including on rank 0.
+Use `erllama_tp_rank_role:status()` on the rank node while it starts:
+
+```erlang
+#{group_id := <<"glm">>, generation := 1, world := 2,
+  rank := 0, state := ready} = erllama_tp_rank_role:status().
+```
+
+You see `forming` during bootstrap and loading, then `ready` once the local
+load succeeds. A failed rank or coordinator leaves a surviving rank at
+`lost` with a `reason`. An identity mismatch gives
+`{incompatible_ranks, RankNumbers}` before native bootstrap. Stop the rank
+applications, start a fresh coordinator, and increase the generation on
+all nodes to form the group again. With no configured rank, the local
+status is `undefined`.
+
+The coordinator address can also be a node name when you register it as
+`erllama_tp_coordinator`. The default local GPU is 0 and the default join
+timeout is 60000 ms. This mode starts rank processes. The serving example
+below uses manually started ranks.
 
 ## 4. Load the model on every rank but 0
 

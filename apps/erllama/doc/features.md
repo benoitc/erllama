@@ -15,7 +15,7 @@ Experimental. See [internals/tensor-parallel-design.md](../../../internals/tenso
 |---|---|---|
 | rank-local API | done | `erllama_tp`: open this node's GPU as one rank, matvec, reduce, close; `erllama_tp_rank` holds a handle in a process for a remote coordinator |
 | bootstrap bridge | done | the communicator's bootstrap callback (`ggml_backend_comm_init_rank`) goes through an Erlang agent and a coordinator, rank-ordered, bounded by the open's deadline |
-| test coordinator | done | `test/erllama_tp_coordinator.erl`; group formation belongs to erllama_cluster |
+| group coordinator | done | `erllama_tp_coordinator` exchanges bootstrap records and watches the ranks for one generation |
 | portable tests | done | `erllama_tp_bootstrap_SUITE`, in CI |
 | hardware tests | done on two hosts | `erllama_tp_nccl_SUITE`, opt-in; hosts prepared with `scripts/tp_hosts.sh` |
 

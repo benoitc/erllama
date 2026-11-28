@@ -6,6 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-28
+
+### Added
+
+- You can form and monitor a tensor-parallel group with `erllama_tp_coordinator`.
+- Set `tp_rank` in the erllama application configuration to start a rank and read its local readiness.
+
 ## [0.13.0] - 2026-11-26
 
 ### Added
@@ -1505,7 +1512,8 @@ Initial public release.
 
 Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
-[Unreleased]: https://github.com/benoitc/erllama/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/benoitc/erllama/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/benoitc/erllama/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/benoitc/erllama/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/benoitc/erllama/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/benoitc/erllama/compare/v0.10.1...v0.11.0
