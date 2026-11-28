@@ -14,6 +14,7 @@ Two harnesses live here:
 
 | Model and hardware | What we measured |
 | --- | --- |
+| TinyLlama 1.1B on one and two GB10s | [Production release qualification over NCCL sockets](../guides/server/tensor-parallel.md#two-host-qualification-28-november-2026) and [individual runs](results/2026-11-28-gb10-release-tp.json) |
 | Qwen2.5-1.5B on M4 Pro, GLM-5.3-Flash and DeepSeek V4 Flash on two GB10s | [Prompt processing and generation at four context lengths](reports/2026-11-25-context-speed/README.md) |
 | Qwen3.8-27B on M4 Pro | [TensorFold and erllama on new prompts and immediate retries](reports/2026-11-26-mac-qwen-27b/README.md) |
 | Qwen2.5-1.5B on M4 Pro | [Time to first visible text with early sampling](reports/2026-11-26-first-token/README.md) |

@@ -1,5 +1,5 @@
-## erllama_server node. Distribution listens on loopback only; remote
-## administration needs an explicit TLS distribution setup.
+## Distribution listens on loopback by default. For a group across hosts,
+## use inet_tls and the release's etc/tp-dist.conf in each role's configuration.
 -name erllama_server@127.0.0.1
 -kernel inet_dist_use_interface {127,0,0,1}
 +K true

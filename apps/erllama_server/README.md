@@ -119,10 +119,12 @@ serve its models at `/mcp`. See [MCP servers](../../guides/server/mcp.md).
 ## Configuration
 
 The `erllama_server` application environment (`config/sys.config` in
-the release). A bad value stops the release from starting.
+the release). A bad value stops the release from starting. To use more than
+one GPU process, follow [Start a serving node and two ranks](../../guides/server/tensor-parallel.md).
 
 | Key | Default | Meaning |
 |---|---|---|
+| `role` | `serving` | a serving node owns the configured groups; a `rank` serves the health, readiness and rank probes |
 | `run_buffer_events` | `1024` | events kept per run for reattachment |
 | `subscriber_max_unacked` | `256` | unread events after which a slow client is cut off (it reattaches) |
 | `run_retention_ms` | `300000` | how long a finished run stays available to `attach` and `result` |
@@ -133,7 +135,7 @@ the release). A bad value stops the release from starting.
 | `default_parallel` | `4` | requests a model serves at once (its `parallel` load option overrides it) |
 | `kv_unified` | `true` | those requests share one KV pool of `n_ctx` (`false`: each gets `n_ctx / parallel`) |
 | `default_model` | none | the model a request without one uses |
-| `models` | `[]` | local files registered at boot: `#{name, path}` plus `n_ctx`, `n_gpu_layers`, `parallel`, `kv_unified`, `mmproj`, `keep_alive` |
+| `models` | `[]` | local files registered at boot: `#{name, path}` plus `n_ctx`, `n_gpu_layers`, `parallel`, `kv_unified`, `mmproj`, `keep_alive`, or a tensor-parallel `group` |
 | `hf_token` | `HF_TOKEN` | Hugging Face token for gated repositories |
 | `hf_base_url`, `ollama_base_url` | the public registries | where pulls go (a mirror) |
 | `max_active_pulls` | `4` | downloads at once |

@@ -24,7 +24,7 @@ Its other exports are test and tooling hooks, left out of these docs.
 """.
 -behaviour(gen_server).
 
--export([start/1, matvec/3, reduce/2, info/1, stop/1]).
+-export([start/1, start_link/1, matvec/3, reduce/2, info/1, stop/1]).
 -export([load/3, decode/2, stats/1, ref_load/3, ref_decode/2]).
 -export([seq_op/2]).
 -export([backend/3, follow_stats/1, describe/3, time_reduce/3, kill/1]).
@@ -36,6 +36,7 @@ Its other exports are test and tooling hooks, left out of these docs.
     rank :: non_neg_integer(),
     world :: pos_integer(),
     model :: erllama_nif:model_ref() | undefined,
+    loaded_identity :: tuple() | undefined,
     ctx :: erllama_nif:context_ref() | undefined,
     ref_model :: erllama_nif:model_ref() | undefined,
     ref_ctx :: erllama_nif:context_ref() | undefined,
@@ -70,6 +71,11 @@ gives it. Options: `gpu` (default 0), `rank`, `world`, `join`,
 -spec start(map()) -> {ok, pid()} | {error, term()}.
 start(Opts) ->
     gen_server:start(?MODULE, Opts, []).
+
+-doc false.
+-spec start_link(map()) -> {ok, pid()} | {error, term()}.
+start_link(Opts) ->
+    gen_server:start_link(?MODULE, Opts, []).
 
 -doc false.
 -spec matvec(pid(), [[float()]], [float()]) -> {ok, [float()], [float()]} | {error, term()}.
@@ -172,9 +178,13 @@ describe(Path, {MOpts, COpts}, World) ->
     Head =
         case file:open(Path, [read, binary, raw]) of
             {ok, F} ->
-                {ok, Bin} = file:read(F, 1048576),
-                ok = file:close(F),
-                crypto:hash(sha256, Bin);
+                try file:read(F, 1048576) of
+                    {ok, Bin} -> crypto:hash(sha256, Bin);
+                    eof -> {error, empty_model};
+                    {error, _} = Error -> Error
+                after
+                    ok = file:close(F)
+                end;
             {error, _} = E ->
                 E
         end,
@@ -204,8 +214,8 @@ handle_call({matvec, W, X}, _From, #state{handle = H} = S) ->
     {reply, erllama_tp:matvec(H, W, X), S};
 handle_call({reduce, V}, _From, #state{handle = H} = S) ->
     {reply, erllama_tp:reduce(H, V), S};
-handle_call({load, Path, {MOpts, COpts}}, _From, #state{handle = H} = S) ->
-    reply_loaded(load_with(Path, MOpts#{tp_rank => H}, split_context_opts(COpts)), split, S);
+handle_call({load, Path, Opts}, _From, S) ->
+    load_share(Path, Opts, S);
 handle_call({decode, Tokens}, _From, #state{ctx = C} = S) when C =/= undefined ->
     {reply, erllama_nif:tp_decode(C, Tokens), S};
 handle_call({seq_op, Op}, _From, #state{ctx = C} = S) when C =/= undefined ->
@@ -263,14 +273,16 @@ handle_info(_Msg, S) ->
 
 %% The serving rank's sink: every command to every other rank, in order,
 %% tagged with the group's generation.
-forward(Gen, Followers) ->
+forward(Gen, Followers, OwnerRef) ->
     receive
+        {'DOWN', OwnerRef, process, _, _} ->
+            ok;
         {erllama_tp, Seq, Cmd} ->
             M = {erllama_tp, Gen, Seq, Cmd},
             _ = [F ! M || F <- Followers],
-            forward(Gen, Followers)
+            forward(Gen, Followers, OwnerRef)
     after 3600000 ->
-        forward(Gen, Followers)
+        forward(Gen, Followers, OwnerRef)
     end.
 
 terminate(_Reason, #state{handle = H, host = B} = S) ->
@@ -279,9 +291,17 @@ terminate(_Reason, #state{handle = H, host = B} = S) ->
     _ = [erllama_nif:free_model(M) || M <- [S#state.model, S#state.ref_model], M =/= undefined],
     erllama_tp:close(H).
 
-reply_loaded({ok, M, C}, split, S) -> {reply, ok, S#state{model = M, ctx = C}};
-reply_loaded({ok, M, C}, ref, S) -> {reply, ok, S#state{ref_model = M, ref_ctx = C}};
-reply_loaded({error, _} = E, _, S) -> {reply, E, S}.
+load_share(Path, {MOpts, COpts}, #state{handle = H} = S) ->
+    Identity = {unicode:characters_to_binary(Path), MOpts, COpts},
+    Loaded = load_with(Path, MOpts#{tp_rank => H}, split_context_opts(COpts)),
+    reply_loaded(Loaded, {split, Identity}, S).
+
+reply_loaded({ok, M, C}, {split, Identity}, S) ->
+    {reply, ok, S#state{model = M, ctx = C, loaded_identity = Identity}};
+reply_loaded({ok, M, C}, ref, S) ->
+    {reply, ok, S#state{ref_model = M, ref_ctx = C}};
+reply_loaded({error, _} = E, _, S) ->
+    {reply, E, S}.
 
 %% A split model keeps no recurrent-state snapshots unless the caller
 %% asks: llama.cpp's split backend cannot split the snapshot's view of a
@@ -296,32 +316,47 @@ split_context_opts(COpts) ->
 
 %% Every follower must hold the same model as this rank; then this
 %% rank's context sends to a forwarder that keeps them in step.
-host_model(Config, Followers, #state{handle = H, world = W, gen = Gen}) ->
+host_model(Config, Followers, #state{handle = H, world = W, gen = Gen} = S) ->
     #{model_path := Path} = Config,
     MOpts = maps:get(model_opts, Config, #{}),
     COpts = maps:get(context_opts, Config, #{}),
     Mine = describe(Path, {MOpts, COpts}, W),
+    Identity = {unicode:characters_to_binary(Path), MOpts, COpts},
     case [F || {F, Desc} <- Followers, Desc =/= Mine] of
+        [] when S#state.model =/= undefined, S#state.loaded_identity =/= Identity ->
+            {error, {incompatible_ranks, [0]}};
         [] ->
             Pids = [F || {F, _} <- Followers],
-            Fwd = spawn_link(fun() -> forward(Gen, Pids) end),
-            erllama_model_llama:init(Config#{
+            Owner = self(),
+            Fwd = spawn_link(fun() -> forward(Gen, Pids, monitor(process, Owner)) end),
+            HostConfig = Config#{
                 model_opts => MOpts#{tp_rank => H},
                 context_opts => (split_context_opts(COpts))#{tp_sink => Fwd}
-            });
+            },
+            case open_host(HostConfig, S) of
+                {ok, _} = Ok ->
+                    Ok;
+                Error ->
+                    unlink(Fwd),
+                    exit(Fwd, shutdown),
+                    Error
+            end;
         Bad ->
             {error, {incompatible_ranks, Bad}}
     end.
 
+open_host(Config, #state{model = undefined}) ->
+    erllama_model_llama:init(Config);
+open_host(Config, #state{model = Model, ctx = Ctx}) ->
+    ok = erllama_nif:free_context(Ctx),
+    case erllama_model_llama:init_loaded(Model, Config) of
+        {ok, _} = Ok -> Ok;
+        {error, Reason} -> {consumed, Reason}
+    end.
+
 %% Rank 0 hosting erllama_model_tp's backend.
 hosting({host, Config0, Followers}, #state{host = undefined} = S) ->
-    Config = maps:remove(tp_kv_timeout, Config0),
-    case host_model(Config, Followers, S) of
-        {ok, B} ->
-            {reply, ok, S#state{host = B, kv_timeout = maps:get(tp_kv_timeout, Config0, 30000)}};
-        {error, _} = E ->
-            {reply, E, S}
-    end;
+    start_host(Config0, Followers, S);
 hosting({kv_pack, _} = Req, S) ->
     checkpointing(Req, S);
 hosting({kv_unpack, _, _} = Req, S) ->
@@ -342,6 +377,22 @@ hosting({free_ref, Id}, #state{refs = Refs} = S) ->
     end;
 hosting(_Req, S) ->
     {reply, {error, not_loaded}, S}.
+
+start_host(Config0, Followers, S) ->
+    Config = maps:remove(tp_kv_timeout, Config0),
+    case host_model(Config, Followers, S) of
+        {ok, B} ->
+            {reply, ok, S#state{
+                model = undefined,
+                ctx = undefined,
+                host = B,
+                kv_timeout = maps:get(tp_kv_timeout, Config0, 30000)
+            }};
+        {consumed, Why} ->
+            {stop, {host_failed, Why}, {error, Why}, S#state{model = undefined, ctx = undefined}};
+        {error, _} = E ->
+            {reply, E, S}
+    end.
 
 %% -----------------------------------------------------------------------------
 %% Checkpoints

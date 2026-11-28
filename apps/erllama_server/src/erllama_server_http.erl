@@ -23,7 +23,7 @@ start_link() ->
             Listen = #{ip => maps:get(ip, Http, {127, 0, 0, 1}), port => port(Http)},
             Opts = #{
                 http => Listen,
-                router => livery_router:compile(routes() ++ mcp_routes()),
+                router => livery_router:compile(service_routes()),
                 middleware => middleware()
             },
             case livery:start_service(Opts) of
@@ -33,6 +33,18 @@ start_link() ->
                 {error, _} = E ->
                     E
             end
+    end.
+
+service_routes() ->
+    case erllama_server_config:get(role) of
+        rank ->
+            [
+                {<<"GET">>, <<"/health">>, {erllama_server_http_ops, health}},
+                {<<"GET">>, <<"/ready">>, {erllama_server_http_ops, rank_ready}},
+                {<<"GET">>, <<"/rank">>, {erllama_server_http_ops, rank}}
+            ];
+        serving ->
+            routes() ++ mcp_routes()
     end.
 
 %% The MCP endpoint, when `mcp_endpoint' turns it on.

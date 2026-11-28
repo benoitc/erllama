@@ -6,6 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- The release includes a mutual TLS distribution profile for groups across hosts.
+- HTTP status API 2 reports grouped models, rank readiness and loss reasons. Prometheus exposes group state and lost slots.
+- Start serving and rank roles from the same release with separate config files.
+- Register a tensor-parallel group to serve a model by name and see when a rank is lost.
+
 ### Changed
 
 - Model pulls and local registration accept numbered GGUF shards as one

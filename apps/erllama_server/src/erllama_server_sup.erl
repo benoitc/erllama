@@ -23,20 +23,28 @@ start_link() ->
 %% last: it only takes requests once everything it calls is up.
 init([]) ->
     SupFlags = #{strategy => rest_for_one, intensity => 5, period => 30},
-    Children = [
-        worker(erllama_server_failures),
-        worker(erllama_server_registry),
-        worker(erllama_server_models),
-        worker(erllama_server_runs),
-        worker(erllama_server_convs),
-        worker(erllama_server_responses),
-        supervisor(erllama_server_run_sup),
-        supervisor(erllama_server_pull_sup),
-        supervisor(erllama_server_agent_sup),
-        worker(erllama_server_mcp),
-        worker(erllama_server_http)
-    ],
+    Children =
+        case erllama_server_config:get(role) of
+            rank -> [worker(erllama_server_http)];
+            serving -> serving_children()
+        end,
     {ok, {SupFlags, Children}}.
+
+serving_children() ->
+    Models = erllama_server_config:get(models),
+    erllama_server_group_boot:coordinators(Models) ++
+        [
+            worker(erllama_server_failures),
+            worker(erllama_server_registry),
+            worker(erllama_server_models),
+            worker(erllama_server_runs),
+            worker(erllama_server_convs),
+            worker(erllama_server_responses),
+            supervisor(erllama_server_run_sup),
+            supervisor(erllama_server_pull_sup),
+            supervisor(erllama_server_agent_sup),
+            worker(erllama_server_mcp)
+        ] ++ erllama_server_group_boot:loaders(Models) ++ [worker(erllama_server_http)].
 
 supervisor(Mod) ->
     #{id => Mod, start => {Mod, start_link, []}, type => supervisor, shutdown => infinity}.

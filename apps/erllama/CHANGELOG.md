@@ -6,6 +6,11 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- You can form and monitor a tensor-parallel group with `erllama_tp_coordinator`.
+- Set `tp_rank` in the erllama application configuration to start a rank and read its local readiness.
+
 ## [0.13.0] - 2026-11-26
 
 ### Added

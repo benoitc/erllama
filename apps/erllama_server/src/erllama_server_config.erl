@@ -12,7 +12,8 @@
 
 -spec defaults() -> #{atom() => term()}.
 defaults() ->
-    #{
+    (http_defaults())#{
+        role => serving,
         run_buffer_events => 1024,
         subscriber_max_unacked => 256,
         run_retention_ms => 300000,
@@ -28,12 +29,6 @@ defaults() ->
         hf_token => undefined,
         hf_base_url => <<"https://huggingface.co">>,
         ollama_base_url => <<"https://registry.ollama.ai">>,
-        %% HTTP APIs: off unless `http' is set.
-        http => undefined,
-        api_keys => [],
-        allow_unauthenticated => false,
-        max_body_bytes => 33554432,
-        max_http_requests => 64,
         %% MCP: servers whose tools agent sessions may use, and the opt-in
         %% endpoint exposing the release to MCP clients.
         mcp_servers => [],
@@ -51,6 +46,16 @@ defaults() ->
         kv_unified => true
     }.
 
+http_defaults() ->
+    #{
+        %% HTTP APIs: off unless `http' is set.
+        http => undefined,
+        api_keys => [],
+        allow_unauthenticated => false,
+        max_body_bytes => 33554432,
+        max_http_requests => 64
+    }.
+
 -spec validate() -> ok | {error, term()}.
 validate() ->
     validate(maps:from_list(application:get_all_env(erllama_server))).
@@ -62,8 +67,14 @@ validate(Env) when is_map(Env) ->
      || K := V <- maps:with(maps:keys(defaults()), Env), not valid(K, V)
     ],
     case Bad of
-        [] -> check_http(maps:merge(defaults(), Env));
-        [{K, V} | _] -> {error, {invalid_config, K, V}}
+        [] ->
+            Config = maps:merge(defaults(), Env),
+            maybe
+                ok ?= check_http(Config),
+                check_role(Config, application:get_env(erllama, tp_rank))
+            end;
+        [{K, V} | _] ->
+            {error, {invalid_config, K, V}}
     end.
 
 %% An HTTP listener reachable from other machines needs API keys, unless
@@ -75,19 +86,28 @@ check_http(#{http := #{ip := Ip}, api_keys := [], allow_unauthenticated := false
 check_http(_) ->
     ok.
 
+check_role(#{role := rank, http := undefined}, _) ->
+    {error, {invalid_config, role, rank_requires_http}};
+check_role(#{role := rank, models := [], mcp_endpoint := false}, {ok, C}) when is_map(C) ->
+    ok;
+check_role(#{role := rank}, _) ->
+    {error, {invalid_config, role, rank_requires_tp_rank_and_no_serving_models}};
+check_role(#{role := serving, models := Models}, undefined) ->
+    erllama_server_group_boot:validate(Models);
+check_role(#{role := serving}, _) ->
+    {error, {invalid_config, role, tp_rank_requires_rank_role}}.
+
+valid(role, R) ->
+    R =:= serving orelse R =:= rank;
 valid(run_retention_ms, V) ->
     is_integer(V) andalso V >= 0;
 valid(keep_alive_ms, V) ->
     V =:= infinity orelse (is_integer(V) andalso V >= 0);
 valid(data_dir, V) ->
     V =:= undefined orelse is_path(V);
-valid(default_model, V) ->
+valid(K, V) when K =:= default_model; K =:= hf_token ->
     V =:= undefined orelse is_name(V);
-valid(hf_token, V) ->
-    V =:= undefined orelse is_name(V);
-valid(hf_base_url, V) ->
-    is_url(V);
-valid(ollama_base_url, V) ->
+valid(K, V) when K =:= hf_base_url; K =:= ollama_base_url ->
     is_url(V);
 valid(models, V) ->
     is_list(V) andalso lists:all(fun valid_model/1, V);
@@ -161,8 +181,10 @@ unique_names(Servers) ->
     length(Names) =:= length(lists:usort(Names)).
 
 %% A model registered at boot: `#{name, path}' plus load options.
-valid_model(#{name := N, path := P}) -> is_name(N) andalso is_path(P);
-valid_model(_) -> false.
+valid_model(#{name := N, path := P} = Entry) ->
+    is_name(N) andalso is_path(P) andalso element(1, erllama_server_group:entry(Entry, #{})) =:= ok;
+valid_model(_) ->
+    false.
 
 valid_ip(Ip) when is_tuple(Ip) -> tuple_size(Ip) =:= 4 orelse tuple_size(Ip) =:= 8;
 valid_ip(_) -> false.

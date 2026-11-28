@@ -53,6 +53,25 @@ config_rejects_bad_values_test() ->
     ?assertMatch({error, {invalid_config, default_parallel, 65}}, V(#{default_parallel => 65})),
     ?assertMatch({error, {invalid_config, kv_unified, yes}}, V(#{kv_unified => yes})).
 
+rank_role_requires_a_local_rank_test() ->
+    ?assertMatch(
+        {error, {invalid_config, role, _}},
+        erllama_server_config:validate(#{role => rank, http => #{port => 0}})
+    ).
+
+conflicting_coordinators_test() ->
+    G = #{
+        group_id => <<"g">>, generation => 1, world => 2, coordinator => g, followers => [node()]
+    },
+    M = #{name => <<"a">>, path => "/a.gguf", group => G},
+    ?assertEqual(ok, erllama_server_config:validate(#{models => [M]})),
+    ?assertMatch(
+        {error, {invalid_config, models, _}},
+        erllama_server_config:validate(#{
+            models => [M, M#{name := <<"b">>, group := G#{group_id := <<"b">>}}]
+        })
+    ).
+
 bad_config_fails_the_start_test() ->
     application:set_env(erllama_server, run_buffer_events, -1),
     try

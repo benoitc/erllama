@@ -1,0 +1,185 @@
+{
+  "window_start": "2026-11-28T08:10:36Z",
+  "caps0": "{ok,#{device => \"CUDA0\",gpus => 1,init_rank => true,allreduce => true}}",
+  "caps1": "{ok,#{device => \"CUDA0\",gpus => 1,init_rank => true,allreduce => true}}",
+  "solo": [
+    {
+      "tokens": 64,
+      "prompt_tokens": 38,
+      "ttft_ms": 24.46,
+      "end_to_end_tps": 241.27,
+      "decode_tps": 261.64
+    },
+    {
+      "tokens": 64,
+      "prompt_tokens": 38,
+      "ttft_ms": 15.77,
+      "end_to_end_tps": 249.3,
+      "decode_tps": 261.46
+    },
+    {
+      "tokens": 64,
+      "prompt_tokens": 38,
+      "ttft_ms": 16.22,
+      "end_to_end_tps": 249.68,
+      "decode_tps": 262.38
+    }
+  ],
+  "group1": {
+    "reason": null,
+    "state": "ready",
+    "world": 2,
+    "model": "tiny:latest",
+    "n_seq_max": 1,
+    "generation": 1,
+    "group_id": "tiny-qualification",
+    "ranks": [
+      {
+        "reason": null,
+        "state": "ready",
+        "rank": 0
+      },
+      {
+        "reason": null,
+        "state": "ready",
+        "rank": 1
+      }
+    ]
+  },
+  "split": [
+    {
+      "tokens": 64,
+      "prompt_tokens": 38,
+      "ttft_ms": 70.4,
+      "end_to_end_tps": 44.88,
+      "decode_tps": 46.48
+    },
+    {
+      "tokens": 64,
+      "prompt_tokens": 38,
+      "ttft_ms": 67.57,
+      "end_to_end_tps": 36.77,
+      "decode_tps": 37.66
+    },
+    {
+      "tokens": 64,
+      "prompt_tokens": 38,
+      "ttft_ms": 100.85,
+      "end_to_end_tps": 28.67,
+      "decode_tps": 29.56
+    }
+  ],
+  "warm": {
+    "prompt": 440,
+    "equal": true,
+    "counts": {
+      "hits_exact": 0,
+      "hits_longest_prefix": 1,
+      "hits_resume": 0
+    },
+    "diagnostic": "#{hit => {ok,#{kind => partial,prefix_len => 384}},\n  stat =>\n      #{pack => ok,unpack => ok,pack_ok => 3,pack_ms => 110.772,\n        pack_bytes => 20918271,unpack_ok => 1,unpack_ms => 60.028,\n        unpack_bytes => 0}}"
+  },
+  "cancel": {
+    "status": "cancelled",
+    "next_request": 200
+  },
+  "failure_event": {
+    "code": "server_error",
+    "message": "{tp_rank_lost,shutdown}"
+  },
+  "interrupted_request_failed": true,
+  "loss": {
+    "group": {
+      "reason": {
+        "code": "tp_rank_lost",
+        "rank": 1,
+        "detail": "noconnection"
+      },
+      "state": "lost",
+      "world": 2,
+      "model": "tiny:latest",
+      "n_seq_max": 1,
+      "generation": 1,
+      "group_id": "tiny-qualification",
+      "ranks": [
+        {
+          "reason": {
+            "code": "tp_rank_lost",
+            "rank": 1,
+            "detail": "noconnection"
+          },
+          "state": "lost",
+          "rank": 0
+        },
+        {
+          "reason": {
+            "code": "tp_rank_lost",
+            "rank": 1,
+            "detail": "noconnection"
+          },
+          "state": "lost",
+          "rank": 1
+        }
+      ]
+    },
+    "http": 503,
+    "error": {
+      "error": {
+        "code": "tp_rank_lost",
+        "message": "a rank of the model group was lost",
+        "param": "model",
+        "type": "server_error"
+      }
+    }
+  },
+  "group2": {
+    "reason": null,
+    "state": "ready",
+    "world": 2,
+    "model": "tiny:latest",
+    "n_seq_max": 1,
+    "generation": 2,
+    "group_id": "tiny-qualification",
+    "ranks": [
+      {
+        "reason": null,
+        "state": "ready",
+        "rank": 0
+      },
+      {
+        "reason": null,
+        "state": "ready",
+        "rank": 1
+      }
+    ]
+  },
+  "generation2_reply": "One flower is the rose. The rose",
+  "restored": "ready",
+  "window_end": "2026-11-28T08:13:10Z",
+  "build": {
+    "base_commit": "b50a5d32698daa9ad6ebf19b49e1f6b961aad65c",
+    "source_archive_sha256": "20fe5311c87ee57dd58d66041dd2fabcedebbce413ff9d780fc0ac1503580833",
+    "release_archive_sha256": "7d5a3257afb7c563c321e9efebde6597bef76f4939fe3686065622d45829a3ff",
+    "nif_sha256": "bfa8fe0be7b568236a4215bbaede26ce574187308629b40ee5acb17c4383fae3",
+    "otp": "28.3.1",
+    "cuda_toolkit": "13.0.88",
+    "nccl": "2.32.6",
+    "driver": "580.178.04"
+  },
+  "setup": {
+    "model_file": "tinyllama-1.1b-chat.gguf",
+    "model_sha256": "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0",
+    "rank_hosts": [
+      "gx10-fa8e",
+      "gx10-e25e"
+    ],
+    "gpu_per_rank": "NVIDIA GB10",
+    "nccl_network": "Socket",
+    "interface": "enp1s0f0np0",
+    "distribution": "inet_tls",
+    "n_ctx": 2048,
+    "n_seq_max": 1,
+    "temperature": 0,
+    "timing_prompt": "Write a detailed numbered list of ways to grow vegetables in a small garden. Explain every item."
+  }
+}

@@ -9,11 +9,13 @@
 %% counters, and the server's models, jobs and failures) and `/status'
 %% (erllama_server_api:status/0 as JSON: what runs, waits and failed).
 
--export([health/1, ready/1, metrics/1, status/1]).
+-export([health/1, ready/1, rank_ready/1, rank/1, metrics/1, status/1]).
 
 status(_Req) ->
     {ok, S} = erllama_server_api:status(),
-    erllama_server_http_kit:json(200, jsonable(S)).
+    erllama_server_http_kit:json(200, (jsonable(S))#{
+        api := 2, groups => erllama_server_group_status:groups()
+    }).
 
 %% Status values include terms JSON has no form for (error reasons,
 %% pids): they are shown as Erlang text.
@@ -36,18 +38,45 @@ key(K) -> iolist_to_binary(io_lib:format("~0tp", [K])).
 health(Req) ->
     (livery_health:live())(Req).
 
-ready(Req) ->
-    Checks = [
-        {<<"erllama">>, fun() -> alive(erllama_sup) end},
-        {<<"registry">>, fun() -> alive(erllama_server_registry) end},
-        {<<"models">>, fun() -> alive(erllama_server_models) end}
+ready(_Req) ->
+    Infra = [
+        N
+     || {N, P} <- [
+            {erllama, erllama_sup},
+            {registry, erllama_server_registry},
+            {models, erllama_server_models}
+        ],
+        whereis(P) =:= undefined
     ],
-    (livery_health:ready(Checks))(Req).
+    try erllama_server_group_status:groups() of
+        [] ->
+            probe(Infra, #{});
+        Groups ->
+            Failed = [group || lists:any(fun(#{state := S}) -> S =/= ready end, Groups)],
+            probe(Infra ++ Failed, #{groups => Groups})
+    catch
+        exit:_ -> probe(lists:usort([group | Infra]), #{})
+    end.
 
-alive(Name) ->
-    case whereis(Name) of
-        undefined -> {error, down};
-        _ -> ok
+probe([], Extra) ->
+    erllama_server_http_kit:json(200, Extra#{status => ok});
+probe(Failed, Extra) ->
+    erllama_server_http_kit:json(503, Extra#{status => unavailable, failed => Failed}).
+
+rank_ready(_Req) ->
+    Rank = local_rank(),
+    probe([rank || maps:get(state, Rank) =/= ready], #{rank => Rank}).
+
+rank(_Req) ->
+    case local_rank() of
+        #{state := unavailable} = Status -> erllama_server_http_kit:json(503, Status);
+        Status -> erllama_server_http_kit:json(200, Status)
+    end.
+
+local_rank() ->
+    case erllama_tp_rank_role:status() of
+        undefined -> #{state => unavailable};
+        Status -> erllama_server_group_status:rank(Status)
     end.
 
 metrics(_Req) ->
@@ -77,6 +106,7 @@ server_gauges() ->
         gauge(<<"erllama_server_active_runs">>, Runs),
         gauge(<<"erllama_server_waiting_runs">>, Waiting),
         gauge(<<"erllama_server_active_pulls">>, Pulls),
+        erllama_server_group_status:metrics(erllama_server_group_status:groups()),
         failure_counters()
     ].
 

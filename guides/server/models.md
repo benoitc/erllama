@@ -40,6 +40,33 @@ $R/bin/erllama pull https://example.com/model.gguf --sha256 9f86d0...
 - An Ollama model's Go template is not used; the chat template inside
   the GGUF file is.
 
+## Serve a model on a rank group
+
+For release startup, follow [Start a serving node and two ranks](tensor-parallel.md).
+For manual registration, start the named coordinator on your serving node and configure each rank as
+described in the [tensor-parallel guide](../tensor-parallel.md). Register the
+same absolute GGUF path on the serving node. For example, for two ranks:
+
+```erlang
+Group = #{group_id => <<"glm">>, generation => 1, world => 2,
+          coordinator => <<"glm_group">>, followers => [<<"rank1@gpu1.internal">>]},
+{ok, _} = erllama_server_api:register_model("/models/glm.gguf",
+              #{name => <<"glm">>, group => Group}),
+{ok, _} = erllama_server_api:load(<<"glm">>, #{}).
+```
+
+Use the coordinator's registered name and list follower nodes in rank order,
+starting at rank 1. The server discovers rank 0 through the coordinator.
+It uses the model and context options loaded by the ranks. If you also set
+`n_ctx`, `parallel`, `kv_unified`, or `n_gpu_layers` on the entry, match
+those settings to the ranks. A grouped model stays loaded by default.
+
+You can now start and stream runs with the registered model name. If a rank
+exits, active runs fail with `{tp_rank_lost, Reason}` and the registry shows
+`status => lost`. To serve again, form a fresh generation and register the
+entry with that generation. Explicitly unloading a grouped model also stops
+rank 0. The registry file contains only the group declaration.
+
 ## Register a file you already have
 
 ```bash

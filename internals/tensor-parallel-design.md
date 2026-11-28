@@ -21,8 +21,7 @@ experimental: two hosts are verified, larger groups are not.
 - **erllama holds only rank-local resources.** `erllama_tp` opens this
   node's GPU backend, joins the backend's communicator and runs
   collectives. Forming a group (which ranks, when, which generation)
-  is the coordinator's job: `erllama_cluster` later, a test coordinator
-  (`apps/erllama/test/erllama_tp_coordinator.erl`) here.
+  is the caller's job. Start one `erllama_tp_coordinator` per generation.
 - **Tensor data stays native.** Only the communicator's bootstrap
   records cross Erlang. Reductions go GPU to GPU through the backend's
   communicator (NCCL for CUDA).
@@ -54,7 +53,7 @@ erllama_tp:open/5       (serves the bridge)       (one per group)
   deadline ends the wait, and `init_rank` returns no communicator.
 - `Join` is a fun, or `{call, Server}` for a coordinator that answers
   `{exchange, Rank, Round, Bytes}` calls, possibly on another node.
-- The test coordinator answers each round once every rank's record is
+- The coordinator answers each round once every rank's record is
   in, and fails the group if a round is not complete in time.
 
 ## Using a rank
@@ -325,8 +324,8 @@ NCCL_NET=Socket NCCL_SOCKET_IFNAME==enp1s0f0np0 \
 | a rank lost while serving | the coordinator kills the other ranks; `erllama_model_tp` answers `{error, {tp_rank_lost, Why}}`, the model fails its requests once and stops; the serving VM is unaffected |
 | rank 0 silent past `tp_call_timeout` (default 120 s) | the same, and rank 0 is killed |
 
-Watching the group is the coordinator's job (`erllama_tp_coordinator:watch/2`
-in the tests): when a rank process goes, it kills the others with
+Watching the group is the coordinator's job (`erllama_tp_coordinator:watch/2`).
+When a rank exits abnormally, it kills the other rank nodes with
 `erllama_tp_rank:kill/1`, because a rank left in a collective with a
 lost peer never returns.
 
@@ -428,5 +427,4 @@ every bump.
   `Rank < World`), but only two hosts are verified, and four-host
   testing is open.
 - Metal.
-- A production coordinator (`erllama_cluster`); the suites use the
-  test coordinator.
+- Starting rank and serving roles from release configuration.

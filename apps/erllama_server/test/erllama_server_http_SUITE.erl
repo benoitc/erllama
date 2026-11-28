@@ -634,6 +634,8 @@ ops_endpoints(Config) ->
     {200, St} = get(Config, <<"/status">>),
     ?assertMatch(
         #{
+            <<"api">> := 2,
+            <<"groups">> := [],
             <<"models">> := [_, _],
             <<"runs">> := #{},
             <<"agents">> := [],

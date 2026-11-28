@@ -8,6 +8,27 @@ decisions are in
 library's own record is in
 [apps/erllama/doc/features.md](../../erllama/doc/features.md).
 
+## Tensor-parallel registry models
+
+You can register a GGUF against a named group and serve it through the usual
+run API. The group test uses two local Erlang peer nodes with simulated rank
+computation and a real GGUF vocabulary. It covers a completion, a follower lost
+during streaming, refusal to reuse that generation, and a new generation serving
+the same model name. See [Managing models](../../../guides/server/models.md#serve-a-model-on-a-rank-group).
+
+The release can start a serving role and its coordinators, or one configured
+rank with a probe-only listener. To check the three-process startup on a CPU,
+build with `rebar3 as test release` and run
+`python3 scripts/check_tp_release.py /absolute/path/to/stories260K.gguf`.
+The test starts the release launcher three times, sends an HTTP chat request
+and stops the follower. It checks HTTP status API 2, readiness, rank state,
+metrics and inference errors, then repeats startup with incompatible rank options.
+Pass `--tls` to check the release's mutual TLS profile with OpenSSL-generated certificates.
+The test checks rejection in each direction, then serves a completion with trusted certificates.
+Both reference ranks run the whole GGUF on CPU and
+compare their results. CUDA/NCCL tensor splitting has a separate hardware suite.
+See [Start a serving node and two ranks](../../../guides/server/tensor-parallel.md).
+
 ## Phase 1: repository and build migration (implemented)
 
 | Step | State | Notes |

@@ -25,6 +25,7 @@
 
 -export([
     init/1,
+    init_loaded/2,
     terminate/1,
     shared_state/1,
     kv_format/1,
@@ -138,6 +139,17 @@ init(Config0) ->
                     E
             end;
         {error, _} = E ->
+            E
+    end.
+
+-doc false.
+-spec init_loaded(erllama_nif:model_ref(), map()) -> {ok, #s{}} | {error, term()}.
+init_loaded(Model, #{model_path := Path, model_opts := MOpts} = Config0) ->
+    case derive_fingerprint(Path, Config0) of
+        {ok, Config} ->
+            post_load(Model, Config, MOpts, undefined);
+        {error, _} = E ->
+            _ = erllama_nif:free_model(Model),
             E
     end.
 

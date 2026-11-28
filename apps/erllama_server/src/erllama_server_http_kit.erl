@@ -63,24 +63,29 @@ err(Proto, Status, Msg) ->
     err(Proto, Status, Msg, null).
 
 -spec err(protocol(), 100..599, iodata(), binary() | null) -> livery_resp:resp().
-err(openai, Status, Msg, Param) ->
+err(P, Status, Msg, Param) -> err(P, Status, Msg, Param, null).
+
+err(openai, Status, Msg, Param, Code) ->
     json(Status, #{
         <<"error">> => #{
             <<"message">> => iolist_to_binary(Msg),
             <<"type">> => openai_type(Status),
             <<"param">> => Param,
-            <<"code">> => null
+            <<"code">> => Code
         }
     });
-err(anthropic, Status, Msg, _Param) ->
+err(anthropic, Status, Msg, _Param, Code) ->
     json(Status, #{
         <<"type">> => <<"error">>,
-        <<"error">> => #{
+        <<"error">> => with_code(Code, #{
             <<"type">> => anthropic_type(Status), <<"message">> => iolist_to_binary(Msg)
-        }
+        })
     });
-err(ollama, Status, Msg, _Param) ->
-    json(Status, #{<<"error">> => iolist_to_binary(Msg)}).
+err(ollama, Status, Msg, _Param, Code) ->
+    json(Status, with_code(Code, #{<<"error">> => iolist_to_binary(Msg)})).
+
+with_code(null, M) -> M;
+with_code(Code, M) -> M#{<<"code">> => Code}.
 
 openai_type(401) -> <<"authentication_error">>;
 openai_type(404) -> <<"not_found_error">>;
@@ -104,6 +109,12 @@ crash(Class, Reason, Stack) ->
 
 %% A service API refusal as an HTTP error.
 -spec api_error(protocol(), term()) -> livery_resp:resp().
+api_error(P, {group_unavailable, _}) ->
+    err(P, 503, <<"the model group is unavailable">>, <<"model">>, group_unavailable);
+api_error(P, {tp_rank_lost, _}) ->
+    err(P, 503, <<"a rank of the model group was lost">>, <<"model">>, tp_rank_lost);
+api_error(P, {incompatible_ranks, _}) ->
+    err(P, 503, <<"rank identities differ">>, <<"model">>, incompatible_ranks);
 api_error(P, {unknown_model, M}) ->
     err(P, 404, [<<"model '">>, to_bin(M), <<"' not found">>], <<"model">>);
 api_error(P, {model_file_missing, M}) ->

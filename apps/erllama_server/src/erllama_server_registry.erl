@@ -24,6 +24,7 @@
     add/1,
     resolve/1,
     list/0,
+    grouped/0,
     alias/2,
     copy/2,
     remove/1,
@@ -76,6 +77,9 @@ add(Entry) ->
 resolve(Name) ->
     gen_server:call(?MODULE, {resolve, Name}).
 
+-spec grouped() -> [map()].
+grouped() -> gen_server:call(?MODULE, grouped).
+
 -spec list() -> [map()].
 list() ->
     gen_server:call(?MODULE, list).
@@ -115,6 +119,7 @@ blobs_dir() ->
 
 -spec init([]) -> {ok, state()}.
 init([]) ->
+    _ = erllama_server_group:init(),
     Dir = erllama_server_config:data_dir(),
     ok = filelib:ensure_path(filename:join(Dir, "blobs")),
     File = filename:join(Dir, "registry.json"),
@@ -122,6 +127,10 @@ init([]) ->
     St = boot_models(erllama_server_config:get(models), St0),
     {ok, St}.
 
+handle_call({group_lost, Key, Why}, _, St) ->
+    {reply, erllama_server_group:down(Key, Why), St};
+handle_call({bind_group, Key, Pids}, _, St) ->
+    {reply, erllama_server_group:bind(Key, Pids), St};
 handle_call({register_local, Path, Opts}, _From, St) ->
     reply_change(local_entry(Path, Opts), St);
 handle_call({add, #{shard_digests := [_, _ | _] = Digests, name := Name} = Entry}, _From, St) ->
@@ -135,6 +144,8 @@ handle_call({add, Entry}, _From, St) ->
     reply_change({ok, Entry#{name := normalize(maps:get(name, Entry))}}, St);
 handle_call({resolve, Name}, _From, St) ->
     {reply, find(Name, St), St};
+handle_call(grouped, _, #state{entries = E, default = D} = St) ->
+    {reply, [view(X, D) || _ := #{group := _} = X <- maps:iterator(E, ordered)], St};
 handle_call(list, _From, #state{entries = E, default = D} = St) ->
     {reply, [view(X, D) || _ := X <- maps:iterator(E, ordered)], St};
 handle_call({alias, Alias0, Name}, _From, St) ->
@@ -188,6 +199,9 @@ handle_call(_Req, _From, St) ->
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
+handle_info({{tp_member, Key}, _, process, _, Reason}, St) ->
+    ok = erllama_server_group:down(Key, Reason),
+    {noreply, St};
 handle_info(_Msg, St) ->
     {noreply, St}.
 
@@ -195,7 +209,14 @@ handle_info(_Msg, St) ->
 %% Entries
 %% -----------------------------------------------------------------------------
 
-reply_change({ok, #{name := Name} = Entry}, St) ->
+reply_change({ok, Entry}, St) ->
+    store_entry(
+        erllama_server_group:entry(Entry, maps:without([status, reason, default], Entry)), St
+    );
+reply_change({error, _} = E, St) ->
+    {reply, E, St}.
+
+store_entry({ok, #{name := Name} = Entry}, St) ->
     St1 = St#state{entries = (St#state.entries)#{Name => Entry}},
     case save(St1) of
         ok ->
@@ -207,7 +228,7 @@ reply_change({ok, #{name := Name} = Entry}, St) ->
         {error, _} = E ->
             {reply, E, St}
     end;
-reply_change({error, _} = E, St) ->
+store_entry({error, _} = E, St) ->
     {reply, E, St}.
 
 local_entry(Path0, Opts) ->
@@ -223,7 +244,7 @@ local_entry(Path0, Opts) ->
             MmProj = maps:get(mmproj, Opts, undefined),
             case check_projector(Load, MmProj) of
                 ok ->
-                    {ok, #{
+                    erllama_server_group:entry(Opts, #{
                         name => Name,
                         source => #{kind => local, ref => Path},
                         path => First,
@@ -234,7 +255,7 @@ local_entry(Path0, Opts) ->
                         defaults => #{},
                         keep_alive => maps:get(keep_alive, Opts, undefined),
                         created_at => now_ms()
-                    }};
+                    });
                 {error, _} = E ->
                     E
             end;
@@ -318,7 +339,7 @@ view(#{path := Path} = Entry, Default) ->
             true -> ok;
             false -> missing
         end,
-    Entry#{status => Status, default => maps:get(name, Entry) =:= Default}.
+    erllama_server_group:view(Entry#{status => Status, default => maps:get(name, Entry) =:= Default}).
 
 entry_present(#{load := #{backend := erllama_model_mlx}}, Path) ->
     filelib:is_regular(filename:join(Path, "config.json"));
@@ -353,6 +374,11 @@ delete_unused_blobs(Entry, Remaining) ->
 
 boot_models([], St) ->
     St;
+boot_models([#{name := N, path := P, group := _} = M | Rest], #state{entries = Entries} = St) ->
+    case local_entry(P, M) of
+        {ok, Entry} -> boot_models(Rest, St#state{entries = Entries#{normalize(N) => Entry}});
+        {error, Why} -> error({invalid_group_model, N, Why})
+    end;
 boot_models([#{name := N, path := P} = M | Rest], #state{entries = E} = St) ->
     Name = normalize(N),
     case is_map_key(Name, E) of
@@ -447,7 +473,7 @@ null_or(undefined) -> null;
 null_or(V) -> V.
 
 encode_entry(E) ->
-    (maps:with([shard_digests], E))#{
+    (maps:with([shard_digests, group], E))#{
         <<"name">> => maps:get(name, E),
         <<"source">> => #{
             <<"kind">> => maps:get(kind, maps:get(source, E)),
@@ -472,7 +498,16 @@ decode(#{<<"version">> := ?VERSION, <<"models">> := Models} = Doc) ->
 decode_entry(
     #{<<"name">> := N, <<"path">> := P, <<"source">> := #{<<"kind">> := K, <<"ref">> := R}} = M
 ) ->
-    (atom_keys(M, [shard_digests]))#{
+    Extra =
+        case maps:find(<<"group">>, M) of
+            {ok, Raw} ->
+                Group = atom_keys(Raw, [group_id, generation, world, coordinator, followers]),
+                {ok, Part} = erllama_server_group:entry(#{group => Group}, #{}),
+                Part;
+            error ->
+                #{}
+        end,
+    (maps:merge(Extra, atom_keys(M, [shard_digests])))#{
         name => N,
         source => #{kind => source_kind(K), ref => R},
         path => P,

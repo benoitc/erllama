@@ -10,7 +10,7 @@
 %% Key}}` or `{error, {invalid_option, Key, Value}}` so callers get a
 %% typed reason instead of a crash inside the model process.
 
--export([load_config/1, request_opts/1, prefill_opts/1, chat_opts/1]).
+-export([load_config/1, rank_options/1, request_opts/1, prefill_opts/1, chat_opts/1]).
 
 -define(LOAD_KEYS, [
     backend,
@@ -201,6 +201,15 @@ load_config(Config) when is_map(Config) ->
     ]);
 load_config(Other) ->
     {error, {invalid_config, config, Other}}.
+
+-spec rank_options(map()) -> {ok, map()} | {error, term()}.
+rank_options(C) ->
+    steps(C, [
+        fun(M) -> sub_keys(M, model_opts, ?MODEL_OPT_KEYS -- [tp_rank]) end,
+        fun(M) -> sub_keys(M, context_opts, ?CONTEXT_OPT_KEYS -- [tp_sink]) end,
+        fun check_sub_types/1,
+        fun check_fit_exclusive/1
+    ]).
 
 %% The auto-fit only touches parameters still at their llama
 %% defaults, so combining it with manual placement would fail only
